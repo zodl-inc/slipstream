@@ -1,0 +1,54 @@
+# Slipstream — a high-performance Zcash light-wallet sync engine.
+# Standalone workspace (extracted from the ZcashLightClientKit slipstream branch).
+# Consumes published librustzcash crates; the engine adds orchestration only.
+
+[workspace]
+members = ["core", "cli", "gpuhash", "protogen"]
+resolver = "3"
+
+[workspace.dependencies]
+# Slipstream shared versions (P0-review carry-over). Root package keeps its own
+# [dependencies] block; slipstream crates inherit from here.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tonic = "0.14"
+prost = "0.14"
+tonic-prost = "0.14"
+futures-util = "0.3"
+thiserror = "2"
+tracing = "0.1"
+zcash_protocol = "0.9"
+zcash_client_backend = { version = "0.23", features = [
+    "lightwalletd-tonic-tls-webpki-roots",
+    "orchard",
+    "pczt",
+    "tor",
+    "transparent-inputs",
+    "unstable",
+] }
+zcash_client_sqlite = { version = "0.21", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_keys = { version = "0.14", features = ["orchard"] }
+rusqlite = "0.37"
+secrecy = "0.8"
+rand = "0.8"
+sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
+orchard = { version = "0.14", features = ["unstable-voting-circuits"] }
+zcash_primitives = "0.28"
+transparent = { package = "zcash_transparent", version = "0.8", default-features = false }
+zcash_script = "0.4"
+tempfile = "3"          # dev-only usage; listed here for version unity
+incrementalmerkletree = { version = "0.8", default-features = false }
+shardtree = "0.6"
+rayon = "1.7"
+zip32 = "0.2"
+
+# Phase B (GPU Sinsemilla offload) — used ONLY by slipstream-gpuhash, behind the
+# slipstream-core `gpu` feature. Never enters the default libzcashlc build. (Decision Log
+# 2026-06-15, B0.1.) Versions: sinsemilla/group match the orchard 0.14 / pasta_curves 0.5
+# stack already resolved by this workspace.
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+sinsemilla = "0.1"
+group = "0.13"
+pasta_curves = "0.5"
+ff = "0.13"
