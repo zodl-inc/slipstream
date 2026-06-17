@@ -9,6 +9,9 @@ than the reference path — while producing a **byte-identical** wallet database
 > from them. It builds *on top of* the official `librustzcash` crates published on crates.io —
 > it does not fork or modify them.
 
+> **Reviewing or auditing?** Start with **[`REVIEWING.md`](REVIEWING.md)** — a dense
+> module-and-data-flow map (where to look, and why) written for Zcash protocol engineers.
+
 ## Result
 
 On a 2016 iPad (A10 Fusion) restoring a real multi-month wallet, the reference
@@ -22,7 +25,8 @@ Every cryptographic and wallet-logic decision is delegated to **unmodified** `li
 crates (`zcash_client_backend`, `zcash_client_sqlite`, `shardtree`, `orchard`, `sapling`).
 Slipstream owns only the **orchestration**: parallel block fetch with a device-RAM-scaled byte
 budget, a sparse in-memory commitment tree with a checkpoint-downgrade, a write-behind
-persistence lane, spend-before-sync scan ordering, tip-following, mempool, and resilience.
+persistence lane, spend-before-sync scan ordering, tip-following, mempool, a per-call Tor
+transport policy, and resilience.
 
 Because the engine is a *consumer* of published `librustzcash`, it is platform-neutral Rust:
 it powers an iOS wallet SDK today (via an FFI layer that lives in the consuming SDK, not here)
@@ -45,7 +49,7 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (144 + 29 tests)
+cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (161 + 29 tests)
 cargo build --workspace                           # full workspace incl. the parked gpuhash
 ```
 

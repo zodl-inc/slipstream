@@ -310,7 +310,33 @@ fn cmd_sync(
             }
         });
 
-        let result = slipstream_core::engine::sync_once(&cfg, ufvk_arg, Some(progress)).await;
+        // --follow: run the FULL autonomous engine session (import if --ufvk, resilient initial
+        // pass, then tip-following + mempool) via slipstream_core::session::run_session — the
+        // SAME orchestration the FFI uses. Observability = the ticker above + the engine's own
+        // tracing (the "sync stage split" lines). Runs until Ctrl-C; returns only on a
+        // non-transient initial error. Replaces the old bespoke loop (which exited on any
+        // follow-pass blip — the exact resilience hazard the lift removes).
+        if follow {
+            let scfg = slipstream_core::SessionConfig {
+                engine: cfg.clone(),
+                account: ufvk_arg.map(|(s, h)| (s.to_string(), h)),
+                tor: None,
+            };
+            let reporter = slipstream_core::SessionReporter {
+                progress: std::sync::Arc::clone(&progress),
+                state: std::sync::Arc::new(std::sync::Mutex::new(
+                    slipstream_core::ffi_handle::SyncState::Done,
+                )),
+                events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            };
+            println!("follow: running autonomous engine session (Ctrl-C to stop) ...");
+            slipstream_core::session::run_session(scfg, reporter).await;
+            ticker.abort();
+            eprintln!("sync session ended: non-transient initial error (see logs above)");
+            std::process::exit(1);
+        }
+
+        let result = slipstream_core::engine::sync_once(&cfg, ufvk_arg, Some(progress), None).await;
 
         // Abort the ticker (JoinHandle::abort is fine per spec — no cleanup needed).
         ticker.abort();
@@ -370,69 +396,6 @@ fn cmd_sync(
                     println!("reorgs: {} recovered", outcome.report.reorgs_recovered);
                 }
 
-                // ── T8.1 follow loop (CLI variant) ──────────────────────────
-                // When --follow is set, keep polling the tip and running catch-up
-                // passes until Ctrl-C. The jittered sleep matches the FFI follow
-                // loop's randomised cadence (FOLLOW_POLL_MIN_SECS=10 ..
-                // FOLLOW_POLL_MAX_SECS=30), using the same range for consistency.
-                if follow {
-                    // CLI-local jitter: same [10, 30] range as the FFI loop.
-                    const FOLLOW_CLI_POLL_MIN: u64 = 10;
-                    const FOLLOW_CLI_POLL_MAX: u64 = 30;
-
-                    let mut last_tip = outcome.chain_tip;
-                    println!("follow: watching for new blocks (Ctrl-C to stop) ...");
-                    loop {
-                        // Jittered sleep.
-                        let span = (FOLLOW_CLI_POLL_MAX - FOLLOW_CLI_POLL_MIN + 1) as f64;
-                        let sample = rand::random::<f64>();
-                        let offset = (sample * span) as u64;
-                        let secs = FOLLOW_CLI_POLL_MIN
-                            + offset.min(FOLLOW_CLI_POLL_MAX - FOLLOW_CLI_POLL_MIN);
-                        println!("follow: sleeping {secs}s ...");
-                        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
-
-                        // Cheap probe.
-                        match slipstream_core::engine::probe_tip(&cfg).await {
-                            Ok(observed) => {
-                                if !slipstream_core::engine::should_resync(last_tip, observed) {
-                                    println!("follow: tip unchanged ({observed}), no pass needed");
-                                    continue;
-                                }
-                                println!(
-                                    "follow: tip advanced {last_tip} → {observed}, syncing ..."
-                                );
-                                match slipstream_core::engine::sync_once(
-                                    &cfg,
-                                    None, // keyless: account already imported
-                                    None,
-                                )
-                                .await
-                                {
-                                    Ok(fo) => {
-                                        last_tip = fo.chain_tip;
-                                        println!(
-                                            "follow pass: +{} blocks, tip={}, txs={}",
-                                            fo.report.scan.blocks,
-                                            fo.chain_tip,
-                                            fo.enhance.txs_stored
-                                        );
-                                    }
-                                    Err(e) => {
-                                        eprintln!("follow pass failed: {e}");
-                                        std::process::exit(1);
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("follow probe failed: {e}");
-                                // Non-fatal for the CLI (mirrors the FFI transient tolerance):
-                                // just warn and try again next iteration.
-                                println!("follow: probe error — will retry next cycle");
-                            }
-                        }
-                    }
-                }
             }
             Err(e) => {
                 eprintln!("sync failed: {e}");
@@ -489,10 +452,10 @@ fn cmd_oracle(
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let verdict = rt.block_on(async {
         println!("oracle: run A (upstream persistence) …");
-        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), Some((ufvk.as_str(), birthday)), None).await?;
+        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), Some((ufvk.as_str(), birthday)), None, None).await?;
         println!("oracle: run A done — tip {} in {:.1?}", a.chain_tip, a.elapsed);
         println!("oracle: run B (sparse_b={sparse_b} write_behind_b={write_behind_b} gpu_subtree_b={gpu_subtree_b} persist_depth_b={persist_depth_b}) …");
-        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), Some((ufvk.as_str(), birthday)), None).await?;
+        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), Some((ufvk.as_str(), birthday)), None, None).await?;
         println!("oracle: run B done — tip {} in {:.1?}", b.chain_tip, b.elapsed);
         if a.chain_tip != b.chain_tip {
             eprintln!("oracle: TIP SKEW (A={} B={}) — rerun when the chain is quiet", a.chain_tip, b.chain_tip);
