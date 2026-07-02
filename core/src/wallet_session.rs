@@ -42,6 +42,14 @@ impl WalletSession {
         }
         {
             let conn = Connection::open(db_path).map_err(|e| wallet_err("pre-open", e))?;
+            // [audit ENG-1] busy_timeout is per-CONNECTION (never persisted in the file): set it on
+            // every connection we open, so a WAL checkpoint or the Swift SDK's concurrent reader
+            // (which carries its own 5s timeout) surfaces as a short wait, never an instant
+            // SQLITE_BUSY error. The main WalletDb connection is opened internally by
+            // zcash_client_sqlite (no public conn access); single-writer discipline makes writer
+            // contention impossible there — these side connections are the ones that can race.
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| wallet_err("set busy_timeout", e))?;
             // Note 1: pragma_update_and_check in rusqlite 0.37 takes Option<&str> for schema_name
             // (not Option<DatabaseName> as in older versions) — plan code compiles as-written.
             let mode: String = conn
@@ -55,7 +63,48 @@ impl WalletSession {
             .map_err(|e| wallet_err("open wallet db", e))?;
         zcash_client_sqlite::wallet::init::init_wallet_db(&mut db, None)
             .map_err(|e| wallet_err("init/migrations", e))?;
+        // [#1755] Install the slipstream-owned, read-side reconciliation view
+        // (additive; see `reconcile.rs`). It is a VIEW — adds no rows to data.db,
+        // never runs on the scan hot path, and is invisible to the golden oracle
+        // (which diffs `type='table'` only). Idempotent, so every host inherits it
+        // with no FFI change. WAL (set above) permits this short side connection.
+        {
+            let conn = Connection::open(db_path).map_err(|e| wallet_err("reconcile view open", e))?;
+            // [audit ENG-1] same per-connection timeout as the pre-open connection above.
+            conn.busy_timeout(std::time::Duration::from_secs(5))
+                .map_err(|e| wallet_err("set busy_timeout (reconcile)", e))?;
+            crate::reconcile::create_reconcile_view(&conn)?;
+        }
         Ok(Self { network, db, db_path: db_path.to_path_buf() })
+    }
+
+    /// [API v2 §4.4] The wallet's recovery ceiling: MAX(`accounts.recover_until_height`), or
+    /// `None` when no account has one (new wallets / fully non-restore imports). The scheduler
+    /// compares suggested ranges against this once per suggest round to drive the snapshot's
+    /// `is_recovering`. Read through a short side connection (same pattern as the reconcile view;
+    /// WAL permits it) so it needs no upstream API surface.
+    pub fn max_recover_until(&self) -> Result<Option<u64>, SlipstreamError> {
+        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("recover_until open", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| wallet_err("recover_until busy_timeout", e))?;
+        let max: Option<i64> = conn
+            .query_row("SELECT MAX(recover_until_height) FROM accounts", [], |row| row.get(0))
+            .map_err(|e| wallet_err("recover_until query", e))?;
+        Ok(max.and_then(|v| u64::try_from(v).ok()))
+    }
+
+    /// [API v2 §4.4 / Phase E] The wallet's oldest account birthday: MIN(`accounts.birthday_height`),
+    /// or `None` when no accounts exist. With the chain tip and the remaining scan queue it seeds the
+    /// global permille floor once per suggest round (`scheduler::global_floor_permille`). Same
+    /// short-side-connection pattern as `max_recover_until`.
+    pub fn min_birthday(&self) -> Result<Option<u64>, SlipstreamError> {
+        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("birthday open", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| wallet_err("birthday busy_timeout", e))?;
+        let min: Option<i64> = conn
+            .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| row.get(0))
+            .map_err(|e| wallet_err("birthday query", e))?;
+        Ok(min.and_then(|v| u64::try_from(v).ok()))
     }
 
     /// Keyless import: UFVK string + birthday treestate (server-provided at

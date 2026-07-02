@@ -49,7 +49,7 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (161 + 29 tests)
+cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (180 + 29 tests)
 cargo build --workspace                           # full workspace incl. the parked gpuhash
 ```
 
@@ -69,14 +69,14 @@ Edition 2024, Rust 1.90+. Depends only on published crates.io `librustzcash`.
 | Milestone | What it is |
 |---|---|
 | **v0.1** | Foundation: the first engine cut — 64 min → 16 min restore. |
-| **v0.2** | The engine rewrite (this repo's current snapshot): record device runs (iPad A10 8:32, iPhone ~1:20), ~12× over the reference SDK sync; in production use in the Zodl wallet. |
+| **v0.2** | The engine rewrite: record device runs (iPad A10 8:32, iPhone ~1:20), ~12× over the reference SDK sync; in production use in the Zodl wallet. |
 | **v0.2.5** | Restore-correctness era (shipped in Zodl betas): read-side reconciliation view (`slipstream_v_tx_reconciled`), never-overshoot recovery balance, transient-network resilience. |
-| **v0.3** | **Engine API v2 — exported wallet semantics** (current, in the development tree): the engine now owns what every host used to re-derive. Snapshot carries `is_recovering` (scheduler-computed, terminal fail-safe latch built in), blessed monotonic `progress_permille` (seeded with the wallet's global position, so a catch-up reads ~100% and an interrupted restore resumes where it left off), and `stalled_seconds`; the event ring is criticality-aware (done/error/found-transactions survive overflow); `slipstream_v_recovery_balance` joins the versioned SQL views; hosts can poke `notify_tx_change` after a broadcast; and a unified wallet-summary FFI resolves the recovery phase internally. One `derive_snapshot` is shared by the C FFI and Rust hosts — proven by the `slipstream watch` CLI acting as a second host with zero wallet math of its own. |
+| **v0.3** | **Engine API v2 — exported wallet semantics** (this repo's current snapshot): the engine now owns what every host used to re-derive. Snapshot carries `is_recovering` (scheduler-computed, terminal fail-safe latch built in), blessed monotonic `progress_permille` (seeded with the wallet's global position, so a catch-up reads ~100% and an interrupted restore resumes where it left off), and `stalled_seconds`; the event ring is criticality-aware (done/error/found-transactions survive overflow); `slipstream_v_recovery_balance` joins the versioned SQL views; hosts can poke `notify_tx_change` after a broadcast; and a unified wallet-summary FFI resolves the recovery phase internally. One `derive_snapshot` is shared by the C FFI and Rust hosts — proven by the `slipstream watch` CLI acting as a second host with zero wallet math of its own. |
 | **v0.4** | (planned) The performance lever, renumbered from the old v0.3 slot: GPU/SIMD work reduction — the parked GPU subtree kernel (narrow win that regressed device extremes; see the perf-learnings doc) and the SIMD trial-decryption exploration. |
 
-This repository currently contains the **v0.2** snapshot; v0.2.5 and v0.3 live in the
-development tree (the Zodl wallet SDK's `slipstream` branch) and land here with the next
-re-extract.
+This repository contains the **v0.3** snapshot (tag `v0.3.0`), re-extracted from the
+development tree (the Zodl wallet SDK's `slipstream` branch) — it includes the v0.2.5
+restore-correctness work and the full engine API v2.
 
 ## License
 

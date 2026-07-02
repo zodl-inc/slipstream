@@ -19,7 +19,9 @@ use crate::connector::TorConn;
 use crate::engine::{SyncOutcome, probe_tip, should_resync, sync_once, wall_clock_utc};
 use crate::error::SlipstreamError;
 use crate::events::Progress;
-use crate::ffi_handle::{EVENT_RING_CAP, FfiSlipstreamEvent, SyncState};
+use crate::ffi_handle::{FfiSlipstreamEvent, SyncState};
+#[cfg(test)]
+use crate::ffi_handle::EVENT_RING_CAP;
 
 /// Per-session configuration: the per-pass engine config + optional account import + optional Tor.
 #[derive(Clone, Debug)]
@@ -171,14 +173,13 @@ impl SessionReporter {
         *self.state.lock().unwrap_or_else(|p| p.into_inner()) = s;
     }
 
-    /// Push one event onto the ring, dropping the oldest when full (cap-then-push at
-    /// `EVENT_RING_CAP` — the exact pre-lift `push_ring_event` semantics).
+    /// Push one event onto the bounded ring. v2 ([audit ENG-4]): overflow evicts the oldest
+    /// DROPPABLE event (started/progress) first — done/error/found-transactions survive — and
+    /// every eviction is logged. Policy lives in `ffi_handle::push_event_bounded` (shared with
+    /// the panic supervisor's push).
     pub fn push_event(&self, e: FfiSlipstreamEvent) {
         let mut ring = self.events.lock().unwrap_or_else(|p| p.into_inner());
-        if ring.len() >= EVENT_RING_CAP {
-            ring.remove(0);
-        }
-        ring.push(e);
+        crate::ffi_handle::push_event_bounded(&mut ring, e);
     }
 }
 
@@ -189,7 +190,25 @@ impl SessionReporter {
 /// Returns only if the initial pass hits a NON-transient error (after surfacing `Error` to the
 /// reporter — exactly the pre-lift FFI behaviour). On success it never returns: it follows the
 /// chain tip until the host aborts the task. Panics are converted to `Error` by the supervisor.
-pub async fn run_session(config: SessionConfig, reporter: SessionReporter) {
+pub async fn run_session(
+    config: SessionConfig,
+    reporter: SessionReporter,
+    pass_lock: Arc<tokio::sync::Mutex<()>>,
+) {
+    // ── Serialize overlapping passes on this handle (Keystone restore race, 2026-06-30) ───────
+    // Hold the pass lock for the WHOLE session — this is the OUTERMOST local. On a
+    // start()-while-running restart the host aborts the previous task (lib.rs
+    // `zcashlc_slipstream_start`), but tokio's `abort()` is ASYNCHRONOUS: the old pass keeps
+    // running until its next await. Acquiring here makes this new pass wait until the aborted old
+    // pass has unwound and dropped its guard; because guards drop in reverse acquisition order, the
+    // old pass's `WalletSession` (and its `data.db` connection) is already closed by then — so the
+    // two passes never touch `data.db` concurrently. Without this, `importAccount`'s restart raced
+    // two passes on one DB → panic → `SyncState::Error(2)` (the `rustSlipstreamSyncFailed` dialog a
+    // Keystone restore hit). The host always abort()s the old task before spawning the new one, so
+    // the old holder is guaranteed to release — no deadlock. A tokio `Mutex` is not poisoned by a
+    // panic/cancel, so even a panicking old pass frees the lock cleanly.
+    let _pass_guard = pass_lock.lock().await;
+
     // Notify SyncStarted (tag=1) — emitted exactly ONCE, before any retry or follow pass.
     reporter.push_event(FfiSlipstreamEvent { tag: 1, value: 0 });
 
@@ -565,5 +584,43 @@ mod tests {
         assert_eq!(*r.state.lock().unwrap(), SyncState::Syncing);
         r.set_state(SyncState::Error(2));
         assert_eq!(*r.state.lock().unwrap(), SyncState::Error(2));
+    }
+
+    /// The pass-lock contract `run_session` relies on (Keystone restore race fix, 2026-06-30):
+    /// an ABORTED task that holds `pass_lock` MUST release it so the next pass can acquire —
+    /// otherwise `importAccount`'s `start()`-while-running restart would deadlock instead of
+    /// racing. Proves a cancelled holder drops its guard (a tokio `Mutex` is not poisoned by
+    /// cancellation) and the next acquirer then proceeds promptly. This is the property that lets
+    /// `run_session` hold `pass_lock` for the whole follow loop yet still be safely restarted.
+    #[tokio::test]
+    async fn pass_lock_released_when_holder_is_aborted() {
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+
+        // Task A acquires the lock and holds it until aborted (mirrors the OLD pass running the
+        // follow loop forever). It signals once it actually holds the guard.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let a_lock = Arc::clone(&lock);
+        let a = tokio::spawn(async move {
+            let _g = a_lock.lock().await;
+            let _ = tx.send(());
+            std::future::pending::<()>().await; // hold until aborted
+        });
+        rx.await.expect("task A signals it holds the pass lock");
+
+        // The lock is genuinely held: a bounded acquire times out.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), lock.lock())
+                .await
+                .is_err(),
+            "pass lock must be held by the in-flight pass"
+        );
+
+        // Abort A — exactly what `zcashlc_slipstream_start` does to the previous pass on restart.
+        a.abort();
+
+        // The aborted holder must release the lock so the NEW pass can acquire — no deadlock.
+        let _reacquired = tokio::time::timeout(Duration::from_millis(500), lock.lock())
+            .await
+            .expect("an aborted pass must release pass_lock so the restart can proceed");
     }
 }
