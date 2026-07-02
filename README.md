@@ -1,5 +1,7 @@
 # Slipstream
 
+<img width="2400" height="1260" alt="slipstream-social-1200x630-dark-2400" src="https://github.com/user-attachments/assets/5e7cfa97-3991-43e3-a164-f5d7a5619aa5" />
+
 A high-performance sync engine for Zcash light wallets. Slipstream re-architects the
 download → trial-decrypt → commitment-tree → persist pipeline to sync **dramatically faster**
 than the reference path — while producing a **byte-identical** wallet database.
