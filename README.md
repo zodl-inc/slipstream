@@ -64,12 +64,19 @@ Edition 2024, Rust 1.90+. Depends only on published crates.io `librustzcash`.
 - **`docs/2026-06-15-perf-spikes-learnings.md`** — what was tried, measured, and parked
   (GPU offload, deeper write-behind pipelining) and why.
 
-## Status
+## Status & versioning
 
-**v0.2** — the engine rewrite, in use in the Zodl iOS wallet; being prepared for external
-review and audit. **v0.3** (a SIMD trial-decryption kernel) is planned. The GPU subtree kernel
-is implemented but **parked** — a narrow win that regressed device extremes; see the
-perf-learnings doc.
+| Milestone | What it is |
+|---|---|
+| **v0.1** | Foundation: the first engine cut — 64 min → 16 min restore. |
+| **v0.2** | The engine rewrite (this repo's current snapshot): record device runs (iPad A10 8:32, iPhone ~1:20), ~12× over the reference SDK sync; in production use in the Zodl wallet. |
+| **v0.2.5** | Restore-correctness era (shipped in Zodl betas): read-side reconciliation view (`slipstream_v_tx_reconciled`), never-overshoot recovery balance, transient-network resilience. |
+| **v0.3** | **Engine API v2 — exported wallet semantics** (current, in the development tree): the engine now owns what every host used to re-derive. Snapshot carries `is_recovering` (scheduler-computed, terminal fail-safe latch built in), blessed monotonic `progress_permille` (seeded with the wallet's global position, so a catch-up reads ~100% and an interrupted restore resumes where it left off), and `stalled_seconds`; the event ring is criticality-aware (done/error/found-transactions survive overflow); `slipstream_v_recovery_balance` joins the versioned SQL views; hosts can poke `notify_tx_change` after a broadcast; and a unified wallet-summary FFI resolves the recovery phase internally. One `derive_snapshot` is shared by the C FFI and Rust hosts — proven by the `slipstream watch` CLI acting as a second host with zero wallet math of its own. |
+| **v0.4** | (planned) The performance lever, renumbered from the old v0.3 slot: GPU/SIMD work reduction — the parked GPU subtree kernel (narrow win that regressed device extremes; see the perf-learnings doc) and the SIMD trial-decryption exploration. |
+
+This repository currently contains the **v0.2** snapshot; v0.2.5 and v0.3 live in the
+development tree (the Zodl wallet SDK's `slipstream` branch) and land here with the next
+re-extract.
 
 ## License
 
