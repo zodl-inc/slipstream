@@ -14,6 +14,11 @@ than the reference path — while producing a **byte-identical** wallet database
 > **Reviewing or auditing?** Start with **[`REVIEWING.md`](REVIEWING.md)** — a dense
 > module-and-data-flow map (where to look, and why) written for Zcash protocol engineers.
 
+> **Building your own SDK on top of Slipstream** (any language)? Start with
+> **[`HOSTING.md`](HOSTING.md)** — the complete host contract: what to call to get
+> `data.db` filled, how to read the snapshot/events/SQL surface correctly, and the short
+> list of rules that keep a host thin and bug-free.
+
 ## Result
 
 On a 2016 iPad (A10 Fusion) restoring a real multi-month wallet, the reference
