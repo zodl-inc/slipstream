@@ -59,8 +59,26 @@ impl WalletSession {
             conn.pragma_update(None, "synchronous", "NORMAL")
                 .map_err(|e| wallet_err("set synchronous", e))?;
         }
-        let mut db = WalletDb::for_path(db_path, network, zcash_client_sqlite::util::SystemClock, rand::rngs::OsRng)
-            .map_err(|e| wallet_err("open wallet db", e))?;
+        // [B4-12 / ZRUST0096] Open the MAIN wallet connection ourselves so it gets a
+        // busy_timeout — upstream's `for_path` sets NONE, so any competing writer (a host
+        // `importAccount` landing mid-pass, or a restart's orphaned write-behind commit:
+        // `spawn_blocking` is uncancellable by abort, so it can outlive the pass that
+        // spawned it) surfaced as an immediate SQLITE_BUSY → non-transient Wallet error →
+        // Error state (the Keystone delete→re-import field failure, 2026-07-02). 15 s —
+        // the worst observed device commit is a few seconds (A10): WAITING beats dying.
+        // Mirrors upstream `for_path` otherwise (array vtab module, then wrap).
+        let wallet_conn = Connection::open(db_path).map_err(|e| wallet_err("open wallet db", e))?;
+        wallet_conn
+            .busy_timeout(std::time::Duration::from_secs(15))
+            .map_err(|e| wallet_err("set busy_timeout (wallet)", e))?;
+        rusqlite::vtab::array::load_module(&wallet_conn)
+            .map_err(|e| wallet_err("load array vtab", e))?;
+        let mut db = WalletDb::from_connection(
+            wallet_conn,
+            network,
+            zcash_client_sqlite::util::SystemClock,
+            rand::rngs::OsRng,
+        );
         zcash_client_sqlite::wallet::init::init_wallet_db(&mut db, None)
             .map_err(|e| wallet_err("init/migrations", e))?;
         // [#1755] Install the slipstream-owned, read-side reconciliation view
@@ -163,6 +181,42 @@ impl WalletSession {
             .map_err(|e| wallet_err("suggest_scan_ranges", e))
     }
 
+    /// [API v2.1 E-3] The wallet's PERSISTED view of the chain tip (`WalletRead::chain_height`,
+    /// scan-queue derived), or `None` when the wallet has never seen a tip (fresh DB). Used by
+    /// the open-time snapshot seed: it is the tip the last `update_chain_tip` recorded, so the
+    /// truthful-from-open snapshot can report a real height before any network call.
+    pub fn chain_height(&self) -> Result<Option<u64>, SlipstreamError> {
+        Ok(self
+            .db
+            .chain_height()
+            .map_err(|e| wallet_err("chain_height", e))?
+            .map(|h| u64::from(u32::from(h))))
+    }
+
+    /// [API v2.1 E-4] Cheap signature of the wallet's transaction set:
+    /// `(COUNT(transactions), COUNT(unreconciled per slipstream_v_tx_reconciled))`.
+    /// The scheduler compares it across range boundaries and bumps `tx_set_version` when it
+    /// moved — catching set changes that arrive WITHOUT an enhancement write (the classic
+    /// case: scanning a historic block stores the received note that LINKS an
+    /// already-stored dangling spend, flipping it reconciled). Same short-side-connection
+    /// pattern as `max_recover_until`; both counts are over wallet-sized tables (cheap).
+    pub fn tx_set_signature(&self) -> Result<(u64, u64), SlipstreamError> {
+        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("tx sig open", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| wallet_err("tx sig busy_timeout", e))?;
+        let total: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
+            .map_err(|e| wallet_err("tx sig count", e))?;
+        let unreconciled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM slipstream_v_tx_reconciled WHERE reconciled = 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| wallet_err("tx sig unreconciled", e))?;
+        Ok((u64::try_from(total).unwrap_or(0), u64::try_from(unreconciled).unwrap_or(0)))
+    }
+
     /// Exclusive access for the scan driver (scan_cached_blocks needs &mut).
     pub fn db_mut(&mut self) -> &mut Db {
         &mut self.db
@@ -254,6 +308,61 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .expect("pragma");
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    /// [API v2.1 E-4] The tx-set signature moves on INSERTS (count) and on reconcile-LINKAGE
+    /// transitions (unreconciled count) — the two classes the boundary check must catch.
+    #[test]
+    fn tx_set_signature_tracks_inserts_and_linkage() {
+        use rusqlite::params;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let s = WalletSession::open(Network::MainNetwork, &path).expect("open");
+        assert_eq!(s.tx_set_signature().expect("sig"), (0, 0), "fresh wallet");
+
+        let conn = Connection::open(&path).expect("side conn");
+        // Same as reconcile.rs's fixture: raw fixture rows without full FK graphs.
+        conn.pragma_update(None, "foreign_keys", false).expect("fk off");
+        // A pure receive (no observed spends) is reconciled immediately: count moves, not unreconciled.
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height)
+             VALUES (1, ?1, 400, 0, 400)",
+            params![vec![0x01u8; 32]],
+        )
+        .expect("insert pure receive");
+        assert_eq!(s.tx_set_signature().expect("sig"), (1, 0), "insert moves the count");
+
+        // A dangling shielded spend (nullifier observed, note not yet received) flips unreconciled.
+        let txid2 = vec![0x02u8; 32];
+        let nf = vec![0xBBu8; 32];
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height)
+             VALUES (2, ?1, 500, 0, 500)",
+            params![txid2],
+        )
+        .expect("insert spend tx");
+        conn.execute(
+            "INSERT INTO tx_locator_map (block_height, tx_index, txid) VALUES (500, 0, ?1)",
+            params![vec![0x02u8; 32]],
+        )
+        .expect("insert locator");
+        conn.execute(
+            "INSERT INTO nullifier_map (spend_pool, nf, block_height, tx_index) VALUES (2, ?1, 500, 0)",
+            params![nf],
+        )
+        .expect("insert nullifier");
+        assert_eq!(s.tx_set_signature().expect("sig"), (2, 1), "dangling spend flips unreconciled");
+
+        // Scanning the origin block receives the note -> the spend LINKS with NO new tx row:
+        // exactly the change class only the signature (not the enhance counter) can see.
+        conn.execute(
+            "INSERT INTO sapling_received_notes
+                (transaction_id, output_index, account_id, diversifier, value, rcm, nf, is_change)
+             VALUES (1, 0, 1, x'00', 0, x'00', ?1, 0)",
+            params![nf],
+        )
+        .expect("link note");
+        assert_eq!(s.tx_set_signature().expect("sig"), (2, 0), "linkage moves the signature");
     }
 
     #[test]

@@ -62,7 +62,31 @@ pub struct Progress {
     /// monotonicRecoveryProgress floor and its warm-start seeding: a follow-up catch-up
     /// pass holds the prior high-water mark instead of flashing back to 0%).
     pub progress_permille_floor: AtomicU64,
+    /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
+    /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
+    /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
+    /// when this counter has advanced since `start()`, i.e. "THIS run refreshed the tip",
+    /// independent of whether the fetched tip happens to equal the persisted one.
+    /// Monotonic per handle; deliberately NOT reset by [`Self::begin_pass`].
+    pub tip_refreshes: AtomicU64,
+    /// [API v2.1 E-4] Monotonic version of the wallet's STORED transaction set. Bumped exactly
+    /// when the set changes: a transaction stored/updated by enhancement or the mempool
+    /// monitor, a reconcile-linkage transition detected at a range boundary (the scheduler's
+    /// `(tx_count, unreconciled_count)` signature moved), or a host submit-poke
+    /// (`zcashlc_slipstream_notify_tx_change`). The HOST rule is one line: version moved →
+    /// re-fetch + publish `foundTransactions` (replaces the SDK's counter-watch + SyncDone
+    /// fallback + count-dedup strategy). The host's own reconcile-FILTER edge (`is_recovering`
+    /// flips — visibility policy per API v2 §0) is deliberately NOT folded in here: the filter
+    /// is host policy, so its edge is host-observed from the same snapshot.
+    /// Monotonic per handle; deliberately NOT reset by [`Self::begin_pass`].
+    pub tx_set_version: AtomicU64,
 }
+
+/// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
+/// suggest-round seed this many permille (or more) BELOW the current floor means the scan
+/// scope grew (import/rewind), not that progress regressed. See
+/// [`Progress::rebaseline_floor_if_scope_expanded`].
+pub const FLOOR_REBASELINE_EPSILON_PERMILLE: u64 = 50;
 
 impl Progress {
     /// Bump `fetched_blocks` by `n` (Relaxed — poll-only, no ordering guarantee).
@@ -86,10 +110,39 @@ impl Progress {
         self.touch();
     }
 
-    /// Set `chain_tip` (Relaxed store).
+    /// Set `chain_tip` (Relaxed store). Stores a VALUE only — callers that just persisted a
+    /// freshly-fetched server tip must also call [`Self::note_tip_refreshed`]; the E-3
+    /// open-time seed calls this alone (a persisted tip is not proof of freshness).
     #[inline]
     pub fn set_chain_tip(&self, tip: u64) {
         self.chain_tip.store(tip, Ordering::Relaxed);
+    }
+
+    /// [API v2.1 E-2] Record that a sync pass successfully persisted a freshly-fetched
+    /// server tip (`session.update_chain_tip` returned Ok). Drives the FFI `tip_fresh` fact.
+    #[inline]
+    pub fn note_tip_refreshed(&self) {
+        self.tip_refreshes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Read the tip-refresh counter (see [`Self::note_tip_refreshed`]).
+    #[inline]
+    pub fn tip_refreshes(&self) -> u64 {
+        self.tip_refreshes.load(Ordering::Relaxed)
+    }
+
+    /// [API v2.1 E-4] Record that the wallet's stored transaction set changed (see the
+    /// `tx_set_version` field doc for the exact bump sites).
+    #[inline]
+    pub fn bump_tx_set_version(&self) {
+        self.tx_set_version.fetch_add(1, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Read the tx-set version (see [`Self::bump_tx_set_version`]).
+    #[inline]
+    pub fn tx_set_version(&self) -> u64 {
+        self.tx_set_version.load(Ordering::Relaxed)
     }
 
     /// Set `current_range_end` (Relaxed store).
@@ -185,6 +238,24 @@ impl Progress {
         let clamped = raw.min(1000);
         self.progress_permille_floor.fetch_max(clamped, Ordering::Relaxed);
         self.progress_permille_floor.load(Ordering::Relaxed)
+    }
+
+    /// [API v2.1 E-5] When a suggest round's GLOBAL seed lands materially BELOW the current
+    /// session floor, the scan SCOPE EXPANDED under the floor's feet — an imported account
+    /// with an older birthday, or a rewind re-growing the queue — and the old floor (folded
+    /// to ~1000 by the previous scope's Done) would MASK the whole re-scan at ~100%. Reset
+    /// the floor to the new truthful seed so the blessed permille reads a genuine climb.
+    /// Normal operation can never trigger it: within one scope the seed is monotone (the
+    /// queue only shrinks between suggest rounds) and tip drift moves it by <1‰ — the
+    /// epsilon is 50× above that noise and far below any real expansion (an import drops
+    /// the seed by hundreds of permille). Returns whether a re-baseline happened.
+    pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64) -> bool {
+        let current = self.progress_permille_floor.load(Ordering::Relaxed);
+        if seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current {
+            self.progress_permille_floor.store(seed.min(1000), Ordering::Relaxed);
+            return true;
+        }
+        false
     }
 
     /// Reset the per-pass RATIO counters at the start of a sync pass.
@@ -492,6 +563,9 @@ mod tests {
         p.add_enhanced(20);
         p.add_ranges_completed();
         p.add_reorg();
+        p.note_tip_refreshed();
+        p.bump_tx_set_version();
+        p.bump_tx_set_version();
 
         // Pass 2 begins (app foregrounded, start() on the same handle).
         p.begin_pass();
@@ -508,5 +582,28 @@ mod tests {
         assert_eq!(p.ranges_completed(), 1, "ranges_completed is monotonic per handle");
         assert_eq!(p.reorgs(), 1, "reorgs_recovered is cumulative diagnostics");
         assert_eq!(p.chain_tip(), 3_374_188, "chain_tip is overwritten by the new pass anyway");
+        // [E-2/E-4] The freshness and tx-set counters are per-handle facts, not pass ratios.
+        assert_eq!(p.tip_refreshes(), 1, "tip_refreshes is monotonic per handle");
+        assert_eq!(p.tx_set_version(), 2, "tx_set_version is monotonic per handle");
+    }
+
+    /// [API v2.1 E-5] The floor re-baselines when the scope EXPANDS (seed materially below
+    /// the floor — import/rewind) and stays monotone against within-scope noise.
+    #[test]
+    fn floor_rebaseline_on_scope_expansion_only() {
+        let p = Progress::default();
+        assert_eq!(p.permille_floor(990), 990);
+        // Within-scope drift up to the epsilon never re-baselines (tip drift is <1‰).
+        assert!(!p.rebaseline_floor_if_scope_expanded(989), "1‰ dip is noise");
+        assert!(
+            !p.rebaseline_floor_if_scope_expanded(990 - FLOOR_REBASELINE_EPSILON_PERMILLE),
+            "exactly-epsilon dip is still within scope"
+        );
+        assert_eq!(p.permille_floor(0), 990, "floor held through noise");
+        // Import with an older birthday: the seed plummets → re-baseline to the truth.
+        assert!(p.rebaseline_floor_if_scope_expanded(120), "material drop = scope expansion");
+        assert_eq!(p.permille_floor(0), 120, "floor re-baselined to the expanded-scope seed");
+        // …and climbs monotonically again within the new scope.
+        assert_eq!(p.permille_floor(300), 300);
     }
 }
