@@ -15,18 +15,28 @@ document is one level below that: the contract that guide is built on.)
 
 Slipstream is the **read side** of a Zcash light wallet, packaged as an engine:
 
-```
-                      ┌──────────────────────────────────────────────┐
- lightwalletd  ──────▶│  slipstream: fetch ∥ scan ∥ persist ∥ enhance │──────▶  data.db
- (gRPC, optional Tor) │  + mempool watch + transparent refresh       │   (zcash_client_sqlite
-                      └──────────────────────────────────────────────┘    standard schema
-                              ▲                    │                       + 2 read views)
-                     start / stop / poll     snapshot + events
-                              │                    ▼
-                      ┌──────────────────────────────────────────────┐
-                      │                YOUR SDK (any language)        │
-                      │  keys · UI state · spends · broadcasting      │
-                      └──────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    LWD["lightwalletd<br/><i>gRPC · optional Tor</i>"]
+
+    subgraph ENGINE["Slipstream engine"]
+        direction TB
+        PIPE["fetch ∥ scan ∥ persist ∥ enhance"]
+        LOOP["tip following · mempool watch<br/>transparent refresh · reorg recovery"]
+        PIPE ~~~ LOOP
+    end
+
+    DB[("data.db<br/><i>standard zcash_client_sqlite schema<br/>+ 2 read views</i>")]
+
+    subgraph HOST["YOUR SDK — any language"]
+        H["keys · spends · broadcasting · UI"]
+    end
+
+    LWD -- "blocks · tree states · txs" --> ENGINE
+    ENGINE -- "writes" --> DB
+    HOST -- "open · start · stop" --> ENGINE
+    ENGINE -- "snapshot + events (polled)" --> HOST
+    DB -- "SQL reads" --> HOST
 ```
 
 - **The engine owns:** transport (concurrent block streams; isolated Tor circuits for the
