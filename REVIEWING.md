@@ -38,6 +38,7 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `mempool.rs` | `run_session`: `GetMempoolStream` → `decrypt_and_store_transaction` (0-conf); non-fatal. |
 | `wallet_session.rs` | `WalletSession` — the `zcash_client_sqlite` `WalletDb` wrapper + account import; persisted-state reads (`chain_height`, `max_recover_until`, `min_birthday`, `tx_set_signature`). |
 | `reconcile.rs` | `slipstream_v_tx_reconciled` — read-side view flagging txs whose shielded spend hasn't linked yet (recent-first restore visibility; installed idempotently at `WalletSession::open`). |
+| `scan_queue.rs` | `prune_orphaned_historic_ranges` — drops Historic queue rows below every remaining account's birthday at `WalletSession::open` (an account deleted mid-restore leaves its deep ranges queued; upstream `delete_account` never touches `scan_queue`). |
 | `anchor.rs` | `restore_anchor` — wallet-provisioning primitive (restore `recover_until` with offline checkpoint fallback; reorg-safe new-wallet tree state; Tor-or-offline, never a direct de-anonymising fallback). |
 | `chunk.rs`, `block_source.rs` | In-memory chunk buffering / block-source plumbing feeding the scan kernel. |
 | `events.rs` | `Progress` (poll atomics), `Event`, `Snapshot` — the host-facing progress surface. |
