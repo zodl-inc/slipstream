@@ -29,6 +29,12 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `session.rs` | `run_session` autonomous lifecycle; `SessionConfig` / `SessionReporter`; retry/jitter/backoff. |
 | `scheduler.rs` | `run_to_completion`: Spend-before-Sync scan-range loop + per-range enhancement. |
 | `scan.rs` | `scan_chunks`: batched `scan_cached_blocks`; treestate prefetch + bounded retry. |
+| `census.rs` | v0.4: per-wallet shard census (touched/noted/graftable fraction — predicts the graft ceiling) + the BenchSummary JSON writer. |
+| `graft.rs` | v0.4: the restart-safe graft buffer table (side connection; pre-txn appends, post-commit cleanup) + `server_root` lookup. |
+| `graft_accumulator.rs` | v0.4: pure per-pool state machine — buffer note-free shards, eager-flush on the first owned note, close-clean at shard boundaries; range-end shards always build. |
+| `batch_sinsemilla.rs` | v0.4: batch-affine Sinsemilla combine (lockstep half-steps, one Montgomery batch inversion each) — byte-identical, KAT-gated. |
+| `lookup_build.rs` | v0.4: the shared lookup-build machinery (precompute map → verbatim `from_iter` → convert) parameterized by a batch-combine fn; routes batch > gpu > scalar. |
+| `batch_ecdh.rs` | v0.5 (seed): C0 measurement probe for the batched trial-decrypt kernel (DH = 92.4% of compact decrypt). |
 | `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut. |
 | `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**). |
 | `connector.rs` | Per-call Tor policy (`ConnPurpose` → circuit); `TorConn` bootstrap; bounded circuit-build + retry-on-fresh-circuit. |

@@ -156,6 +156,9 @@ pub struct SyncReport {
     pub persist_wait_elapsed: Duration,
     /// T6.9 write-behind: Σ wall time of the deferred commits themselves.
     pub persist_busy_elapsed: Duration,
+    /// v0.4 census (spec §3.2): per-pool shard census unioned across all ranges.
+    pub census_sapling: crate::census::ShardCensus,
+    pub census_orchard: crate::census::ShardCensus,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -310,7 +313,19 @@ pub async fn run_to_completion(
 
         let scan_started = std::time::Instant::now();
         let scan_result: Result<ScanStats, SlipstreamError> =
-            scan_chunks(session, &mut scan_client, start, rx, progress.clone(), config, skipped_keys, tor).await;
+            scan_chunks(
+                session,
+                &mut scan_client,
+                start,
+                rx,
+                progress.clone(),
+                config,
+                skipped_keys,
+                tor,
+                // v0.4 Plan A: only Historic ranges buffer (accumulator rule 2).
+                range.priority() == ScanPriority::Historic,
+            )
+            .await;
         let scan_wall = scan_started.elapsed();
 
         // Error-precedence rationale (deviation from plan's draft `??` which loses nuance):
@@ -430,6 +445,8 @@ pub async fn run_to_completion(
         // persist_wait portion — it is honest loop wall time; see engine.rs log).
         report.persist_wait_elapsed += scan_stats.persist_wait;
         report.persist_busy_elapsed += scan_stats.persist_busy;
+        report.census_sapling.merge(&scan_stats.census_sapling);
+        report.census_orchard.merge(&scan_stats.census_orchard);
         report.enhance.requests += scan_stats.interleaved_enhance.requests;
         report.enhance.txs_stored += scan_stats.interleaved_enhance.txs_stored;
         report.enhance.statuses_set += scan_stats.interleaved_enhance.statuses_set;

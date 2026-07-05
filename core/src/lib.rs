@@ -3,7 +3,12 @@
 //! docs/slipstream/ROADMAP.md for the build plan.
 
 pub mod anchor;
+// v0.5 Plan C (C1 home; today only the C0 probe — test-gated, no prod code).
+#[cfg(test)]
+mod batch_ecdh;
+pub(crate) mod batch_sinsemilla;
 pub mod block_source;
+pub mod census;
 pub mod chunk;
 pub mod config;
 pub mod connector;
@@ -13,6 +18,12 @@ pub mod error;
 pub mod events;
 pub mod ffi_handle;
 pub mod fetch;
+// dead_code: consumed by the sparse build path in v0.4 plan Task 7 — this allow
+// is deleted in that diff (buffer CRUD lands first so Task 6/7 build on green).
+#[allow(dead_code)]
+pub(crate) mod graft;
+#[allow(dead_code)]
+pub(crate) mod graft_accumulator;
 pub mod grpc;
 pub mod mempool;
 pub mod oracle;
@@ -20,6 +31,7 @@ pub mod persist;
 pub mod reconcile;
 #[cfg(feature = "gpu")]
 mod gpu_subtree;
+pub(crate) mod lookup_build;
 pub mod scan;
 pub mod scan_queue;
 pub mod scheduler;

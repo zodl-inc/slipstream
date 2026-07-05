@@ -84,6 +84,33 @@ pub struct EngineConfig {
     /// is byte-for-byte identical when off (kill switch: `--gpu-subtree false`).
     pub gpu_subtree: bool,
 
+    /// v0.4 P0 bench (spec §3.1): when set, the engine writes a machine-readable
+    /// end-of-pass `BenchSummary` JSON (stage split + shard census) to this path —
+    /// consumed by `slipstream-cli bench` and bench-ios. `None` (default) = off.
+    pub bench_json_path: Option<PathBuf>,
+
+    /// v0.4 Plan A (spec §4): graft server-provided subtree roots for note-free
+    /// shards instead of computing them locally. Requires `sparse_persistence`.
+    /// **Default ON since 2026-07-05** — P3 device gates passed 100% (4-device
+    /// fleet −13..−46%, T10b spend-proof green, mainnet audit 19/19). Kill
+    /// switch: `ZCASH_GRAFT_SUBTREE=0` — off = byte-for-byte the v0.3 path.
+    pub graft_subtree: bool,
+
+    /// v0.4 sampling verify (spec §4 trust): every Nth graftable shard is BUILT
+    /// anyway and its computed root compared to the server root — a mismatch is
+    /// logged loudly and the BUILT shard wins (fallback beats trust). 0 = off,
+    /// 1 = verify every graft (the full-audit mode used for validation runs).
+    /// Deterministic by shard index (reproducible; no RNG in the hot path).
+    pub graft_verify_sample: u32,
+
+    /// v0.4 Plan B (spec §5): batch-affine Orchard combine — all of a fragment's
+    /// combines computed level-synchronously with shared Montgomery inversions
+    /// (~12× the scalar combine in the probe), byte-identical output (KAT +
+    /// lookup_build gate). Applies to every Orchard build incl. the segments
+    /// that survive grafting. **Default ON since 2026-07-05** (P3 gates passed;
+    /// +15.7% on note-bearing wallets). Kill switch: `ZCASH_BATCH_COMBINE=0`.
+    pub batch_combine: bool,
+
     /// Persist-pipelining: max unpersisted units (in-flight + queued) before the scan
     /// side blocks. `1` = legacy strict depth-1 backpressure (byte-for-byte identical).
     /// Higher lets scan run further ahead so more persist hides behind scan (~22%
@@ -118,6 +145,10 @@ impl EngineConfig {
             sparse_persistence: true,
             write_behind: true,
             gpu_subtree: false,
+            bench_json_path: None,
+            graft_subtree: true,
+            graft_verify_sample: 16,
+            batch_combine: true,
             persist_depth: 1,
         }
     }
@@ -153,6 +184,16 @@ impl EngineConfig {
         if self.write_behind && !self.sparse_persistence {
             return Err(SlipstreamError::Config(
                 "write_behind requires sparse_persistence (the deferred commit runs the sparse put_blocks path)".into(),
+            ));
+        }
+        if self.graft_subtree && !self.sparse_persistence {
+            return Err(SlipstreamError::Config(
+                "graft_subtree requires sparse_persistence (the graft verdict lives in the sparse build path)".into(),
+            ));
+        }
+        if self.graft_subtree && !self.write_behind {
+            return Err(SlipstreamError::Config(
+                "graft_subtree requires write_behind (the graft plan runs in the persist lane; the inline path never grafts — v0.4 plan Task 7b rev 2)".into(),
             ));
         }
         if self.gpu_subtree && !self.sparse_persistence {

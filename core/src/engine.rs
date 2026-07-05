@@ -23,7 +23,7 @@ use crate::{
 /// tag in the log doesn't match HEAD's value, the device is running a stale
 /// XCFramework (the three-layer gotcha, consuming side). Probe a built slice with:
 /// `strings <slice>/libzcashlc.framework/libzcashlc | grep <tag>`.
-pub const ENGINE_BUILD: &str = "2026-06-17.torretry";
+pub const ENGINE_BUILD: &str = "2026-07-05.v04-defaults-on";
 
 /// Current wall-clock time as a `YYYY-MM-DD HH:MM:SSZ` UTC string.
 ///
@@ -165,6 +165,8 @@ pub async fn sync_once(
         sparse = config.sparse_persistence,
         write_behind = config.write_behind,
         gpu_subtree = config.gpu_subtree,
+        graft_subtree = config.graft_subtree,
+        batch_combine = config.batch_combine,
         started_at_utc = %wall_clock_utc(),
         "engine pass starting"
     );
@@ -264,6 +266,37 @@ pub async fn sync_once(
         write_behind = config.write_behind,
         "sync stage split"
     );
+
+    // v0.4 P0 (spec §3): shard census on the pass record — `graftable` PREDICTS
+    // Plan A's ceiling for this wallet before the graft exists.
+    info!(
+        sapling_shards = outcome.report.census_sapling.shards(),
+        sapling_noted = outcome.report.census_sapling.noted_shards(),
+        sapling_graftable = outcome.report.census_sapling.graftable_fraction(),
+        orchard_shards = outcome.report.census_orchard.shards(),
+        orchard_noted = outcome.report.census_orchard.noted_shards(),
+        orchard_graftable = outcome.report.census_orchard.graftable_fraction(),
+        "shard census"
+    );
+
+    // v0.4 P0 (spec §3.1): the machine-readable bench artifact, host-opted via config.
+    if let Some(path) = &config.bench_json_path {
+        let bench = crate::census::BenchSummary {
+            engine_build: ENGINE_BUILD,
+            total_s: outcome.elapsed.as_secs_f64(),
+            fetch_s: outcome.report.fetch_elapsed.as_secs_f64(),
+            scan_s: outcome.report.scan_elapsed.as_secs_f64(),
+            enhance_s: outcome.enhance_elapsed.as_secs_f64(),
+            persist_wait_s,
+            persist_overlap_s: (persist_busy_s - persist_wait_s).max(0.0),
+            blocks: outcome.report.scan.blocks,
+            sapling: (&outcome.report.census_sapling).into(),
+            orchard: (&outcome.report.census_orchard).into(),
+        };
+        if let Err(e) = bench.write_json(path) {
+            tracing::warn!(path = %path.display(), %e, "bench JSON write failed");
+        }
+    }
 
     Ok(outcome)
 }

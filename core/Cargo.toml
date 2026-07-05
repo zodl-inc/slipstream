@@ -1,8 +1,8 @@
 [package]
 name = "slipstream-core"
-# Milestone versioning (see the slipstream repo README "Status"): v0.3 = the engine API v2
-# era — exported wallet semantics (recovery latch, blessed progress, views, unified summary).
-version = "0.3.6"
+# Milestone versioning (see the slipstream repo README "Status"): v0.4 = "graft, don't
+# grind" — server subtree-root grafting + batch-affine Sinsemilla, DEFAULT ON (P3 passed).
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -31,8 +31,20 @@ orchard = { workspace = true }
 incrementalmerkletree = { workspace = true }
 shardtree = { workspace = true }
 slipstream-gpuhash = { path = "../gpuhash", optional = true } # Phase B `gpu` feature only
+# v0.4 Plan B (batch_sinsemilla.rs): batch-affine combine — same workspace-pinned
+# versions the B0 GPU work introduced; pure CPU, no wgpu, always compiled.
+sinsemilla = { workspace = true }
+pasta_curves = { workspace = true }
+group = { workspace = true }
+ff = { workspace = true }
 rayon = { workspace = true }
 zip32 = { workspace = true }
+# v0.4 T10b (oracle testkit): real note encryption for the owned-note fixture in
+# the graft spend-proof — `Domain` trait for epk bytes; orchard supplies the rest.
+zcash_note_encryption = { workspace = true }
+# v0.4 T10b step 2: the pay-to-self ZcashAddress in the spend-proof's zip321
+# request (already in the workspace graph via the FFI — zero new compile weight).
+zcash_address = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -43,6 +55,10 @@ zcash_script = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# T10b spend-proof: the sapling stub prover's trait signatures name these types
+# (never invoked — orchard-only transactions); versions pinned by sapling 0.7.
+jubjub = { workspace = true }
+bls12_381 = { workspace = true }
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the B2 transport
 # deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
