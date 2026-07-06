@@ -27,10 +27,10 @@ ZcashLightClientKit on the same wallet.
 
 | Device | Reference SDK | Slipstream |
 |---|---|---|
-| MacBook Pro (M4) | 22:30 | **~20 s** |
-| iPhone (A18) | 1:04:26 | **43 s** |
-| iPad Air (A14) | 25:11 | **68 s** (~22×) |
-| iPad 2016 (A10, 2 GB RAM) | 1:04:26 | **4:43** (~13×) |
+| MacBook Pro (M4) | 22:30 | **~20 s** (~70×) |
+| iPhone (A18) | 16:55 | **43 s** (~24×) |
+| iPad Air (A14) | 25:11 | **68 s** (~23×) |
+| iPad 2016 (A10, 2 GB RAM) | 1:04:26 | **4:43** (~14×) |
 
 On device, Slipstream also beats the Zingo and Zkool reference engines. Methodology and
 full numbers in `docs/`.
