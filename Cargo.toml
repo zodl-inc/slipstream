@@ -3,7 +3,16 @@
 # Consumes published librustzcash crates; the engine adds orchestration only.
 
 [workspace]
-members = ["core", "cli", "gpuhash", "protogen"]
+members = [
+    "core",
+    "cli",
+    "gpuhash",
+    "protogen",
+    # v0.5 vendored forks (also [patch.crates-io]-ed below) — members so
+    # their in-crate KATs run with `cargo test -p orchard`.
+    "vendor/zcash_note_encryption",
+    "vendor/orchard",
+]
 resolver = "3"
 
 [workspace.dependencies]
@@ -57,3 +66,7 @@ sinsemilla = "0.1"
 group = "0.13"
 pasta_curves = "0.5"
 ff = "0.13"
+
+[patch.crates-io]
+zcash_note_encryption = { path = "vendor/zcash_note_encryption" }
+orchard = { path = "vendor/orchard" }

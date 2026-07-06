@@ -23,7 +23,7 @@ use crate::{
 /// tag in the log doesn't match HEAD's value, the device is running a stale
 /// XCFramework (the three-layer gotcha, consuming side). Probe a built slice with:
 /// `strings <slice>/libzcashlc.framework/libzcashlc | grep <tag>`.
-pub const ENGINE_BUILD: &str = "2026-07-05.v04-defaults-on";
+pub const ENGINE_BUILD: &str = "2026-07-06.v05-endo-on";
 
 /// Current wall-clock time as a `YYYY-MM-DD HH:MM:SSZ` UTC string.
 ///
@@ -167,9 +167,17 @@ pub async fn sync_once(
         gpu_subtree = config.gpu_subtree,
         graft_subtree = config.graft_subtree,
         batch_combine = config.batch_combine,
+        batch_decrypt = config.batch_decrypt,
+        endo_mul = config.endo_mul,
+        local_treestate = config.local_treestate,
         started_at_utc = %wall_clock_utc(),
         "engine pass starting"
     );
+    // v0.5 C1: the forked orchard's batched-DH kernel is a process-global
+    // toggle (the swap point is a trait impl with no config channel).
+    orchard::batch_dh::set_enabled(config.batch_decrypt);
+    // v0.5 C2: GLV endomorphism per-item multiplication (same toggle pattern).
+    orchard::endo::set_enabled(config.endo_mul);
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
     let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
@@ -222,6 +230,9 @@ pub async fn sync_once(
     report.enhance.txs_stored += final_enhance.txs_stored;
     report.enhance.statuses_set += final_enhance.statuses_set;
     report.enhance.skipped += final_enhance.skipped;
+    report.enhance.fetch_wait += final_enhance.fetch_wait;
+    report.enhance.store += final_enhance.store;
+    report.enhance.address += final_enhance.address;
     // Total enhance_elapsed = per-range elapsed (in report) + final run elapsed.
     let total_enhance_elapsed = report.enhance_elapsed + final_enhance_elapsed;
 
@@ -279,6 +290,51 @@ pub async fn sync_once(
         "shard census"
     );
 
+    // v0.5 pacer split (plan §3): the scan lane's wall decomposed. The residue
+    // (scan_s minus everything measured) is bookkeeping between the timed spans
+    // — a large residue is itself a finding.
+    let scan_split = &outcome.report;
+    let scan_split_sum = scan_split.scan_recv_wait
+        + scan_split.scan_call
+        + scan_split.scan_prefetch_wait
+        + scan_split.scan_interleave_drain
+        + scan_split.scan_final_drain
+        + scan_split.scan_absorb;
+    info!(
+        recv_wait_s = scan_split.scan_recv_wait.as_secs_f64(),
+        scan_call_s = scan_split.scan_call.as_secs_f64(),
+        prefetch_wait_s = scan_split.scan_prefetch_wait.as_secs_f64(),
+        interleave_drain_s = scan_split.scan_interleave_drain.as_secs_f64(),
+        final_drain_s = scan_split.scan_final_drain.as_secs_f64(),
+        absorb_s = scan_split.scan_absorb.as_secs_f64(),
+        residue_s = (outcome.report.scan_elapsed.as_secs_f64() - scan_split_sum.as_secs_f64())
+            .max(0.0),
+        "scan lane split"
+    );
+    info!(
+        fetch_wait_s = outcome.enhance.fetch_wait.as_secs_f64(),
+        store_s = outcome.enhance.store.as_secs_f64(),
+        address_s = outcome.enhance.address.as_secs_f64(),
+        requests = outcome.enhance.requests,
+        "enhance split"
+    );
+
+    // v0.5 C1 did-it-fire stats (the graft lever's lesson): calls proves the
+    // batched seam is reached, kernel_lanes proves the kernel engaged, dh_s
+    // is the true cross-thread production DH cost (ON/OFF pairs = real ratio).
+    let (batch_dh_calls, batch_dh_lanes, batch_dh_kernel_lanes, batch_dh_nanos) =
+        orchard::batch_dh::stats();
+    let batch_dh_s = batch_dh_nanos as f64 / 1e9;
+    info!(
+        calls = batch_dh_calls,
+        lanes = batch_dh_lanes,
+        kernel_lanes = batch_dh_kernel_lanes,
+        dh_s = batch_dh_s,
+        endo_calls = orchard::endo::calls(),
+        enabled = config.batch_decrypt,
+        "batch_dh fire stats"
+    );
+
     // v0.4 P0 (spec §3.1): the machine-readable bench artifact, host-opted via config.
     if let Some(path) = &config.bench_json_path {
         let bench = crate::census::BenchSummary {
@@ -290,6 +346,20 @@ pub async fn sync_once(
             persist_wait_s,
             persist_overlap_s: (persist_busy_s - persist_wait_s).max(0.0),
             blocks: outcome.report.scan.blocks,
+            batch_dh_calls,
+            batch_dh_lanes,
+            batch_dh_kernel_lanes,
+            batch_dh_s,
+            scan_recv_wait_s: outcome.report.scan_recv_wait.as_secs_f64(),
+            scan_call_s: outcome.report.scan_call.as_secs_f64(),
+            scan_prefetch_wait_s: outcome.report.scan_prefetch_wait.as_secs_f64(),
+            scan_interleave_drain_s: outcome.report.scan_interleave_drain.as_secs_f64(),
+            scan_final_drain_s: outcome.report.scan_final_drain.as_secs_f64(),
+            scan_absorb_s: outcome.report.scan_absorb.as_secs_f64(),
+            endo_calls: orchard::endo::calls(),
+            enhance_fetch_s: outcome.enhance.fetch_wait.as_secs_f64(),
+            enhance_store_s: outcome.enhance.store.as_secs_f64(),
+            enhance_address_s: outcome.enhance.address.as_secs_f64(),
             sapling: (&outcome.report.census_sapling).into(),
             orchard: (&outcome.report.census_orchard).into(),
         };

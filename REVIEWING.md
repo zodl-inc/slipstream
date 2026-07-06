@@ -34,7 +34,8 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `graft_accumulator.rs` | v0.4: pure per-pool state machine — buffer note-free shards, eager-flush on the first owned note, close-clean at shard boundaries; range-end shards always build. |
 | `batch_sinsemilla.rs` | v0.4: batch-affine Sinsemilla combine (lockstep half-steps, one Montgomery batch inversion each) — byte-identical, KAT-gated. |
 | `lookup_build.rs` | v0.4: the shared lookup-build machinery (precompute map → verbatim `from_iter` → convert) parameterized by a batch-combine fn; routes batch > gpu > scalar. |
-| `batch_ecdh.rs` | v0.5 (seed): C0 measurement probe for the batched trial-decrypt kernel (DH = 92.4% of compact decrypt). |
+| `batch_ecdh.rs` | v0.5: C0 measurement probe (DH = 92.4% of compact decrypt) + the shared wired A/B harness (`wired_decrypt_ab`) proving batch/endo levers byte-identical through the real `ka_agree_dec` seam + `endo_bench`. |
+| `treestate.rs` | v0.5 (parked, default OFF): local running-frontier treestate derivation + off-path server audit + process fuse — built, audited byte-identical, measured out (naive per-leaf absorb costs more than the RTT it saves); revival path = batch-affine bulk absorb. |
 | `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut. |
 | `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**). |
 | `connector.rs` | Per-call Tor policy (`ConnPurpose` → circuit); `TorConn` bootstrap; bounded circuit-build + retry-on-fresh-circuit. |
@@ -46,12 +47,14 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `reconcile.rs` | `slipstream_v_tx_reconciled` — read-side view flagging txs whose shielded spend hasn't linked yet (recent-first restore visibility; installed idempotently at `WalletSession::open`). |
 | `scan_queue.rs` | `prune_orphaned_historic_ranges` — drops Historic queue rows below every remaining account's birthday at `WalletSession::open` (an account deleted mid-restore leaves its deep ranges queued; upstream `delete_account` never touches `scan_queue`). |
 | `anchor.rs` | `restore_anchor` — wallet-provisioning primitive (restore `recover_until` with offline checkpoint fallback; reorg-safe new-wallet tree state; Tor-or-offline, never a direct de-anonymising fallback). |
-| `chunk.rs`, `block_source.rs` | In-memory chunk buffering / block-source plumbing feeding the scan kernel. |
+| `chunk.rs`, `block_source.rs` | In-memory chunk buffering / block-source plumbing feeding the scan kernel; v0.5: `ChunkQueueSender` boundary-fetcher hook — the per-chunk treestate fetch spawns at chunk EMIT so the RTT hides under queue+scan+submit. |
 | `events.rs` | `Progress` (poll atomics), `Event`, `Snapshot` — the host-facing progress surface. |
 | `ffi_handle.rs` | `SlipstreamHandle` (runtime + state + event ring), `SyncState`, `FfiSlipstreamSnapshot/Event`, `spawn_supervised` (panic → `Error`). |
 | `oracle.rs` | `semantic_diff` — row/byte-level `data.db` equivalence vs the upstream path. |
 | `verify.rs` | Server / scan-continuity validation. |
 | `config.rs` | `EngineConfig` (tunables, device-memory derate), `Endpoint`. |
+| `vendor/orchard` (fork) | v0.5: pinned 0.14.0 + `batch_dh.rs` (lockstep kernel, kept as instrument/record: fire-stats counters + cross-thread DH timer) + `endo.rs` (GLV decomposition, φ-mapped wNAF table, half-width Straus ladder — 300k-verified constants re-proven in-crate, default path since 2026-07-06) + the runtime toggles (`set_enabled`). |
+| `vendor/zcash_note_encryption` (fork) | v0.5: pinned 0.4.1 + the `BatchDomain::batch_ka_agree_dec` seam (default = per-item byte-for-byte). |
 | `error.rs` | `SlipstreamError` + `is_transient` (drives every retry decision). |
 
 `gpuhash/` (crate `slipstream-gpuhash`, cargo feature `gpu`, **default-off**) — wgpu Orchard Sinsemilla
