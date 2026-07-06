@@ -91,7 +91,7 @@ vendored forks under `vendor/`.
 | Milestone | What it is |
 |---|---|
 | **v0.1** | Foundation. First engine cut: 64 min → 16 min restore. |
-| **v0.2** | Engine rewrite. ~12× the reference SDK (iPad A10 8:32, iPhone ~1:20). In production in the Zodl wallet. |
+| **v0.2** | Engine rewrite. ~12× the reference SDK (iPad A10 8:32, iPhone ~1:20). |
 | **v0.2.5** | Restore correctness. Read-side reconciliation view, never-overshoot recovery balance, transient-network retry. |
 | **v0.3** | Engine API v2. Engine-owned wallet semantics: `is_recovering`, monotonic `progress_permille`, `stalled_seconds`, criticality-aware event ring, recovery-balance view, unified wallet-summary FFI. |
 | **v0.3.5** | API v2.1 — thin hosts. Snapshot truthful from open. Self-rationing wallet summary. `tip_fresh`, `tx_set_version`. Progress re-baselines when scan scope expands. `restore_anchor` owns wallet provisioning. |
