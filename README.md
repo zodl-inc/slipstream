@@ -8,8 +8,9 @@ than the reference path — while producing a **byte-identical** wallet database
 
 > **Independent project.** Slipstream is a personal R&D project by Lukas Korba. It is **not**
 > an Electric Coin Company, Zcash Foundation, or company product, and carries no endorsement
-> from them. It builds *on top of* the official `librustzcash` crates published on crates.io —
-> it does not fork or modify them.
+> from them. It builds on the official `librustzcash` crates published on crates.io; since
+> v0.5 two of them (`orchard`, `zcash_note_encryption`) are carried as minimally-patched
+> vendored forks — byte-identical output, headed upstream.
 
 > **Reviewing or auditing?** Start with **[`REVIEWING.md`](REVIEWING.md)** — a dense
 > module-and-data-flow map (where to look, and why) written for Zcash protocol engineers.
@@ -21,21 +22,33 @@ than the reference path — while producing a **byte-identical** wallet database
 
 ## Result
 
-On a 2016 iPad (A10 Fusion) restoring a real multi-month wallet, the reference
-ZcashLightClientKit took **1:04:26**; Slipstream brings the same restore to **~9 minutes
-(≈7×)**. On an A14 iPad the engine rewrite measured **25:11 → 2:05 (~12×)**, and on device it
-beats the Zingo and Zkool reference engines. Methodology and full numbers in `docs/`.
+One real wallet, four devices, defaults only (v0.5). Reference times: the stock
+ZcashLightClientKit on the same wallet.
+
+| Device | Reference SDK | Slipstream |
+|---|---|---|
+| MacBook Pro (M4) | — | **~20 s** |
+| iPhone (A18) | — | **43 s** |
+| iPad Air (A14) | 25:11 | **68 s** (~22×) |
+| iPad 2016 (A10, 2 GB RAM) | 1:04:26 | **4:43** (~13×) |
+
+On device, Slipstream also beats the Zingo and Zkool reference engines. Methodology and
+full numbers in `docs/`.
 
 ## Design — "upstream brain, Slipstream body"
 
-Every cryptographic and wallet-logic decision is delegated to **unmodified** `librustzcash`
-crates (`zcash_client_backend`, `zcash_client_sqlite`, `shardtree`, `orchard`, `sapling`).
+Every cryptographic and wallet-logic decision is delegated to the `librustzcash` crates
+(`zcash_client_backend`, `zcash_client_sqlite`, `shardtree`, `sapling`) — unmodified,
+published on crates.io. Two crates (`orchard`, `zcash_note_encryption`) are vendored under
+`vendor/` as minimally-patched forks carrying the v0.5 trial-decrypt seam (batched-DH hook +
+GLV endomorphism ladder) — byte-identical output, KAT-gated, tracked for upstreaming.
+
 Slipstream owns only the **orchestration**: parallel block fetch with a device-RAM-scaled byte
 budget, a sparse in-memory commitment tree with a checkpoint-downgrade, a write-behind
 persistence lane, spend-before-sync scan ordering, tip-following, mempool, a per-call Tor
 transport policy, and resilience.
 
-Because the engine is a *consumer* of published `librustzcash`, it is platform-neutral Rust:
+Because the engine is a *consumer* of `librustzcash`, it is platform-neutral Rust:
 it powers an iOS wallet SDK today (via an FFI layer that lives in the consuming SDK, not here)
 and can be embedded anywhere Rust runs.
 
@@ -45,6 +58,7 @@ and can be embedded anywhere Rust runs.
 | `cli` — `slipstream-cli` | benchmark / golden-oracle / A-B harness |
 | `gpuhash` — `slipstream-gpuhash` | **parked** GPU Sinsemilla kernel — off by default; a default build links zero `wgpu` |
 | `protogen` | dev-only gRPC code generator |
+| `vendor/` | the two patched forks (`orchard`, `zcash_note_encryption`), wired via `[patch.crates-io]` |
 
 ## Correctness
 
@@ -56,11 +70,12 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (180 + 29 tests)
+cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (226 + 32 tests)
 cargo build --workspace                           # full workspace incl. the parked gpuhash
 ```
 
-Edition 2024, Rust 1.90+. Depends only on published crates.io `librustzcash`.
+Edition 2024, Rust 1.90+. Dependencies are published crates.io releases plus the two
+vendored forks under `vendor/`.
 
 ## Documentation
 
@@ -75,19 +90,17 @@ Edition 2024, Rust 1.90+. Depends only on published crates.io `librustzcash`.
 
 | Milestone | What it is |
 |---|---|
-| **v0.1** | Foundation: the first engine cut — 64 min → 16 min restore. |
-| **v0.2** | The engine rewrite: record device runs (iPad A10 8:32, iPhone ~1:20), ~12× over the reference SDK sync; in production use in the Zodl wallet. |
-| **v0.2.5** | Restore-correctness era (shipped in Zodl betas): read-side reconciliation view (`slipstream_v_tx_reconciled`), never-overshoot recovery balance, transient-network resilience. |
-| **v0.3** | **Engine API v2 — exported wallet semantics**: the engine now owns what every host used to re-derive. Snapshot carries `is_recovering` (scheduler-computed, terminal fail-safe latch built in), blessed monotonic `progress_permille` (seeded with the wallet's global position, so a catch-up reads ~100% and an interrupted restore resumes where it left off), and `stalled_seconds`; the event ring is criticality-aware (done/error/found-transactions survive overflow); `slipstream_v_recovery_balance` joins the versioned SQL views; hosts can poke `notify_tx_change` after a broadcast; and a unified wallet-summary FFI resolves the recovery phase internally. One `derive_snapshot` is shared by the C FFI and Rust hosts — proven by the `slipstream watch` CLI acting as a second host with zero wallet math of its own. |
-| **v0.3.5** | **Engine API v2.1 — the thin-host sweep**: the remaining wallet policy hosts still carried moved down, so a host is marshalling + delivery and nothing else. The snapshot is **truthful from open** (recovery flag, progress floor, persisted tip and spendability seeded from the wallet DB — no pre-first-scan blind window, a mid-restore relaunch reads correctly from the first poll); the unified wallet summary **rations its own cost** (serve-cached + background refresh at range boundaries — hosts may call it every tick, it never competes with scanning); `tip_fresh` reports whether the *current run* has proven the chain tip (stale-tip spendable masking becomes an engine fact); `tx_set_version` monotonically versions the stored transaction set — one host rule, "version moved → re-fetch", covering enhancement writes, mined/expired transitions, mempool hits, scan-driven reconcile linkage and post-broadcast pokes; the progress floor **re-baselines itself when the scan scope expands**, so importing an account with an older birthday reads as a genuine 0→100% climb; and the new handle-less **`restore_anchor`** primitive owns wallet provisioning — restore `recover_until` with an offline bundled-checkpoint fallback, reorg-safe new-wallet tree state, Tor-or-offline (never a de-anonymising direct retry). |
-| **v0.3.6** | **Lifecycle hardening** (this repo's current snapshot — the finish-line wave before the first slipstream-default wallet release): the wallet file is **quiescent when a session stops** — the write-behind commit holds a writer gate for its whole life (compute + transaction) and stop/start DRAIN it and JOIN the aborted pass, so a host wallet write (account delete/import, rewind truncate) can never interleave with an orphaned engine write; **orphaned historic scan ranges are pruned at every session open** (upstream `delete_account` leaves the deleted account's deep ranges queued — without the prune, a wallet grinds a phantom restore for keys that no longer exist, and a wedged wallet now self-heals at its next open); and the session **revives after non-transient pass failures** with a capped backoff (15 s → 5 min) instead of staying dead until relaunch — every failure still surfaces truthfully, but one-shot causes self-heal on the first attempt (validated in the field the day it shipped). |
-| **v0.4** | **"Graft, don't grind" — the work-reduction release, ON BY DEFAULT.** Fresh restores are 13–46% faster across a four-device fleet (M4 −46% at 18.7 s median, iPhone A18 −29% at 55 s, iPad A14 −13%, iPad A10 −33%) via two gated levers that both cleared the full gate suite (semantic oracles, a spend-from-grafted-witness proof adjudicated by the orchard Halo2 circuit itself, a mainnet root audit 19/19, and 100% device scenario rows): **subtree-root grafting** (note-free completed shards install the server-provided root instead of being rebuilt — a 1-in-16 sampling audit rebuilds and compares, and a mismatching graft always loses to the built shard) and **batch-affine Sinsemilla** (the shards that do build run their combines level-synchronously with shared Montgomery inversions — byte-identical output, ~12× the scalar combine in isolation). New instruments ride along: a per-wallet shard census that predicts the graft ceiling, `slipstream bench` (fresh-restore stage split, machine-readable), and lane-level graft verdict counters. Kill switches: `ZCASH_GRAFT_SUBTREE=0`, `ZCASH_BATCH_COMBINE=0`. |
-| **v0.5** | **The scan-pacer release — every day is a good-server day, ON BY DEFAULT.** Another 26–42% off fresh restores on top of v0.4 (production fleet, one wallet, one morning: M4 ~19–20 s weather-immune, iPhone A18 43.1 s, iPad A14 67.6 s, iPad A10 (2 GB, 2018) 283 s — all-time −45% band everywhere). Three changes: **boundary treestate prefetch** (the per-chunk `GetTreeState` RPC — measured at up to 62% of the scan wall on bad server days — is spawned at chunk emit and fully hidden behind scanning; device `prefetch_wait` drops to microseconds and sync times stop swinging with server-side "network weather"); **gated interleaved enhancement** (interleave passes + their full persist drains fire only when notes were actually found since the last run — the 1→21 s no-op drain swings collapse to <1.5 s); and **GLV endomorphism trial-decrypt DH** (vendored `orchard` fork: half-length Straus ladder over a φ-mapped wNAF table on the per-item Diffie–Hellman path — byte-identical, KAT-gated, −24% DH core-time at 100% coverage on every measured chip, +15–16% wall where DH saturates cores). Negative results recorded honestly: the lockstep batched-DH kernel (Plan C) was production-refuted by its own fire-stats instruments (slower per-lane under real concurrency, zero wall transfer), and local treestate derivation was built, audited byte-identical, then measured out (naive absorb costs more than it saves; parked default-off). Kill switch: `ZCASH_ENDO_MUL=0`. |
+| **v0.1** | Foundation. First engine cut: 64 min → 16 min restore. |
+| **v0.2** | Engine rewrite. ~12× the reference SDK (iPad A10 8:32, iPhone ~1:20). In production in the Zodl wallet. |
+| **v0.2.5** | Restore correctness. Read-side reconciliation view, never-overshoot recovery balance, transient-network retry. |
+| **v0.3** | Engine API v2. Engine-owned wallet semantics: `is_recovering`, monotonic `progress_permille`, `stalled_seconds`, criticality-aware event ring, recovery-balance view, unified wallet-summary FFI. |
+| **v0.3.5** | API v2.1 — thin hosts. Snapshot truthful from open. Self-rationing wallet summary. `tip_fresh`, `tx_set_version`. Progress re-baselines when scan scope expands. `restore_anchor` owns wallet provisioning. |
+| **v0.3.6** | Lifecycle hardening. Wallet file quiescent on stop (writer gate: drain + join). Orphaned scan ranges pruned at open. Session revival with capped backoff. |
+| **v0.4** | "Graft, don't grind" — work reduction, **on by default**. Restores 13–46% faster fleet-wide. Subtree-root grafting (1-in-16 sampling audit; gates included a Halo2-adjudicated spend-from-grafted-witness proof and a 19/19 mainnet root audit) + batch-affine Sinsemilla (~12× the scalar combine). Byte-identical. Kill switches: `ZCASH_GRAFT_SUBTREE=0`, `ZCASH_BATCH_COMBINE=0`. |
+| **v0.5** | Scan pacer — **on by default**. Another 26–42% off restores. Boundary treestate prefetch (server RTT fully hidden; sync times stop swinging with server weather). Gated interleaved enhancement. GLV endomorphism trial-decrypt DH (−24% DH core-time, byte-identical, KAT-gated). Negatives recorded honestly: lockstep batched-DH kernel and local treestate derivation were built, measured, and rejected. Kill switch: `ZCASH_ENDO_MUL=0`. |
 
-This repository contains the **v0.5.0** snapshot (tag `v0.5.0`), re-extracted from the
-development tree (the Zodl wallet SDK's `slipstream` branch) — it includes the v0.2.5
-restore-correctness work, the full engine API v2/v2.1 thin-host surface, and the v0.4
-work-reduction + v0.5 scan-pacer levers.
+This repository is the **v0.5.0** snapshot (tag `v0.5.0`), re-extracted from the
+development tree (the Zodl wallet SDK's `slipstream` branch).
 
 ## License
 
