@@ -297,6 +297,76 @@ pub mod testkit {
     /// sits deliberately BELOW NU5 and cannot host orchard chains (v0.4 T10b).
     pub const SYNTH_ORCHARD_START: u64 = 1_700_000;
 
+    /// Dual-pool synthetic chain from [`SYNTH_ORCHARD_START`]: every block has
+    /// `orch_per_block` orchard actions; every `sap_every`-th block ALSO has
+    /// one sapling output. The interspersed sapling stream gives the two pools
+    /// DIFFERENT checkpoint-id sets — the shape that makes the cross-pool
+    /// `ensure_checkpoints` fill non-empty (the sandblasting-era regression
+    /// vector). cmu streams are the deterministic counters `synth_chain_state`
+    /// replays: sapling `cmu(1..)`, orchard `cmu(2_000_000 + k)`.
+    pub fn synth_blocks_dual(
+        count: u64,
+        orch_per_block: u32,
+        sap_every: u64,
+    ) -> Vec<CompactBlock> {
+        let mut blocks = Vec::with_capacity(count as usize);
+        let mut sap_tree_size: u32 = 0;
+        let mut orch_tree_size: u32 = 0;
+        let mut sap_counter: u64 = 1;
+        let mut orch_counter: u64 = 0;
+        for i in 0..count {
+            let height = SYNTH_ORCHARD_START + i;
+            let actions = (0..orch_per_block)
+                .map(|_| {
+                    let a = CompactOrchardAction {
+                        nullifier: cmu(1_000_000 + orch_counter),
+                        cmx: cmu(2_000_000 + orch_counter),
+                        ephemeral_key: h32(0xEE, orch_counter),
+                        ciphertext: vec![0xC7; 52],
+                    };
+                    orch_counter += 1;
+                    a
+                })
+                .collect::<Vec<_>>();
+            orch_tree_size += orch_per_block;
+            let outputs = if i % sap_every == 0 {
+                let o = CompactSaplingOutput {
+                    cmu: cmu(sap_counter),
+                    ephemeral_key: h32(0xE5, sap_counter),
+                    ciphertext: vec![0xC7; 52],
+                };
+                sap_counter += 1;
+                sap_tree_size += 1;
+                vec![o]
+            } else {
+                vec![]
+            };
+            let tx = CompactTx {
+                index: 0,
+                txid: h32(0x77, height),
+                fee: 0,
+                spends: vec![],
+                outputs,
+                actions,
+                ..Default::default()
+            };
+            blocks.push(CompactBlock {
+                proto_version: 0,
+                height,
+                hash: h32(0xBB, height),
+                prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
+                time: height as u32,
+                header: vec![],
+                vtx: vec![tx],
+                chain_metadata: Some(ChainMetadata {
+                    sapling_commitment_tree_size: sap_tree_size,
+                    orchard_commitment_tree_size: orch_tree_size,
+                }),
+            });
+        }
+        blocks
+    }
+
     /// One genuine orchard compact action: a REAL note encrypted to `ufvk`'s
     /// external orchard address, so compact trial-decryption finds it and the
     /// wallet can later SPEND it (the T10b witness proof). The nullifier field
@@ -570,6 +640,24 @@ pub mod testkit {
         graft_verify_sample: u32,
         prepare: impl FnOnce(&mut WalletSession, &TreeState) -> Result<(), SlipstreamError>,
     ) -> Result<((u64, u64), (u64, u64)), SlipstreamError> {
+        scan_synthetic_windows_write_behind_with_tip(
+            dir, blocks, window_lens, graft, graft_verify_sample, None, prepare,
+        )
+        .await
+    }
+
+    /// As above, but with an explicit chain-tip override — lets a test place the
+    /// scanned windows deep below the tip (DEEP_HISTORY_CHECKPOINT_MARGIN
+    /// territory), the shape of a historic-range restore over spam-era blocks.
+    pub async fn scan_synthetic_windows_write_behind_with_tip(
+        dir: &Path,
+        blocks: Vec<CompactBlock>,
+        window_lens: &[usize],
+        graft: bool,
+        graft_verify_sample: u32,
+        tip_override: Option<u64>,
+        prepare: impl FnOnce(&mut WalletSession, &TreeState) -> Result<(), SlipstreamError>,
+    ) -> Result<((u64, u64), (u64, u64)), SlipstreamError> {
         if window_lens.iter().sum::<usize>() != blocks.len() {
             return Err(SlipstreamError::Wallet(format!(
                 "window_lens sum {} != blocks {}",
@@ -589,7 +677,8 @@ pub mod testkit {
         };
         prepare(&mut session, &birthday_ts)?;
         session.ensure_account(TEST_UFVK, birthday_ts.clone())?;
-        let tip = blocks.last().map(|b| b.height).unwrap_or(SYNTH_START);
+        let tip =
+            tip_override.unwrap_or_else(|| blocks.last().map(|b| b.height).unwrap_or(SYNTH_START));
         session.update_chain_tip(tip)?;
 
         // Seed the facade under the no-pending barrier; open the lane's own
@@ -777,6 +866,26 @@ pub mod testkit {
                 .map_err(|e| SlipstreamError::Wallet(format!("invalid synth cmu {n}: {e}")))?;
             let _ = frontier.append(node);
         }
+        // Orchard synth chains (synth_blocks_orchard): the foreign cmx pattern
+        // is the same deterministic counter stream (cmu(2_000_000 + k)), so the
+        // orchard frontier replays exactly. Chains with owned actions splice a
+        // real cmx into the stream and would need it here too — multi-window
+        // drivers currently only use foreign-only orchard chains.
+        let orch_total: u64 = last
+            .chain_metadata
+            .as_ref()
+            .map(|m| m.orchard_commitment_tree_size as u64)
+            .unwrap_or(0);
+        let mut orch_frontier: Frontier<orchard::tree::MerkleHashOrchard, 32> = Frontier::empty();
+        for k in 0..orch_total {
+            let bytes: [u8; 32] = cmu(2_000_000 + k)
+                .as_slice()
+                .try_into()
+                .map_err(|_| SlipstreamError::Wallet("synth cmx width".into()))?;
+            let node = Option::from(orchard::tree::MerkleHashOrchard::from_bytes(&bytes))
+                .ok_or_else(|| SlipstreamError::Wallet(format!("invalid synth cmx {k}")))?;
+            let _ = orch_frontier.append(node);
+        }
         let mut hash = [0u8; 32];
         hash[0] = 0xBB;
         hash[1..9].copy_from_slice(&last.height.to_le_bytes());
@@ -784,7 +893,7 @@ pub mod testkit {
             BlockHeight::from(last.height as u32),
             zcash_primitives::block::BlockHash(hash),
             frontier,
-            incrementalmerkletree::frontier::Frontier::empty(),
+            orch_frontier,
         ))
     }
 }
@@ -1308,6 +1417,70 @@ mod tests {
     /// root mismatch would fail loudly; equality of checkpoints + caps proves the
     /// grafted root feeds the same tree the built path computes.
     /// Heavy (2× 66k-action scans): `cargo test -p slipstream-core --release
+    /// 2026-07-06 sandblasting-era P0 regression: deep-history windows scanned
+    /// over a shard whose store row is a ROOT-ONLY leaf (the pass-start
+    /// subtree-root ingest installs one for every chain-wide-completed shard)
+    /// used to panic in shardtree's `prune_excess_checkpoints`: window 1's
+    /// ~100 ensured store checkpoints point into interior the graft
+    /// accumulator BUFFERED (never inserted into the tree), and window 2's
+    /// prune evicts them in one per-shard `clear_flags` batch straight into
+    /// the root-only leaf — "Tree state inconsistent with checkpoints".
+    /// With DEEP_HISTORY_CHECKPOINT_MARGIN dooming, deep batches create no
+    /// per-block checkpoints, so there is nothing to evict; the scan must
+    /// complete. Fast (2,200 actions) — guards the suite by default.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deep_history_over_ingested_root_only_shard_survives() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // 220 note-free blocks, 10 orchard actions each, a sapling output every
+        // 3rd block — the interspersed sapling stream makes the cross-pool
+        // ensure_checkpoints fill non-empty (the flood vector); all positions
+        // stay inside each pool's shard 0.
+        let blocks = super::testkit::synth_blocks_dual(220, 10, 3);
+        let last_height = blocks.last().expect("blocks").height;
+        // The chain tip sits far above the scanned windows — the historic-
+        // range restore shape (margin is 10_000; use 2× for headroom).
+        let tip = last_height + 20_000;
+        // Both pools' shard 0 are chain-wide complete: serve roots so the
+        // ingest installs root-only leaves. The values are never compared
+        // (neither shard completes within the scanned windows) — any
+        // canonical elements work; borrow the first synthetic cmx/cmu.
+        let orch_root: [u8; 32] = blocks[0].vtx[0].actions[0]
+            .cmx
+            .as_slice()
+            .try_into()
+            .expect("cmx is 32 bytes");
+        let sap_root: [u8; 32] = blocks[0].vtx[0].outputs[0]
+            .cmu
+            .as_slice()
+            .try_into()
+            .expect("cmu is 32 bytes");
+        let res = super::testkit::scan_synthetic_windows_write_behind_with_tip(
+            dir.path(),
+            blocks,
+            &[110, 110],
+            true,
+            0,
+            Some(tip),
+            move |session, _birthday_ts| {
+                use orchard::tree::MerkleHashOrchard;
+                use zcash_client_backend::data_api::chain::CommitmentTreeRoot;
+                use zcash_primitives::merkle_tree::HashSer;
+                let orch_node = Option::from(MerkleHashOrchard::from_bytes(&orch_root))
+                    .ok_or_else(|| SlipstreamError::Wallet("orch root decode".into()))?;
+                let sap_node = sapling::Node::read(&sap_root[..])
+                    .map_err(|e| SlipstreamError::Wallet(format!("sap root decode: {e}")))?;
+                let h = zcash_protocol::consensus::BlockHeight::from(last_height as u32);
+                let roots = crate::grpc::SubtreeRoots {
+                    sapling: vec![CommitmentTreeRoot::from_parts(h, sap_node)],
+                    orchard: vec![CommitmentTreeRoot::from_parts(h, orch_node)],
+                };
+                session.put_subtree_roots(&roots)
+            },
+        )
+        .await;
+        assert!(res.is_ok(), "deep-history scan over root-only shards died: {res:?}");
+    }
+
     /// -- --ignored graft_real_install`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "heavy: 2× 66k-action orchard scans; run explicitly (use --release)"]

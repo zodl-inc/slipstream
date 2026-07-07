@@ -83,6 +83,87 @@ const _: () = assert!(
     "window must mirror upstream PRUNING_DEPTH / max_checkpoints"
 );
 
+/// Batches whose last height sits at least this far below the chain tip carry
+/// NO per-block checkpoints at all (every `Retention::Checkpoint` in the
+/// stream is downgraded up front; only the per-chunk `from_state` frontier
+/// checkpoint — `Marking::Reference`, materialized by `insert_frontier` —
+/// survives).
+///
+/// Correctness (the sandblasting-era panic, 2026-07-06, traced live): the
+/// v0.4 graft accumulator BUFFERS note-free historic rows instead of
+/// inserting them, which breaks TWO assumptions at once. (1) The cross-pool
+/// `ensure_checkpoints` maps are deliberately taken PRE-dooming
+/// (upstream-identical inputs), and the add loops' `height > min_cp` filter
+/// assumed built-segment insertion keeps the store's min checkpoint at the
+/// window cutoff — with everything buffered nothing inserts, `min_cp` stays
+/// ancient, and the filter admits THOUSANDS of cross-pool checkpoint adds
+/// per era chunk (traced: 319 after chunk 1, 3,174 by chunk 2 vs max 100).
+/// (2) The pass-start subtree-root ingest has installed a ROOT-ONLY leaf for
+/// every chain-wide-completed shard, and the buffered rows' retention never
+/// materializes — so when the next `insert_frontier`'s
+/// `prune_excess_checkpoints` mass-evicts that flood in per-shard
+/// `clear_flags` batches, it descends into a root-only leaf with thousands
+/// of positions and hits shardtree's "Tree state inconsistent with
+/// checkpoints" panic arm. Dooming the stream up front empties the cp_pos
+/// maps, so the flood never happens and there is nothing to evict; the
+/// surviving per-chunk frontier checkpoints sit on leaves `insert_frontier`
+/// materialized, and their single-position clears are handled gracefully.
+///
+/// Equivalence: upstream's own serial scan prunes every checkpoint deeper
+/// than `PRUNING_DEPTH` (100) as it goes, so the final `data.db` checkpoint
+/// set — the newest window near the tip — is unchanged; deep-history
+/// checkpoints are pure churn in both worlds. Rewinds deeper than the margin
+/// re-anchor from a server `TreeState` exactly as upstream does. The margin
+/// is deliberately enormous next to the reorg depth (100).
+const DEEP_HISTORY_CHECKPOINT_MARGIN: u32 = 10_000;
+
+/// Open-time self-heal for wallets damaged by the pre-fix sandblasting-era
+/// checkpoint flood (see [`DEEP_HISTORY_CHECKPOINT_MARGIN`]): builds that ran
+/// v0.4/v0.5 before the fix persisted THOUSANDS of deep-history checkpoint
+/// rows (a poisoned specimen: 3,174 orchard rows spanning the whole spam era
+/// vs the healthy 100-row tip window). Every later pass — even a 10-block tip
+/// verify — then mass-evicts them into root-only ingested shard leaves and
+/// dies in shardtree's "Tree state inconsistent with checkpoints" panic arm,
+/// wedging the wallet in the revival loop.
+///
+/// The heal deletes checkpoint rows (and their marks-removed satellites)
+/// deeper than the margin below each pool's own max checkpoint id. For
+/// healthy wallets this is a no-op (upstream-equivalent pruning never leaves
+/// deep rows); for flooded wallets it restores exactly the state upstream's
+/// own `prune_excess_checkpoints` would have converged to. The flooded rows'
+/// retention flags were never materialized in the tree (their commitments
+/// were buffered), so store-row deletion needs no tree-side flag cleanup;
+/// stale flags from any legitimately-built deep checkpoints merely keep a
+/// node alive (bloat, not breakage).
+///
+/// Returns rows deleted across both pools.
+pub fn heal_flooded_checkpoints(
+    conn: &rusqlite::Connection,
+) -> Result<u64, rusqlite::Error> {
+    let mut deleted = 0u64;
+    for pool in ["sapling", "orchard"] {
+        let max_id: Option<i64> = conn.query_row(
+            &format!("SELECT MAX(checkpoint_id) FROM {pool}_tree_checkpoints"),
+            [],
+            |r| r.get(0),
+        )?;
+        let Some(max_id) = max_id else { continue };
+        let cutoff = max_id - i64::from(DEEP_HISTORY_CHECKPOINT_MARGIN);
+        deleted += conn.execute(
+            &format!(
+                "DELETE FROM {pool}_tree_checkpoint_marks_removed
+                 WHERE checkpoint_id < :cutoff"
+            ),
+            rusqlite::named_params! { ":cutoff": cutoff },
+        )? as u64;
+        deleted += conn.execute(
+            &format!("DELETE FROM {pool}_tree_checkpoints WHERE checkpoint_id < :cutoff"),
+            rusqlite::named_params! { ":cutoff": cutoff },
+        )? as u64;
+    }
+    Ok(deleted)
+}
+
 // ── In-memory shard store ──────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
@@ -978,6 +1059,23 @@ pub fn sparse_put_blocks(
             // a filtered `existing` map would remap an ensure-height whose
             // nearest own-pool checkpoint lies below the cutoff onto the
             // frontier position instead of that checkpoint's position.
+            // Deep-history batches carry no per-block checkpoints at all — see
+            // DEEP_HISTORY_CHECKPOINT_MARGIN for the full why (the
+            // sandblasting-era prune-into-root-only-leaf panic) and the
+            // upstream-equivalence argument. Dooming the stream BEFORE the
+            // cp_pos extraction starves the entire pipeline consistently:
+            // empty maps → ensure_checkpoints adds nothing → no store
+            // checkpoints → nothing for prune_excess_checkpoints to evict
+            // into an unmaterialized (buffered/root-only) shard.
+            let deep_history = wdb.chain_height()?.is_some_and(|tip| {
+                last_scanned_height + DEEP_HISTORY_CHECKPOINT_MARGIN < tip
+            });
+            if deep_history {
+                let doom_all = BlockHeight::from(u32::MAX);
+                downgrade_doomed_checkpoints(&mut sapling_commitments, doom_all);
+                downgrade_doomed_checkpoints(&mut orchard_commitments, doom_all);
+            }
+
             let sapling_cp_pos = stream_checkpoint_positions(
                 Position::from(from_state.final_sapling_tree().tree_size()),
                 &sapling_commitments,

@@ -32,8 +32,10 @@ ZcashLightClientKit on the same wallet.
 | iPad Air (A14) | 25:11 | **68 s** (~23×) |
 | iPad 2016 (A10, 2 GB RAM) | 1:04:26 | **4:43** (~14×) |
 
-On device, Slipstream also beats the Zingo and Zkool reference engines. Methodology and
-full numbers in `docs/`.
+Deep history holds up: a real 2019 wallet — ~2.4M blocks including the entire 2022–23
+"sandblasting" spam era — restores in **51 minutes** (M4), a range effectively
+unrestorable on the reference path. On device, Slipstream also beats the Zingo and Zkool
+reference engines. Methodology and full numbers in `docs/`.
 
 ## Design — "upstream brain, Slipstream body"
 
@@ -70,7 +72,7 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (226 + 32 tests)
+cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (228 + 32 tests)
 cargo build --workspace                           # full workspace incl. the parked gpuhash
 ```
 
@@ -98,8 +100,9 @@ vendored forks under `vendor/`.
 | **v0.3.6** | Lifecycle hardening. Wallet file quiescent on stop (writer gate: drain + join). Orphaned scan ranges pruned at open. Session revival with capped backoff. |
 | **v0.4** | "Graft, don't grind" — work reduction, **on by default**. Restores 13–46% faster fleet-wide. Subtree-root grafting (1-in-16 sampling audit; gates included a Halo2-adjudicated spend-from-grafted-witness proof and a 19/19 mainnet root audit) + batch-affine Sinsemilla (~12× the scalar combine). Byte-identical. Kill switches: `ZCASH_GRAFT_SUBTREE=0`, `ZCASH_BATCH_COMBINE=0`. |
 | **v0.5** | Scan pacer — **on by default**. Another 26–42% off restores. Boundary treestate prefetch (server RTT fully hidden; sync times stop swinging with server weather). Gated interleaved enhancement. GLV endomorphism trial-decrypt DH (−24% DH core-time, byte-identical, KAT-gated). Negatives recorded honestly: lockstep batched-DH kernel and local treestate derivation were built, measured, and rejected. Kill switch: `ZCASH_ENDO_MUL=0`. |
+| **v0.5.1** | Sandblasting-era restore fix. Deep-history batches no longer flood the checkpoint store (v0.4 graft interaction — panicked mid-era); damaged wallets self-heal at the next session open. Red-proven regression tests; validated by a full-era 2.4M-block restore. |
 
-This repository is the **v0.5.0** snapshot (tag `v0.5.0`), re-extracted from the
+This repository is the **v0.5.1** snapshot (tag `v0.5.1`), re-extracted from the
 development tree (the Zodl wallet SDK's `slipstream` branch).
 
 ## License

@@ -107,6 +107,21 @@ impl WalletSession {
                 ),
                 Err(e) => tracing::warn!(%e, "scan queue prune failed (non-fatal) — continuing"),
             }
+            // Sandblasting-era flood heal (2026-07-06): wallets that scanned the
+            // spam era on a pre-fix build carry thousands of deep-history
+            // checkpoint rows that panic every subsequent pass — delete them at
+            // open so damaged wallets self-repair without a reset. No-op on
+            // healthy wallets. Warn-and-continue, same policy as the prune above.
+            match crate::persist::heal_flooded_checkpoints(&conn) {
+                Ok(0) => {}
+                Ok(n) => info!(
+                    healed = n,
+                    "checkpoint store: deleted flooded deep-history checkpoint rows (pre-fix sandblasting damage)"
+                ),
+                Err(e) => {
+                    tracing::warn!(%e, "checkpoint flood heal failed (non-fatal) — continuing")
+                }
+            }
         }
         Ok(Self { network, db, db_path: db_path.to_path_buf() })
     }
@@ -327,6 +342,44 @@ mod tests {
 
     /// [API v2.1 E-4] The tx-set signature moves on INSERTS (count) and on reconcile-LINKAGE
     /// transitions (unreconciled count) — the two classes the boundary check must catch.
+    #[test]
+    fn open_heals_flooded_deep_history_checkpoints() {
+        // 2026-07-06 sandblasting-era P0: wallets that scanned the spam era on
+        // a pre-fix build carry thousands of deep-history checkpoint rows that
+        // panic every later pass. Opening the session must delete everything
+        // deeper than the margin below each pool's max checkpoint id — and be
+        // a no-op within the retained window.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        // First open creates the schema.
+        drop(WalletSession::open(Network::MainNetwork, &path).expect("open"));
+        {
+            let conn = Connection::open(&path).expect("reopen");
+            // The poisoned shape: a flood spanning the era + a healthy tip window.
+            let mut stmt = conn
+                .prepare("INSERT INTO orchard_tree_checkpoints (checkpoint_id, position) VALUES (?1, ?2)")
+                .expect("prepare");
+            for id in (1_687_103..1_990_103).step_by(100) {
+                stmt.execute(rusqlite::params![id, 1_000]).expect("insert flood");
+            }
+            for id in 3_402_885..3_402_985 {
+                stmt.execute(rusqlite::params![id, 2_000_000]).expect("insert window");
+            }
+        }
+        // Second open runs the heal.
+        drop(WalletSession::open(Network::MainNetwork, &path).expect("open heals"));
+        let conn = Connection::open(&path).expect("reopen");
+        let (n, min_id): (u64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), MIN(checkpoint_id) FROM orchard_tree_checkpoints",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .expect("count");
+        assert_eq!(n, 100, "only the tip window survives the heal");
+        assert!(min_id >= 3_402_985 - 10_000, "flood rows below the margin are gone");
+    }
+
     #[test]
     fn tx_set_signature_tracks_inserts_and_linkage() {
         use rusqlite::params;
