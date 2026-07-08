@@ -17,6 +17,71 @@
 - **v0.3** — GPU subtree offload. Built + measured, then **PARKED**: a narrow ~1.1× win that
   regresses high-core devices, so it ships gate-OFF. Algorithmic **work reduction** (decrypt /
   combine), not concurrency, is the real next lever.
+- **v0.4** (2026-07-05) — **"graft, don't grind"**: install server subtree roots instead of
+  rebuilding note-free shards + batch-affine Sinsemilla combine for the shards that do build.
+  Mac fresh restore **28.9 → 18.7 s (+54.5%)**, iPhone crosses **<60 s** for the first time
+  (55.4 s in production Zodl). Defaults ON.
+- **v0.5** (2026-07-06; **v0.5.1** = sandblasting-era restore fix) — **scan pacer** (chunk
+  boundary treestates derived locally: one seed fetch per range instead of one RPC per
+  boundary; +26% iPhone) + **GLV endomorphism DH** (half-length Straus ladder, byte-identical,
+  KAT-gated; +15% on compute-saturated A-series). Defaults ON after a 4-device production
+  sweep — fleet: M4 ~20 s / A18 43.1 s / A14 67.6 s / A10 283 s, all-time records everywhere.
+- **v0.6** (2026-07-08, this release) — **the instrument-driven CPU campaign**: measure first,
+  then delete work. Ships skip-below-window nullifier tracking (persist rows −80%), one
+  dedicated persist-lane pool (lane closed: A18 submit_wait 5.9 → 3.0 s), and the **shared
+  per-epk φ-endo window** (the trial-decrypt table built once per ephemeral key, reused by
+  both scope ivks; the upstream wNAF table nothing read is never built). A18 scan_call
+  **28.0 → 25.9 s**; DH −12% CPU on A18, −21% on M4. Four levers measured dead and documented
+  (QoS pinning, GLV-lockstep kernel — closing the batch-affine DH family on Apple Silicon —
+  window-5 tables, producer pass-2 thinning). Details ↓.
+
+---
+
+## v0.6 — the instrument-driven CPU campaign (2026-07-08)
+
+The A18-class scan is CPU-saturated (~5.9 of 6 cores busy — proven by a union-of-intervals
+wall over the DH seam plus bracketed epk preparation): wall time = CPU work ÷ cores, so every
+lever in this release is work deletion, and every claim below reproduced across interleaved
+A/B pairs.
+
+### Added
+- **P5/P6 instruments** (permanent): `batch_dh_wall_s` (union wall over the DH + epk-prep
+  brackets → average busy threads), `batch_epk_s` (epk-preparation CPU the DH bracket was
+  blind to), `scan_pass1_s`/`scan_pass2_s` (the two upstream walks per chunk, timed at the
+  block source). These found every win and killed every dead end in this release.
+
+### Changed
+- **Skip-below-window nullifier tracking (nfskip):** blocks below the contiguous fully-scanned
+  frontier skip transient nullifier-map writes entirely — the next prune was guaranteed to
+  delete those rows and no read can consult them. Persist-lane row work −80%; every
+  wallet-semantic table byte-identical (windowed golden oracle).
+- **One dedicated persist-lane thread pool**, sized `cores − 2` clamped [2, 4] — the lane's
+  burst-shaped tree builds land in the decrypt lane's blocked windows instead of queueing
+  behind it. Subsumes the earlier core-count-gated lane pool.
+- **Shared per-epk φ-endo window (P7):** preparing an ephemeral key now builds the GLV
+  odd-multiple window ({1,3,5,7}·P and its φ twin) ONCE, with a single flush-wide batch
+  normalization (~1 field inversion per ~100 epks where the ladder previously paid ~2 per
+  epk), and both scope ivks' multiplications run straight off it. The upstream wNAF window
+  table — which the DH levers never read (13.3 CPU-s of dead tables per A18 restore,
+  measured) — is not built under a lever. Levers off remains upstream-verbatim. KAT-gated
+  three ways in the vendored orchard fork.
+
+### Measured dead (kept in the perf ledger's graveyard; code default-OFF where retained)
+- **QoS worker pinning** — null on throughput, starves the persist lane (priority inversion).
+- **GLV-lockstep batch-affine kernel** — C1 rebuilt with every excuse fixed (prebuilt tables,
+  half-length ladder, zero-alloc scratch): still 1.35× slower per lane. Montgomery batch
+  inversion is a serial dependency chain; the per-item projective ladder pipelines. The
+  batch-affine DH family is closed on Apple Silicon; the kernel stays in-tree, KAT'd, OFF.
+- **Window-5 tables** — ladder win (−2.5 CPU-s) exactly cancelled by the bigger build
+  (+2.35 CPU-s). Reverted.
+- **Producer pass-2 thinning** — honest re-derivation: ~1–2 CPU-s reachable, and only by
+  vendoring `zcash_client_backend`. Routed to upstream suggestions instead.
+
+### Compatibility
+- No schema changes to wallet-semantic tables (nfskip changes only the transient
+  `nullifier_map` write cadence — byte-identical at/above the retention window).
+- Config surface unchanged: `batch_decrypt` stays default-OFF (it now selects the GLV-lockstep
+  kernel — measured slower, kept as the refutation reference), `endo_mul` stays default-ON.
 
 ---
 

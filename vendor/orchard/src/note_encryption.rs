@@ -160,9 +160,17 @@ impl Domain for OrchardDomain {
         ivk: &Self::IncomingViewingKey,
         epk: &Self::PreparedEphemeralPublicKey,
     ) -> Self::SharedSecret {
-        // [slipstream fork] v0.5 C2: GLV endomorphism split (half-length
-        // Straus ladder) — per-item, allocation-light, byte-identical
-        // (KAT-gated in endo.rs). OFF by default.
+        // [slipstream fork] v0.6 P7: an epk prepared under a DH lever carries
+        // the shared φ-endo window — the GLV ladder runs straight off it, no
+        // per-multiplication table build (the window is reused by BOTH scope
+        // ivks; the build cost was one field inversion per multiplication).
+        // Wnaf-prepared epks keep the v0.5 C2 behavior: solo GLV ladder when
+        // endo is on, else upstream's prepared wNAF walk verbatim. Every
+        // path is byte-identical (KAT-gated in endo.rs).
+        if epk.endo_table().is_some() {
+            crate::endo::note_call();
+            return epk.agree(ivk);
+        }
         if crate::endo::enabled() {
             crate::endo::note_call();
             return SharedSecret::from_kernel_point(crate::endo::mul_endo(
@@ -253,6 +261,46 @@ impl Domain for OrchardDomain {
 }
 
 impl BatchDomain for OrchardDomain {
+    /// [slipstream fork] v0.6 P6/P7: still BRACKETED (`batch_epk_s` — this
+    /// work runs inside the batch task yet outside the DH bracket, invisible
+    /// to the busy readout), but the P6 suspicion is now the P7 lever: the
+    /// lever paths read only the raw point, never the wNAF table upstream
+    /// preparation builds (~858k tables, 13.3 CPU-s per A18 restore,
+    /// measured). Under a DH lever this parses (decompresses) per item and
+    /// then builds every live epk's shared φ-endo window with ONE flush-wide
+    /// batch normalization — the window both scope ivks' multiplications
+    /// reuse. Levers off: the upstream default, byte-identical.
+    fn batch_epk(
+        ephemeral_keys: impl Iterator<Item = EphemeralKeyBytes>,
+    ) -> Vec<(Option<Self::PreparedEphemeralPublicKey>, EphemeralKeyBytes)> {
+        #[cfg(feature = "std")]
+        let started = std::time::Instant::now();
+        // Joins the same union-wall interval as the DH bracket (task-core wall).
+        #[cfg(feature = "std")]
+        let _wall = crate::batch_dh::wall_enter();
+        let out = if crate::endo::enabled() || crate::batch_dh::enabled() {
+            let (epks, keys): (Vec<_>, Vec<_>) = ephemeral_keys
+                .map(|ephemeral_key| (Self::epk(&ephemeral_key), ephemeral_key))
+                .unzip();
+            PreparedEphemeralPublicKey::batch_tabled(epks)
+                .into_iter()
+                .zip(keys)
+                .collect()
+        } else {
+            ephemeral_keys
+                .map(|ephemeral_key| {
+                    (
+                        Self::epk(&ephemeral_key).map(Self::prepare_epk),
+                        ephemeral_key,
+                    )
+                })
+                .collect()
+        };
+        #[cfg(feature = "std")]
+        crate::batch_dh::note_epk_nanos(started.elapsed().as_nanos() as u64);
+        out
+    }
+
     fn batch_kdf<'a>(
         items: impl Iterator<Item = (Option<Self::SharedSecret>, &'a EphemeralKeyBytes)>,
     ) -> Vec<Option<Self::SymmetricKey>> {
@@ -267,12 +315,15 @@ impl BatchDomain for OrchardDomain {
     }
 
     /// [slipstream fork] Batched same-scalar DH: every trial-decryption lane
-    /// multiplies by the SAME ivk, so the lockstep-affine kernel shares one
-    /// inversion per ladder step across the whole batch (~1.6x the per-item
-    /// prepared path at production batch size — the prepared path is already
-    /// wNAF-tabled). OFF by default — `crate::batch_dh::set_enabled` is the
-    /// engine's runtime toggle; degenerate lanes fall back per-item, so the
-    /// output is byte-identical either way (KAT-gated in batch_dh.rs).
+    /// multiplies by the SAME ivk, so a lockstep-affine kernel shares one
+    /// inversion per ladder step across the whole batch. Two kernels behind
+    /// the toggle: [v0.6 P8] the GLV-lockstep kernel for window-prepared
+    /// epks (prebuilt P7 tables + half-length ladder — the rebuild of C1 on
+    /// the instrument-named fixes), and the v0.5 C1 full-width kernel for
+    /// Wnaf-prepared epks (unchanged). OFF by default —
+    /// `crate::batch_dh::set_enabled` is the engine's runtime toggle;
+    /// degenerate lanes fall back per-item, so the output is byte-identical
+    /// either way (KAT-gated in batch_dh.rs).
     fn batch_ka_agree_dec<'a>(
         ivk: &Self::IncomingViewingKey,
         epks: impl Iterator<Item = Option<&'a Self::PreparedEphemeralPublicKey>>,
@@ -286,6 +337,9 @@ impl BatchDomain for OrchardDomain {
         crate::batch_dh::note_call(epks.len());
         #[cfg(feature = "std")]
         let started = std::time::Instant::now();
+        // [v0.6 P5] DH-wall interval — held to fn exit on BOTH paths.
+        #[cfg(feature = "std")]
+        let _wall = crate::batch_dh::wall_enter();
         if !crate::batch_dh::enabled() {
             let out = epks
                 .into_iter()
@@ -296,34 +350,66 @@ impl BatchDomain for OrchardDomain {
             return out;
         }
 
-        // Gather the live lanes' raw bases and BATCH-normalize them — one
-        // shared inversion for the whole batch instead of one per point
-        // (per-point to_affine cost ~as much as the kernel saved).
-        let mut lane_index = Vec::with_capacity(epks.len());
-        let mut projective = Vec::with_capacity(epks.len());
+        // [v0.6 P8] Partition live lanes: an epk prepared under a lever
+        // carries the shared φ-endo window — those run the GLV-lockstep
+        // kernel (prebuilt tables, half-length ladder, no input
+        // normalization). Wnaf-prepared lanes keep the v0.5 C1 full-width
+        // kernel byte-for-byte. In practice a batch is all one kind; the
+        // split costs one pass.
+        let mut t_index = Vec::with_capacity(epks.len());
+        let mut t_tables: Vec<&crate::endo::EndoTable> = Vec::with_capacity(epks.len());
+        let mut w_index = Vec::new();
+        let mut w_projective = Vec::new();
         for (i, epk) in epks.iter().enumerate() {
             if let Some(epk) = epk {
-                lane_index.push(i);
-                projective.push(epk.raw_point());
+                match epk.endo_table() {
+                    Some(t) => {
+                        t_index.push(i);
+                        t_tables.push(t);
+                    }
+                    None => {
+                        w_index.push(i);
+                        w_projective.push(epk.raw_point());
+                    }
+                }
             }
         }
-        use group::prime::PrimeCurveAffine as _;
-        let mut bases =
-            alloc::vec![pasta_curves::pallas::Affine::identity(); projective.len()];
-        pasta_curves::pallas::Point::batch_normalize(&projective, &mut bases);
-        crate::batch_dh::note_kernel_lanes(bases.len());
         let k = ivk.raw_scalar();
-        let products = crate::batch_dh::batch_mul_same_scalar(&k, &bases);
-
         let mut out: Vec<Option<SharedSecret>> = epks.iter().map(|_| None).collect();
-        for (j, i) in lane_index.into_iter().enumerate() {
-            out[i] = Some(match products[j] {
-                Some(affine) => {
-                    SharedSecret::from_kernel_point(pasta_curves::pallas::Point::from(affine))
-                }
-                // Degenerate lane (poison-marked) -> the per-item path.
-                None => Self::ka_agree_dec(ivk, epks[i].expect("lane was live")),
-            });
+
+        if !t_tables.is_empty() {
+            crate::batch_dh::note_kernel_lanes(t_tables.len());
+            let products = crate::batch_dh::batch_mul_same_scalar_glv(&k, &t_tables);
+            for (j, i) in t_index.into_iter().enumerate() {
+                out[i] = Some(match products[j] {
+                    Some(affine) => {
+                        SharedSecret::from_kernel_point(pasta_curves::pallas::Point::from(affine))
+                    }
+                    // Degenerate lane (poison-marked) -> the per-item path.
+                    None => Self::ka_agree_dec(ivk, epks[i].expect("lane was live")),
+                });
+            }
+        }
+
+        if !w_projective.is_empty() {
+            // Gather the raw bases and BATCH-normalize them — one shared
+            // inversion for the whole batch instead of one per point
+            // (per-point to_affine cost ~as much as the kernel saved).
+            use group::prime::PrimeCurveAffine as _;
+            let mut bases =
+                alloc::vec![pasta_curves::pallas::Affine::identity(); w_projective.len()];
+            pasta_curves::pallas::Point::batch_normalize(&w_projective, &mut bases);
+            crate::batch_dh::note_kernel_lanes(bases.len());
+            let products = crate::batch_dh::batch_mul_same_scalar(&k, &bases);
+            for (j, i) in w_index.into_iter().enumerate() {
+                out[i] = Some(match products[j] {
+                    Some(affine) => {
+                        SharedSecret::from_kernel_point(pasta_curves::pallas::Point::from(affine))
+                    }
+                    // Degenerate lane (poison-marked) -> the per-item path.
+                    None => Self::ka_agree_dec(ivk, epks[i].expect("lane was live")),
+                });
+            }
         }
         #[cfg(feature = "std")]
         crate::batch_dh::note_nanos(started.elapsed().as_nanos() as u64);

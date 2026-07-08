@@ -12,11 +12,29 @@ use crate::chunk::Chunk;
 
 pub struct MemBlockSource<'a> {
     chunk: &'a Chunk,
+    /// v0.6 P6: wall spent inside each `with_blocks` walk, in call order.
+    /// Upstream `scan_cached_blocks` walks the source EXACTLY twice per
+    /// call — pass 1 feeds the batch runners (walk wall = feed + task
+    /// spawning), pass 2 re-walks doing the wallet-side processing (walk
+    /// wall = extract recv + nullifier checks + ScannedBlock assembly) —
+    /// so after the scan call, [0] = pass 1 and [1] = pass 2. The A18 P5
+    /// readout showed the wall lives in ONE of these; this names which.
+    /// RefCell: `with_blocks` takes `&self` and the producer is
+    /// single-threaded.
+    walk_wall: std::cell::RefCell<Vec<std::time::Duration>>,
 }
 
 impl<'a> MemBlockSource<'a> {
     pub fn new(chunk: &'a Chunk) -> Self {
-        Self { chunk }
+        Self { chunk, walk_wall: std::cell::RefCell::new(Vec::with_capacity(2)) }
+    }
+
+    /// `(pass1, pass2)` walk walls recorded so far (zero if a walk didn't
+    /// happen — e.g. an error exit). Walks beyond the second are ignored;
+    /// the two-walk shape is upstream `scan_cached_blocks`' structure.
+    pub fn walk_walls(&self) -> (std::time::Duration, std::time::Duration) {
+        let w = self.walk_wall.borrow();
+        (w.first().copied().unwrap_or_default(), w.get(1).copied().unwrap_or_default())
     }
 }
 
@@ -32,21 +50,27 @@ impl BlockSource for MemBlockSource<'_> {
     where
         F: FnMut(CompactBlock) -> Result<(), ChainError<WalletErrT, Self::Error>>,
     {
+        let started = std::time::Instant::now();
         let from = from_height.map(u64::from).unwrap_or(0);
         let mut served = 0usize;
-        for b in &self.chunk.blocks {
-            if b.height < from {
-                continue;
+        let mut serve = || {
+            for b in &self.chunk.blocks {
+                if b.height < from {
+                    continue;
+                }
+                if let Some(l) = limit
+                    && served >= l
+                {
+                    break;
+                }
+                with_block(b.clone())?;
+                served += 1;
             }
-            if let Some(l) = limit
-                && served >= l
-            {
-                break;
-            }
-            with_block(b.clone())?;
-            served += 1;
-        }
-        Ok(())
+            Ok(())
+        };
+        let result = serve();
+        self.walk_wall.borrow_mut().push(started.elapsed());
+        result
     }
 }
 

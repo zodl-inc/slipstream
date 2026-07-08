@@ -164,6 +164,15 @@ pub struct SyncReport {
     pub scan_interleave_drain: Duration,
     pub scan_final_drain: Duration,
     pub scan_absorb: Duration,
+    /// v0.6 P1 residue split — see `ScanStats` for the per-field contracts.
+    pub scan_state_prep: Duration,
+    pub scan_prefetch_spawn: Duration,
+    pub scan_submit_wait: Duration,
+    pub scan_submit_extra: Duration,
+    pub scan_reseed: Duration,
+    /// v0.6 P6 two-pass split of scan_call — see `ScanStats`.
+    pub scan_pass1: Duration,
+    pub scan_pass2: Duration,
     /// v0.4 census (spec §3.2): per-pool shard census unioned across all ranges.
     pub census_sapling: crate::census::ShardCensus,
     pub census_orchard: crate::census::ShardCensus,
@@ -481,6 +490,15 @@ pub async fn run_to_completion(
         report.scan_interleave_drain += scan_stats.interleave_drain;
         report.scan_final_drain += scan_stats.final_drain;
         report.scan_absorb += scan_stats.treestate_absorb;
+        // v0.6 P1 residue split.
+        report.scan_state_prep += scan_stats.state_prep;
+        report.scan_prefetch_spawn += scan_stats.prefetch_spawn;
+        report.scan_submit_wait += scan_stats.submit_wait;
+        report.scan_submit_extra += scan_stats.submit_extra;
+        report.scan_reseed += scan_stats.reseed;
+        // v0.6 P6 two-pass split.
+        report.scan_pass1 += scan_stats.scan_pass1;
+        report.scan_pass2 += scan_stats.scan_pass2;
         report.census_sapling.merge(&scan_stats.census_sapling);
         report.census_orchard.merge(&scan_stats.census_orchard);
         report.enhance.requests += scan_stats.interleaved_enhance.requests;

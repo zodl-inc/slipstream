@@ -117,6 +117,62 @@ const _: () = assert!(
 /// is deliberately enormous next to the reorg depth (100).
 const DEEP_HISTORY_CHECKPOINT_MARGIN: u32 = 10_000;
 
+/// v0.6 P4b: the nullifier-map pruning depth (mirrors upstream put_blocks'
+/// literal `100` passed to `prune_tracked_nullifiers`). Used both at the prune
+/// call AND to derive `track_floor` — the skip-below-window rule that avoids
+/// inserting nullifier/locator rows the very next call's prune would delete
+/// (measured at ~85% of the rows prologue on M4 and A18 alike).
+pub(crate) const NULLIFIER_PRUNE_DEPTH: u32 = 100;
+
+/// v0.6 P4c/P4d (subsumes T6.9b): the persist lane's dedicated rayon pool —
+/// THE one pool policy for all persist-side rayon work. Installed at the
+/// sap∥orch `rayon::join` in `sparse_put_blocks`, which rayon-scopes ALL
+/// nested parallelism (the join arms AND upstream `build_subtrees`'
+/// `par_chunks`) onto these threads, never the global pool's decrypt workers.
+///
+/// Why dedicated — three generations of field evidence:
+/// - A10 4-core (T6.9, 2026-06-13): sharing the global pool queued the lane's
+///   tree work behind decrypt — tree wall 12.9 s vs 6.7 s of work on one
+///   chunk, persist_wait 259 s over the pass. Isolation was worth ≈200 s.
+/// - A18 6-core (P4c, 2026-07-07): same pathology at production scale once
+///   the nfskip diet exposed it — tree_join wall 17.7–28.8 s on ~6.5 s of
+///   work. A dedicated pool made tree_join equal its bucket sum again.
+/// - The retired T6.9b2 core-count branch ("isolate only on ≤4 cores; a
+///   2-thread pool DOUBLED Mac scan_s 5.58→11.23 s") was measured against the
+///   PRE-diet lane (rows ~15 s/pass + checkpoint churn); post-nfskip the Mac
+///   lane is ~4 s/pass and the 2-thread sanity run showed no regression
+///   (tree_join 3.35→2.52 s). Always isolate now.
+///
+/// Why `cores − 2` clamped to [2, 4] (P4d): the lane's cost is burst-shaped —
+/// the big shard-crossing builds land exactly while the scan lane is blocked
+/// in submit_wait, i.e. while the DH threads are IDLE. A 2-thread pool left
+/// 4 of the A18's 6 cores unused during the only windows that bind the wall
+/// (measured: build doubled 5.2→10.9 s, submit_wait stuck at ~5.8 s). The
+/// floor of 2 keeps the sap∥orch join genuinely parallel within the A10's
+/// 4-thread budget (2 lane + 2 decrypt — the T6.9b tuning); the cap of 4
+/// keeps overlap-time competition with DH negligible.
+///
+/// Process-global (OnceLock): concurrent sessions share one bounded pool
+/// rather than stacking per-lane threads. The inline (write_behind=false)
+/// path routes through it too — it never overlaps decrypt, so isolation
+/// costs it nothing at these thread counts, and one mechanism beats two.
+/// Falls back to the global pool if construction ever fails (never
+/// observed — but a perf lever must not become a crash).
+fn persist_pool() -> Option<&'static rayon::ThreadPool> {
+    use std::sync::OnceLock;
+    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(2, usize::from);
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(cores.saturating_sub(2).clamp(2, 4))
+            .thread_name(|i| format!("slipstream-persist-{i}"))
+            .build()
+            .map_err(|e| tracing::warn!(%e, "persist pool build failed — global pool fallback"))
+            .ok()
+    })
+    .as_ref()
+}
+
 /// Open-time self-heal for wallets damaged by the pre-fix sandblasting-era
 /// checkpoint flood (see [`DEEP_HISTORY_CHECKPOINT_MARGIN`]): builds that ran
 /// v0.4/v0.5 before the fix persisted THOUSANDS of deep-history checkpoint
@@ -865,6 +921,11 @@ pub fn sparse_put_blocks(
 
     let t_rows = std::time::Instant::now();
     let mut rows_ms = 0u128;
+    // v0.6 P4 rows sub-split: where inside the prologue the time goes.
+    let mut rows_block_meta_ns = 0u128;
+    let mut rows_nf_ns = 0u128;
+    let mut rows_txs_ns = 0u128;
+    let mut rows_gap_ns = 0u128;
     let mut tree_ms = 0u128;
     let mut sap_tree_ms = 0u128;
     let mut orch_tree_ms = 0u128;
@@ -873,12 +934,55 @@ pub fn sparse_put_blocks(
     let mut flush_ms = 0u128;
     let mut downgraded = 0u64;
 
+    // v0.6 P4b: the call's last height, read before `blocks` moves into the closure.
+    let call_last_height = blocks.last().map(|b| b.height());
+
     inner.transactionally::<_, _, SqliteClientError>(|wdb| {
         let mut sapling_commitments = vec![];
         let mut orchard_commitments = vec![];
         let mut last_scanned_height: Option<BlockHeight> = None;
         let mut note_positions: Vec<(ShieldedProtocol, Position)> = vec![];
         let mut tx_refs = HashSet::new();
+
+        // ── v0.6 P4b: skip below-window nullifier tracking ───────────────────
+        // Measured (Mac + A18, identical ratios): `track_block_*_nullifiers` +
+        // `prune_tracked_nullifiers` = ~85% of the rows prologue — the insert-
+        // all-then-prune-to-(fully_scanned − 100) pattern inserts ~10k blocks'
+        // nullifier/locator rows per chunk and deletes all but a trailing window
+        // one call later. Skip the inserts the NEXT call's prune is guaranteed
+        // to delete. Sound because (each step load-bearing):
+        //   1. We skip ONLY when this call extends the contiguous fully-scanned
+        //      frontier (`fully_scanned == from_state.height()`): then the next
+        //      frontier-adjacent call's prune anchor is ≥ this call's last
+        //      height, so every skipped row would be deleted there. Non-adjacent
+        //      calls (the recent-first / chain-tip ranges, whose rows serve
+        //      cross-range spend detection) skip NOTHING — full upstream
+        //      behavior.
+        //   2. No read can see the difference: `detect_*_spend` looks up spends
+        //      of a note received at height N, which can only exist at heights
+        //      ≥ N — blocks processed LATER in the ascending order (their spends
+        //      are linked by `mark_*_note_spent`, not the map), or ALREADY
+        //      tracked by earlier non-adjacent (higher) ranges. Skipped rows are
+        //      strictly below the window and strictly below any future range.
+        //   3. `slipstream_v_tx_reconciled` is documented "robust to
+        //      prune_tracked_nullifiers timing" (its test is note-received, not
+        //      nullifier-tracked), and the recovery-critical rows are the
+        //      non-adjacent ranges' — never skipped.
+        // End state after each commit ≡ upstream's end state one prune later;
+        // the golden oracle (final-state semantic diff) adjudicates on top.
+        let track_floor: Option<BlockHeight> = {
+            let fully_scanned = wdb.block_fully_scanned()?.map(|m| m.block_height());
+            if fully_scanned == Some(from_state.block_height()) {
+                call_last_height.and_then(|last| {
+                    let floor = BlockHeight::from(
+                        u32::from(last).saturating_sub(NULLIFIER_PRUNE_DEPTH),
+                    );
+                    (floor > from_state.block_height() + 1).then_some(floor)
+                })
+            } else {
+                None
+            }
+        };
 
         for block in blocks.into_iter() {
             // ll/wallet.rs:278-287 — height-consecutive guard.
@@ -898,6 +1002,7 @@ pub fn sparse_put_blocks(
                 .map_err(|_| SqliteClientError::CorruptedData("sapling output count exceeds u32".into()))?;
             let orchard_count = u32::try_from(block.orchard().commitments().len())
                 .map_err(|_| SqliteClientError::CorruptedData("orchard action count exceeds u32".into()))?;
+            let t_bm = std::time::Instant::now();
             wdb.put_block_meta(
                 block.height(),
                 block.block_hash(),
@@ -907,7 +1012,9 @@ pub fn sparse_put_blocks(
                 block.orchard().final_tree_size(),
                 orchard_count,
             )?;
+            rows_block_meta_ns += t_bm.elapsed().as_nanos();
 
+            let t_txs = std::time::Instant::now();
             for tx in block.transactions() {
                 // ll/wallet.rs:304-312.
                 let tx_ref = wdb.put_tx_meta(tx, block.height())?;
@@ -998,9 +1105,17 @@ pub fn sparse_put_blocks(
                 }
             }
 
-            // ll/wallet.rs:380-390 — nullifier tracking.
-            wdb.track_block_sapling_nullifiers(block.height(), block.sapling().nullifier_map())?;
-            wdb.track_block_orchard_nullifiers(block.height(), block.orchard().nullifier_map())?;
+            rows_txs_ns += t_txs.elapsed().as_nanos();
+
+            // ll/wallet.rs:380-390 — nullifier tracking (v0.6 P4b: skipped for
+            // blocks the next call's prune is guaranteed to delete — see the
+            // track_floor derivation above).
+            if track_floor.is_none_or(|floor| block.height() >= floor) {
+                let t_nf = std::time::Instant::now();
+                wdb.track_block_sapling_nullifiers(block.height(), block.sapling().nullifier_map())?;
+                wdb.track_block_orchard_nullifiers(block.height(), block.orchard().nullifier_map())?;
+                rows_nf_ns += t_nf.elapsed().as_nanos();
+            }
 
             // ll/wallet.rs:399-417 — note positions.
             note_positions.extend(block.transactions().iter().flat_map(|wtx| {
@@ -1021,6 +1136,7 @@ pub fn sparse_put_blocks(
         }
 
         // ll/wallet.rs:440-457 — gap addresses for involved accounts.
+        let t_gap = std::time::Instant::now();
         for (account_id, key_scope) in wdb.find_involved_accounts(tx_refs)? {
             if let Some(t_key_scope) = key_scope {
                 use ReceiverRequirement::*;
@@ -1033,7 +1149,8 @@ pub fn sparse_put_blocks(
         }
 
         // ll/wallet.rs:459-462.
-        wdb.prune_tracked_nullifiers(100)?;
+        wdb.prune_tracked_nullifiers(NULLIFIER_PRUNE_DEPTH)?;
+        rows_gap_ns += t_gap.elapsed().as_nanos();
         rows_ms = t_rows.elapsed().as_millis();
 
         if let Some(last_scanned_height) = last_scanned_height {
@@ -1155,7 +1272,17 @@ pub fn sparse_put_blocks(
                 SqliteClientError::CorruptedData(format!("sparse tree: {e:?}"))
             }
 
-            let (sap_result, orch_result) = rayon::join(
+            // v0.6 P4c: run the per-pool join in the lane's OWN small pool.
+            // On the shared global pool the join's tasks queue behind the scan's
+            // DH saturation — measured on the A18 as ~20 s of tree_join wall
+            // over ~6.5 s of real work (and it GREW when the rows fix freed the
+            // lane: the bottleneck moved from disk to queueing). `install`
+            // scopes nested rayon too (upstream `build_subtrees`' par_chunks +
+            // the batch-affine combine), so the whole tree pipeline stops
+            // waiting on the scanner. This removes a priority-inversion
+            // artifact rather than adding parallelism: the lane's real work is
+            // small and already off the critical path — it just needs to RUN.
+            let join_pools = || rayon::join(
                 || -> Result<(u64, PoolTimers, (u64, u64)), SqliteClientError> {
                     let t_pool = std::time::Instant::now();
                     let mut timers = PoolTimers::default();
@@ -1392,6 +1519,11 @@ pub fn sparse_put_blocks(
                     Ok((orch_downgraded, timers, orch_audit))
                 },
             );
+            let (sap_result, orch_result) = if let Some(pool) = persist_pool() {
+                pool.install(join_pools)
+            } else {
+                join_pools()
+            };
             // Propagate errors from both sides after join (no unwrap/expect).
             let (sap_downgraded, sap_timers, sap_audit) = sap_result?;
             let (orch_downgraded, orch_timers, orch_audit) = orch_result?;
@@ -1457,7 +1589,37 @@ pub fn sparse_put_blocks(
     // tree_ms ≈ max(sap, orch) when the join truly runs in parallel, ≈ sap + orch when
     // it degenerates to serial (single-thread rayon pool) — this distinguishes
     // "lopsided pools" from "no parallelism" directly in device logs.
-    info!(rows_ms, tree_ms, sap_tree_ms, orch_tree_ms, flush_ms, downgraded, "sparse put_blocks");
+    info!(
+        rows_ms,
+        rows_block_meta_ms = (rows_block_meta_ns / 1_000_000) as u64,
+        rows_nf_ms = (rows_nf_ns / 1_000_000) as u64,
+        rows_txs_ms = (rows_txs_ns / 1_000_000) as u64,
+        rows_gap_ms = (rows_gap_ns / 1_000_000) as u64,
+        tree_ms,
+        sap_tree_ms,
+        orch_tree_ms,
+        flush_ms,
+        downgraded,
+        "sparse put_blocks"
+    );
+    // v0.6 P2: feed the pass-level lane totals (bucket sums across pools).
+    lane_stats::record(
+        rows_ms as u64,
+        tree_ms as u64,
+        flush_ms as u64,
+        downgraded,
+        (sap_split.downgrade_ms + orch_split.downgrade_ms) as u64,
+        (sap_split.build_ms + orch_split.build_ms) as u64,
+        (sap_split.frontier_ms + orch_split.frontier_ms) as u64,
+        (sap_split.insert_ms + orch_split.insert_ms) as u64,
+        (sap_split.ensure_ms + orch_split.ensure_ms) as u64,
+    );
+    lane_stats::record_rows_split(
+        (rows_block_meta_ns / 1_000_000) as u64,
+        (rows_nf_ns / 1_000_000) as u64,
+        (rows_txs_ns / 1_000_000) as u64,
+        (rows_gap_ns / 1_000_000) as u64,
+    );
     // T6.8-L3b sub-attribution: per-pool pipeline split (one line per pool, per chunk).
     // The dominant orchard sub-bucket decides the L3b optimization target.
     info!(
@@ -1580,6 +1742,126 @@ fn doomed_checkpoint_cutoff(
         .rev()
         .nth(SPARSE_CHECKPOINT_WINDOW as usize - 1)
         .copied()
+}
+
+/// v0.6 P2 (PERF_LEDGER #1's instrument): pass-level persist-lane totals.
+/// Process-cumulative cross-thread atomics (the write-behind lane runs the
+/// put_blocks closures on its own thread); the engine snapshots at pass start
+/// and logs the delta at pass end ("persist lane split") + bench JSON.
+/// Bucket sums are ACROSS pools (sap + orch); `tree_join_ms` is the join's
+/// wall time (≈ max(pools) when parallel, ≈ sum when serial).
+pub mod lane_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static ROWS_MS: AtomicU64 = AtomicU64::new(0);
+    static TREE_JOIN_MS: AtomicU64 = AtomicU64::new(0);
+    static FLUSH_MS: AtomicU64 = AtomicU64::new(0);
+    static DOWNGRADE_MS: AtomicU64 = AtomicU64::new(0);
+    static BUILD_MS: AtomicU64 = AtomicU64::new(0);
+    static FRONTIER_MS: AtomicU64 = AtomicU64::new(0);
+    static INSERT_MS: AtomicU64 = AtomicU64::new(0);
+    static ENSURE_MS: AtomicU64 = AtomicU64::new(0);
+    static DOWNGRADED: AtomicU64 = AtomicU64::new(0);
+    // v0.6 P4: the rows prologue sub-split.
+    static ROWS_BLOCK_META_MS: AtomicU64 = AtomicU64::new(0);
+    static ROWS_NF_MS: AtomicU64 = AtomicU64::new(0);
+    static ROWS_TXS_MS: AtomicU64 = AtomicU64::new(0);
+    static ROWS_GAP_MS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct Totals {
+        pub calls: u64,
+        pub rows_ms: u64,
+        pub rows_block_meta_ms: u64,
+        pub rows_nf_ms: u64,
+        pub rows_txs_ms: u64,
+        pub rows_gap_ms: u64,
+        pub tree_join_ms: u64,
+        pub flush_ms: u64,
+        pub downgrade_ms: u64,
+        pub build_ms: u64,
+        pub frontier_ms: u64,
+        pub insert_ms: u64,
+        pub ensure_ms: u64,
+        pub downgraded: u64,
+    }
+
+    impl Totals {
+        /// This-pass delta against a pass-start snapshot.
+        pub fn delta_since(&self, start: &Totals) -> Totals {
+            Totals {
+                calls: self.calls.saturating_sub(start.calls),
+                rows_ms: self.rows_ms.saturating_sub(start.rows_ms),
+                rows_block_meta_ms: self
+                    .rows_block_meta_ms
+                    .saturating_sub(start.rows_block_meta_ms),
+                rows_nf_ms: self.rows_nf_ms.saturating_sub(start.rows_nf_ms),
+                rows_txs_ms: self.rows_txs_ms.saturating_sub(start.rows_txs_ms),
+                rows_gap_ms: self.rows_gap_ms.saturating_sub(start.rows_gap_ms),
+                tree_join_ms: self.tree_join_ms.saturating_sub(start.tree_join_ms),
+                flush_ms: self.flush_ms.saturating_sub(start.flush_ms),
+                downgrade_ms: self.downgrade_ms.saturating_sub(start.downgrade_ms),
+                build_ms: self.build_ms.saturating_sub(start.build_ms),
+                frontier_ms: self.frontier_ms.saturating_sub(start.frontier_ms),
+                insert_ms: self.insert_ms.saturating_sub(start.insert_ms),
+                ensure_ms: self.ensure_ms.saturating_sub(start.ensure_ms),
+                downgraded: self.downgraded.saturating_sub(start.downgraded),
+            }
+        }
+    }
+
+    pub fn totals() -> Totals {
+        Totals {
+            calls: CALLS.load(Ordering::Relaxed),
+            rows_ms: ROWS_MS.load(Ordering::Relaxed),
+            rows_block_meta_ms: ROWS_BLOCK_META_MS.load(Ordering::Relaxed),
+            rows_nf_ms: ROWS_NF_MS.load(Ordering::Relaxed),
+            rows_txs_ms: ROWS_TXS_MS.load(Ordering::Relaxed),
+            rows_gap_ms: ROWS_GAP_MS.load(Ordering::Relaxed),
+            tree_join_ms: TREE_JOIN_MS.load(Ordering::Relaxed),
+            flush_ms: FLUSH_MS.load(Ordering::Relaxed),
+            downgrade_ms: DOWNGRADE_MS.load(Ordering::Relaxed),
+            build_ms: BUILD_MS.load(Ordering::Relaxed),
+            frontier_ms: FRONTIER_MS.load(Ordering::Relaxed),
+            insert_ms: INSERT_MS.load(Ordering::Relaxed),
+            ensure_ms: ENSURE_MS.load(Ordering::Relaxed),
+            downgraded: DOWNGRADED.load(Ordering::Relaxed),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record(
+        rows_ms: u64,
+        tree_join_ms: u64,
+        flush_ms: u64,
+        downgraded: u64,
+        downgrade_ms: u64,
+        build_ms: u64,
+        frontier_ms: u64,
+        insert_ms: u64,
+        ensure_ms: u64,
+    ) {
+        CALLS.fetch_add(1, Ordering::Relaxed);
+        ROWS_MS.fetch_add(rows_ms, Ordering::Relaxed);
+        TREE_JOIN_MS.fetch_add(tree_join_ms, Ordering::Relaxed);
+        FLUSH_MS.fetch_add(flush_ms, Ordering::Relaxed);
+        DOWNGRADE_MS.fetch_add(downgrade_ms, Ordering::Relaxed);
+        BUILD_MS.fetch_add(build_ms, Ordering::Relaxed);
+        FRONTIER_MS.fetch_add(frontier_ms, Ordering::Relaxed);
+        INSERT_MS.fetch_add(insert_ms, Ordering::Relaxed);
+        ENSURE_MS.fetch_add(ensure_ms, Ordering::Relaxed);
+        DOWNGRADED.fetch_add(downgraded, Ordering::Relaxed);
+    }
+
+    /// v0.6 P4: the rows prologue sub-split (block-meta / nullifier-tracking /
+    /// decrypted-tx section / gap-addresses+prune).
+    pub(crate) fn record_rows_split(block_meta_ms: u64, nf_ms: u64, txs_ms: u64, gap_ms: u64) {
+        ROWS_BLOCK_META_MS.fetch_add(block_meta_ms, Ordering::Relaxed);
+        ROWS_NF_MS.fetch_add(nf_ms, Ordering::Relaxed);
+        ROWS_TXS_MS.fetch_add(txs_ms, Ordering::Relaxed);
+        ROWS_GAP_MS.fetch_add(gap_ms, Ordering::Relaxed);
+    }
 }
 
 /// T6.8-L3b sub-attribution: wall-time split of one pool's in-memory tree
@@ -2047,59 +2329,6 @@ impl WalletWrite for WriteBehindFacade {
 
 // ── Persist lane ───────────────────────────────────────────────────────────────
 
-/// T6.9b — Thread count for the lane's DEDICATED rayon pool.
-///
-/// Why 2, not 1:
-///   The per-pool `rayon::join` inside `sparse_put_blocks` dispatches the
-///   sapling and orchard tree pipelines in PARALLEL (T6.8-L3a). With 1 lane
-///   thread, `join` degenerates to serial (left closure runs inline; right
-///   waits) — identical to before L3a on the lane. With 2 lane threads, both
-///   closures run concurrently inside the lane pool, preserving the ≈10–15%
-///   intra-commit parallelism measured at T6.8-L3a while still being fully
-///   isolated from the decrypt pool.
-///
-/// Why not more:
-///   The lane executes EXACTLY ONE commit at a time (depth-1 backpressure is
-///   structural). Adding a third thread adds no further in-commit parallelism
-///   (only 2 independent sub-tasks exist — sap + orch join); it would merely
-///   gift spare CPU to the commit while the decrypt side is already competing
-///   for the same cores. On a 4-core A10 the budget is 4 threads total; we
-///   want the lane to occupy at most 2 so decrypt can fill the other 2.
-///
-/// Why a DEDICATED pool at all (T6.9b contention fix):
-///   Before this change, `rayon::join` in `sparse_put_blocks` used the GLOBAL
-///   pool — the same pool the concurrent decrypt tasks (zcash_client_backend
-///   BatchRunners, rayon::spawn_fifo) saturate. On a 4-core A10, field
-///   evidence (T6.9 iPad log 2026-06-13) showed the lane's tree work queuing
-///   behind decrypt tasks: tree wall 12.9s vs per-pool sum 6.7s on one chunk
-///   (≈60% inflation due to scheduling contention); depth-1 persist_wait
-///   inflated to 259s over the pass, reducing the write-behind benefit by ≈200s.
-///   With a lane-owned pool, ALL rayon work inside the commit closure — the
-///   `rayon::join` itself AND upstream's `build_subtrees`' `par_chunks` — lands
-///   on the lane's 2 threads, never touching the global pool's decrypt workers.
-const LANE_POOL_THREADS: usize = 2;
-
-/// Saturation threshold for the lane-pool policy: at or below this many cores,
-/// the global rayon pool is assumed decrypt-saturated during overlap.
-const LANE_ISOLATION_MAX_CORES: usize = 4;
-
-/// T6.9b2 — saturation-aware lane-pool policy.
-///
-/// The T6.9 field data cuts both ways: on the 4-core A10 the shared global
-/// pool produced ~60% lane-busy inflation (queueing behind decrypt), so a
-/// dedicated small pool helps; but on a 10-core Mac the SAME dedicated
-/// 2-thread pool starved `build_subtrees` and DOUBLED scan_s (5.58→11.23s
-/// measured) because the global pool there has idle capacity the lane should
-/// use. Policy: isolate (Some(2)) only on low-core machines where decrypt
-/// saturates everything (≤ LANE_ISOLATION_MAX_CORES logical cores); share the
-/// global pool (None) elsewhere. A heuristic, honestly labeled: core count is
-/// a proxy for "decrypt saturates the pool", which held in every measurement
-/// to date (A10=4 pathological, iPhone 6-core and Mac 10-core healthy shared).
-fn lane_pool_policy() -> Option<usize> {
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    if cores <= LANE_ISOLATION_MAX_CORES { Some(LANE_POOL_THREADS) } else { None }
-}
-
 /// A deferred-commit job: runs against the lane's Db + tree state on a blocking
 /// thread. Boxed so lane mechanics (serial order, depth-1 backpressure, error
 /// propagation, drain) are unit-testable without `ScannedBlock` values.
@@ -2111,22 +2340,16 @@ pub(crate) type PersistJob =
 type PersistTaskOutput = (Db, SparseTreeState, Result<std::time::Duration, SqliteClientError>);
 
 /// The write-behind persist lane: owns a SECOND `WalletDb` connection to the
-/// same wallet file (WAL), the per-range `SparseTreeState`, and a DEDICATED
-/// rayon thread pool (T6.9b, `LANE_POOL_THREADS` = 2). Runs at most ONE
-/// deferred commit at a time via `spawn_blocking` (ownership ping-pongs
+/// same wallet file (WAL) and the per-range `SparseTreeState`. Runs at most
+/// ONE deferred commit at a time via `spawn_blocking` (ownership ping-pongs
 /// through the task — serialization is structural, not advisory).
 ///
-/// Thread-pool isolation (T6.9b): every commit closure runs via
-/// `lane_pool.install(|| …)`. Rayon scoping guarantees ALL nested rayon usage
-/// inside — the `rayon::join` (T6.8-L3a) AND upstream `build_subtrees`'
-/// `par_chunks` — lands on the lane's 2-thread pool, never on the global
-/// pool that decrypt workers saturate. This eliminates the scheduling-
-/// contention inflation observed on the 4-core A10 (T6.9 field evidence).
-///
-/// The INLINE path (write_behind=false) is UNTOUCHED: it calls
-/// `sparse_put_blocks` directly (no `spawn_blocking`, no lane pool) so its
-/// `rayon::join` keeps using the global pool — inline persist never runs
-/// concurrently with decrypt, so there is no pool-queueing pathology there.
+/// Thread-pool isolation: the lane's rayon work runs on the dedicated
+/// [`persist_pool`], installed at the sap∥orch join inside
+/// `sparse_put_blocks` itself (v0.6 P4c/P4d — the policy, sizing, and full
+/// A10/A18/Mac evidence live on that fn). Write-behind and inline
+/// (write_behind=false) paths both route through it, since the install site
+/// is inside the shared commit logic.
 ///
 /// No concurrent-writer hazard by design: while a commit is in flight the scan
 /// side performs ZERO database work (all its reads are virtualized by
@@ -2142,11 +2365,6 @@ type PersistTaskOutput = (Db, SparseTreeState, Result<std::time::Duration, Sqlit
 pub struct PersistLane {
     db: Option<Db>,
     sparse: Option<SparseTreeState>,
-    /// Dedicated rayon pool (T6.9b), present only when `lane_pool_policy()`
-    /// says to isolate (low-core saturated machines). `None` = commits use the
-    /// global pool (measured-best on ≥6-core machines — see T6.9b2 policy doc).
-    /// Arc so it can be moved into `spawn_blocking` closures cheaply.
-    lane_pool: Option<std::sync::Arc<rayon::ThreadPool>>,
     /// [B4-16 drain] When attached (production scan path), every deferred commit holds a
     /// [`crate::events::WalletWriterGate`] for its WHOLE life (tree compute + DB txn), so
     /// the FFI stop()/start() drain can wait out an orphan commit that `task.abort()`
@@ -2206,7 +2424,6 @@ impl PersistLane {
             zcash_client_sqlite::util::SystemClock,
             rand::rngs::OsRng,
         );
-        let lane_pool = Self::build_lane_pool(lane_pool_policy())?;
         let graft = if graft_buffering {
             Some(GraftCtx::open(wallet_db_path, graft_verify_sample)?)
         } else {
@@ -2217,7 +2434,6 @@ impl PersistLane {
         Ok(Self {
             db: Some(db),
             sparse: Some(sparse),
-            lane_pool,
             progress: None,
             in_flight: None,
             in_flight_span: (0, 0),
@@ -2233,27 +2449,6 @@ impl PersistLane {
     /// test drivers (no stop()/start() drain to serve) may skip.
     pub fn attach_writer_gate(&mut self, progress: crate::events::ProgressArc) {
         self.progress = Some(progress);
-    }
-
-    /// Build the optional dedicated lane pool per the given policy.
-    /// Factored out so tests can exercise both branches deterministically.
-    fn build_lane_pool(
-        threads: Option<usize>,
-    ) -> Result<Option<std::sync::Arc<rayon::ThreadPool>>, crate::error::SlipstreamError> {
-        match threads {
-            None => Ok(None),
-            Some(n) => Ok(Some(std::sync::Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .thread_name(|i| format!("slipstream-lane-{i}"))
-                    .build()
-                    .map_err(|e| {
-                        crate::error::SlipstreamError::Wallet(format!(
-                            "persist lane pool build: {e}"
-                        ))
-                    })?,
-            ))),
-        }
     }
 
     pub fn total_wait(&self) -> std::time::Duration {
@@ -2433,9 +2628,9 @@ impl PersistLane {
     /// already in flight or the queue is empty. Errors loudly if the lane
     /// connection was lost (poisoned by an earlier panic).
     ///
-    /// T6.9b: the job runs via `lane_pool.install(|| …)` so ALL nested rayon usage
-    /// inside `sparse_put_blocks` (the `rayon::join` for sapling∥orchard and
-    /// upstream `build_subtrees`' `par_chunks`) lands on the lane's dedicated pool.
+    /// Rayon isolation happens INSIDE the job (`sparse_put_blocks` installs
+    /// [`persist_pool`] at its sap∥orch join) — the closure itself just runs
+    /// on the blocking thread.
     fn spawn_next(&mut self) -> Result<(), crate::error::SlipstreamError> {
         if self.in_flight.is_some() {
             return Ok(());
@@ -2448,9 +2643,6 @@ impl PersistLane {
                 "write-behind persist lane unusable (connection lost by an earlier failure)".into(),
             ));
         };
-        // Arc::clone so the spawn_blocking closure can own a reference to the
-        // lane pool without borrowing `self`.  Cheap (atomic ref-count bump).
-        let pool = self.lane_pool.clone();
         // [B4-16 drain] Acquired BEFORE the spawn (no window where the commit exists but
         // the counter reads 0) and moved into the closure — held across compute + txn,
         // released by Drop on completion or panic.
@@ -2459,11 +2651,7 @@ impl PersistLane {
         self.in_flight = Some(tokio::task::spawn_blocking(move || {
             let _gate = gate;
             let started = std::time::Instant::now();
-            let result = match pool {
-                Some(p) => p.install(|| job(&mut db, &mut sparse)),
-                None => job(&mut db, &mut sparse),
-            }
-            .map(|()| started.elapsed());
+            let result = job(&mut db, &mut sparse).map(|()| started.elapsed());
             (db, sparse, result)
         }));
         Ok(())
@@ -2830,26 +3018,24 @@ mod write_behind_tests {
         .expect("lane open")
     }
 
-    /// T6.9b: the lane pool must be created with LANE_POOL_THREADS threads.
-    /// Verifies that pool construction succeeds and that `install` executes
-    /// inside the pool (observed thread count equals configured value).
+    /// v0.6 P4c/P4d: the dedicated persist pool must exist and carry the
+    /// policy thread count for this machine — `cores − 2` clamped to [2, 4] —
+    /// and `install` must actually scope work onto it.
     #[test]
-    fn lane_pool_policy_branches() {
-        // T6.9b2: both policy branches construct correctly.
-        let isolated = PersistLane::build_lane_pool(Some(LANE_POOL_THREADS))
-            .expect("isolated pool builds");
-        let observed = isolated.expect("Some pool").current_num_threads();
+    fn persist_pool_policy() {
+        let pool = persist_pool().expect("dedicated persist pool builds");
+        let cores = std::thread::available_parallelism().map_or(2, usize::from);
         assert_eq!(
-            observed, LANE_POOL_THREADS,
-            "isolated lane pool must have LANE_POOL_THREADS={LANE_POOL_THREADS} threads, got {observed}"
+            pool.current_num_threads(),
+            cores.saturating_sub(2).clamp(2, 4),
+            "pool size must follow the cores−2 [2,4] clamp"
         );
-        let shared = PersistLane::build_lane_pool(None).expect("shared-policy builds");
-        assert!(shared.is_none(), "None policy must mean global-pool sharing");
-        // The runtime policy returns one of the two valid shapes for THIS machine
-        // (None on ≥ 6-core machines: shared global pool).
-        if let Some(n) = lane_pool_policy() {
-            assert_eq!(n, LANE_POOL_THREADS);
-        }
+        let inside = pool.install(rayon::current_num_threads);
+        assert_eq!(
+            inside,
+            pool.current_num_threads(),
+            "install() must run closures inside the dedicated pool"
+        );
     }
 
     /// Depth-1 backpressure: submit(N+1) must complete unit N first — N+1's

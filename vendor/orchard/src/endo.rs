@@ -16,6 +16,8 @@
 //! the GLV constants are re-verified from scratch in-crate
 //! (`decompose_reconstructs`): wrong constants cannot pass the tests.
 
+use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ff::{PrimeField, WithSmallOrderMulGroup};
@@ -171,29 +173,101 @@ fn endo_affine(p: &pallas::Affine) -> pallas::Affine {
     pallas::Affine::from_xy(pallas::Base::ZETA * c.x(), *c.y()).unwrap()
 }
 
-/// `k·P` via the GLV split + Straus shared-doubling ladder (window-4 wNAF
-/// on both halves; odd-multiple tables of P and φ(P), one shared batch
-/// normalization). Byte-identical to `P * k` — KAT-gated.
-pub fn mul_endo(p: &pallas::Point, k: &pallas::Scalar) -> pallas::Point {
-    if bool::from(p.is_identity()) {
-        return pallas::Point::identity();
+/// [v0.6 P7] The GLV window for one base point: odd multiples {1,3,5,7}·P
+/// and {1,3,5,7}·φ(P), affine. Built ONCE per ephemeral key and shared by
+/// every multiplication against it — each trial-decrypt epk is multiplied
+/// by BOTH scope ivks, and the per-call build was one field inversion per
+/// multiplication (the 4-point batch normalization). [`endo_tables`]
+/// amortizes that inversion across a whole flush instead. 512 bytes.
+#[derive(Clone, Debug)]
+pub(crate) struct EndoTable {
+    /// {1,3,5,7}·P
+    t1: [pallas::Affine; 4],
+    /// {1,3,5,7}·φ(P)
+    t2: [pallas::Affine; 4],
+}
+
+impl EndoTable {
+    /// The base point P (= t1[0]) back as a projective point — what the
+    /// batched same-scalar kernel and any raw-point consumer expect.
+    pub(crate) fn point(&self) -> pallas::Point {
+        pallas::Point::from(self.t1[0])
     }
+
+    /// [v0.6 P8] {1,3,5,7}·P for the GLV-lockstep kernel's bulk extract.
+    pub(crate) fn t1(&self) -> &[pallas::Affine; 4] {
+        &self.t1
+    }
+
+    /// [v0.6 P8] {1,3,5,7}·φ(P) for the GLV-lockstep kernel's bulk extract.
+    pub(crate) fn t2(&self) -> &[pallas::Affine; 4] {
+        &self.t2
+    }
+
+    /// Solo build (per-item preparation and [`mul_endo`]): one 4-point
+    /// batch normalization — exactly the ladder's historical per-call cost.
+    pub(crate) fn from_point(p: &pallas::Point) -> Self {
+        endo_tables(core::slice::from_ref(p))
+            .pop()
+            .expect("one table per input point")
+    }
+}
+
+/// Build [`EndoTable`]s for a batch of NON-IDENTITY points with ONE shared
+/// batch normalization across all 4·n odd multiples — the per-call ladder
+/// build paid one field inversion per multiplication (two per epk); this
+/// pays ~one per flush. Projective group ops only: no hand-rolled affine
+/// formulas to re-verify, and on a prime-order curve the odd multiples of a
+/// non-identity point are never the identity, so the normalized tables are
+/// always well-formed. Callers guarantee non-identity inputs (prepared epks
+/// are `NonIdentityPallasPoint`; `mul_endo` guards).
+pub(crate) fn endo_tables(points: &[pallas::Point]) -> Vec<EndoTable> {
+    let n = points.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // Odd multiples per point, projective (cheap adds, no inversions),
+    // interleaved [1·P₀, 3·P₀, 5·P₀, 7·P₀, 1·P₁, ...].
+    let mut proj = Vec::with_capacity(n * 4);
+    for p in points {
+        debug_assert!(
+            !bool::from(p.is_identity()),
+            "endo_tables contract: non-identity points only"
+        );
+        let two_p = p.double();
+        let mut m = *p;
+        proj.push(m);
+        for _ in 1..4 {
+            m += two_p;
+            proj.push(m);
+        }
+    }
+    // ONE inversion for the whole batch.
+    let mut affine = vec![pallas::Affine::identity(); n * 4];
+    pallas::Point::batch_normalize(&proj, &mut affine);
+    affine
+        .chunks_exact(4)
+        .map(|c| {
+            let t1: [pallas::Affine; 4] = c.try_into().expect("chunks of 4");
+            let t2 = [
+                endo_affine(&t1[0]),
+                endo_affine(&t1[1]),
+                endo_affine(&t1[2]),
+                endo_affine(&t1[3]),
+            ];
+            EndoTable { t1, t2 }
+        })
+        .collect()
+}
+
+/// `k·P` for the P a prepared [`EndoTable`] encodes — the GLV split +
+/// Straus shared-doubling ladder with NO per-call table build (that is the
+/// whole point of sharing the window across both scope ivks). Byte-identical
+/// to `P * k` — KAT-gated.
+pub(crate) fn mul_with_table(t: &EndoTable, k: &pallas::Scalar) -> pallas::Point {
     let ((s1, a1), (s2, a2)) = decompose(k);
     if a1 == 0 && a2 == 0 {
         return pallas::Point::identity();
-    }
-
-    // Odd multiples {1,3,5,7}·P (projective), one batch normalization.
-    let two_p = p.double();
-    let mut odds = [*p; 4];
-    for i in 1..4 {
-        odds[i] = odds[i - 1] + two_p;
-    }
-    let mut t1 = [pallas::Affine::identity(); 4];
-    pallas::Point::batch_normalize(&odds, &mut t1);
-    let mut t2 = [pallas::Affine::identity(); 4];
-    for (dst, src) in t2.iter_mut().zip(t1.iter()) {
-        *dst = endo_affine(src);
     }
 
     let (d1, l1) = wnaf_digits(a1);
@@ -205,7 +279,7 @@ pub fn mul_endo(p: &pallas::Point, k: &pallas::Scalar) -> pallas::Point {
         acc = acc.double();
         let d = if i < l1 { d1[i] } else { 0 };
         if d != 0 {
-            let mut a = t1[(d.unsigned_abs() / 2) as usize];
+            let mut a = t.t1[(d.unsigned_abs() / 2) as usize];
             if (d < 0) ^ s1 {
                 a = -a;
             }
@@ -213,7 +287,7 @@ pub fn mul_endo(p: &pallas::Point, k: &pallas::Scalar) -> pallas::Point {
         }
         let d = if i < l2 { d2[i] } else { 0 };
         if d != 0 {
-            let mut a = t2[(d.unsigned_abs() / 2) as usize];
+            let mut a = t.t2[(d.unsigned_abs() / 2) as usize];
             if (d < 0) ^ s2 {
                 a = -a;
             }
@@ -223,10 +297,23 @@ pub fn mul_endo(p: &pallas::Point, k: &pallas::Scalar) -> pallas::Point {
     acc
 }
 
+/// `k·P` via the GLV split + Straus shared-doubling ladder (window-4 wNAF
+/// on both halves; odd-multiple tables of P and φ(P), one shared batch
+/// normalization). Byte-identical to `P * k` — KAT-gated. [v0.6 P7] now a
+/// solo-table build + [`mul_with_table`]: same arithmetic, one ladder
+/// implementation.
+pub fn mul_endo(p: &pallas::Point, k: &pallas::Scalar) -> pallas::Point {
+    if bool::from(p.is_identity()) {
+        return pallas::Point::identity();
+    }
+    mul_with_table(&EndoTable::from_point(p), k)
+}
+
 /// Width-4 wNAF of a u128 magnitude — allocation-free (per-call in the hot
 /// per-item path, unlike the once-per-batch C1 recoder). A ≤2^127 magnitude
 /// yields at most 129 digits; the array is sized with headroom.
-fn wnaf_digits(a: u128) -> ([i8; 132], usize) {
+/// [v0.6 P8] pub(crate): the GLV-lockstep kernel recodes the same halves.
+pub(crate) fn wnaf_digits(a: u128) -> ([i8; 132], usize) {
     debug_assert!(a >> 127 == 0, "magnitude must be <= 127 bits");
     let mut digits = [0i8; 132];
     let mut n = 0;
@@ -297,6 +384,79 @@ mod tests {
             };
             let rec = half(s1, a1) + half(s2, a2) * pallas::Scalar::ZETA;
             assert_eq!(rec, k, "k1 + k2*lambda must reconstruct k");
+        }
+    }
+
+    /// [v0.6 P7] KAT: the shared-table ladder equals the curve's own scalar
+    /// multiplication for BATCH-built tables — proves `endo_tables`' odd
+    /// multiples (t2/φ included) and `mul_with_table`'s digit walk together.
+    #[test]
+    fn tabled_mul_matches_group_mul() {
+        let g = pallas::Point::generator();
+        let points: Vec<pallas::Point> = (0..24u64)
+            .map(|i| g * pallas::Scalar::from(31 + i))
+            .collect();
+        let tables = endo_tables(&points);
+        assert_eq!(tables.len(), points.len());
+        for (i, (p, t)) in points.iter().zip(&tables).enumerate() {
+            assert_eq!(t.point(), *p, "table {i} must round-trip its base point");
+            for k in scalars(12) {
+                assert_eq!(mul_with_table(t, &k), p * k, "table {i}");
+            }
+            // Edges per table: 0, ±1, λ.
+            assert_eq!(
+                mul_with_table(t, &pallas::Scalar::ZERO),
+                pallas::Point::identity()
+            );
+            assert_eq!(mul_with_table(t, &pallas::Scalar::ONE), *p);
+            assert_eq!(mul_with_table(t, &-pallas::Scalar::ONE), -p);
+            assert_eq!(
+                mul_with_table(t, &pallas::Scalar::ZETA),
+                p * pallas::Scalar::ZETA
+            );
+        }
+    }
+
+    /// [v0.6 P7] Batch build == solo build: the flush-wide normalization
+    /// changes the arithmetic route, not the values.
+    #[test]
+    fn batch_tables_equal_solo_tables() {
+        let g = pallas::Point::generator();
+        let points: Vec<pallas::Point> = (0..32u64)
+            .map(|i| g * pallas::Scalar::from(97 + i))
+            .collect();
+        for (p, batch) in points.iter().zip(endo_tables(&points)) {
+            let solo = EndoTable::from_point(p);
+            assert_eq!(batch.t1, solo.t1);
+            assert_eq!(batch.t2, solo.t2);
+        }
+    }
+
+    /// [v0.6 P7] End-to-end through the REAL types: a Tabled prepared epk
+    /// must agree byte-for-byte with the upstream Wnaf-prepared epk, for
+    /// BOTH scope ivks (the table is shared across them — that is the win).
+    #[test]
+    fn tabled_epk_agrees_byte_identical() {
+        use crate::keys::{
+            FullViewingKey, PreparedEphemeralPublicKey, PreparedIncomingViewingKey, Scope,
+            SpendingKey,
+        };
+
+        let sk = SpendingKey::from_bytes([9; 32]).unwrap();
+        let fvk = FullViewingKey::from(&sk);
+        let g = pallas::Point::generator();
+        for scope in [Scope::External, Scope::Internal] {
+            let ivk = PreparedIncomingViewingKey::new(&fvk.to_ivk(scope));
+            for i in 0..32u64 {
+                let p = g * pallas::Scalar::from(1_000 + i);
+                let wnaf = PreparedEphemeralPublicKey::testing_from_point(p);
+                let tabled = PreparedEphemeralPublicKey::testing_from_point_tabled(p);
+                assert_eq!(
+                    wnaf.agree(&ivk).to_bytes(),
+                    tabled.agree(&ivk).to_bytes(),
+                    "scope {scope:?}, lane {i}"
+                );
+            }
         }
     }
 

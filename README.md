@@ -101,8 +101,9 @@ vendored forks under `vendor/`.
 | **v0.4** | "Graft, don't grind" — work reduction, **on by default**. Restores 13–46% faster fleet-wide. Subtree-root grafting (1-in-16 sampling audit; gates included a Halo2-adjudicated spend-from-grafted-witness proof and a 19/19 mainnet root audit) + batch-affine Sinsemilla (~12× the scalar combine). Byte-identical. Kill switches: `ZCASH_GRAFT_SUBTREE=0`, `ZCASH_BATCH_COMBINE=0`. |
 | **v0.5** | Scan pacer — **on by default**. Another 26–42% off restores. Boundary treestate prefetch (server RTT fully hidden; sync times stop swinging with server weather). Gated interleaved enhancement. GLV endomorphism trial-decrypt DH (−24% DH core-time, byte-identical, KAT-gated). Negatives recorded honestly: lockstep batched-DH kernel and local treestate derivation were built, measured, and rejected. Kill switch: `ZCASH_ENDO_MUL=0`. |
 | **v0.5.1** | Sandblasting-era restore fix. Deep-history batches no longer flood the checkpoint store (v0.4 graft interaction — panicked mid-era); damaged wallets self-heal at the next session open. Red-proven regression tests; validated by a full-era 2.4M-block restore. |
+| **v0.6** | The instrument-driven CPU campaign. A18-class scan proven CPU-saturated (wall = CPU ÷ cores), then work deleted where the instruments pointed: skip-below-window nullifier tracking (persist rows −80%), a dedicated persist-lane pool, and the shared per-epk φ-endo window (trial-decrypt GLV tables built once per ephemeral key, reused by both scope ivks; the unread upstream wNAF table is never built). A18 scan_call 28.0 → 25.9 s; DH −12% CPU (A18) / −21% (M4). Four negatives documented: QoS pinning, GLV-lockstep kernel (batch-affine DH closed on Apple Silicon), window-5 tables, pass-2 thinning. Byte-identical, KAT-gated. |
 
-This repository is the **v0.5.1** snapshot (tag `v0.5.1`), re-extracted from the
+This repository is the **v0.6.0** snapshot (tag `v0.6.0`), re-extracted from the
 development tree (the Zodl wallet SDK's `slipstream` branch).
 
 ## License

@@ -112,6 +112,22 @@ pub struct BenchSummary {
     /// ON/OFF pair of these measures the kernel's real ratio; against
     /// `scan_s × cores` it bounds DH's share of the scan.
     pub batch_dh_s: f64,
+    /// v0.6 P5: union-of-intervals wall for the (orchard-domain) DH seam —
+    /// time ≥1 `batch_ka_agree_dec` in flight on any thread.
+    /// `batch_dh_s / batch_dh_wall_s` = average busy threads DURING DH;
+    /// `scan_call_s − batch_dh_wall_s` = the scan's serial non-DH share
+    /// (decode, AEAD trial decrypt, sapling-pool DH, batch assembly).
+    /// Discriminates the two scan-floor levers: under-parallelized bursts
+    /// vs serial gaps.
+    pub batch_dh_wall_s: f64,
+    /// v0.6 P6: CPU inside `batch_epk` (epk point decompression + per-epk
+    /// table build) — batch-task work the DH bracket was blind to; joins
+    /// the same union wall. True bracketed-task busy =
+    /// `(batch_dh_s + batch_epk_s) / batch_dh_wall_s`. P6 sized the waste
+    /// here (13.3 CPU-s of unread wNAF tables on A18); since P7 the build
+    /// is the shared φ-endo window both scope ivks reuse, so this should
+    /// read ~decompression + a small batched build.
+    pub batch_epk_s: f64,
     /// v0.5 pacer split (2026-07-06 plan §3): the scan lane's wall decomposed.
     /// `scan_s ≈ recv_wait + call + prefetch_wait + interleave_drain +
     /// final_drain + persist_wait_s + residue`.
@@ -122,6 +138,40 @@ pub struct BenchSummary {
     pub scan_final_drain_s: f64,
     /// v0.5 local treestate: the lever's own cost (frontier absorption).
     pub scan_absorb_s: f64,
+    /// v0.6 P1 residue split — the previously-unnamed serial segments:
+    /// from_state construction, prefetch spawn, in-loop submit wait/extra,
+    /// post-enhance nullifier reseed. What remains is true residue.
+    pub scan_state_prep_s: f64,
+    pub scan_prefetch_spawn_s: f64,
+    pub scan_submit_wait_s: f64,
+    pub scan_submit_extra_s: f64,
+    pub scan_reseed_s: f64,
+    /// v0.6 P6: scan_call's interior split at the block source — upstream
+    /// walks it TWICE per call: pass 1 feeds the batch runners (DH tasks
+    /// spawn as thresholds fill), pass 2 re-walks doing the wallet-side
+    /// processing (per-tx result extract + nullifier checks + ScannedBlock
+    /// assembly). `pass1 + pass2 ≈ scan_call`. P5's verdict: the A18 wall
+    /// lives in pass 2 — these two fields prove and size it on-device.
+    pub scan_pass1_s: f64,
+    pub scan_pass2_s: f64,
+    /// v0.6 P2: the persist lane's pass totals (PERF_LEDGER #1's instrument).
+    /// Bucket sums are across pools; tree_join is the rayon::join wall.
+    pub persist_calls: u64,
+    pub persist_rows_s: f64,
+    /// v0.6 P4: the rows prologue sub-split (block-meta INSERTs / nullifier
+    /// tracking / decrypted-tx section / gap-addresses + prune).
+    pub persist_rows_block_meta_s: f64,
+    pub persist_rows_nf_s: f64,
+    pub persist_rows_txs_s: f64,
+    pub persist_rows_gap_s: f64,
+    pub persist_tree_join_s: f64,
+    pub persist_flush_s: f64,
+    pub persist_downgrade_s: f64,
+    pub persist_build_s: f64,
+    pub persist_frontier_s: f64,
+    pub persist_insert_s: f64,
+    pub persist_ensure_s: f64,
+    pub persist_downgraded: u64,
     /// v0.5 C2: multiplications served by the GLV endo path (0 = lever off).
     pub endo_calls: u64,
     /// Enhancement wall split: awaiting gRPC tx fetches vs serial DB applies
@@ -142,7 +192,7 @@ impl BenchSummary {
             )
         }
         format!(
-            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_dh_calls\":{},\"batch_dh_lanes\":{},\"batch_dh_kernel_lanes\":{},\"batch_dh_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"endo_calls\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
+            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_dh_calls\":{},\"batch_dh_lanes\":{},\"batch_dh_kernel_lanes\":{},\"batch_dh_s\":{},\"batch_dh_wall_s\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_rows_block_meta_s\":{},\"persist_rows_nf_s\":{},\"persist_rows_txs_s\":{},\"persist_rows_gap_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_frontier_s\":{},\"persist_insert_s\":{},\"persist_ensure_s\":{},\"persist_downgraded\":{},\"endo_calls\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
             self.engine_build,
             self.total_s,
             self.fetch_s,
@@ -155,12 +205,35 @@ impl BenchSummary {
             self.batch_dh_lanes,
             self.batch_dh_kernel_lanes,
             self.batch_dh_s,
+            self.batch_dh_wall_s,
+            self.batch_epk_s,
             self.scan_recv_wait_s,
             self.scan_call_s,
             self.scan_prefetch_wait_s,
             self.scan_interleave_drain_s,
             self.scan_final_drain_s,
             self.scan_absorb_s,
+            self.scan_state_prep_s,
+            self.scan_prefetch_spawn_s,
+            self.scan_submit_wait_s,
+            self.scan_submit_extra_s,
+            self.scan_reseed_s,
+            self.scan_pass1_s,
+            self.scan_pass2_s,
+            self.persist_calls,
+            self.persist_rows_s,
+            self.persist_rows_block_meta_s,
+            self.persist_rows_nf_s,
+            self.persist_rows_txs_s,
+            self.persist_rows_gap_s,
+            self.persist_tree_join_s,
+            self.persist_flush_s,
+            self.persist_downgrade_s,
+            self.persist_build_s,
+            self.persist_frontier_s,
+            self.persist_insert_s,
+            self.persist_ensure_s,
+            self.persist_downgraded,
             self.endo_calls,
             self.enhance_fetch_s,
             self.enhance_store_s,
@@ -234,12 +307,35 @@ mod tests {
             batch_dh_lanes: 700,
             batch_dh_kernel_lanes: 690,
             batch_dh_s: 0.75,
+            batch_dh_wall_s: 0.35,
+            batch_epk_s: 0.05,
             scan_recv_wait_s: 0.1,
             scan_call_s: 0.8,
             scan_prefetch_wait_s: 0.05,
             scan_interleave_drain_s: 0.03,
             scan_final_drain_s: 0.02,
             scan_absorb_s: 0.07,
+            scan_state_prep_s: 0.04,
+            scan_prefetch_spawn_s: 0.01,
+            scan_submit_wait_s: 0.02,
+            scan_submit_extra_s: 0.01,
+            scan_reseed_s: 0.03,
+            scan_pass1_s: 0.15,
+            scan_pass2_s: 0.65,
+            persist_calls: 30,
+            persist_rows_s: 0.5,
+            persist_rows_block_meta_s: 0.2,
+            persist_rows_nf_s: 0.15,
+            persist_rows_txs_s: 0.05,
+            persist_rows_gap_s: 0.02,
+            persist_tree_join_s: 0.9,
+            persist_flush_s: 0.1,
+            persist_downgrade_s: 0.2,
+            persist_build_s: 0.4,
+            persist_frontier_s: 0.15,
+            persist_insert_s: 0.1,
+            persist_ensure_s: 0.05,
+            persist_downgraded: 59000,
             endo_calls: 42,
             enhance_fetch_s: 0.06,
             enhance_store_s: 0.04,
@@ -255,7 +351,11 @@ mod tests {
             "\"total_s\":1.5",
             "\"blocks\":100",
             "\"batch_dh_kernel_lanes\":690",
+            "\"batch_dh_wall_s\":0.35",
+            "\"batch_epk_s\":0.05",
             "\"scan_call_s\":0.8",
+            "\"scan_pass1_s\":0.15",
+            "\"scan_pass2_s\":0.65",
             "\"enhance_fetch_s\":0.06",
             "\"orchard\":{",
             "\"graftable_fraction\":0.5",

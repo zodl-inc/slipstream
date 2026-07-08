@@ -127,18 +127,53 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, Slipstre
 }
 
 /// Multiset of canonicalized rows for one table.
+/// v0.6 P4b: tables whose row RESIDUE depends on put_blocks call cadence, not
+/// wallet semantics. `prune_tracked_nullifiers` anchors on the fully-scanned
+/// frontier at each call, so even two UPSTREAM syncs with different chunk sizes
+/// disagree on which below-window rows linger. The contract compared here is
+/// therefore WINDOWED: both sides are normalized to rows at or above
+/// `max(block_height across A∪B) − NULLIFIER_PRUNE_DEPTH` — everything any
+/// read (`detect_*_spend`, `slipstream_v_tx_reconciled`) can ever consult —
+/// and STRICT equality is required inside that window. Slipstream's
+/// skip-below-window tracking (persist.rs `track_floor`) elides exactly the
+/// below-window residue that upstream's own next prune would delete.
+const TRANSIENT_WINDOW_TABLES: &[&str] = &["nullifier_map", "tx_locator_map"];
+
+fn transient_window_floor(
+    a: &Connection,
+    b: &Connection,
+    table: &str,
+) -> Result<Option<u32>, SlipstreamError> {
+    let max_of = |conn: &Connection| -> Result<Option<u32>, SlipstreamError> {
+        conn.query_row(
+            &format!("SELECT MAX(block_height) FROM \"{table}\""),
+            [],
+            |row| row.get::<_, Option<u32>>(0),
+        )
+        .map_err(|e| wallet_err("max height", e))
+    };
+    Ok(max_of(a)?
+        .max(max_of(b)?)
+        .map(|h| h.saturating_sub(crate::persist::NULLIFIER_PRUNE_DEPTH)))
+}
+
 fn row_multiset(
     conn: &Connection,
     table: &str,
     cols: &[String],
+    min_height: Option<u32>,
 ) -> Result<HashMap<String, i64>, SlipstreamError> {
     let col_list = cols
         .iter()
         .map(|c| format!("\"{c}\""))
         .collect::<Vec<_>>()
         .join(", ");
+    let filter = match min_height {
+        Some(h) => format!(" WHERE block_height >= {h}"),
+        None => String::new(),
+    };
     let mut stmt = conn
-        .prepare(&format!("SELECT {col_list} FROM \"{table}\""))
+        .prepare(&format!("SELECT {col_list} FROM \"{table}\"{filter}"))
         .map_err(|e| wallet_err("select", e))?;
     let mut rows = stmt.query([]).map_err(|e| wallet_err("query", e))?;
     let mut set: HashMap<String, i64> = HashMap::new();
@@ -171,8 +206,15 @@ pub fn semantic_diff(db_a: &Path, db_b: &Path) -> Result<DiffReport, SlipstreamE
     let mut report = DiffReport::default();
     for table in tables {
         let cols = table_columns(&a, &table).or_else(|_| table_columns(&b, &table))?;
-        let ms_a = row_multiset(&a, &table, &cols).unwrap_or_default();
-        let ms_b = row_multiset(&b, &table, &cols).unwrap_or_default();
+        // Windowed comparison for cadence-transient tables (see
+        // TRANSIENT_WINDOW_TABLES); full-table strict equality everywhere else.
+        let min_height = if TRANSIENT_WINDOW_TABLES.contains(&table.as_str()) {
+            transient_window_floor(&a, &b, &table).unwrap_or(None)
+        } else {
+            None
+        };
+        let ms_a = row_multiset(&a, &table, &cols, min_height).unwrap_or_default();
+        let ms_b = row_multiset(&b, &table, &cols, min_height).unwrap_or_default();
         let rows_a: i64 = ms_a.values().sum();
         let rows_b: i64 = ms_b.values().sum();
         let mut only_in_a = vec![];

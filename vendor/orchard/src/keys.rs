@@ -1,5 +1,6 @@
 //! Key structures for Orchard.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use corez::io::{self, Read, Write};
 
@@ -857,31 +858,117 @@ impl EphemeralPublicKey {
     }
 }
 
+/// [slipstream fork] What a prepared epk carries. Upstream precomputes a
+/// wNAF window table for the per-item `[ivk]·epk` walk; under the DH levers
+/// (v0.5 C1 kernel / C2 endo) that table is never read — both consume the
+/// raw point — so v0.6 P7 builds the shared GLV window instead and skips
+/// the wNAF build entirely (13.3 CPU-s per A18 restore, measured).
+#[derive(Clone, Debug)]
+enum PreparedEpkInner {
+    /// Upstream verbatim: wNAF window table (+ fork-retained raw point).
+    Wnaf(PreparedNonIdentityBase),
+    /// [v0.6 P7] Shared φ-endo odd-multiple window, built once per epk and
+    /// reused by every multiplication against it (both scope ivks). Boxed:
+    /// 512 bytes — same heap-allocation shape as the wNAF table it replaces.
+    Tabled(Box<crate::endo::EndoTable>),
+}
+
 /// An Orchard ephemeral public key that has been precomputed for trial decryption.
 #[derive(Clone, Debug)]
-pub struct PreparedEphemeralPublicKey(PreparedNonIdentityBase);
+pub struct PreparedEphemeralPublicKey(PreparedEpkInner);
 
 impl PreparedEphemeralPublicKey {
     pub(crate) fn new(epk: EphemeralPublicKey) -> Self {
-        PreparedEphemeralPublicKey(PreparedNonIdentityBase::new(epk.0))
+        // [slipstream fork] The lever paths never read the wNAF table, and
+        // the upstream path never reads the GLV window — build only the one
+        // this pass multiplies with. The toggles are set once per sync pass
+        // before scanning starts, and EITHER variant is correct under either
+        // toggle state (KAT-gated), so this is a fast-path choice, not a
+        // soundness gate.
+        if crate::endo::enabled() || crate::batch_dh::enabled() {
+            Self::new_tabled(epk)
+        } else {
+            PreparedEphemeralPublicKey(PreparedEpkInner::Wnaf(PreparedNonIdentityBase::new(epk.0)))
+        }
+    }
+
+    /// [v0.6 P7] Prepare by building the shared GLV window — solo build (one
+    /// 4-point normalization); the batched flush path is [`Self::batch_tabled`].
+    pub(crate) fn new_tabled(epk: EphemeralPublicKey) -> Self {
+        PreparedEphemeralPublicKey(PreparedEpkInner::Tabled(Box::new(
+            crate::endo::EndoTable::from_point(&epk.0),
+        )))
+    }
+
+    /// [v0.6 P7] Batched preparation for a whole flush: ONE batch
+    /// normalization across every live epk's odd multiples, where the solo
+    /// path pays one field inversion per epk. `None` lanes (invalid
+    /// encodings) pass through as `None`.
+    pub(crate) fn batch_tabled(
+        epks: Vec<Option<EphemeralPublicKey>>,
+    ) -> Vec<Option<PreparedEphemeralPublicKey>> {
+        let live: Vec<pallas::Point> = epks
+            .iter()
+            .filter_map(|e| e.as_ref().map(|e| *e.0))
+            .collect();
+        let mut tables = crate::endo::endo_tables(&live).into_iter();
+        epks.into_iter()
+            .map(|e| {
+                e.map(|_| {
+                    PreparedEphemeralPublicKey(PreparedEpkInner::Tabled(Box::new(
+                        tables.next().expect("one table per live epk"),
+                    )))
+                })
+            })
+            .collect()
     }
 
     pub(crate) fn agree(&self, ivk: &PreparedIncomingViewingKey) -> SharedSecret {
-        SharedSecret(ka_orchard_prepared(&ivk.0, &self.0))
+        match &self.0 {
+            PreparedEpkInner::Wnaf(base) => SharedSecret(ka_orchard_prepared(&ivk.0, base)),
+            // [v0.6 P7] the GLV ladder straight off the shared window; the
+            // product of a nonzero scalar and a non-identity point on a
+            // prime-order curve is non-identity. Byte-identical (KAT-gated).
+            PreparedEpkInner::Tabled(t) => {
+                SharedSecret::from_kernel_point(crate::endo::mul_with_table(t, &ivk.raw_scalar()))
+            }
+        }
+    }
+
+    /// [v0.6 P7] The shared GLV window, when this epk was prepared under a
+    /// DH lever (`None` for upstream wNAF-prepared epks).
+    pub(crate) fn endo_table(&self) -> Option<&crate::endo::EndoTable> {
+        match &self.0 {
+            PreparedEpkInner::Wnaf(_) => None,
+            PreparedEpkInner::Tabled(t) => Some(t),
+        }
     }
 
     /// [slipstream fork] raw ephemeral point for the batched same-scalar DH kernel.
     pub(crate) fn raw_point(&self) -> pallas::Point {
-        self.0.raw_point()
+        match &self.0 {
+            PreparedEpkInner::Wnaf(base) => base.raw_point(),
+            PreparedEpkInner::Tabled(t) => t.point(),
+        }
     }
 
     /// [slipstream fork] test-only: wrap a raw point as a prepared epk (the
     /// batch_dh KAT fabricates ephemeral keys directly on the curve).
     #[cfg(test)]
     pub(crate) fn testing_from_point(p: pallas::Point) -> Self {
-        PreparedEphemeralPublicKey(PreparedNonIdentityBase::new(
+        PreparedEphemeralPublicKey(PreparedEpkInner::Wnaf(PreparedNonIdentityBase::new(
             crate::spec::NonIdentityPallasPoint::from_kernel(p),
-        ))
+        )))
+    }
+
+    /// [v0.6 P7] test-only tabled twin of [`Self::testing_from_point`] — lets
+    /// KATs compare the two variants without touching the global toggles
+    /// (tests run concurrently; the toggles are process-wide).
+    #[cfg(test)]
+    pub(crate) fn testing_from_point_tabled(p: pallas::Point) -> Self {
+        PreparedEphemeralPublicKey(PreparedEpkInner::Tabled(Box::new(
+            crate::endo::EndoTable::from_point(&p),
+        )))
     }
 }
 

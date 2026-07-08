@@ -188,6 +188,26 @@ pub struct ScanStats {
     /// v0.5 local treestate: Σ absorbing scanned commitments into the running
     /// frontiers (the lever's own cost — replaces prefetch_wait when on).
     pub treestate_absorb: std::time::Duration,
+    /// v0.6 P1 residue split — the previously-untimed serial segments, named.
+    /// Σ constructing `from_state` per sub-batch (treestate proto → ChainState:
+    /// BOTH pool frontiers are parsed every sub-batch on the server path).
+    pub state_prep: std::time::Duration,
+    /// Σ the prefetch decision + tokio::spawn + clones per sub-batch.
+    pub prefetch_spawn: std::time::Duration,
+    /// Σ blocked awaiting the previous deferred commit INSIDE the sub-batch
+    /// loop (the in-loop slice of the lane's total_wait).
+    pub submit_wait: std::time::Duration,
+    /// Σ the submit() region beyond that wait — stash move + spawn overhead.
+    pub submit_extra: std::time::Duration,
+    /// Σ re-seeding the facade's nullifier views after interleaved enhancement.
+    pub reseed: std::time::Duration,
+    /// v0.6 P6: upstream `scan_cached_blocks`' TWO source walks, timed at our
+    /// `MemBlockSource`. Pass 1 = feed the batch runners (+ rayon task spawn);
+    /// pass 2 = per-tx extract (recv) + wallet-side processing (nullifier
+    /// checks, ScannedBlock assembly). `pass1 + pass2 ≈ scan_call`. The A18
+    /// P5 readout says the wall lives in pass 2 — this measures it on-device.
+    pub scan_pass1: std::time::Duration,
+    pub scan_pass2: std::time::Duration,
     /// v0.4 census (spec §3.2): per-pool shard-touch vs owned-note-shard counts
     /// for this range (copied out of whichever SparseTreeState ran the builds —
     /// the persist lane's on the write-behind path, the scan task's inline).
@@ -451,6 +471,7 @@ async fn scan_chunks_inner(
             // boundary (started at emit — its RTT has been hiding under queue
             // wait + scan since); use it when this sub-batch IS that boundary,
             // spawn late otherwise (mid-chunk sub-batches, tests, darkside).
+            let spawn_started = Instant::now();
             let audit_this = local_mode
                 && config.treestate_verify_sample > 0
                 && boundary_index.is_multiple_of(u64::from(config.treestate_verify_sample));
@@ -473,7 +494,9 @@ async fn scan_chunks_inner(
                 }
                 None
             };
+            stats.prefetch_spawn += spawn_started.elapsed();
 
+            let state_started = Instant::now();
             let from_state = match (&local_ts, &local_boundary) {
                 // v0.5: boundary served locally — zero round-trips.
                 (Some(ts), Some((bh, bhash))) => {
@@ -490,6 +513,7 @@ async fn scan_chunks_inner(
                 // state — the ONE fetch this range still needs.
                 local_ts = Some(crate::treestate::LocalTreestate::seed(&from_state));
             }
+            stats.state_prep += state_started.elapsed();
 
             let from_height = u32::try_from(sub_start)
                 .map_err(|_| SlipstreamError::Wallet(format!("height {sub_start} exceeds u32")))?;
@@ -506,8 +530,11 @@ async fn scan_chunks_inner(
             //     next_state was fetched at the previous chunk's end height, and
             //     sub_start == chunk_start == prev_chunk_end + 1.
             let batch_start_time = Instant::now();
+            // v0.6 P6: source lives OUTSIDE the closure so its two-walk split
+            // (pass 1 = feed runners, pass 2 = wallet-side processing) can be
+            // read back after the call.
+            let source = MemBlockSource::new(&chunk);
             let scan_result = tokio::task::block_in_place(|| {
-                let source = MemBlockSource::new(&chunk);
                 if let Some(wb) = wb.as_mut() {
                     // T6.9 write-behind: virtualized reads + stash (no DB work
                     // on this task; the commit is deferred to the persist lane).
@@ -544,6 +571,10 @@ async fn scan_chunks_inner(
                 }
             });
             let elapsed_ms = batch_start_time.elapsed().as_millis() as u64;
+            let (walk1, walk2) = source.walk_walls();
+            stats.scan_pass1 += walk1;
+            stats.scan_pass2 += walk2;
+            drop(source);
 
             let summary = match scan_result {
                 Ok(s) => s,
@@ -563,6 +594,7 @@ async fn scan_chunks_inner(
             if let Some(wb) = wb.as_mut()
                 && let Some(pending) = wb.facade.take_stash()
             {
+                let submit_started = Instant::now();
                 let wait_before = wb.lane.total_wait();
                 if let Err(e) = wb.lane.submit(pending).await {
                     if let Some(p) = &prefetch {
@@ -570,8 +602,10 @@ async fn scan_chunks_inner(
                     }
                     return Err(e);
                 }
-                chunk_persist_wait_ms +=
-                    (wb.lane.total_wait() - wait_before).as_millis() as u64;
+                let waited = wb.lane.total_wait() - wait_before;
+                chunk_persist_wait_ms += waited.as_millis() as u64;
+                stats.submit_wait += waited;
+                stats.submit_extra += submit_started.elapsed().saturating_sub(waited);
             }
 
             let scanned = u64::from(u32::from(summary.scanned_range().end))
@@ -745,9 +779,11 @@ async fn scan_chunks_inner(
             // facade's running nullifier views from the now-complete DB.
             // Unconditional (the non-fatal error arm may have partially written).
             if let Some(wb) = wb.as_mut() {
+                let reseed_started = Instant::now();
                 wb.facade
                     .reseed_nullifiers(&*session.db_mut())
                     .map_err(|e| SlipstreamError::Wallet(format!("write-behind reseed: {e}")))?;
+                stats.reseed += reseed_started.elapsed();
             }
         }
     }

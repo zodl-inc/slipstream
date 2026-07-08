@@ -116,8 +116,10 @@ enum Cmd {
         /// DEFAULT ON since v0.4.0 — pass `--batch-combine false` for a baseline run.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         batch_combine: bool,
-        /// v0.5 C1 lever: batched same-scalar trial-decrypt DH (forked orchard
-        /// lockstep kernel). Default OFF until the C3 device gates.
+        /// Batched same-scalar trial-decrypt DH (forked orchard lockstep
+        /// kernel). Since v0.6 P8 this selects the GLV-lockstep kernel
+        /// (prebuilt shared windows + half-length ladder). Default OFF
+        /// pending its own device A/B.
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         batch_decrypt: bool,
         /// v0.5 scan-pacer lever: derive chunk-boundary treestates locally
@@ -907,10 +909,14 @@ fn cmd_oracle(
 }
 
 fn main() {
+    // v0.6 P6: `zcash_client_backend=warn` silences upstream's per-block
+    // INFO spans (`#[instrument]` on add_block + scan_block_with_runners =
+    // ~600k span creations + fmt-layer field formatting per restore, all on
+    // the producer thread — named by the Mac profile). RUST_LOG overrides.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "info,zcash_client_backend=warn".into()),
         )
         .init();
 

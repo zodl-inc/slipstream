@@ -111,11 +111,16 @@ pub struct EngineConfig {
     /// +15.7% on note-bearing wallets). Kill switch: `ZCASH_BATCH_COMBINE=0`.
     pub batch_combine: bool,
 
-    /// v0.5 Plan C (C1): batched same-scalar trial-decrypt DH — the forked
-    /// orchard's lockstep-affine kernel (one shared inversion per ladder step
-    /// across the whole batch; ~2.1× the per-item prepared path, byte-identical,
-    /// KAT-gated in the fork). Default OFF until the C3 device gates; kill/dev
-    /// switch: `ZCASH_BATCH_DECRYPT`. Process-global toggle set at pass start.
+    /// Batched same-scalar trial-decrypt DH — the forked orchard's
+    /// lockstep-affine kernel (one shared inversion per ladder step across
+    /// the whole batch; byte-identical, KAT-gated in the fork). [v0.6 P8]
+    /// the toggle now selects the GLV-lockstep kernel for window-prepared
+    /// epks (prebuilt P7 tables + half-length digit schedule + per-call
+    /// scratch — the rebuild of v0.5 C1 on the instrument-named fixes; C1's
+    /// full-width kernel remains behind it for Wnaf-prepared epks). Default
+    /// OFF pending its own device A/B (C1's lesson: microbench wins don't
+    /// automatically survive scan concurrency). Kill/dev switch:
+    /// `ZCASH_BATCH_DECRYPT`. Process-global toggle set at pass start.
     pub batch_decrypt: bool,
 
     /// v0.5 scan-pacer lever (2026-07-06 plan): derive chunk-boundary

@@ -23,7 +23,7 @@ use crate::{
 /// tag in the log doesn't match HEAD's value, the device is running a stale
 /// XCFramework (the three-layer gotcha, consuming side). Probe a built slice with:
 /// `strings <slice>/libzcashlc.framework/libzcashlc | grep <tag>`.
-pub const ENGINE_BUILD: &str = "2026-07-06.v05-era-fix";
+pub const ENGINE_BUILD: &str = "2026-07-08.v0.6.0";
 
 /// Current wall-clock time as a `YYYY-MM-DD HH:MM:SSZ` UTC string.
 ///
@@ -178,6 +178,9 @@ pub async fn sync_once(
     orchard::batch_dh::set_enabled(config.batch_decrypt);
     // v0.5 C2: GLV endomorphism per-item multiplication (same toggle pattern).
     orchard::endo::set_enabled(config.endo_mul);
+    // v0.6 P2: persist-lane totals are process-cumulative atomics — snapshot
+    // here so the pass-end log reports THIS pass's delta.
+    let persist_lane_start = crate::persist::lane_stats::totals();
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
     let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
@@ -299,7 +302,12 @@ pub async fn sync_once(
         + scan_split.scan_prefetch_wait
         + scan_split.scan_interleave_drain
         + scan_split.scan_final_drain
-        + scan_split.scan_absorb;
+        + scan_split.scan_absorb
+        + scan_split.scan_state_prep
+        + scan_split.scan_prefetch_spawn
+        + scan_split.scan_submit_wait
+        + scan_split.scan_submit_extra
+        + scan_split.scan_reseed;
     info!(
         recv_wait_s = scan_split.scan_recv_wait.as_secs_f64(),
         scan_call_s = scan_split.scan_call.as_secs_f64(),
@@ -307,9 +315,39 @@ pub async fn sync_once(
         interleave_drain_s = scan_split.scan_interleave_drain.as_secs_f64(),
         final_drain_s = scan_split.scan_final_drain.as_secs_f64(),
         absorb_s = scan_split.scan_absorb.as_secs_f64(),
+        // v0.6 P1: the residue named — state prep, spawn, in-loop submit
+        // wait/extra, post-enhance reseed. residue_s is what remains unnamed.
+        state_prep_s = scan_split.scan_state_prep.as_secs_f64(),
+        prefetch_spawn_s = scan_split.scan_prefetch_spawn.as_secs_f64(),
+        submit_wait_s = scan_split.scan_submit_wait.as_secs_f64(),
+        submit_extra_s = scan_split.scan_submit_extra.as_secs_f64(),
+        reseed_s = scan_split.scan_reseed.as_secs_f64(),
+        // v0.6 P6: scan_call's two-pass interior (pass1 = feed runners,
+        // pass2 = wallet-side processing; pass1 + pass2 ≈ scan_call).
+        pass1_s = scan_split.scan_pass1.as_secs_f64(),
+        pass2_s = scan_split.scan_pass2.as_secs_f64(),
         residue_s = (outcome.report.scan_elapsed.as_secs_f64() - scan_split_sum.as_secs_f64())
             .max(0.0),
         "scan lane split"
+    );
+    // v0.6 P2: the persist lane's pass delta — PERF_LEDGER #1's decomposition.
+    let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
+    info!(
+        calls = persist_lane.calls,
+        rows_s = persist_lane.rows_ms as f64 / 1e3,
+        rows_block_meta_s = persist_lane.rows_block_meta_ms as f64 / 1e3,
+        rows_nf_s = persist_lane.rows_nf_ms as f64 / 1e3,
+        rows_txs_s = persist_lane.rows_txs_ms as f64 / 1e3,
+        rows_gap_s = persist_lane.rows_gap_ms as f64 / 1e3,
+        tree_join_s = persist_lane.tree_join_ms as f64 / 1e3,
+        flush_s = persist_lane.flush_ms as f64 / 1e3,
+        downgrade_s = persist_lane.downgrade_ms as f64 / 1e3,
+        build_s = persist_lane.build_ms as f64 / 1e3,
+        frontier_s = persist_lane.frontier_ms as f64 / 1e3,
+        insert_s = persist_lane.insert_ms as f64 / 1e3,
+        ensure_s = persist_lane.ensure_ms as f64 / 1e3,
+        downgraded = persist_lane.downgraded,
+        "persist lane split"
     );
     info!(
         fetch_wait_s = outcome.enhance.fetch_wait.as_secs_f64(),
@@ -322,14 +360,26 @@ pub async fn sync_once(
     // v0.5 C1 did-it-fire stats (the graft lever's lesson): calls proves the
     // batched seam is reached, kernel_lanes proves the kernel engaged, dh_s
     // is the true cross-thread production DH cost (ON/OFF pairs = real ratio).
-    let (batch_dh_calls, batch_dh_lanes, batch_dh_kernel_lanes, batch_dh_nanos) =
-        orchard::batch_dh::stats();
+    let (
+        batch_dh_calls,
+        batch_dh_lanes,
+        batch_dh_kernel_lanes,
+        batch_dh_nanos,
+        batch_dh_wall_nanos,
+        batch_epk_nanos,
+    ) = orchard::batch_dh::stats();
     let batch_dh_s = batch_dh_nanos as f64 / 1e9;
+    // v0.6 P5/P6: union wall over the DH + batch_epk brackets —
+    // (dh_s + epk_s)/wall = avg busy threads inside the bracketed task core.
+    let batch_dh_wall_s = batch_dh_wall_nanos as f64 / 1e9;
+    let batch_epk_s = batch_epk_nanos as f64 / 1e9;
     info!(
         calls = batch_dh_calls,
         lanes = batch_dh_lanes,
         kernel_lanes = batch_dh_kernel_lanes,
         dh_s = batch_dh_s,
+        dh_wall_s = batch_dh_wall_s,
+        epk_s = batch_epk_s,
         endo_calls = orchard::endo::calls(),
         enabled = config.batch_decrypt,
         "batch_dh fire stats"
@@ -350,12 +400,35 @@ pub async fn sync_once(
             batch_dh_lanes,
             batch_dh_kernel_lanes,
             batch_dh_s,
+            batch_dh_wall_s,
+            batch_epk_s,
             scan_recv_wait_s: outcome.report.scan_recv_wait.as_secs_f64(),
             scan_call_s: outcome.report.scan_call.as_secs_f64(),
             scan_prefetch_wait_s: outcome.report.scan_prefetch_wait.as_secs_f64(),
             scan_interleave_drain_s: outcome.report.scan_interleave_drain.as_secs_f64(),
             scan_final_drain_s: outcome.report.scan_final_drain.as_secs_f64(),
             scan_absorb_s: outcome.report.scan_absorb.as_secs_f64(),
+            scan_state_prep_s: outcome.report.scan_state_prep.as_secs_f64(),
+            scan_prefetch_spawn_s: outcome.report.scan_prefetch_spawn.as_secs_f64(),
+            scan_submit_wait_s: outcome.report.scan_submit_wait.as_secs_f64(),
+            scan_submit_extra_s: outcome.report.scan_submit_extra.as_secs_f64(),
+            scan_reseed_s: outcome.report.scan_reseed.as_secs_f64(),
+            scan_pass1_s: outcome.report.scan_pass1.as_secs_f64(),
+            scan_pass2_s: outcome.report.scan_pass2.as_secs_f64(),
+            persist_calls: persist_lane.calls,
+            persist_rows_s: persist_lane.rows_ms as f64 / 1e3,
+            persist_rows_block_meta_s: persist_lane.rows_block_meta_ms as f64 / 1e3,
+            persist_rows_nf_s: persist_lane.rows_nf_ms as f64 / 1e3,
+            persist_rows_txs_s: persist_lane.rows_txs_ms as f64 / 1e3,
+            persist_rows_gap_s: persist_lane.rows_gap_ms as f64 / 1e3,
+            persist_tree_join_s: persist_lane.tree_join_ms as f64 / 1e3,
+            persist_flush_s: persist_lane.flush_ms as f64 / 1e3,
+            persist_downgrade_s: persist_lane.downgrade_ms as f64 / 1e3,
+            persist_build_s: persist_lane.build_ms as f64 / 1e3,
+            persist_frontier_s: persist_lane.frontier_ms as f64 / 1e3,
+            persist_insert_s: persist_lane.insert_ms as f64 / 1e3,
+            persist_ensure_s: persist_lane.ensure_ms as f64 / 1e3,
+            persist_downgraded: persist_lane.downgraded,
             endo_calls: orchard::endo::calls(),
             enhance_fetch_s: outcome.enhance.fetch_wait.as_secs_f64(),
             enhance_store_s: outcome.enhance.store.as_secs_f64(),
