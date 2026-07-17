@@ -30,7 +30,7 @@ futures-util = "0.3"
 thiserror = "2"
 tracing = "0.1"
 zcash_protocol = "=0.10.0"
-zcash_client_backend = { version = "=0.23.0", features = [
+zcash_client_backend = { version = "=0.24.0-rc.1", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -38,7 +38,7 @@ zcash_client_backend = { version = "=0.23.0", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "=0.21.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_keys = { version = "=0.15.0", features = ["orchard"] }
 rusqlite = "0.37"
 secrecy = "0.8"
@@ -75,19 +75,19 @@ ff = "0.13"
 # the whole family rides [patch.crates-io] against the canonical repo — never
 # direct git+branch deps. `=x.y.z` pins on the patched crates (above) stop a
 # future crates.io patch release from out-resolving the [patch] block. The rev
-# is zcash/librustzcash main as last validated against this engine snapshot
-# (the #2604 merge); bump deliberately, with the engine gates re-run. The whole
-# block dies at the 0.24-era crates.io release.
+# is current zcash/librustzcash main — the same rev upstream zcash_voting rides,
+# so SDK-side consumers resolve one family instance; bump deliberately, with the
+# engine gates re-run. The whole block dies at the 0.24-era crates.io release.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
