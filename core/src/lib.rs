@@ -26,18 +26,22 @@ pub(crate) mod graft;
 pub(crate) mod graft_accumulator;
 pub mod grpc;
 pub mod mempool;
+pub mod network;
 pub mod oracle;
 pub mod persist;
+pub mod probe;
 pub mod reconcile;
 #[cfg(feature = "gpu")]
 mod gpu_subtree;
 pub(crate) mod lookup_build;
 pub mod scan;
 pub mod scan_queue;
+pub mod throttle;
 pub mod scheduler;
 pub mod session;
 pub mod transparent;
 pub mod treestate;
+pub mod vendor_shim;
 pub mod verify;
 pub mod wallet_session;
 
@@ -51,6 +55,7 @@ pub mod darkside;
 pub use config::{EngineConfig, Endpoint};
 pub use error::SlipstreamError;
 pub use events::{Bound, Event, Progress, ProgressArc, Snapshot, SyncMode};
+pub use network::{CustomActivations, SlipstreamNetwork};
 pub use session::{SessionConfig, SessionReporter, TorSessionConfig, run_session};
 pub use zcash_protocol::consensus::Network;
 

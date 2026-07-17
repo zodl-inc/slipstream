@@ -14,15 +14,24 @@ use zcash_client_backend::data_api::{
 use zcash_client_backend::proto::service::TreeState;
 use zcash_client_sqlite::WalletDb;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::{error::SlipstreamError, grpc::SubtreeRoots};
 
-// Mirror rust/src/lib.rs:132 — same generics, same clock/rng.
-pub(crate) type Db = WalletDb<Connection, Network, zcash_client_sqlite::util::SystemClock, rand::rngs::OsRng>;
+use crate::network::SlipstreamNetwork;
+
+// Mirror rust/src/lib.rs:132 — same generics, same clock/rng — except the params
+// type: the engine session is generic-capable via [`SlipstreamNetwork`] (IW-0.5,
+// custom chains), while the FFI's own WalletDb stays stock-`Network` typed.
+pub(crate) type Db = WalletDb<
+    Connection,
+    SlipstreamNetwork,
+    zcash_client_sqlite::util::SystemClock,
+    rand::rngs::OsRng,
+>;
 
 pub struct WalletSession {
-    pub network: Network,
+    pub network: SlipstreamNetwork,
     db: Db,
     // Used by seed_block_metadata (cfg(any(test, feature = "darkside")) only).
     #[cfg_attr(not(any(test, feature = "darkside")), allow(dead_code))]
@@ -36,7 +45,11 @@ fn wallet_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
 impl WalletSession {
     /// Sets WAL (a persistent file property) via a plain connection, then opens
     /// the WalletDb ONCE and runs migrations (seedless — keyless engine).
-    pub fn open(network: Network, db_path: &Path) -> Result<Self, SlipstreamError> {
+    pub fn open(
+        network: impl Into<SlipstreamNetwork>,
+        db_path: &Path,
+    ) -> Result<Self, SlipstreamError> {
+        let network = network.into();
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| wallet_err("create wallet dir", e))?;
         }
@@ -326,6 +339,9 @@ pub const TEST_UFVK: &str = concat!(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // [IW-2b] IW-0.5 moved the session onto SlipstreamNetwork; the consensus
+    // Network literal the fixtures use converts via `From<Network>`.
+    use zcash_protocol::consensus::Network;
 
     #[test]
     fn open_sets_wal_and_initializes_schema() {

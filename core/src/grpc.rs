@@ -161,6 +161,17 @@ pub async fn get_lightd_info(client: &mut LwdClient) -> Result<LightdInfo, Slips
     with_unary_timeout("get_lightd_info", client.get_lightd_info(Empty {})).await
 }
 
+/// Broadcast a raw transaction ([B7] send tooling). Returns the server's
+/// `(error_code, error_message)`; code 0 = accepted into the mempool.
+pub async fn send_transaction(
+    client: &mut LwdClient,
+    tx_bytes: Vec<u8>,
+) -> Result<(i32, String), SlipstreamError> {
+    let req = zcash_client_backend::proto::service::RawTransaction { data: tx_bytes, height: 0 };
+    let resp = with_unary_timeout("send_transaction", client.send_transaction(req)).await?;
+    Ok((resp.error_code as i32, resp.error_message))
+}
+
 pub async fn get_latest_block_height(client: &mut LwdClient) -> Result<u64, SlipstreamError> {
     Ok(with_unary_timeout("get_latest_block", client.get_latest_block(ChainSpec {}))
         .await?

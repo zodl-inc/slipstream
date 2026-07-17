@@ -34,7 +34,7 @@ mod tests {
             let start = Position::from(0);
             let mut a = crate::lookup_build::tests::synth(n);
             let mut b = crate::lookup_build::tests::synth(n);
-            let cpu = crate::persist::build_subtrees::<MerkleHashOrchard, ORCHARD_SHARD_HEIGHT>(start, &mut a);
+            let cpu = crate::persist::build_subtrees::<MerkleHashOrchard, ORCHARD_SHARD_HEIGHT>(start, &mut a, crate::persist::BUILD_CHUNK_SIZE);
             let gpu = build_subtrees_gpu::<ORCHARD_SHARD_HEIGHT>(start, &mut b);
             assert_eq!(cpu, gpu, "GPU subtree build diverged from CPU at n={n}");
         }

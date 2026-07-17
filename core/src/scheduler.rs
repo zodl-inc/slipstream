@@ -144,6 +144,14 @@ pub struct SyncReport {
     /// Total wall-clock time spent in the fetch pipeline (across all ranges).
     /// Accumulated from `FetchStats::elapsed` per range. Default: zero.
     pub fetch_elapsed: Duration,
+    /// [v0.7 P0] Total estimated wire bytes across all ranges — with
+    /// `fetch_elapsed` this yields the pass-average wire MB/s.
+    pub wire_bytes: u64,
+    /// [v0.7 P0] Worst sustained 5 s wire throughput across all ranges
+    /// (MB/s; the minimum of each range's `FetchStats::worst_window_mbps`).
+    /// 0.0 = no range produced a full window. Interpret beside recv_wait
+    /// (the ahead-gate caveat on `FetchStats::worst_window_mbps`).
+    pub wire_worst_window_mbps: f64,
     /// Total wall-clock time spent in scan_chunks (across all ranges).
     /// Measured around the scan call per range. Default: zero.
     pub scan_elapsed: Duration,
@@ -334,6 +342,12 @@ pub async fn run_to_completion(
         let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
+        // [v0.7 P2] Arm the wire-collapse detector only when the engine has
+        // somewhere to fail over TO (and the kill switch is on). Tor passes
+        // never have alternates armed (the probe is skipped there too).
+        if config.wire_failover && !config.alternate_endpoints.is_empty() {
+            plan.failover = Some(crate::fetch::WireFailoverArm::default());
+        }
         let endpoint = config.endpoint.clone();
         // Clone the progress Arc for the fetch task so it can bump fetched_blocks.
         let fetch_progress = progress.clone();
@@ -473,6 +487,17 @@ pub async fn run_to_completion(
         report.fetch.blocks += fetch_stats.blocks;
         report.fetch.bytes += fetch_stats.bytes;
         report.fetch_elapsed += fetch_stats.elapsed;
+        // [v0.7 P0] wire health: pass-total bytes + the worst sustained
+        // 5 s window across ranges (skip windowless ranges, e.g. tiny tips).
+        report.wire_bytes += fetch_stats.bytes;
+        if !fetch_stats.wire_samples.is_empty() {
+            let w = fetch_stats.worst_window_mbps(5.0);
+            if w > 0.0
+                && (report.wire_worst_window_mbps == 0.0 || w < report.wire_worst_window_mbps)
+            {
+                report.wire_worst_window_mbps = w;
+            }
+        }
         report.scan.blocks += scan_stats.blocks;
         report.scan.sapling_received += scan_stats.sapling_received;
         report.scan.orchard_received += scan_stats.orchard_received;

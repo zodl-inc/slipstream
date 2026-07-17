@@ -3,9 +3,8 @@
 
 use std::path::PathBuf;
 
-use zcash_protocol::consensus::Network;
-
 use crate::error::SlipstreamError;
+use crate::network::SlipstreamNetwork;
 
 /// lightwalletd endpoint.
 // Deliberately exhaustive: an endpoint is exactly (host, port, tls).
@@ -22,16 +21,56 @@ impl Endpoint {
         let scheme = if self.tls { "https" } else { "http" };
         format!("{}://{}:{}", scheme, self.host, self.port)
     }
+
+    /// Inverse of [`Endpoint::uri`]: parses `http(s)://host:port` (a trailing
+    /// `/` is tolerated). The scheme selects `tls`; the LAST `:` splits host
+    /// from port. [v0.7 P1b] This is the FFI wire format for alternate-server
+    /// lists (hosts ship newline-separated URIs). DNS hostnames and IPv4 only —
+    /// bracketed IPv6 literals are not lightwalletd endpoints in practice and
+    /// are rejected by the port parse.
+    pub fn parse_uri(s: &str) -> Result<Self, String> {
+        let (tls, rest) = if let Some(r) = s.strip_prefix("https://") {
+            (true, r)
+        } else if let Some(r) = s.strip_prefix("http://") {
+            (false, r)
+        } else {
+            return Err(format!("endpoint URI must start with http:// or https://: {s:?}"));
+        };
+        let rest = rest.strip_suffix('/').unwrap_or(rest);
+        let (host, port) = rest
+            .rsplit_once(':')
+            .ok_or_else(|| format!("endpoint URI missing :port: {s:?}"))?;
+        if host.is_empty() {
+            return Err(format!("endpoint URI has empty host: {s:?}"));
+        }
+        let port: u16 =
+            port.parse().map_err(|e| format!("endpoint URI port ({e}): {s:?}"))?;
+        Ok(Endpoint { host: host.to_string(), port, tls })
+    }
 }
 
 /// Engine configuration. Construct via [`EngineConfig::new`]; fields are public tunables.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct EngineConfig {
-    pub network: Network,
+    pub network: SlipstreamNetwork,
     /// Path to the (existing, zcash_client_sqlite-managed) wallet database.
     pub wallet_db_path: PathBuf,
     pub endpoint: Endpoint,
+    /// [v0.7 P1] Alternate lightwalletd endpoints. When non-empty, a pass
+    /// begins with a ~1 s parallel probe of `endpoint` + these (tip
+    /// freshness + a timed ~100-block sample) and COMMITS to the winner for
+    /// the whole pass — the probe never blocks a pass (budget overrun ⇒
+    /// `endpoint` as configured). Empty = exactly the pre-v0.7 single-server
+    /// behavior. Additive: `EngineConfig::new` leaves it empty.
+    pub alternate_endpoints: Vec<Endpoint>,
+    /// [v0.7 P2] Mid-pass wire-collapse failover (armed only when
+    /// `alternate_endpoints` is non-empty): the fetch layer detects a
+    /// sustained throughput collapse or full stall on the CURRENT server
+    /// (recv-attributed — scan backpressure can never trip it), the engine
+    /// cools that endpoint, re-probes the rest, and resumes from the wallet
+    /// DB. Default ON; this is the kill switch.
+    pub wire_failover: bool,
     /// Concurrent GetBlockRange sub-streams (P1).
     pub fetch_streams: usize,
     /// Target blocks per in-memory chunk / per scan call (P1/P2).
@@ -102,6 +141,12 @@ pub struct EngineConfig {
     /// 1 = verify every graft (the full-audit mode used for validation runs).
     /// Deterministic by shard index (reproducible; no RNG in the hot path).
     pub graft_verify_sample: u32,
+    /// [B6] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
+    /// when `Some(h)`, checkpoints at heights ≥ h on the 288-block grid are durable
+    /// anchors, exempt from checkpoint downgrade/dooming and excess-checkpoint
+    /// pruning — the migration crate (MOB-1455) pre-signs transfers against them.
+    /// `None` (default) = retention off, byte-identical to pre-B6 behavior.
+    pub anchor_retention_height: Option<u32>,
 
     /// v0.4 Plan B (spec §5): batch-affine Orchard combine — all of a fragment's
     /// combines computed level-synchronously with shared Montgomery inversions
@@ -168,11 +213,18 @@ impl EngineConfig {
     /// Run an interleaved enhancement pass every 3 completed chunks by default (T6.1).
     pub const DEFAULT_ENHANCE_EVERY_CHUNKS: u32 = 3;
 
-    pub fn new(network: Network, wallet_db_path: PathBuf, endpoint: Endpoint) -> Self {
+    pub fn new(
+        network: impl Into<SlipstreamNetwork>,
+        wallet_db_path: PathBuf,
+        endpoint: Endpoint,
+    ) -> Self {
+        let network = network.into();
         Self {
             network,
             wallet_db_path,
             endpoint,
+            alternate_endpoints: Vec::new(),
+            wire_failover: true,
             fetch_streams: Self::DEFAULT_FETCH_STREAMS,
             chunk_blocks: Self::DEFAULT_CHUNK_BLOCKS,
             memory_budget_bytes: Self::DEFAULT_MEMORY_BUDGET,
@@ -185,6 +237,7 @@ impl EngineConfig {
             bench_json_path: None,
             graft_subtree: true,
             graft_verify_sample: 16,
+            anchor_retention_height: None,
             batch_combine: true,
             batch_decrypt: false,
             local_treestate: false,
@@ -285,7 +338,50 @@ mod tests {
     }
 
     fn config() -> EngineConfig {
-        EngineConfig::new(Network::MainNetwork, PathBuf::from("/tmp/data.db"), endpoint())
+        EngineConfig::new(crate::Network::MainNetwork, PathBuf::from("/tmp/data.db"), endpoint())
+    }
+
+    // ── v0.7 P1b: Endpoint::parse_uri (the FFI alternate-server wire format) ──
+
+    #[test]
+    fn parse_uri_round_trips_uri() {
+        for ep in [
+            Endpoint { host: "zec.rocks".into(), port: 443, tls: true },
+            Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false },
+        ] {
+            assert_eq!(Endpoint::parse_uri(&ep.uri()).unwrap(), ep);
+        }
+    }
+
+    #[test]
+    fn parse_uri_scheme_selects_tls() {
+        let https = Endpoint::parse_uri("https://lwd.zcashexplorer.app:9067").unwrap();
+        assert!(https.tls);
+        assert_eq!(https.host, "lwd.zcashexplorer.app");
+        assert_eq!(https.port, 9067);
+        let http = Endpoint::parse_uri("http://localhost:9067").unwrap();
+        assert!(!http.tls);
+    }
+
+    #[test]
+    fn parse_uri_tolerates_trailing_slash() {
+        let ep = Endpoint::parse_uri("https://zec.rocks:443/").unwrap();
+        assert_eq!(ep, Endpoint { host: "zec.rocks".into(), port: 443, tls: true });
+    }
+
+    #[test]
+    fn parse_uri_rejects_malformed() {
+        for bad in [
+            "zec.rocks:443",           // no scheme
+            "wss://zec.rocks:443",     // wrong scheme
+            "https://zec.rocks",       // no port
+            "https://:443",            // empty host
+            "https://zec.rocks:port",  // non-numeric port
+            "https://zec.rocks:70000", // port overflow
+            "",
+        ] {
+            assert!(Endpoint::parse_uri(bad).is_err(), "should reject {bad:?}");
+        }
     }
 
     #[test]

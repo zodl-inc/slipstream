@@ -267,3 +267,10 @@ debug = 2
 
 [profile.release]
 debug = 2
+
+# [P8-strip gate] standalone workspace root so the fork builds/tests outside
+# the monorepo workspace (which no longer lists the vendor forks as members).
+[workspace]
+
+[patch.crates-io]
+zcash_note_encryption = { path = "../zcash_note_encryption" }

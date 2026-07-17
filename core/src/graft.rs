@@ -22,15 +22,18 @@ use incrementalmerkletree::{Marking, Retention};
 use rusqlite::{Connection, params};
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_primitives::merkle_tree::HashSer;
-use zcash_protocol::{ShieldedProtocol, consensus::BlockHeight};
+use zcash_protocol::{ShieldedPool, consensus::BlockHeight};
 
 /// One buffered commitment row.
 pub(crate) type BufferRow<H> = (u64, H, Retention<BlockHeight>);
 
-fn pool_code(pool: ShieldedProtocol) -> i64 {
+fn pool_code(pool: ShieldedPool) -> i64 {
     match pool {
-        ShieldedProtocol::Sapling => 2,
-        ShieldedProtocol::Orchard => 3,
+        ShieldedPool::Sapling => 2,
+        ShieldedPool::Orchard => 3,
+        // [IW-6] the graft never runs for ironwood today (tiny tree, serial
+        // lane, no lwd subtree roots) but the mapping is real.
+        ShieldedPool::Ironwood => 4,
     }
 }
 
@@ -100,7 +103,7 @@ fn decode_retention(
 /// Append rows for one shard (INSERT OR REPLACE — idempotent under rescan).
 pub(crate) fn append_rows<H: HashSer>(
     conn: &Connection,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     shard_index: u64,
     rows: &[BufferRow<H>],
 ) -> Result<(), SqliteClientError> {
@@ -140,7 +143,7 @@ pub(crate) fn append_rows<H: HashSer>(
 /// table doesn't exist yet (flag just turned on) or holds nothing for the shard.
 pub(crate) fn load_shard<H: HashSer>(
     conn: &Connection,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     shard_index: u64,
 ) -> Result<Vec<BufferRow<H>>, SqliteClientError> {
     if !buffer_table_exists(conn)? {
@@ -173,7 +176,7 @@ pub(crate) fn load_shard<H: HashSer>(
 /// Drop one shard's buffer (close-verdict cleanup — graft installed or built).
 pub(crate) fn delete_shard(
     conn: &Connection,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     shard_index: u64,
 ) -> Result<(), SqliteClientError> {
     if !buffer_table_exists(conn)? {
@@ -189,7 +192,7 @@ pub(crate) fn delete_shard(
 /// Rewind support (plan Task 9): drop every buffered row at or above `min_position`.
 pub(crate) fn delete_from_position(
     conn: &Connection,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     min_position: u64,
 ) -> Result<(), SqliteClientError> {
     if !buffer_table_exists(conn)? {
@@ -202,10 +205,11 @@ pub(crate) fn delete_from_position(
     Ok(())
 }
 
-fn shards_table(pool: ShieldedProtocol) -> &'static str {
+fn shards_table(pool: ShieldedPool) -> &'static str {
     match pool {
-        ShieldedProtocol::Sapling => "sapling_tree_shards",
-        ShieldedProtocol::Orchard => "orchard_tree_shards",
+        ShieldedPool::Sapling => "sapling_tree_shards",
+        ShieldedPool::Orchard => "orchard_tree_shards",
+        ShieldedPool::Ironwood => "ironwood_tree_shards",
     }
 }
 
@@ -218,7 +222,7 @@ fn shards_table(pool: ShieldedProtocol) -> &'static str {
 /// or the table absent — every "no root" shape falls back to build.
 pub(crate) fn server_root<H: HashSer>(
     conn: &Connection,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     shard_index: u64,
 ) -> Result<Option<H>, SqliteClientError> {
     use rusqlite::OptionalExtension as _;
@@ -297,9 +301,9 @@ mod tests {
         // Append out of order to prove ORDER BY, not insertion order.
         let mut shuffled = rows.clone();
         shuffled.reverse();
-        append_rows(&conn, ShieldedProtocol::Orchard, 7, &shuffled).expect("append");
+        append_rows(&conn, ShieldedPool::Orchard, 7, &shuffled).expect("append");
         let loaded: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedProtocol::Orchard, 7).expect("load");
+            load_shard(&conn, ShieldedPool::Orchard, 7).expect("load");
         assert_eq!(loaded, rows);
     }
 
@@ -309,10 +313,10 @@ mod tests {
         ensure_buffer_table(&conn).expect("table");
         let rows: Vec<BufferRow<MerkleHashOrchard>> =
             vec![(5, h(1), Retention::Ephemeral), (6, h(2), Retention::Marked)];
-        append_rows(&conn, ShieldedProtocol::Orchard, 0, &rows).expect("append 1");
-        append_rows(&conn, ShieldedProtocol::Orchard, 0, &rows).expect("append 2 (rescan)");
+        append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append 1");
+        append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append 2 (rescan)");
         let loaded: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedProtocol::Orchard, 0).expect("load");
+            load_shard(&conn, ShieldedPool::Orchard, 0).expect("load");
         assert_eq!(loaded, rows, "REPLACE semantics — no duplicates, same content");
     }
 
@@ -321,16 +325,16 @@ mod tests {
         let conn = mem_conn();
         ensure_buffer_table(&conn).expect("table");
         let row = |p: u64| vec![(p, h(0), Retention::Ephemeral)];
-        append_rows(&conn, ShieldedProtocol::Orchard, 1, &row(10)).expect("o1");
-        append_rows(&conn, ShieldedProtocol::Orchard, 2, &row(70_000)).expect("o2");
-        append_rows(&conn, ShieldedProtocol::Sapling, 1, &row(11)).expect("s1");
-        delete_shard(&conn, ShieldedProtocol::Orchard, 1).expect("delete o1");
+        append_rows(&conn, ShieldedPool::Orchard, 1, &row(10)).expect("o1");
+        append_rows(&conn, ShieldedPool::Orchard, 2, &row(70_000)).expect("o2");
+        append_rows(&conn, ShieldedPool::Sapling, 1, &row(11)).expect("s1");
+        delete_shard(&conn, ShieldedPool::Orchard, 1).expect("delete o1");
         let o1: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedProtocol::Orchard, 1).expect("load o1");
+            load_shard(&conn, ShieldedPool::Orchard, 1).expect("load o1");
         let o2: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedProtocol::Orchard, 2).expect("load o2");
+            load_shard(&conn, ShieldedPool::Orchard, 2).expect("load o2");
         let s1: Vec<BufferRow<sapling::Node>> =
-            load_shard(&conn, ShieldedProtocol::Sapling, 1).expect("load s1");
+            load_shard(&conn, ShieldedPool::Sapling, 1).expect("load s1");
         assert!(o1.is_empty());
         assert_eq!(o2.len(), 1);
         assert_eq!(s1.len(), 1, "sapling shard 1 untouched by orchard delete");
@@ -340,10 +344,10 @@ mod tests {
     fn missing_table_reads_as_empty_and_deletes_noop() {
         let conn = mem_conn();
         let loaded: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedProtocol::Orchard, 3).expect("load");
+            load_shard(&conn, ShieldedPool::Orchard, 3).expect("load");
         assert!(loaded.is_empty());
-        delete_shard(&conn, ShieldedProtocol::Orchard, 3).expect("delete noop");
-        delete_from_position(&conn, ShieldedProtocol::Orchard, 0).expect("rewind noop");
+        delete_shard(&conn, ShieldedPool::Orchard, 3).expect("delete noop");
+        delete_from_position(&conn, ShieldedPool::Orchard, 0).expect("rewind noop");
     }
 
     #[test]
@@ -351,7 +355,7 @@ mod tests {
         let conn = mem_conn();
         // Missing table → None (not an error).
         let none: Option<MerkleHashOrchard> =
-            server_root(&conn, ShieldedProtocol::Orchard, 3).expect("missing table");
+            server_root(&conn, ShieldedPool::Orchard, 3).expect("missing table");
         assert!(none.is_none());
         // Mini replica of the upstream shards schema (commitment_tree.rs).
         conn.execute_batch(
@@ -365,13 +369,13 @@ mod tests {
         .expect("ddl");
         // Missing row → None.
         let none: Option<MerkleHashOrchard> =
-            server_root(&conn, ShieldedProtocol::Orchard, 3).expect("missing row");
+            server_root(&conn, ShieldedPool::Orchard, 3).expect("missing row");
         assert!(none.is_none());
         // NULL root_hash (locally-built shard) → None.
         conn.execute("INSERT INTO orchard_tree_shards (shard_index) VALUES (7)", [])
             .expect("null row");
         let none: Option<MerkleHashOrchard> =
-            server_root(&conn, ShieldedProtocol::Orchard, 7).expect("null root");
+            server_root(&conn, ShieldedPool::Orchard, 7).expect("null root");
         assert!(none.is_none());
         // Ingested root (HashSer bytes, exactly what put_shard_roots writes) → Some.
         let root = h(4);
@@ -384,11 +388,11 @@ mod tests {
         )
         .expect("root row");
         let got: Option<MerkleHashOrchard> =
-            server_root(&conn, ShieldedProtocol::Orchard, 3).expect("read root");
+            server_root(&conn, ShieldedPool::Orchard, 3).expect("read root");
         assert_eq!(got, Some(root));
         // Pools are disjoint: sapling table absent → None even though orchard has data.
         let none: Option<sapling::Node> =
-            server_root(&conn, ShieldedProtocol::Sapling, 3).expect("other pool");
+            server_root(&conn, ShieldedPool::Sapling, 3).expect("other pool");
         assert!(none.is_none());
     }
 
@@ -399,10 +403,10 @@ mod tests {
         let rows: Vec<BufferRow<MerkleHashOrchard>> = (0..4u64)
             .map(|i| (100 + i, h(0), Retention::Ephemeral))
             .collect();
-        append_rows(&conn, ShieldedProtocol::Orchard, 0, &rows).expect("append");
-        delete_from_position(&conn, ShieldedProtocol::Orchard, 102).expect("rewind");
+        append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append");
+        delete_from_position(&conn, ShieldedPool::Orchard, 102).expect("rewind");
         let loaded: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedProtocol::Orchard, 0).expect("load");
+            load_shard(&conn, ShieldedPool::Orchard, 0).expect("load");
         assert_eq!(loaded.iter().map(|r| r.0).collect::<Vec<_>>(), vec![100, 101]);
     }
 }

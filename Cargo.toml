@@ -1,6 +1,6 @@
 # Slipstream — a high-performance Zcash light-wallet sync engine.
 # Standalone workspace (extracted from the ZcashLightClientKit slipstream branch).
-# Consumes published librustzcash crates; the engine adds orchestration only.
+# Consumes librustzcash crates; the engine adds orchestration only.
 
 [workspace]
 members = [
@@ -8,25 +8,29 @@ members = [
     "cli",
     "gpuhash",
     "protogen",
-    # v0.5 vendored forks (also [patch.crates-io]-ed below) — members so
-    # their in-crate KATs run with `cargo test -p orchard`.
-    "vendor/zcash_note_encryption",
-    "vendor/orchard",
+    # v0.5 vendored forks — un-membered since the workspace rides orchard 0.15
+    # (the forks are 0.14-based; see vendor/*/Cargo.toml — each carries its own
+    # bolted-on [workspace] so its in-crate KATs still run standalone with
+    # `cargo test` from inside the vendor directory). Re-vendor onto the 0.15
+    # line or retire via the upstream seam PRs to restore the DH-path perf work.
+    # "vendor/zcash_note_encryption",
+    # "vendor/orchard",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 # Slipstream shared versions (P0-review carry-over). Root package keeps its own
 # [dependencies] block; slipstream crates inherit from here.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# "net" is for slipstream-core::throttle (the v0.7 weather-machine TCP proxy).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
 tonic = "0.14"
 prost = "0.14"
 tonic-prost = "0.14"
 futures-util = "0.3"
 thiserror = "2"
 tracing = "0.1"
-zcash_protocol = "0.9"
-zcash_client_backend = { version = "0.23", features = [
+zcash_protocol = "=0.10.0"
+zcash_client_backend = { version = "=0.23.0", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "pczt",
@@ -34,31 +38,31 @@ zcash_client_backend = { version = "0.23", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.21", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
-zcash_keys = { version = "0.14", features = ["orchard"] }
+zcash_client_sqlite = { version = "=0.21.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_keys = { version = "=0.15.0", features = ["orchard"] }
 rusqlite = "0.37"
 secrecy = "0.8"
 rand = "0.8"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-orchard = { version = "0.14", features = ["unstable-voting-circuits"] }
-zcash_primitives = "0.28"
-transparent = { package = "zcash_transparent", version = "0.8", default-features = false }
+orchard = { version = "0.15.0", features = ["unstable-voting-circuits"] }
+zcash_primitives = "=0.29.0"
+transparent = { package = "zcash_transparent", version = "=0.9.0", default-features = false }
 zcash_script = "0.4"
 tempfile = "3"          # dev-only usage; listed here for version unity
 incrementalmerkletree = { version = "0.8", default-features = false }
-shardtree = "0.6"
+shardtree = "0.7"
 rayon = "1.7"
 zip32 = "0.2"
 zcash_note_encryption = "0.4.1"
-zcash_address = "0.12"
+zcash_address = "=0.13.0"
 # T10b spend-proof stub prover signatures only (already in the graph via sapling).
 jubjub = "0.10"
 bls12_381 = "0.8"
 
 # Phase B (GPU Sinsemilla offload) — used ONLY by slipstream-gpuhash, behind the
-# slipstream-core `gpu` feature. Never enters the default libzcashlc build. (Decision Log
-# 2026-06-15, B0.1.) Versions: sinsemilla/group match the orchard 0.14 / pasta_curves 0.5
-# stack already resolved by this workspace.
+# slipstream-core `gpu` feature. (Decision Log 2026-06-15, B0.1.) Versions:
+# sinsemilla/group match the pasta_curves 0.5 stack already resolved by this
+# workspace.
 wgpu = "29"
 pollster = "0.4"
 bytemuck = { version = "1", features = ["derive"] }
@@ -67,6 +71,23 @@ group = "0.13"
 pasta_curves = "0.5"
 ff = "0.13"
 
+# The Ironwood-era librustzcash family is not fully released to crates.io yet, so
+# the whole family rides [patch.crates-io] against the canonical repo — never
+# direct git+branch deps. `=x.y.z` pins on the patched crates (above) stop a
+# future crates.io patch release from out-resolving the [patch] block. The rev
+# is zcash/librustzcash main as last validated against this engine snapshot
+# (the #2604 merge); bump deliberately, with the engine gates re-run. The whole
+# block dies at the 0.24-era crates.io release.
 [patch.crates-io]
-zcash_note_encryption = { path = "vendor/zcash_note_encryption" }
-orchard = { path = "vendor/orchard" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "292e758462e3bc7dfb4d7272d9f88ab671bf1cab" }

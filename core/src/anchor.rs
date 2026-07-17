@@ -22,7 +22,7 @@
 
 use tracing::{info, warn};
 use zcash_client_backend::proto::service::TreeState;
-use zcash_protocol::consensus::{Network, NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use crate::{
     config::Endpoint,
@@ -59,7 +59,7 @@ pub struct Anchor {
 /// host's bundled checkpoint. `tor`: `Some` ⇒ identifying calls ride an isolated circuit.
 pub async fn restore_anchor(
     endpoint: &Endpoint,
-    network: Network,
+    network: crate::network::SlipstreamNetwork,
     intent: AnchorIntent,
     tor: Option<&TorConn>,
 ) -> Anchor {
@@ -153,7 +153,7 @@ mod tests {
         let endpoint = Endpoint { host: "invalid.host.invalid".into(), port: 1, tls: false };
         let anchor = restore_anchor(
             &endpoint,
-            Network::MainNetwork,
+            crate::network::SlipstreamNetwork::MAIN,
             AnchorIntent::Restore { birthday: 2_000_000, fallback_checkpoint: 1_500_000 },
             None,
         )
@@ -166,7 +166,7 @@ mod tests {
 
         let anchor = restore_anchor(
             &endpoint,
-            Network::MainNetwork,
+            crate::network::SlipstreamNetwork::MAIN,
             AnchorIntent::Restore { birthday: 1_000_000, fallback_checkpoint: 1_500_000 },
             None,
         )
@@ -179,7 +179,7 @@ mod tests {
     #[tokio::test]
     async fn offline_new_wallet_yields_no_anchor() {
         let endpoint = Endpoint { host: "invalid.host.invalid".into(), port: 1, tls: false };
-        let anchor = restore_anchor(&endpoint, Network::MainNetwork, AnchorIntent::New, None).await;
+        let anchor = restore_anchor(&endpoint, crate::network::SlipstreamNetwork::MAIN, AnchorIntent::New, None).await;
         assert_eq!(anchor.height, 0);
         assert!(anchor.treestate.is_none());
     }

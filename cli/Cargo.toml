@@ -1,6 +1,6 @@
 [package]
 name = "slipstream-cli"
-version = "0.6.0"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
@@ -32,3 +32,12 @@ rusqlite = { workspace = true }
 zcash_client_sqlite = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_protocol = { workspace = true }
+# `derive-ufvk` (Ironwood testnet fixture tooling): mnemonic → seed → UFVK, so
+# claimed faucet wallets are usable with `sync --network test` in one step.
+bip39 = "2"
+zcash_keys = { workspace = true }
+sapling = { workspace = true }
+jubjub = { workspace = true }
+bls12_381 = { workspace = true }
+zcash_address = { workspace = true }
+zip32 = { workspace = true }

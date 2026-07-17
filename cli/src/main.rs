@@ -14,6 +14,31 @@ struct Cli {
 enum Cmd {
     /// Print engine crate version info.
     Version,
+    /// [v0.7 P0] The weather machine: run a local TCP proxy with a
+    /// bandwidth cap in front of a lightwalletd, so "sick server" is
+    /// reproducible on demand (plain TCP — point it at a --no-tls darkside
+    /// or local lightwalletd; TLS upstreams pin their own hostname and are
+    /// out of scope). Runs until Ctrl-C.
+    ThrottleProxy {
+        /// Upstream lightwalletd host:port (plain TCP), e.g. 127.0.0.1:9067
+        #[arg(long)]
+        target: String,
+        /// Local port to listen on (0 = ephemeral, printed at start).
+        #[arg(long, default_value_t = 0)]
+        listen: u16,
+        /// Bandwidth cap in KB/s for the server→client direction, shared
+        /// across all connections (models server egress). 0 = uncapped.
+        #[arg(long, default_value_t = 2_000)]
+        cap_kbps: u64,
+        /// [v0.7 P2] Scripted collapse: after this many seconds, retune the
+        /// cap to --collapse-to-kbps (0 = no scripted collapse). The manual
+        /// twin of the P4 mid-pass gate.
+        #[arg(long, default_value_t = 0)]
+        collapse_after_s: u64,
+        /// Cap to collapse TO (KB/s) when --collapse-after-s fires.
+        #[arg(long, default_value_t = 300)]
+        collapse_to_kbps: u64,
+    },
     /// Fetch a block range into memory and report throughput (G1 benchmark).
     Fetch {
         /// lightwalletd URL, e.g. https://zec.rocks:443 or http://127.0.0.1:9067
@@ -32,8 +57,60 @@ enum Cmd {
         #[arg(long, default_value_t = true)]
         baseline: bool,
     },
+    /// Derive a UFVK from a BIP-39 mnemonic (testnet fixture tooling — the
+    /// phrase lands in shell history, so use it for TESTNET seeds only, e.g.
+    /// wallets claimed from the Ironwood testnet faucet).
+    DeriveUfvk {
+        /// The BIP-39 mnemonic phrase (quote the whole phrase).
+        #[arg(long)]
+        mnemonic: String,
+        /// ZIP-32 account index.
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        /// Network the key encoding targets.
+        #[arg(long, value_enum, default_value_t = NetworkArg::Test)]
+        network: NetworkArg,
+    },
+    /// [B7] Send funds from a synced wallet (testnet spike tooling — the
+    /// mnemonic lands in shell history, so use it for TESTNET seeds only).
+    /// Defaults to a SELF-send (the account's own unified address).
+    Send {
+        /// Network the wallet database belongs to.
+        #[arg(long, value_enum, default_value_t = NetworkArg::Test)]
+        network: NetworkArg,
+        /// lightwalletd URL to broadcast through.
+        #[arg(long)]
+        server: String,
+        /// Wallet directory (a synced data.db must exist inside).
+        #[arg(long)]
+        wallet_dir: std::path::PathBuf,
+        /// The BIP-39 mnemonic phrase for the spending key (quote it).
+        #[arg(long)]
+        mnemonic: String,
+        /// ZIP-32 account index the wallet was derived from.
+        #[arg(long, default_value_t = 0)]
+        account: u32,
+        /// Recipient address; omitted = the account's own unified address.
+        #[arg(long)]
+        to: Option<String>,
+        /// Amount in zatoshis.
+        #[arg(long, default_value_t = 10_000_000)]
+        zats: u64,
+    },
     /// Full sync pass into a wallet database (creates it if absent).
     Sync {
+        /// Network the wallet database belongs to.
+        #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
+        network: NetworkArg,
+        /// [IW-0.5] Custom-chain activation heights: comma-separated
+        /// `upgrade=height` pairs (keys: overwinter, sapling, blossom, heartwood,
+        /// canopy, nu5, nu6, nu6_1, nu6_2), with the literal `genesis` as
+        /// shorthand for "every known upgrade active from height 1" (later pairs
+        /// override). When set, --network selects only the CONSTANTS (HRPs, coin
+        /// type). The valargroup Ironwood testnet =
+        /// `--network main --custom-heights genesis,nu6_2=5000`.
+        #[arg(long)]
+        custom_heights: Option<String>,
         /// lightwalletd URL, e.g. https://zec.rocks:443 or http://127.0.0.1:9067
         #[arg(long)]
         server: String,
@@ -56,6 +133,12 @@ enum Cmd {
         /// Pass `--sparse false` to disable (kill switch — reverts to upstream path).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         sparse: bool,
+        /// [B6] Anchor-retention floor: checkpoints at heights >= this on the
+        /// 288-block grid become durable anchors (exempt from checkpoint
+        /// downgrade/pruning) — the migration crate's pre-signed-transfer
+        /// anchors. Off when omitted.
+        #[arg(long)]
+        anchor_retention: Option<u32>,
         /// Byte budget per fetch sub-chunk (T6.8-S adaptive split; makes dense
         /// "sandblasting" eras traversable). Must be >= 1 MiB.
         #[arg(long, default_value_t = slipstream_core::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES)]
@@ -92,9 +175,17 @@ enum Cmd {
     /// split + shard census + the Plan-A graftable prediction, also written as
     /// JSON (the artifact bench-ios shares).
     Bench {
+        /// Network the wallet database belongs to.
+        #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
+        network: NetworkArg,
         /// lightwalletd URL, e.g. https://zec.rocks:443
         #[arg(long)]
         server: String,
+        /// [v0.7 P1] Alternate lightwalletd URLs (repeatable). With any
+        /// present, the pass probes all servers (~1 s) and commits the
+        /// winner — the pit-crew lever's A/B switch.
+        #[arg(long = "alternate-server")]
+        alternate_server: Vec<String>,
         /// UFVK of the reference wallet to restore.
         #[arg(long)]
         ufvk: String,
@@ -160,6 +251,9 @@ enum Cmd {
     /// visible = reconciled OR NOT recovering). ZERO wallet math lives in this command — if
     /// it ever needs any, the engine API is wrong and must grow instead (ENGINE_API_V2.md §8).
     Watch {
+        /// Network the wallet database belongs to.
+        #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
+        network: NetworkArg,
         /// lightwalletd URL, e.g. https://zec.rocks:443
         #[arg(long)]
         server: String,
@@ -180,6 +274,9 @@ enum Cmd {
     /// (A = upstream persistence, B = upstream until T6.3 lands --sparse-b),
     /// then semantically diff the resulting data.db files. Exit 0 = identical.
     Oracle {
+        /// Network the wallet databases belong to.
+        #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
+        network: NetworkArg,
         #[arg(long)]
         server: String,
         /// Wallet dir A (created; must not contain data.db).
@@ -211,6 +308,113 @@ enum Cmd {
         #[arg(long, default_value_t = 10_000)]
         chunk: u32,
     },
+}
+
+/// Network selector shared by the wallet-touching subcommands. Defaults to
+/// mainnet everywhere except `derive-ufvk` (fixture tooling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum NetworkArg {
+    /// Zcash mainnet.
+    Main,
+    /// Zcash testnet (including compatible custom testnets, e.g. the Ironwood
+    /// testnet — the network selects key encodings/consensus parameters; the
+    /// chain served is whatever the --server endpoint speaks).
+    Test,
+}
+
+impl NetworkArg {
+    fn to_network(self) -> slipstream_core::Network {
+        match self {
+            NetworkArg::Main => slipstream_core::Network::MainNetwork,
+            NetworkArg::Test => slipstream_core::Network::TestNetwork,
+        }
+    }
+
+    fn to_network_type(self) -> zcash_protocol::consensus::NetworkType {
+        match self {
+            NetworkArg::Main => zcash_protocol::consensus::NetworkType::Main,
+            NetworkArg::Test => zcash_protocol::consensus::NetworkType::Test,
+        }
+    }
+}
+
+/// [IW-0.5] Resolve the sync network: stock params, or — when `--custom-heights`
+/// is given — the selected constants with the parsed activation schedule.
+fn resolve_network(
+    arg: NetworkArg,
+    custom_heights: Option<&str>,
+) -> slipstream_core::SlipstreamNetwork {
+    match custom_heights {
+        None => arg.to_network().into(),
+        Some(spec) => {
+            let heights = parse_custom_heights(spec).unwrap_or_else(|e| {
+                eprintln!("error: --custom-heights: {e}");
+                std::process::exit(2);
+            });
+            slipstream_core::SlipstreamNetwork::Custom {
+                constants: arg.to_network_type(),
+                heights,
+            }
+        }
+    }
+}
+
+/// Parse `--custom-heights` (see the Sync arg doc for the grammar).
+fn parse_custom_heights(spec: &str) -> Result<slipstream_core::CustomActivations, String> {
+    let mut h = slipstream_core::CustomActivations::default();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        if part == "genesis" {
+            h = slipstream_core::CustomActivations::all_from_genesis();
+            continue;
+        }
+        let (key, val) = part
+            .split_once('=')
+            .ok_or_else(|| format!("expected upgrade=height, got {part:?}"))?;
+        let height: u32 = val
+            .trim()
+            .parse()
+            .map_err(|e| format!("bad height in {part:?}: {e}"))?;
+        let slot = match key.trim() {
+            "overwinter" => &mut h.overwinter,
+            "sapling" => &mut h.sapling,
+            "blossom" => &mut h.blossom,
+            "heartwood" => &mut h.heartwood,
+            "canopy" => &mut h.canopy,
+            "nu5" => &mut h.nu5,
+            "nu6" => &mut h.nu6,
+            "nu6_1" => &mut h.nu6_1,
+            "nu6_2" => &mut h.nu6_2,
+            other => return Err(format!("unknown upgrade {other:?}")),
+        };
+        *slot = Some(height);
+    }
+    Ok(h)
+}
+
+/// Derive and print the UFVK for a BIP-39 mnemonic (see `DeriveUfvk`).
+fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: slipstream_core::Network) {
+    let parsed = bip39::Mnemonic::parse(mnemonic).unwrap_or_else(|e| {
+        eprintln!("error: invalid mnemonic: {e}");
+        std::process::exit(2);
+    });
+    let seed = parsed.to_seed("");
+    let account_id = zip32::AccountId::try_from(account).unwrap_or_else(|_| {
+        eprintln!("error: invalid account index {account}");
+        std::process::exit(2);
+    });
+    let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &seed, account_id)
+        .unwrap_or_else(|e| {
+            eprintln!("error: derivation failed: {e:?}");
+            std::process::exit(2);
+        });
+    println!("{}", usk.to_unified_full_viewing_key().encode(&network));
+    eprintln!(
+        "hint: slipstream sync --network {} --server <lwd-url> --wallet-dir <dir> --ufvk '<above>' --birthday <height>",
+        match network {
+            slipstream_core::Network::MainNetwork => "main",
+            slipstream_core::Network::TestNetwork => "test",
+        }
+    );
 }
 
 fn parse_server(s: &str) -> Result<slipstream_core::Endpoint, String> {
@@ -258,6 +462,55 @@ async fn run_fetch_bench(
     let stats = slipstream_core::fetch::run_fetch(endpoint, plan, tx, None).await?;
     let _ = drain.await;
     Ok(stats)
+}
+
+/// [v0.7 P0] Run the weather machine until Ctrl-C: local plain-TCP proxy
+/// with a shared bandwidth cap in front of a lightwalletd. Point the engine
+/// at the printed address with `http://` (tls=false).
+fn cmd_throttle_proxy(
+    target: String,
+    listen: u16,
+    cap_kbps: u64,
+    collapse_after_s: u64,
+    collapse_to_kbps: u64,
+) {
+    use std::net::ToSocketAddrs as _;
+
+    let target_addr = target
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .unwrap_or_else(|| {
+            eprintln!("cannot resolve --target '{target}' (expected host:port)");
+            std::process::exit(2);
+        });
+    let cap = if cap_kbps == 0 {
+        slipstream_core::throttle::UNCAPPED
+    } else {
+        cap_kbps * 1024
+    };
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    rt.block_on(async move {
+        let proxy = slipstream_core::throttle::ThrottleProxy::start(listen, target_addr, cap)
+            .await
+            .expect("start throttle proxy");
+        println!(
+            "weather machine up: http://{} -> {} (cap {})",
+            proxy.local_addr(),
+            target_addr,
+            if cap_kbps == 0 { "uncapped".to_string() } else { format!("{cap_kbps} KB/s") },
+        );
+        println!("point the engine at it, e.g.: --server http://{}", proxy.local_addr());
+        if collapse_after_s > 0 {
+            println!(
+                "scripted collapse: to {collapse_to_kbps} KB/s after {collapse_after_s} s"
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(collapse_after_s)).await;
+            proxy.set_cap(collapse_to_kbps * 1024);
+            println!("collapse fired: cap now {collapse_to_kbps} KB/s");
+        }
+        std::future::pending::<()>().await; // Ctrl-C terminates the process
+    });
 }
 
 fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline: bool) {
@@ -330,6 +583,7 @@ fn uuid_prefix(bytes: &[u8]) -> String {
 /// The Phase C acceptance harness: renders wallet state ONLY from the v2 contract.
 /// If this function ever needs wallet math, the engine API is wrong (ENGINE_API_V2.md §8).
 fn cmd_watch(
+    network: slipstream_core::Network,
     server: String,
     wallet_dir: std::path::PathBuf,
     ufvk: Option<String>,
@@ -345,11 +599,7 @@ fn cmd_watch(
         std::process::exit(2)
     });
     let db_path = wallet_dir.join("data.db");
-    let cfg = slipstream_core::EngineConfig::new(
-        slipstream_core::Network::MainNetwork,
-        db_path.clone(),
-        endpoint,
-    );
+    let cfg = slipstream_core::EngineConfig::new(network, db_path.clone(), endpoint);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
@@ -364,7 +614,7 @@ fn cmd_watch(
         // wallet (same call the iOS FFI open() makes) — the SECOND-HOST acceptance proof
         // that no host needs pre-first-suggest compensation. Failure = cold snapshot.
         if let Ok(session) =
-            slipstream_core::wallet_session::WalletSession::open(slipstream_core::Network::MainNetwork, &db_path)
+            slipstream_core::wallet_session::WalletSession::open(network, &db_path)
         {
             if let Err(e) =
                 slipstream_core::scheduler::seed_progress_from_wallet(&reporter.progress, &session)
@@ -426,7 +676,7 @@ fn cmd_watch(
                 use zcash_client_backend::data_api::WalletRead;
                 match zcash_client_sqlite::WalletDb::for_path(
                     &db_path,
-                    zcash_protocol::consensus::Network::MainNetwork,
+                    network,
                     zcash_client_sqlite::util::SystemClock,
                     rand::rngs::OsRng,
                 ) {
@@ -537,7 +787,9 @@ fn require_gpu_feature_if(requested: bool, flag: &str) {
 /// not a restore) and prints/persists the engine-written BenchSummary.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
+    network: slipstream_core::Network,
     server: String,
+    alternate_server: Vec<String>,
     ufvk: String,
     birthday: u64,
     wallet_dir: Option<std::path::PathBuf>,
@@ -579,11 +831,7 @@ fn cmd_bench(
     };
 
     let json_path = json.unwrap_or_else(|| dir.join("bench.json"));
-    let mut cfg = slipstream_core::EngineConfig::new(
-        slipstream_core::Network::MainNetwork,
-        dir.join("data.db"),
-        endpoint,
-    );
+    let mut cfg = slipstream_core::EngineConfig::new(network, dir.join("data.db"), endpoint);
     cfg.gpu_subtree = gpu_subtree;
     // v0.4 Plan A lever (Task 8+): live A/B switch — the whole point of bench.
     cfg.graft_subtree = graft;
@@ -594,6 +842,10 @@ fn cmd_bench(
     cfg.persist_depth = persist_depth;
     cfg.graft_verify_sample = graft_verify_sample;
     cfg.batch_combine = batch_combine;
+    cfg.alternate_endpoints = alternate_server
+        .iter()
+        .map(|a| parse_server(a).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) }))
+        .collect();
     cfg.bench_json_path = Some(json_path.clone());
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -671,6 +923,7 @@ fn cmd_bench(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_sync(
+    network: slipstream_core::SlipstreamNetwork,
     server: String,
     wallet_dir: std::path::PathBuf,
     ufvk: Option<String>,
@@ -684,6 +937,7 @@ fn cmd_sync(
     gpu_subtree: bool,
     persist_depth: usize,
     follow: bool,
+    anchor_retention: Option<u32>,
 ) {
     let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
 
@@ -694,21 +948,22 @@ fn cmd_sync(
     let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday)
         .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(2) });
 
-    let mut cfg = slipstream_core::EngineConfig::new(
-        slipstream_core::Network::MainNetwork,
-        wallet_dir.join("data.db"),
-        endpoint,
-    );
+    let mut cfg =
+        slipstream_core::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
     cfg.fetch_streams = streams;
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
     cfg.chunk_split_bytes = chunk_split_bytes;
     cfg.memory_budget_bytes = memory_budget_bytes;
+    cfg.anchor_retention_height = anchor_retention; // [B6]
     require_gpu_feature_if(gpu_subtree, "--gpu-subtree");
     // `--sparse false` (the sparse kill switch) implies write-behind off: the
     // deferred commit runs the sparse put_blocks path, so it cannot outlive it.
     cfg.write_behind = write_behind && sparse;
     cfg.gpu_subtree = gpu_subtree && sparse;
+    // Same rule for the graft (default ON since v0.4): its verdict lives in the
+    // sparse build path, so the sparse kill switch implies graft off.
+    cfg.graft_subtree = cfg.graft_subtree && sparse;
     cfg.persist_depth = persist_depth;
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -838,6 +1093,7 @@ fn cmd_sync(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_oracle(
+    network: slipstream_core::Network,
     server: String,
     wallet_a: std::path::PathBuf,
     wallet_b: std::path::PathBuf,
@@ -867,11 +1123,8 @@ fn cmd_oracle(
         }
     }
     let mk_cfg = |dir: &std::path::Path, sparse: bool, write_behind: bool, gpu_subtree: bool, persist_depth: usize| {
-        let mut cfg = slipstream_core::EngineConfig::new(
-            slipstream_core::Network::MainNetwork,
-            dir.join("data.db"),
-            endpoint.clone(),
-        );
+        let mut cfg =
+            slipstream_core::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
         cfg.fetch_streams = streams;
         cfg.chunk_blocks = chunk;
         cfg.sparse_persistence = sparse;
@@ -908,6 +1161,223 @@ fn cmd_oracle(
     }
 }
 
+/// [B7] Propose, prove, and broadcast a spend from a synced wallet. The
+/// proposal runs upstream's production shapes (greedy selector, ZIP-317
+/// multi-output change, `SpendPolicy::default()` = every shielded pool the
+/// chain has activated, Ironwood included), the transaction is proved with
+/// orchard 0.15's pool-agnostic circuit, and the raw bytes are broadcast via
+/// lightwalletd. Sapling provers are structurally required by the API but an
+/// orchard/ironwood-only transaction never invokes them (the stub panics if
+/// one ever were).
+#[allow(clippy::too_many_arguments)]
+fn cmd_send(
+    network: slipstream_core::Network,
+    server: String,
+    wallet_dir: std::path::PathBuf,
+    mnemonic: String,
+    account: u32,
+    to: Option<String>,
+    zats: u64,
+) {
+    use std::num::{NonZeroU32, NonZeroUsize};
+    use zcash_client_backend::data_api::WalletRead;
+    use zcash_client_backend::data_api::wallet::{
+        ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
+        input_selection::GreedyInputSelector, propose_transfer,
+    };
+    use zcash_client_backend::wallet::OvkPolicy;
+    use zcash_client_backend::fees::{
+        DustOutputPolicy, SplitPolicy, StandardFeeRule, zip317::MultiOutputChangeStrategy,
+    };
+    use zcash_protocol::{ShieldedPool, value::Zatoshis};
+    use zcash_client_backend::zip321::{Payment, TransactionRequest};
+
+    let endpoint = match parse_server(&server) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+
+    // Spending key from the mnemonic (same derivation as `derive-ufvk`).
+    let parsed = bip39::Mnemonic::parse(&mnemonic).unwrap_or_else(|e| {
+        eprintln!("error: invalid mnemonic: {e}");
+        std::process::exit(2);
+    });
+    let seed = parsed.to_seed("");
+    let account_id = zip32::AccountId::try_from(account).expect("account index");
+    let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(&network, &seed, account_id)
+        .expect("usk derivation");
+    let ufvk = usk.to_unified_full_viewing_key();
+
+    let mut session = slipstream_core::wallet_session::WalletSession::open(
+        network,
+        &wallet_dir.join("data.db"),
+    )
+    .expect("open wallet db");
+    let db = session.db_mut();
+    let accounts = db.get_account_ids().expect("account ids");
+    assert_eq!(accounts.len(), 1, "send tooling expects a single-account wallet");
+    let wallet_account = accounts[0];
+
+    // The derived key must be THE wallet's key (guards against wrong mnemonic/account).
+    {
+        use zcash_client_backend::data_api::Account as _;
+        let acct = db
+            .get_account(wallet_account)
+            .expect("get account")
+            .expect("account exists");
+        let wallet_ufvk = acct.ufvk().expect("wallet has a UFVK").encode(&network);
+        assert_eq!(
+            wallet_ufvk,
+            ufvk.encode(&network),
+            "mnemonic/account does not match the wallet's UFVK"
+        );
+    }
+
+    // Recipient: explicit --to, or the account's own unified address (self-send).
+    let to_encoded = to.unwrap_or_else(|| {
+        let (ua, _) = ufvk
+            .default_address(zcash_keys::keys::UnifiedAddressRequest::AllAvailableKeys)
+            .expect("default address");
+        ua.encode(&network)
+    });
+    let addr = ::zcash_address::ZcashAddress::try_from_encoded(&to_encoded)
+        .expect("recipient address parses");
+    println!("to:     {to_encoded}");
+    println!("amount: {zats} zats");
+
+    let request = TransactionRequest::new(vec![
+        Payment::new(addr, Some(Zatoshis::const_from_u64(zats)), None, None, None, vec![])
+            .expect("payment"),
+    ])
+    .expect("transaction request");
+
+    // Production's exact selector + change shapes (rust/src/lib.rs zip317_helper);
+    // Ironwood-spend change routes to Ironwood outputs upstream, the fallback
+    // pool only applies where no better rule fires.
+    let change_strategy = MultiOutputChangeStrategy::new(
+        StandardFeeRule::Zip317,
+        None,
+        ShieldedPool::Orchard,
+        DustOutputPolicy::default(),
+        SplitPolicy::with_min_output_value(
+            NonZeroUsize::new(4).expect("nonzero"),
+            Zatoshis::const_from_u64(10_000_000),
+        ),
+    );
+    let input_selector = GreedyInputSelector::new();
+
+    let proposal = propose_transfer::<_, _, _, _, std::convert::Infallible>(
+        db,
+        &network,
+        wallet_account,
+        &input_selector,
+        &change_strategy,
+        request,
+        ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
+        &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
+        None,
+    )
+    .expect("propose_transfer");
+    for (i, step) in proposal.steps().iter().enumerate() {
+        println!("step {i}: balance {:?}", step.balance());
+    }
+
+    // Sapling provers: structurally required, never invoked for orchard/ironwood-only
+    // (exact stubs from the engine's darkside oracle graft_spend_proof).
+    struct NoSapling;
+    impl sapling::prover::SpendProver for NoSapling {
+        type Proof = ();
+        fn prepare_circuit(
+            _: sapling::ProofGenerationKey,
+            _: sapling::Diversifier,
+            _: sapling::Rseed,
+            _: sapling::value::NoteValue,
+            _: jubjub::Fr,
+            _: sapling::value::ValueCommitTrapdoor,
+            _: bls12_381::Scalar,
+            _: sapling::MerklePath,
+        ) -> Option<sapling::circuit::Spend> {
+            unreachable!("orchard/ironwood-only tx must not prepare sapling spends")
+        }
+        fn create_proof<R: rand::RngCore>(
+            &self,
+            _: sapling::circuit::Spend,
+            _: &mut R,
+        ) -> Self::Proof {
+            unreachable!("orchard/ironwood-only tx must not prove sapling spends")
+        }
+        fn encode_proof(_: Self::Proof) -> sapling::bundle::GrothProofBytes {
+            unreachable!("orchard/ironwood-only tx must not encode sapling spend proofs")
+        }
+    }
+    impl sapling::prover::OutputProver for NoSapling {
+        type Proof = ();
+        fn prepare_circuit(
+            _: &sapling::keys::EphemeralSecretKey,
+            _: sapling::PaymentAddress,
+            _: jubjub::Fr,
+            _: sapling::value::NoteValue,
+            _: sapling::value::ValueCommitTrapdoor,
+        ) -> sapling::circuit::Output {
+            unreachable!("orchard/ironwood-only tx must not prepare sapling outputs")
+        }
+        fn create_proof<R: rand::RngCore>(
+            &self,
+            _: sapling::circuit::Output,
+            _: &mut R,
+        ) -> Self::Proof {
+            unreachable!("orchard/ironwood-only tx must not prove sapling outputs")
+        }
+        fn encode_proof(_: Self::Proof) -> sapling::bundle::GrothProofBytes {
+            unreachable!("orchard/ironwood-only tx must not encode sapling output proofs")
+        }
+    }
+
+    println!("proving + creating transaction (orchard circuit, pool-agnostic)...");
+    let txids = create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+        db,
+        &network,
+        &NoSapling,
+        &NoSapling,
+        &SpendingKeys::from_unified_spending_key(usk),
+        OvkPolicy::Sender,
+        &proposal,
+    )
+    .expect("create_proposed_transactions");
+    assert_eq!(txids.len(), 1, "exactly one transaction expected");
+    let txid = *txids.first();
+    println!("txid:   {txid}");
+
+    let tx = db
+        .get_transaction(txid)
+        .expect("read created tx")
+        .expect("created tx present");
+    let mut raw = Vec::new();
+    tx.write(&mut raw).expect("serialize tx");
+    println!("raw:    {} bytes", raw.len());
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    let (code, message) = rt
+        .block_on(async {
+            let mut client = slipstream_core::grpc::connect(&endpoint).await?;
+            slipstream_core::grpc::send_transaction(&mut client, raw).await
+        })
+        .expect("broadcast");
+    if code == 0 {
+        println!("BROADCAST ACCEPTED: txid {txid}");
+    } else {
+        println!("BROADCAST REJECTED ({code}): {message}");
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     // v0.6 P6: `zcash_client_backend=warn` silences upstream's per-block
     // INFO spans (`#[instrument]` on add_block + scan_block_with_runners =
@@ -925,20 +1395,30 @@ fn main() {
         Cmd::Version => {
             println!("{} {}", slipstream_core::CRATE_NAME, env!("CARGO_PKG_VERSION"));
         }
+        Cmd::ThrottleProxy { target, listen, cap_kbps, collapse_after_s, collapse_to_kbps } => {
+            cmd_throttle_proxy(target, listen, cap_kbps, collapse_after_s, collapse_to_kbps);
+        }
         Cmd::Fetch { server, range, streams, chunk, baseline } => {
             cmd_fetch(server, range, streams, chunk, baseline);
         }
-        Cmd::Sync { server, wallet_dir, ufvk, birthday, streams, chunk, sparse, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow } => {
-            cmd_sync(server, wallet_dir, ufvk, birthday, streams, chunk, sparse, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow);
+        Cmd::DeriveUfvk { mnemonic, account, network } => {
+            cmd_derive_ufvk(&mnemonic, account, network.to_network());
         }
-        Cmd::Bench { server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep } => {
-            cmd_bench(server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep);
+        Cmd::Send { network, server, wallet_dir, mnemonic, account, to, zats } => {
+            cmd_send(network.to_network(), server, wallet_dir, mnemonic, account, to, zats);
         }
-        Cmd::Watch { server, wallet_dir, ufvk, birthday, interval_ms } => {
-            cmd_watch(server, wallet_dir, ufvk, birthday, interval_ms);
+        Cmd::Sync { network, custom_heights, server, wallet_dir, ufvk, birthday, streams, chunk, sparse,
+            anchor_retention, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow } => {
+            cmd_sync(resolve_network(network, custom_heights.as_deref()), server, wallet_dir, ufvk, birthday, streams, chunk, sparse, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow, anchor_retention);
         }
-        Cmd::Oracle { server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk } => {
-            cmd_oracle(server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk);
+        Cmd::Bench { network, server, alternate_server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep } => {
+            cmd_bench(network.to_network(), server, alternate_server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep);
+        }
+        Cmd::Watch { network, server, wallet_dir, ufvk, birthday, interval_ms } => {
+            cmd_watch(network.to_network(), server, wallet_dir, ufvk, birthday, interval_ms);
+        }
+        Cmd::Oracle { network, server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk } => {
+            cmd_oracle(network.to_network(), server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk);
         }
     }
 }
@@ -946,6 +1426,74 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_heights_parse_and_resolve_to_custom_params() {
+        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+
+        // The valargroup Ironwood-testnet shape: main constants, genesis base,
+        // the ironwood-era stand-in at 5000.
+        let net = resolve_network(NetworkArg::Main, Some("genesis,nu6_2=5000"));
+        assert_eq!(
+            net.network_type(),
+            zcash_protocol::consensus::NetworkType::Main
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Sapling),
+            Some(zcash_protocol::consensus::BlockHeight::from_u32(1))
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu6_2),
+            Some(zcash_protocol::consensus::BlockHeight::from_u32(5000))
+        );
+
+        assert!(parse_custom_heights("nu9=1").is_err());
+        assert!(parse_custom_heights("sapling").is_err());
+        assert!(parse_custom_heights("sapling=x").is_err());
+    }
+
+    #[test]
+    fn parses_network_flag_and_defaults_to_main() {
+        let cli = Cli::try_parse_from([
+            "slipstream", "sync",
+            "--network", "test",
+            "--server", "https://lwd.example:443",
+            "--wallet-dir", "/tmp/w",
+        ])
+        .expect("parses");
+        assert!(matches!(cli.cmd, Cmd::Sync { network: NetworkArg::Test, .. }));
+
+        let cli = Cli::try_parse_from([
+            "slipstream", "sync",
+            "--server", "https://lwd.example:443",
+            "--wallet-dir", "/tmp/w",
+        ])
+        .expect("parses");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { network: NetworkArg::Main, .. }),
+            "network must default to mainnet"
+        );
+    }
+
+    #[test]
+    fn derive_ufvk_produces_a_testnet_ufvk() {
+        // The standard BIP-39 test mnemonic; testnet fixture derivation only.
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let seed = bip39::Mnemonic::parse(phrase).expect("valid mnemonic").to_seed("");
+        let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &slipstream_core::Network::TestNetwork,
+            &seed,
+            zip32::AccountId::ZERO,
+        )
+        .expect("derives");
+        let encoded = usk
+            .to_unified_full_viewing_key()
+            .encode(&slipstream_core::Network::TestNetwork);
+        assert!(
+            encoded.starts_with("uviewtest1"),
+            "testnet UFVK must carry the uviewtest HRP, got {encoded}"
+        );
+    }
 
     #[test]
     fn parses_bench_minimal() {

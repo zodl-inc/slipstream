@@ -28,7 +28,7 @@ use zcash_client_backend::data_api::{
 use zcash_client_backend::proto::service::{BlockId, BlockRange, TransparentAddressBlockFilter};
 use zcash_keys::encoding::AddressCodec;
 use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::{BlockHeight, Network};
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     error::SlipstreamError,
@@ -90,7 +90,7 @@ const FETCH_CONCURRENCY: usize = 8;
 pub async fn run_enhancement(
     session: &mut WalletSession,
     client: &mut LwdClient,
-    network: Network,
+    network: crate::network::SlipstreamNetwork,
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError> {
@@ -196,7 +196,7 @@ fn apply_txid_fetch(
     txid: zcash_primitives::transaction::TxId,
     want_enhance: bool,
     fetched: Result<Option<zcash_client_backend::proto::service::RawTransaction>, SlipstreamError>,
-    network: &Network,
+    network: &crate::network::SlipstreamNetwork,
     stats: &mut EnhanceStats,
     progress: Option<&Progress>,
 ) -> Result<(), SlipstreamError> {
@@ -297,7 +297,7 @@ fn effective_range_end(
 async fn apply_address_request(
     session: &mut WalletSession,
     client: &mut LwdClient,
-    network: &Network,
+    network: &crate::network::SlipstreamNetwork,
     tia: TransactionsInvolvingAddress,
     stats: &mut EnhanceStats,
     skipped_keys: &mut HashSet<String>,
