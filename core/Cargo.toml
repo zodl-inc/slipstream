@@ -1,9 +1,9 @@
 [package]
 name = "slipstream-core"
-# Milestone versioning (see the slipstream repo README "Status"): v0.6.2 = the
+# Milestone versioning (see the slipstream repo README "Status"): v0.6.4 = the
 # Ironwood-era snapshot — third-pool (NU6.3) sparse persistence + anchor
 # retention + the librustzcash-main dependency re-ride + failover preview.
-version = "0.6.2"
+version = "0.6.4"
 edition = "2024"
 rust-version = "1.90"
 license = "MIT"
