@@ -135,8 +135,12 @@ pub async fn refresh_utxos(
             );
 
             // sync.rs:511-531: from_parts returns None if recipient address is unknown.
-            let output = WalletTransparentOutput::from_parts(outpoint, txout, mined_height)
-                .ok_or(SlipstreamError::MisbehavingServer)?;
+            // [IW-1 SPIKE] the ironwood-era API adds optional recipient/funding
+            // attribution params — `None` defers to the store's own address→account
+            // resolution (the pre-existing behavior of this ingest path).
+            let output =
+                WalletTransparentOutput::from_parts(outpoint, txout, mined_height, None, None, None)
+                    .ok_or(SlipstreamError::MisbehavingServer)?;
 
             // sync.rs:534-535: put and map UtxoRef → ().
             session

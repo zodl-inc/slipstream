@@ -316,14 +316,13 @@ impl BatchDomain for OrchardDomain {
 
     /// [slipstream fork] Batched same-scalar DH: every trial-decryption lane
     /// multiplies by the SAME ivk, so a lockstep-affine kernel shares one
-    /// inversion per ladder step across the whole batch. Two kernels behind
-    /// the toggle: [v0.6 P8] the GLV-lockstep kernel for window-prepared
-    /// epks (prebuilt P7 tables + half-length ladder — the rebuild of C1 on
-    /// the instrument-named fixes), and the v0.5 C1 full-width kernel for
-    /// Wnaf-prepared epks (unchanged). OFF by default —
-    /// `crate::batch_dh::set_enabled` is the engine's runtime toggle;
-    /// degenerate lanes fall back per-item, so the output is byte-identical
-    /// either way (KAT-gated in batch_dh.rs).
+    /// inversion per ladder step across the whole batch (the v0.5 C1
+    /// full-width kernel, applied to Wnaf-prepared epks). Window-prepared
+    /// epks run the per-item path — their shared φ-endo window ([v0.6 P7])
+    /// beat every batch kernel tried on Apple Silicon ([v0.6 P8] refuted
+    /// and removed). OFF by default — `crate::batch_dh::set_enabled` is the
+    /// engine's runtime toggle; degenerate lanes fall back per-item, so the
+    /// output is byte-identical either way (KAT-gated in batch_dh.rs).
     fn batch_ka_agree_dec<'a>(
         ivk: &Self::IncomingViewingKey,
         epks: impl Iterator<Item = Option<&'a Self::PreparedEphemeralPublicKey>>,
@@ -350,23 +349,18 @@ impl BatchDomain for OrchardDomain {
             return out;
         }
 
-        // [v0.6 P8] Partition live lanes: an epk prepared under a lever
-        // carries the shared φ-endo window — those run the GLV-lockstep
-        // kernel (prebuilt tables, half-length ladder, no input
-        // normalization). Wnaf-prepared lanes keep the v0.5 C1 full-width
-        // kernel byte-for-byte. In practice a batch is all one kind; the
-        // split costs one pass.
-        let mut t_index = Vec::with_capacity(epks.len());
-        let mut t_tables: Vec<&crate::endo::EndoTable> = Vec::with_capacity(epks.len());
+        // Window-prepared epks run the per-item path: the shared φ-endo
+        // window ([v0.6 P7]) beat every batch kernel tried on window inputs
+        // ([v0.6 P8] refuted and removed). Wnaf-prepared lanes keep the
+        // v0.5 C1 full-width kernel byte-for-byte. In practice a batch is
+        // all one kind; the split costs one pass.
         let mut w_index = Vec::new();
         let mut w_projective = Vec::new();
+        let mut out: Vec<Option<SharedSecret>> = epks.iter().map(|_| None).collect();
         for (i, epk) in epks.iter().enumerate() {
             if let Some(epk) = epk {
                 match epk.endo_table() {
-                    Some(t) => {
-                        t_index.push(i);
-                        t_tables.push(t);
-                    }
+                    Some(_) => out[i] = Some(Self::ka_agree_dec(ivk, epk)),
                     None => {
                         w_index.push(i);
                         w_projective.push(epk.raw_point());
@@ -375,21 +369,6 @@ impl BatchDomain for OrchardDomain {
             }
         }
         let k = ivk.raw_scalar();
-        let mut out: Vec<Option<SharedSecret>> = epks.iter().map(|_| None).collect();
-
-        if !t_tables.is_empty() {
-            crate::batch_dh::note_kernel_lanes(t_tables.len());
-            let products = crate::batch_dh::batch_mul_same_scalar_glv(&k, &t_tables);
-            for (j, i) in t_index.into_iter().enumerate() {
-                out[i] = Some(match products[j] {
-                    Some(affine) => {
-                        SharedSecret::from_kernel_point(pasta_curves::pallas::Point::from(affine))
-                    }
-                    // Degenerate lane (poison-marked) -> the per-item path.
-                    None => Self::ka_agree_dec(ivk, epks[i].expect("lane was live")),
-                });
-            }
-        }
 
         if !w_projective.is_empty() {
             // Gather the raw bases and BATCH-normalize them — one shared

@@ -54,22 +54,29 @@ where
     // Fetch the ephemeral keys for each output, and batch-parse and prepare them.
     let ephemeral_keys = D::batch_epk(outputs.iter().map(|(_, output)| output.ephemeral_key()));
 
-    // Derive the shared secrets for all combinations of (ivk, output).
-    // [slipstream fork] One batched same-key agreement PER IVK — domains with a
-    // same-scalar batched kernel (lockstep-affine ladders) accelerate here; the
-    // default is byte-for-byte the old per-item path.
-    let per_ivk: Vec<Vec<Option<D::SharedSecret>>> = ivks
+    // Derive the shared secrets for all combinations of (ivk, output), one batched
+    // same-key agreement per ivk: domains for which same-scalar multiplications can
+    // share work accelerate here, and the default `batch_ka_agree_dec` implementation
+    // is exactly the previous per-item computation.
+    // Reassembly below is in the (output-major, ivk-minor) order the batch-KDF
+    // expects, moving values out of the per-ivk columns (`SharedSecret` need not be
+    // `Clone`).
+    let mut columns: Vec<_> = ivks
         .iter()
-        .map(|ivk| D::batch_ka_agree_dec(ivk, ephemeral_keys.iter().map(|(epk, _)| epk.as_ref())))
+        .map(|ivk| {
+            D::batch_ka_agree_dec(ivk, ephemeral_keys.iter().map(|(epk, _)| epk.as_ref()))
+                .into_iter()
+        })
         .collect();
-    // Reassemble in the (output-major, ivk-minor) order the KDF consumer below
-    // expects — moving values out (SharedSecret is not Clone).
-    let mut columns: Vec<_> = per_ivk.into_iter().map(Vec::into_iter).collect();
     let mut secrets: Vec<Option<D::SharedSecret>> =
         Vec::with_capacity(ephemeral_keys.len() * ivks.len());
     for _ in 0..ephemeral_keys.len() {
         for column in columns.iter_mut() {
-            secrets.push(column.next().expect("all columns have one entry per output"));
+            secrets.push(
+                column
+                    .next()
+                    .expect("all columns have one entry per output"),
+            );
         }
     }
     let items = secrets.into_iter().zip(

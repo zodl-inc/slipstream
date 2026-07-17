@@ -324,14 +324,17 @@ pub trait BatchDomain: Domain {
             .collect()
     }
 
-    /// Computes `Self::ka_agree_dec` on a batch of prepared ephemeral keys
-    /// against ONE viewing key. [slipstream fork addition]
+    /// Computes `Self::ka_agree_dec` on a batch of prepared ephemeral keys against a
+    /// single incoming viewing key.
     ///
-    /// For each item, if the prepared key is `None` (unparseable encoding),
-    /// this returns `None` at that position. Trial decryption multiplies many
-    /// ephemeral keys by the SAME key, so domains where same-scalar
-    /// multiplications can share work (e.g. lockstep-affine ladders with
-    /// batched inversions) override this; the default is the per-item path.
+    /// For each item, if the prepared ephemeral key is `None` (i.e. its encoding could
+    /// not be parsed), this returns `None` at that position.
+    ///
+    /// Trial decryption multiplies many ephemeral keys by the same viewing key, so
+    /// domains for which same-scalar multiplications can share work (for example,
+    /// lockstep ladders over a shared batched field inversion) can override this to
+    /// reduce the cost of the scalar multiplications, which dominate batched trial
+    /// decryption. The default implementation performs the per-item computation.
     fn batch_ka_agree_dec<'a>(
         ivk: &Self::IncomingViewingKey,
         epks: impl Iterator<Item = Option<&'a Self::PreparedEphemeralPublicKey>>,

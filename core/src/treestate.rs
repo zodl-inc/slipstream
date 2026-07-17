@@ -87,7 +87,18 @@ impl LocalTreestate {
     /// The boundary state after everything absorbed so far. `height`/`hash`
     /// identify the last absorbed block.
     pub fn chain_state(&self, height: BlockHeight, hash: BlockHash) -> ChainState {
-        ChainState::new(height, hash, self.sapling.clone(), self.orchard.clone())
+        // [IW-1 SPIKE] This local-frontier machinery is the default-OFF
+        // `local_treestate` path (P2a, parked); it does not track Ironwood yet.
+        // The default path builds ChainState from SERVER tree states, which
+        // carry the real ironwood frontier. Ironwood tracking lands with the
+        // mirror's third-pool arms (IW-2).
+        ChainState::new(
+            height,
+            hash,
+            self.sapling.clone(),
+            self.orchard.clone(),
+            incrementalmerkletree::frontier::Frontier::empty(),
+        )
     }
 }
 
@@ -144,7 +155,8 @@ mod tests {
         }
 
         let got = local.chain_state(BlockHeight::from_u32(11), BlockHash([7u8; 32]));
-        let want = ChainState::new(BlockHeight::from_u32(11), BlockHash([7u8; 32]), sap, orch);
+        let want =
+            ChainState::new(BlockHeight::from_u32(11), BlockHash([7u8; 32]), sap, orch, Frontier::empty());
         assert_eq!(got, want, "absorb order must match direct append order");
     }
 
@@ -161,6 +173,7 @@ mod tests {
             BlockHeight::from_u32(100),
             BlockHash([1u8; 32]),
             sap,
+            Frontier::empty(),
             Frontier::empty(),
         );
         let local = LocalTreestate::seed(&seed);

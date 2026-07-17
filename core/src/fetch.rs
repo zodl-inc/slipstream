@@ -58,6 +58,36 @@ pub struct FetchPlan {
     /// split into many small sub-chunks automatically. Threaded from
     /// [`EngineConfig::chunk_split_bytes`] by the scheduler.
     pub split_bytes: usize,
+    /// [v0.7 P2] Arm the wire-collapse detector (Some ⇔ the engine has
+    /// alternates to fail over to; None = pre-v0.7 behavior verbatim).
+    pub failover: Option<WireFailoverArm>,
+}
+
+/// [v0.7 P2] Detector thresholds. Defaults are the shipped policy; the
+/// throttle-proxy gates (P4) exercise them deterministically.
+#[derive(Clone, Copy, Debug)]
+pub struct WireFailoverArm {
+    /// Consecutive seconds of ZERO arrivals while the reorder stage was
+    /// ready to receive (recv-blocked, NOT queue-blocked — so scan
+    /// backpressure can never trip this) before a full-stall fire. Sits
+    /// above the connector's transient-reconnect backoff (~5–10 s blips)
+    /// and below grpc's 30 s idle kill.
+    pub stall_secs: u64,
+    /// Relative collapse: fire when the rolling window rate falls below
+    /// this fraction of the pass's best window…
+    pub collapse_fraction: f64,
+    /// …AND below this absolute rate (MB/s) — a drop from 20 to 3 MB/s is
+    /// not worth a switch; a drop to below this is.
+    pub painful_mbps: f64,
+    /// Unconditional floor (MB/s): a window below this fires regardless of
+    /// history (nothing is usable at this rate on any supported device).
+    pub floor_mbps: f64,
+}
+
+impl Default for WireFailoverArm {
+    fn default() -> Self {
+        Self { stall_secs: 12, collapse_fraction: 0.15, painful_mbps: 2.0, floor_mbps: 0.2 }
+    }
 }
 
 impl FetchPlan {
@@ -73,6 +103,7 @@ impl FetchPlan {
             retries_per_chunk: 3,
             chunk_timeout: Duration::from_secs(120),
             split_bytes: EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            failover: None,
         }
     }
 
@@ -97,6 +128,11 @@ pub struct FetchStats {
     /// pipeline throughput, not pure network speed. With a fast-draining
     /// consumer (the benchmark drains immediately) it approximates download speed.
     pub elapsed: Duration,
+    /// [v0.7 P0] Wire arrival series: (seconds since fetch begin, cumulative
+    /// bytes) recorded at every sub-chunk ARRIVAL at the reorder stage — the
+    /// raw material for windowed throughput (worst-window reporting now, the
+    /// P2 collapse detector later). ~1 sample per ≤ split_bytes of wire data.
+    pub wire_samples: Vec<(f64, u64)>,
 }
 
 impl FetchStats {
@@ -107,6 +143,40 @@ impl FetchStats {
     pub fn megabytes_per_sec(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
         if secs > 0.0 { self.bytes as f64 / (1024.0 * 1024.0) / secs } else { 0.0 }
+    }
+
+    /// [v0.7 P0] Worst sustained wire throughput across the pass: the
+    /// minimum MB/s over any ≥ `window_s` span between arrival samples (a
+    /// synthetic (0, 0) sample anchors the first window; passes shorter
+    /// than the window rate the whole pass). CAVEAT: ahead-gate
+    /// backpressure (scan slower than wire) parks the workers and reads as
+    /// wire idle here — interpret beside `recv_wait` (high recv_wait =
+    /// wire-bound = this number is the server's doing, which is exactly the
+    /// case the v0.7 wire work exists for).
+    pub fn worst_window_mbps(&self, window_s: f64) -> f64 {
+        let mut samples: Vec<(f64, u64)> = Vec::with_capacity(self.wire_samples.len() + 1);
+        samples.push((0.0, 0));
+        samples.extend(self.wire_samples.iter().copied());
+        if samples.len() < 2 {
+            return self.megabytes_per_sec();
+        }
+        let mut worst = f64::INFINITY;
+        let mut j = 1usize;
+        for i in 0..samples.len() - 1 {
+            if j <= i {
+                j = i + 1;
+            }
+            while j < samples.len() && samples[j].0 - samples[i].0 < window_s {
+                j += 1;
+            }
+            if j == samples.len() {
+                break; // no full window starting at i; later starts are shorter still
+            }
+            let dt = samples[j].0 - samples[i].0;
+            let db = samples[j].1.saturating_sub(samples[i].1) as f64;
+            worst = worst.min(db / (1024.0 * 1024.0) / dt);
+        }
+        if worst.is_finite() { worst } else { self.megabytes_per_sec() }
     }
 }
 
@@ -471,6 +541,116 @@ async fn worker(
     }
 }
 
+// ── v0.7 P2: wire-collapse detector ───────────────────────────────────────────
+
+/// [v0.7 P2] The wire-collapse detector. Lives in the reorder stage because
+/// that is the ONE place where wire-starve and scan-backpressure are
+/// structurally distinguishable: when scan lags, the ChunkQueue fills and
+/// the reorder stage blocks in `queue.send` (arrivals keep landing in the
+/// rx buffer); when the WIRE starves, the stage blocks in `rx.recv` with
+/// nothing arriving. Only recv-blocked time feeds this detector, so a slow
+/// device can never trip a failover.
+///
+/// Two triggers (see [`WireFailoverArm`] for the shipped thresholds):
+/// - STALL: ≥ `stall_secs` consecutive recv-blocked seconds, zero arrivals.
+/// - COLLAPSE: the rolling window rate drops below `collapse_fraction` of
+///   the pass's best window AND below `painful_mbps` (or below the
+///   unconditional `floor_mbps`) — a healthy→sick transition that is
+///   actually worth a switch, never a "20 → 3 MB/s" over-reaction and
+///   never a steady-slow pass tripping against its own baseline (that
+///   shape means the ACCESS network is the constraint — switching servers
+///   cannot help, as the 2026-07-08 hotel day proved).
+///
+/// Clock-free (methods take `now_s` = seconds since fetch begin) so the
+/// trigger logic unit-tests without sleeping.
+struct WireDetector {
+    arm: WireFailoverArm,
+    /// (secs since start, cumulative bytes) — pushed per arrival.
+    samples: Vec<(f64, u64)>,
+    cum_bytes: u64,
+    /// Consecutive recv-starve seconds (reset on any arrival).
+    starve_secs: u64,
+    /// Best rolling-window rate observed this pass (MB/s).
+    best_window_mbps: f64,
+}
+
+/// Rolling window length for the collapse trigger.
+const DETECT_WINDOW_S: f64 = 10.0;
+/// No firing before this much wall + data (connect/ramp grace).
+const DETECT_WARMUP_S: f64 = 15.0;
+const DETECT_WARMUP_BYTES: u64 = 4 * 1024 * 1024;
+
+impl WireDetector {
+    fn new(arm: WireFailoverArm) -> Self {
+        Self {
+            arm,
+            samples: Vec::new(),
+            cum_bytes: 0,
+            starve_secs: 0,
+            best_window_mbps: 0.0,
+        }
+    }
+
+    fn warmed_up(&self, now_s: f64) -> bool {
+        now_s > DETECT_WARMUP_S && self.cum_bytes > DETECT_WARMUP_BYTES
+    }
+
+    /// Rate over the trailing [`DETECT_WINDOW_S`] seconds, MB/s (None until
+    /// the pass is older than the window).
+    fn window_mbps(&self, now_s: f64) -> Option<f64> {
+        let cut = now_s - DETECT_WINDOW_S;
+        if cut <= 0.0 {
+            return None;
+        }
+        // Bytes at the window start = last sample at or before `cut`
+        // (no sample that old ⇒ everything arrived inside the window ⇒
+        // base 0 would overstate the window; use the oldest sample's base).
+        let base = self
+            .samples
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= cut)
+            .map_or(0, |(_, b)| *b);
+        Some(self.cum_bytes.saturating_sub(base) as f64 / (1024.0 * 1024.0) / DETECT_WINDOW_S)
+    }
+
+    /// Record an arrival; may fire the COLLAPSE trigger.
+    fn arrival(&mut self, bytes: u64, now_s: f64) -> Result<(), SlipstreamError> {
+        self.starve_secs = 0;
+        self.cum_bytes += bytes;
+        self.samples.push((now_s, self.cum_bytes));
+        let Some(rate) = self.window_mbps(now_s) else { return Ok(()) };
+        if rate > self.best_window_mbps {
+            self.best_window_mbps = rate;
+        }
+        if !self.warmed_up(now_s) {
+            return Ok(());
+        }
+        let relative_floor = self.arm.collapse_fraction * self.best_window_mbps;
+        let collapsed = (rate < relative_floor && rate < self.arm.painful_mbps)
+            || rate < self.arm.floor_mbps;
+        if collapsed {
+            return Err(SlipstreamError::WireCollapse {
+                measured_mbps: rate,
+                floor_mbps: relative_floor.min(self.arm.painful_mbps).max(self.arm.floor_mbps),
+            });
+        }
+        Ok(())
+    }
+
+    /// Record one second recv-blocked with zero arrivals; may fire STALL.
+    fn starve_tick(&mut self, now_s: f64) -> Result<(), SlipstreamError> {
+        self.starve_secs += 1;
+        if self.warmed_up(now_s) && self.starve_secs >= self.arm.stall_secs {
+            return Err(SlipstreamError::WireCollapse {
+                measured_mbps: 0.0,
+                floor_mbps: self.arm.floor_mbps,
+            });
+        }
+        Ok(())
+    }
+}
+
 // ── T6.8-S reorder/release stage ───────────────────────────────────────────────
 
 #[derive(Debug, Default)]
@@ -479,6 +659,10 @@ struct ReleaseSummary {
     bytes: u64,
     /// Plan chunks fully released (`is_last` seen) — completeness-check input.
     plans_released: u64,
+    /// [v0.7 P0] (secs since fetch begin, cumulative bytes) at every
+    /// sub-chunk ARRIVAL (not ordered release — a sub-chunk parked in the
+    /// reorder buffer already crossed the wire).
+    wire_samples: Vec<(f64, u64)>,
 }
 
 /// Reorder stage: receives sub-chunks in any cross-worker order and releases
@@ -491,6 +675,8 @@ async fn release_ordered(
     queue: &ChunkQueueSender,
     progress: Option<&Arc<Progress>>,
     floor: &AtomicU64,
+    started: Instant,
+    failover: Option<WireFailoverArm>,
 ) -> Result<ReleaseSummary, SlipstreamError> {
     let mut summary = ReleaseSummary::default();
     let mut continuity = Continuity::default();
@@ -500,8 +686,32 @@ async fn release_ordered(
     let mut emitted_chunks: u64 = 0;
     // Per-plan-chunk split accounting for the info! summary line.
     let (mut plan_subs, mut plan_blocks, mut plan_bytes) = (0u64, 0u64, 0u64);
+    // [v0.7 P0] cumulative wire bytes at arrival, for the health timeline.
+    let mut wire_cum: u64 = 0;
+    // [v0.7 P2] armed only when the engine has somewhere to fail over TO.
+    let mut detector = failover.map(WireDetector::new);
 
-    while let Some(sub) = rx.recv().await {
+    loop {
+        // Sliced recv: every full second spent HERE is recv-blocked time —
+        // wire-attributed by construction (scan backpressure blocks this
+        // stage in `queue.send` below, never here).
+        let sub = loop {
+            match tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) => break None,
+                Err(_) => {
+                    if let Some(d) = detector.as_mut() {
+                        d.starve_tick(started.elapsed().as_secs_f64())?;
+                    }
+                }
+            }
+        };
+        let Some(sub) = sub else { break };
+        wire_cum += sub.bytes as u64;
+        summary.wire_samples.push((started.elapsed().as_secs_f64(), wire_cum));
+        if let Some(d) = detector.as_mut() {
+            d.arrival(sub.bytes as u64, started.elapsed().as_secs_f64())?;
+        }
         pending.insert((sub.plan_index, sub.sub_index), sub);
         while let Some(sub) = pending.remove(&next) {
             let SubChunk { plan_index, is_last, bytes, blocks, permit, .. } = sub;
@@ -593,7 +803,9 @@ pub async fn run_fetch(
         }
     };
 
-    let summary = match release_ordered(&mut rx, &queue, progress.as_ref(), &floor).await {
+    let summary = match release_ordered(&mut rx, &queue, progress.as_ref(), &floor, started, plan.failover)
+        .await
+    {
         Ok(s) => s,
         Err(e) => {
             abort_all(&handles);
@@ -611,12 +823,18 @@ pub async fn run_fetch(
             summary.plans_released
         )));
     }
-    let stats =
-        FetchStats { blocks: summary.blocks, bytes: summary.bytes, elapsed: started.elapsed() };
+    let stats = FetchStats {
+        blocks: summary.blocks,
+        bytes: summary.bytes,
+        elapsed: started.elapsed(),
+        wire_samples: summary.wire_samples,
+    };
     info!(
         blocks = stats.blocks,
         mb = stats.bytes / (1024 * 1024),
         elapsed_s = stats.elapsed.as_secs(),
+        wire_mbps = format!("{:.1}", stats.megabytes_per_sec()).as_str(),
+        wire_worst_5s_mbps = format!("{:.1}", stats.worst_window_mbps(5.0)).as_str(),
         "fetch done"
     );
     Ok(stats)
@@ -969,6 +1187,100 @@ mod tests {
         assert!(got.is_none(), "now-floor worker proceeds without a permit");
     }
 
+    // ── v0.7 P2: wire-collapse detector (clock-free trigger matrix) ────────────
+
+    /// Feed `mbps` for `secs` seconds starting at `t0` (1 arrival/second).
+    fn feed(d: &mut WireDetector, mbps: f64, t0: f64, secs: u64) -> Result<(), SlipstreamError> {
+        let bytes = (mbps * 1024.0 * 1024.0) as u64;
+        for i in 0..secs {
+            d.arrival(bytes, t0 + i as f64 + 1.0)?;
+        }
+        Ok(())
+    }
+
+    /// The hotel shape: steady-slow never fires — a pass at its own
+    /// baseline means the ACCESS network binds; switching cannot help.
+    #[test]
+    fn detector_steady_slow_never_fires() {
+        let mut d = WireDetector::new(WireFailoverArm::default());
+        feed(&mut d, 2.3, 0.0, 120).expect("steady 2.3 MB/s must never fire");
+    }
+
+    /// Healthy → collapsed (the P4 mid-pass gate's shape) fires within
+    /// roughly one detection window of the collapse.
+    #[test]
+    fn detector_fires_on_healthy_to_collapse() {
+        let mut d = WireDetector::new(WireFailoverArm::default());
+        feed(&mut d, 14.0, 0.0, 30).expect("healthy phase");
+        let err = feed(&mut d, 0.5, 30.0, 30).expect_err("collapse must fire");
+        assert!(matches!(err, SlipstreamError::WireCollapse { .. }), "{err}");
+    }
+
+    /// A drop that is still comfortable (20 → 3 MB/s, above painful_mbps)
+    /// must NOT fire — switching for a usable rate is churn.
+    #[test]
+    fn detector_no_overreaction_above_painful() {
+        let mut d = WireDetector::new(WireFailoverArm::default());
+        feed(&mut d, 20.0, 0.0, 30).expect("healthy phase");
+        feed(&mut d, 3.0, 30.0, 60).expect("3 MB/s is usable — no fire");
+    }
+
+    /// Full stall: N consecutive recv-starved seconds fire; N−1 do not.
+    #[test]
+    fn detector_stall_threshold_exact() {
+        let arm = WireFailoverArm::default();
+        let mut d = WireDetector::new(arm);
+        feed(&mut d, 10.0, 0.0, 20).expect("warmup");
+        for i in 0..arm.stall_secs - 1 {
+            d.starve_tick(20.0 + i as f64).expect("below threshold");
+        }
+        let err = d.starve_tick(20.0 + arm.stall_secs as f64).expect_err("stall fires at N");
+        assert!(
+            matches!(err, SlipstreamError::WireCollapse { measured_mbps, .. } if measured_mbps == 0.0)
+        );
+    }
+
+    /// A healthy-sized arrival resets the starve counter — reconnect blips
+    /// survive as long as the delivered rate stays usable (an arrival too
+    /// SMALL to keep the window above the painful floor is itself a
+    /// collapse, by design — the sibling test above proves that fires).
+    #[test]
+    fn detector_arrival_resets_starve() {
+        let arm = WireFailoverArm::default();
+        let mut d = WireDetector::new(arm);
+        feed(&mut d, 10.0, 0.0, 20).expect("warmup");
+        for round in 0..3u64 {
+            let base = 20.0 + round as f64 * 12.0;
+            for i in 0..arm.stall_secs - 1 {
+                d.starve_tick(base + i as f64).expect("below threshold");
+            }
+            // 40 MB after the gap keeps the 10 s window comfortably usable.
+            d.arrival(40 * 1024 * 1024, base + (arm.stall_secs - 1) as f64)
+                .expect("healthy blip arrival");
+        }
+    }
+
+    /// Nothing fires before warmup — a slow connect/ramp is not a collapse.
+    #[test]
+    fn detector_silent_before_warmup() {
+        let mut d = WireDetector::new(WireFailoverArm::default());
+        // 10 s of trickle + 11 starves, all inside the warmup horizon.
+        feed(&mut d, 0.05, 0.0, 10).expect("pre-warmup trickle");
+        for i in 0..11u64 {
+            d.starve_tick(10.0 + i as f64).expect("pre-warmup starves");
+        }
+    }
+
+    /// The unconditional floor: a pass that never had a healthy best window
+    /// still fires once the rate is below floor_mbps (unusable everywhere).
+    #[test]
+    fn detector_absolute_floor_fires() {
+        let mut d = WireDetector::new(WireFailoverArm::default());
+        // 0.1 MB/s from the start: warmup needs >4 MiB, so ~45 s in.
+        let err = feed(&mut d, 0.1, 0.0, 120).expect_err("sub-floor trickle must fire");
+        assert!(matches!(err, SlipstreamError::WireCollapse { .. }));
+    }
+
     // ── release_ordered ────────────────────────────────────────────────────────
 
     fn sub(plan_index: u64, sub_index: u64, is_last: bool, blocks: Vec<CompactBlock>) -> SubChunk {
@@ -999,7 +1311,7 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor).await.expect("release");
+        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None).await.expect("release");
         assert_eq!(summary.plans_released, 3);
         assert_eq!(summary.blocks, 60);
         drop(qtx);
@@ -1031,7 +1343,7 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor).await.expect("release");
+        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None).await.expect("release");
         assert_eq!(summary.plans_released, 2);
         drop(qtx);
         let mut released_heights = Vec::new();
@@ -1052,7 +1364,7 @@ mod tests {
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let err = release_ordered(&mut rx, &qtx, None, &floor)
+        let err = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
             .await
             .expect_err("gap must fail");
         assert!(matches!(err, SlipstreamError::Discontinuity { at: 200, .. }), "got: {err}");

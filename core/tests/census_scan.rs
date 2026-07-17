@@ -72,7 +72,6 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
             ..Default::default()
         };
         blocks.push(CompactBlock {
-            proto_version: 0,
             height,
             hash: h32(0xBB, height),
             prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
@@ -82,6 +81,7 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
             chain_metadata: Some(ChainMetadata {
                 sapling_commitment_tree_size: tree_size,
                 orchard_commitment_tree_size: 0,
+                ironwood_commitment_tree_size: 0,
             }),
         });
     }

@@ -194,16 +194,6 @@ impl EndoTable {
         pallas::Point::from(self.t1[0])
     }
 
-    /// [v0.6 P8] {1,3,5,7}·P for the GLV-lockstep kernel's bulk extract.
-    pub(crate) fn t1(&self) -> &[pallas::Affine; 4] {
-        &self.t1
-    }
-
-    /// [v0.6 P8] {1,3,5,7}·φ(P) for the GLV-lockstep kernel's bulk extract.
-    pub(crate) fn t2(&self) -> &[pallas::Affine; 4] {
-        &self.t2
-    }
-
     /// Solo build (per-item preparation and [`mul_endo`]): one 4-point
     /// batch normalization — exactly the ladder's historical per-call cost.
     pub(crate) fn from_point(p: &pallas::Point) -> Self {

@@ -2,7 +2,9 @@
 
 > For Zcash protocol / cryptographic engineers. This is a **map** — where to look and why — not a
 > tutorial. Prose deep-dives live in `docs/book/` (open `index.html`); build journals in `docs/plans/`.
-> The engine consumes **published** librustzcash (crates.io, no forks). It adds *scheduling,
+> The engine consumes **canonical** librustzcash — crates.io releases where published; the
+> Ironwood-era family rides `[patch.crates-io]` onto `zcash/librustzcash` main at a pinned rev
+> (see `Cargo.toml`), never a third-party fork. It adds *scheduling,
 > persistence shape, and transport policy* — **not cryptography**.
 
 ## TL;DR
@@ -36,7 +38,7 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `lookup_build.rs` | v0.4: the shared lookup-build machinery (precompute map → verbatim `from_iter` → convert) parameterized by a batch-combine fn; routes batch > gpu > scalar. |
 | `batch_ecdh.rs` | v0.5: C0 measurement probe (DH = 92.4% of compact decrypt) + the shared wired A/B harness (`wired_decrypt_ab`) proving batch/endo levers byte-identical through the real `ka_agree_dec` seam + `endo_bench`. |
 | `treestate.rs` | v0.5 (parked, default OFF): local running-frontier treestate derivation + off-path server audit + process fuse — built, audited byte-identical, measured out (naive per-leaf absorb costs more than the RTT it saves); revival path = batch-affine bulk absorb. |
-| `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut. |
+| `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut; v0.7 P2: clock-free wire-collapse detector (STALL/COLLAPSE triggers) + bounded (≤ 2) mid-pass failover. |
 | `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**). |
 | `connector.rs` | Per-call Tor policy (`ConnPurpose` → circuit); `TorConn` bootstrap; bounded circuit-build + retry-on-fresh-circuit. |
 | `grpc.rs` | lightwalletd tonic client; unary/stream helpers + deadlines; `retry_get_tree_state`. |
@@ -52,9 +54,13 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `ffi_handle.rs` | `SlipstreamHandle` (runtime + state + event ring), `SyncState`, `FfiSlipstreamSnapshot/Event`, `spawn_supervised` (panic → `Error`). |
 | `oracle.rs` | `semantic_diff` — row/byte-level `data.db` equivalence vs the upstream path. |
 | `verify.rs` | Server / scan-continuity validation. |
-| `config.rs` | `EngineConfig` (tunables, device-memory derate), `Endpoint`. |
-| `vendor/orchard` (fork) | v0.5: pinned 0.14.0 + `batch_dh.rs` (lockstep kernel, kept as instrument/record: fire-stats counters + cross-thread DH timer) + `endo.rs` (GLV decomposition, φ-mapped wNAF table, half-width Straus ladder — 300k-verified constants re-proven in-crate, default path since 2026-07-06) + the runtime toggles (`set_enabled`). |
-| `vendor/zcash_note_encryption` (fork) | v0.5: pinned 0.4.1 + the `BatchDomain::batch_ka_agree_dec` seam (default = per-item byte-for-byte). |
+| `config.rs` | `EngineConfig` (tunables, device-memory derate, `alternate_endpoints`, `anchor_retention_height`), `Endpoint`. |
+| `probe.rs` | v0.7 P1: endpoint probing/racing across `EngineConfig.alternate_endpoints` — picks a healthy server before a pass and feeds the mid-pass failover loop. |
+| `throttle.rs` | v0.7 P0: local TCP throttle proxy (token bucket) — the test-only "weather machine" for simulating sick servers; never on a production path. |
+| `network.rs` | `SlipstreamNetwork` — custom consensus params / activation heights (CLI `--custom-heights`, `--network test`) for exercising Ironwood/NU6.3 against modified-parameter chains pre-activation. |
+| `vendor_shim.rs` | Compatibility shim covering what the un-membered 0.14-based vendor forks used to provide directly, now that the workspace rides orchard 0.15. |
+| `vendor/orchard` (fork, un-membered on the 0.15 graph — standalone KATs only) | v0.5: pinned 0.14.0 + `endo.rs` (GLV decomposition, φ-mapped wNAF table, half-width Straus ladder — 300k-verified constants re-proven in-crate) + the runtime toggles (`set_enabled`); the dead-end lockstep `batch_dh.rs` kernel was removed in v0.6.2. |
+| `vendor/zcash_note_encryption` (fork, un-membered on the 0.15 graph — standalone KATs only) | v0.5: the `BatchDomain::batch_ka_agree_dec` seam (default = per-item byte-for-byte); re-synced verbatim to upstream `release/0.4.2` in v0.6.2. |
 | `error.rs` | `SlipstreamError` + `is_transient` (drives every retry decision). |
 
 `gpuhash/` (crate `slipstream-gpuhash`, cargo feature `gpu`, **default-off**) — wgpu Orchard Sinsemilla

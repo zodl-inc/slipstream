@@ -29,6 +29,17 @@ pub enum SlipstreamError {
     /// (zcash_client_backend-0.22.0/src/sync.rs:404).
     #[error("scan continuity break at height {at}")]
     ScanContinuity { at: u32 },
+
+    /// [v0.7 P2] The wire-collapse detector fired: the CURRENT endpoint's
+    /// throughput fell below the failover floor for a sustained window (or
+    /// the reorder stage starved with zero arrivals) while the scan side was
+    /// keeping up — i.e. the server's doing, not backpressure. The engine's
+    /// failover loop catches this (only ever raised when alternates are
+    /// configured), cools the endpoint down, re-probes, and resumes from the
+    /// wallet DB. `measured_mbps` is the offending window's rate (0.0 for a
+    /// full stall).
+    #[error("wire collapse: {measured_mbps:.2} MB/s sustained (floor {floor_mbps:.2})")]
+    WireCollapse { measured_mbps: f64, floor_mbps: f64 },
 }
 
 impl SlipstreamError {
@@ -44,6 +55,8 @@ impl SlipstreamError {
     /// - `Discontinuity`   → false     (fetch continuity bug; retry would loop)
     /// - `MisbehavingServer` → false   (bad proto / decode error; not a transport transient)
     /// - `Stopped`         → false     (engine lifecycle; not retryable)
+    /// - `WireCollapse`    → false     (handled by the v0.7 failover loop — the generic
+    ///   transient-reconnect path would dial the SAME collapsed server again)
     pub fn is_transient(&self) -> bool {
         matches!(self, SlipstreamError::Transport(_))
     }

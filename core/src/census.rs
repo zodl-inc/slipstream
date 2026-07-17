@@ -95,6 +95,17 @@ pub struct BenchSummary {
     pub engine_build: &'static str,
     pub total_s: f64,
     pub fetch_s: f64,
+    /// [v0.7 P0] Pass-average wire throughput (wire bytes / fetch wall, MB/s).
+    pub wire_mbps_avg: f64,
+    /// [v0.7 P0] Worst sustained 5 s wire window across ranges (MB/s;
+    /// 0.0 = no full window). The collapse-detection signal — interpret
+    /// beside `scan_recv_wait_s` (ahead-gate caveat in fetch.rs).
+    pub wire_worst_5s_mbps: f64,
+    /// [v0.7 P1] Endpoint-probe wall time (0.0 = no alternates configured /
+    /// Tor pass — probe skipped).
+    pub wire_probe_ms: f64,
+    /// [v0.7 P2] Mid-pass wire failovers performed (0 = none needed).
+    pub wire_switches: u64,
     pub scan_s: f64,
     pub enhance_s: f64,
     pub persist_wait_s: f64,
@@ -160,10 +171,6 @@ pub struct BenchSummary {
     pub persist_rows_s: f64,
     /// v0.6 P4: the rows prologue sub-split (block-meta INSERTs / nullifier
     /// tracking / decrypted-tx section / gap-addresses + prune).
-    pub persist_rows_block_meta_s: f64,
-    pub persist_rows_nf_s: f64,
-    pub persist_rows_txs_s: f64,
-    pub persist_rows_gap_s: f64,
     pub persist_tree_join_s: f64,
     pub persist_flush_s: f64,
     pub persist_downgrade_s: f64,
@@ -192,10 +199,14 @@ impl BenchSummary {
             )
         }
         format!(
-            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_dh_calls\":{},\"batch_dh_lanes\":{},\"batch_dh_kernel_lanes\":{},\"batch_dh_s\":{},\"batch_dh_wall_s\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_rows_block_meta_s\":{},\"persist_rows_nf_s\":{},\"persist_rows_txs_s\":{},\"persist_rows_gap_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_frontier_s\":{},\"persist_insert_s\":{},\"persist_ensure_s\":{},\"persist_downgraded\":{},\"endo_calls\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
+            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"wire_mbps_avg\":{},\"wire_worst_5s_mbps\":{},\"wire_probe_ms\":{},\"wire_switches\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_dh_calls\":{},\"batch_dh_lanes\":{},\"batch_dh_kernel_lanes\":{},\"batch_dh_s\":{},\"batch_dh_wall_s\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_frontier_s\":{},\"persist_insert_s\":{},\"persist_ensure_s\":{},\"persist_downgraded\":{},\"endo_calls\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
             self.engine_build,
             self.total_s,
             self.fetch_s,
+            self.wire_mbps_avg,
+            self.wire_worst_5s_mbps,
+            self.wire_probe_ms,
+            self.wire_switches,
             self.scan_s,
             self.enhance_s,
             self.persist_wait_s,
@@ -222,10 +233,6 @@ impl BenchSummary {
             self.scan_pass2_s,
             self.persist_calls,
             self.persist_rows_s,
-            self.persist_rows_block_meta_s,
-            self.persist_rows_nf_s,
-            self.persist_rows_txs_s,
-            self.persist_rows_gap_s,
             self.persist_tree_join_s,
             self.persist_flush_s,
             self.persist_downgrade_s,
@@ -293,11 +300,20 @@ mod tests {
 
     #[test]
     fn bench_summary_json_shape() {
-        let pool = PoolCensusOut { shards: 3, noted_shards: 1, commitments: 42, graftable_fraction: 0.5 };
+        let pool = PoolCensusOut {
+            shards: 3,
+            noted_shards: 1,
+            commitments: 42,
+            graftable_fraction: 0.5,
+        };
         let s = BenchSummary {
             engine_build: "test-build",
             total_s: 1.5,
             fetch_s: 0.25,
+            wire_mbps_avg: 12.5,
+            wire_worst_5s_mbps: 8.0,
+            wire_probe_ms: 850.0,
+            wire_switches: 1,
             scan_s: 1.0,
             enhance_s: 0.125,
             persist_wait_s: 0.0,
@@ -324,10 +340,6 @@ mod tests {
             scan_pass2_s: 0.65,
             persist_calls: 30,
             persist_rows_s: 0.5,
-            persist_rows_block_meta_s: 0.2,
-            persist_rows_nf_s: 0.15,
-            persist_rows_txs_s: 0.05,
-            persist_rows_gap_s: 0.02,
             persist_tree_join_s: 0.9,
             persist_flush_s: 0.1,
             persist_downgrade_s: 0.2,
@@ -349,6 +361,10 @@ mod tests {
         for key in [
             "\"engine_build\":\"test-build\"",
             "\"total_s\":1.5",
+            "\"wire_mbps_avg\":12.5",
+            "\"wire_worst_5s_mbps\":8",
+            "\"wire_probe_ms\":850",
+            "\"wire_switches\":1",
             "\"blocks\":100",
             "\"batch_dh_kernel_lanes\":690",
             "\"batch_dh_wall_s\":0.35",

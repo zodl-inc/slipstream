@@ -66,3 +66,7 @@ default-features = false
 alloc = []
 default = ["alloc"]
 pre-zip-212 = []
+
+# [P8-strip gate] standalone workspace root so the fork builds/tests outside
+# the monorepo workspace (which no longer lists the vendor forks as members).
+[workspace]

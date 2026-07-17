@@ -63,7 +63,11 @@ impl DiffReport {
                 let _ = writeln!(
                     out,
                     "  DIFF {:40} A={} B={} (+A {} / +B {})",
-                    t.table, t.rows_a, t.rows_b, t.only_in_a.len(), t.only_in_b.len()
+                    t.table,
+                    t.rows_a,
+                    t.rows_b,
+                    t.only_in_a.len(),
+                    t.only_in_b.len()
                 );
                 for r in t.only_in_a.iter().take(5) {
                     let _ = writeln!(out, "       only-in-A: {r}");
@@ -132,11 +136,11 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, Slipstre
 /// frontier at each call, so even two UPSTREAM syncs with different chunk sizes
 /// disagree on which below-window rows linger. The contract compared here is
 /// therefore WINDOWED: both sides are normalized to rows at or above
-/// `max(block_height across A∪B) − NULLIFIER_PRUNE_DEPTH` — everything any
-/// read (`detect_*_spend`, `slipstream_v_tx_reconciled`) can ever consult —
-/// and STRICT equality is required inside that window. Slipstream's
-/// skip-below-window tracking (persist.rs `track_floor`) elides exactly the
-/// below-window residue that upstream's own next prune would delete.
+/// `max(block_height across A∪B) − NULLIFIER_MAP_RETENTION_BLOCKS` — everything
+/// any read (`detect_*_spend`, `slipstream_v_tx_reconciled`) can ever consult —
+/// and STRICT equality is required inside that window. The skip-below-window
+/// tracking lives INSIDE upstream `put_blocks_rows` since #2604, keyed on the
+/// same public retention constant used here.
 const TRANSIENT_WINDOW_TABLES: &[&str] = &["nullifier_map", "tx_locator_map"];
 
 fn transient_window_floor(
@@ -152,9 +156,9 @@ fn transient_window_floor(
         )
         .map_err(|e| wallet_err("max height", e))
     };
-    Ok(max_of(a)?
-        .max(max_of(b)?)
-        .map(|h| h.saturating_sub(crate::persist::NULLIFIER_PRUNE_DEPTH)))
+    Ok(max_of(a)?.max(max_of(b)?).map(|h| {
+        h.saturating_sub(zcash_client_backend::data_api::ll::wallet::NULLIFIER_MAP_RETENTION_BLOCKS)
+    }))
 }
 
 fn row_multiset(
@@ -312,22 +316,28 @@ pub mod testkit {
                 index: 0,
                 txid: h32(0x77, height),
                 fee: 0,
-                spends: vec![CompactSaplingSpend { nf: h32(0x4F, height) }],
+                spends: vec![CompactSaplingSpend {
+                    nf: h32(0x4F, height),
+                }],
                 outputs,
                 actions: vec![],
                 ..Default::default()
             };
             blocks.push(CompactBlock {
-                proto_version: 0,
                 height,
                 hash: h32(0xBB, height),
-                prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
+                prev_hash: if i == 0 {
+                    vec![0u8; 32]
+                } else {
+                    h32(0xBB, height - 1)
+                },
                 time: height as u32,
                 header: vec![],
                 vtx: vec![tx],
                 chain_metadata: Some(ChainMetadata {
                     sapling_commitment_tree_size: tree_size,
                     orchard_commitment_tree_size: 0,
+                    ironwood_commitment_tree_size: 0,
                 }),
             });
         }
@@ -346,11 +356,7 @@ pub mod testkit {
     /// `ensure_checkpoints` fill non-empty (the sandblasting-era regression
     /// vector). cmu streams are the deterministic counters `synth_chain_state`
     /// replays: sapling `cmu(1..)`, orchard `cmu(2_000_000 + k)`.
-    pub fn synth_blocks_dual(
-        count: u64,
-        orch_per_block: u32,
-        sap_every: u64,
-    ) -> Vec<CompactBlock> {
+    pub fn synth_blocks_dual(count: u64, orch_per_block: u32, sap_every: u64) -> Vec<CompactBlock> {
         let mut blocks = Vec::with_capacity(count as usize);
         let mut sap_tree_size: u32 = 0;
         let mut orch_tree_size: u32 = 0;
@@ -393,16 +399,20 @@ pub mod testkit {
                 ..Default::default()
             };
             blocks.push(CompactBlock {
-                proto_version: 0,
                 height,
                 hash: h32(0xBB, height),
-                prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
+                prev_hash: if i == 0 {
+                    vec![0u8; 32]
+                } else {
+                    h32(0xBB, height - 1)
+                },
                 time: height as u32,
                 header: vec![],
                 vtx: vec![tx],
                 chain_metadata: Some(ChainMetadata {
                     sapling_commitment_tree_size: sap_tree_size,
                     orchard_commitment_tree_size: orch_tree_size,
+                    ironwood_commitment_tree_size: 0,
                 }),
             });
         }
@@ -448,6 +458,9 @@ pub mod testkit {
             orchard::value::NoteValue::from_raw(value_zat),
             rho,
             rseed,
+            // [IW-2b] orchard 0.15 notes carry a version; darkside fixtures
+            // fabricate vanilla (pre-ironwood) orchard notes.
+            orchard::note::NoteVersion::V2,
         )
         .expect("note parts are consistent by construction");
         let cmx = orchard::note::ExtractedNoteCommitment::from(note.commitment()).to_bytes();
@@ -456,7 +469,12 @@ pub mod testkit {
         let full = enc.encrypt_note_plaintext();
         let full: &[u8] = full.as_ref();
         let ciphertext = full[..52].to_vec();
-        OwnedOrchardAction { nullifier: rho_bytes, cmx, ephemeral_key, ciphertext }
+        OwnedOrchardAction {
+            nullifier: rho_bytes,
+            cmx,
+            ephemeral_key,
+            ciphertext,
+        }
     }
 
     /// Deterministic synthetic ORCHARD chain (v0.4 T10b): `count` linked blocks
@@ -509,16 +527,20 @@ pub mod testkit {
                 ..Default::default()
             };
             blocks.push(CompactBlock {
-                proto_version: 0,
                 height,
                 hash: h32(0xBB, height),
-                prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
+                prev_hash: if i == 0 {
+                    vec![0u8; 32]
+                } else {
+                    h32(0xBB, height - 1)
+                },
                 time: height as u32,
                 header: vec![],
                 vtx: vec![tx],
                 chain_metadata: Some(ChainMetadata {
                     sapling_commitment_tree_size: 0,
                     orchard_commitment_tree_size: tree_size,
+                    ironwood_commitment_tree_size: 0,
                 }),
             });
         }
@@ -554,7 +576,10 @@ pub mod testkit {
         chunk_size: usize,
         sparse: bool,
     ) -> Result<(), SlipstreamError> {
-        let lens: Vec<usize> = blocks.chunks(chunk_size).map(<[CompactBlock]>::len).collect();
+        let lens: Vec<usize> = blocks
+            .chunks(chunk_size)
+            .map(<[CompactBlock]>::len)
+            .collect();
         scan_synthetic_windows(dir, blocks, &lens, sparse)
     }
 
@@ -619,7 +644,9 @@ pub mod testkit {
                     &from_state,
                     window.len(),
                 )
-                .map_err(|e| SlipstreamError::Wallet(format!("scan_cached_blocks (sparse): {e}")))?;
+                .map_err(|e| {
+                    SlipstreamError::Wallet(format!("scan_cached_blocks (sparse): {e}"))
+                })?;
             } else {
                 scan_cached_blocks(
                     &network,
@@ -655,11 +682,9 @@ pub mod testkit {
     ) -> Result<(), SlipstreamError> {
         // verify_sample=1 (audit-every) — audited grafts BUILD, so these callers
         // exercise the full build path even with graft on (the Task 7 gate shape).
-        scan_synthetic_windows_write_behind_with(dir, blocks, window_lens, graft, 1, |_, _| {
-            Ok(())
-        })
-        .await
-        .map(|_| ())
+        scan_synthetic_windows_write_behind_with(dir, blocks, window_lens, graft, 1, |_, _| Ok(()))
+            .await
+            .map(|_| ())
     }
 
     /// v0.4 T10b: [`scan_synthetic_windows_write_behind`] plus a `prepare` hook that
@@ -683,7 +708,13 @@ pub mod testkit {
         prepare: impl FnOnce(&mut WalletSession, &TreeState) -> Result<(), SlipstreamError>,
     ) -> Result<((u64, u64), (u64, u64)), SlipstreamError> {
         scan_synthetic_windows_write_behind_with_tip(
-            dir, blocks, window_lens, graft, graft_verify_sample, None, prepare,
+            dir,
+            blocks,
+            window_lens,
+            graft,
+            graft_verify_sample,
+            None,
+            prepare,
         )
         .await
     }
@@ -726,16 +757,16 @@ pub mod testkit {
         // Seed the facade under the no-pending barrier; open the lane's own
         // connection — exactly as scan.rs::scan_chunks does.
         let range_start = blocks.first().map_or(SYNTH_START, |b| b.height);
-        let mut facade =
-            crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
-                .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
+        let mut facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
+            .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
         let mut lane = crate::persist::PersistLane::open(
             &db_path,
-            crate::Network::MainNetwork,
+            crate::network::SlipstreamNetwork::MAIN,
             1,
             graft,
             graft_verify_sample,
             false,
+            None, // [B6] darkside fixtures: retention off
         )?;
 
         let mut from_state = birthday_ts
@@ -825,17 +856,27 @@ pub mod testkit {
             .first()
             .map(|b| b.height)
             .ok_or_else(|| SlipstreamError::Wallet("empty resume tail".into()))?;
-        let mut facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
-            .map_err(|e| SlipstreamError::Wallet(format!("resume write-behind seed: {e}")))?;
-        let mut lane =
-            crate::persist::PersistLane::open(&db_path, crate::Network::MainNetwork, 1, graft, 1, false)?;
+        let mut facade =
+            crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
+                .map_err(|e| SlipstreamError::Wallet(format!("resume write-behind seed: {e}")))?;
+        let mut lane = crate::persist::PersistLane::open(
+            &db_path,
+            crate::network::SlipstreamNetwork::MAIN,
+            1,
+            graft,
+            1,
+            false,
+            None,
+        )?;
         let mut from_state = synth_chain_state(&blocks[resume_at - 1])?;
         let mut offset = 0usize;
         let mut result: Result<(), SlipstreamError> = Ok(());
         for len in window_lens {
             let window = &tail[offset..offset + len];
             offset += len;
-            let (Some(first), Some(last)) = (window.first(), window.last()) else { continue };
+            let (Some(first), Some(last)) = (window.first(), window.last()) else {
+                continue;
+            };
             let from_height = match u32::try_from(first.height) {
                 Ok(h) => h,
                 Err(_) => {
@@ -854,8 +895,9 @@ pub mod testkit {
                 &from_state,
                 window.len(),
             ) {
-                result =
-                    Err(SlipstreamError::Wallet(format!("scan_cached_blocks (resume): {e}")));
+                result = Err(SlipstreamError::Wallet(format!(
+                    "scan_cached_blocks (resume): {e}"
+                )));
                 break;
             }
             if let Some(pending) = facade.take_stash()
@@ -936,6 +978,9 @@ pub mod testkit {
             zcash_primitives::block::BlockHash(hash),
             frontier,
             orch_frontier,
+            // [IW-2b] ironwood-era ChainState carries a third frontier; darkside
+            // fixture chains have no ironwood outputs.
+            Frontier::empty(),
         ))
     }
 }
@@ -949,8 +994,11 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT); CREATE TABLE u (x BLOB);")
             .expect("schema");
         for (a, b) in rows {
-            conn.execute("INSERT INTO t (a, b) VALUES (?1, ?2)", rusqlite::params![a, b])
-                .expect("insert");
+            conn.execute(
+                "INSERT INTO t (a, b) VALUES (?1, ?2)",
+                rusqlite::params![a, b],
+            )
+            .expect("insert");
         }
     }
 
@@ -962,7 +1010,11 @@ mod tests {
         mk_db(&pa, &[(1, "x"), (2, "y")]);
         mk_db(&pb, &[(2, "y"), (1, "x")]); // insertion order must not matter
         let report = semantic_diff(&pa, &pb).expect("diff");
-        assert!(report.is_clean(), "expected clean diff:\n{}", report.render());
+        assert!(
+            report.is_clean(),
+            "expected clean diff:\n{}",
+            report.render()
+        );
     }
 
     #[test]
@@ -974,7 +1026,11 @@ mod tests {
         mk_db(&pb, &[(1, "x"), (2, "z")]);
         let report = semantic_diff(&pa, &pb).expect("diff");
         assert!(!report.is_clean());
-        let t = report.tables.iter().find(|t| t.table == "t").expect("table t");
+        let t = report
+            .tables
+            .iter()
+            .find(|t| t.table == "t")
+            .expect("table t");
         assert_eq!(t.only_in_a.len(), 1);
         assert_eq!(t.only_in_b.len(), 1);
         assert!(t.only_in_a[0].contains("'y'"));
@@ -988,7 +1044,11 @@ mod tests {
         mk_db(&pa, &[(1, "x"), (1, "x")]);
         mk_db(&pb, &[(1, "x")]);
         let report = semantic_diff(&pa, &pb).expect("diff");
-        let t = report.tables.iter().find(|t| t.table == "t").expect("table t");
+        let t = report
+            .tables
+            .iter()
+            .find(|t| t.table == "t")
+            .expect("table t");
         assert!(!t.is_clean());
         assert_eq!(t.rows_a, 2);
         assert_eq!(t.rows_b, 1);
@@ -1001,7 +1061,8 @@ mod tests {
         let pb = dir.path().join("b.db");
         mk_db(&pa, &[(1, "x")]);
         let conn = Connection::open(&pb).expect("open");
-        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT);").expect("schema");
+        conn.execute_batch("CREATE TABLE t (a INTEGER, b TEXT);")
+            .expect("schema");
         // table `u` missing in B entirely
         let report = semantic_diff(&pa, &pb).expect("diff");
         assert!(report.tables.iter().any(|t| t.table == "u"));
@@ -1022,7 +1083,11 @@ mod tests {
         super::testkit::scan_synthetic(&da, blocks.clone(), 10, false).expect("scan A");
         super::testkit::scan_synthetic(&db, blocks, 10, false).expect("scan B");
         let report = semantic_diff(&da.join("data.db"), &db.join("data.db")).expect("diff");
-        assert!(report.is_clean(), "upstream self-diff not clean:\n{}", report.render());
+        assert!(
+            report.is_clean(),
+            "upstream self-diff not clean:\n{}",
+            report.render()
+        );
     }
 
     /// T6.3b hermetic identity proof: the SAME synthetic chain scanned through
@@ -1094,8 +1159,16 @@ mod tests {
         if let Some((sub, _bytes)) = splitter.finish() {
             lens.push(sub.len());
         }
-        assert!(lens.len() >= 30, "dense chain must split into many sub-chunks, got {}", lens.len());
-        assert_eq!(lens.iter().sum::<usize>(), blocks.len(), "no block lost by the splitter");
+        assert!(
+            lens.len() >= 30,
+            "dense chain must split into many sub-chunks, got {}",
+            lens.len()
+        );
+        assert_eq!(
+            lens.iter().sum::<usize>(),
+            blocks.len(),
+            "no block lost by the splitter"
+        );
 
         super::testkit::scan_synthetic_windows(&da, blocks.clone(), &lens, false)
             .expect("upstream scan at split boundaries");
@@ -1188,7 +1261,9 @@ mod tests {
         // The buffer table must be fully drained on the ON side...
         let conn = rusqlite::Connection::open(don.join("data.db")).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+                r.get(0)
+            })
             .expect("buffer count");
         assert_eq!(left, 0, "buffer rows must be cleaned after build/finish");
         // ...and must not EXIST on the OFF side (flag-off writes nothing new).
@@ -1259,7 +1334,9 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(restarted.join("data.db")).expect("open");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+                r.get(0)
+            })
             .expect("buffer count");
         assert_eq!(left, 0, "resume must drain the buffer");
     }
@@ -1293,7 +1370,10 @@ mod tests {
                 .expect("reopen");
                 let target =
                     zcash_protocol::consensus::BlockHeight::from(blocks[2949].height as u32);
-                session.db_mut().truncate_to_height(target).expect("truncate");
+                session
+                    .db_mut()
+                    .truncate_to_height(target)
+                    .expect("truncate");
             }
             super::testkit::resume_synthetic_windows_write_behind(&w, &blocks, 2950, &[50], graft)
                 .await
@@ -1315,7 +1395,9 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(&dbs[1]).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+                r.get(0)
+            })
             .expect("buffer count");
         assert_eq!(left, 0, "rewind + rescan must leave the buffer drained");
     }
@@ -1343,7 +1425,11 @@ mod tests {
         if let Some((sub, _bytes)) = splitter.finish() {
             lens.push(sub.len());
         }
-        assert_eq!(lens.iter().sum::<usize>(), blocks.len(), "no block lost by the splitter");
+        assert_eq!(
+            lens.iter().sum::<usize>(),
+            blocks.len(),
+            "no block lost by the splitter"
+        );
 
         super::testkit::scan_synthetic_windows(&da, blocks.clone(), &lens, false)
             .expect("upstream scan at split boundaries");
@@ -1381,7 +1467,11 @@ mod tests {
     /// T10b tests. Returns (blocks, ufvk_encoded, seed) — the account is created
     /// FROM SEED (spending, not view-only) inside the hook so the follow-up spend
     /// test can derive the USK for the same account.
-    fn t10b_fixture() -> (Vec<zcash_client_backend::proto::compact_formats::CompactBlock>, String, [u8; 32]) {
+    fn t10b_fixture() -> (
+        Vec<zcash_client_backend::proto::compact_formats::CompactBlock>,
+        String,
+        [u8; 32],
+    ) {
         let seed = [7u8; 32];
         let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
             &zcash_protocol::consensus::MAIN_NETWORK,
@@ -1520,7 +1610,10 @@ mod tests {
             },
         )
         .await;
-        assert!(res.is_ok(), "deep-history scan over root-only shards died: {res:?}");
+        assert!(
+            res.is_ok(),
+            "deep-history scan over root-only shards died: {res:?}"
+        );
     }
 
     /// -- --ignored graft_real_install`.
@@ -1546,7 +1639,11 @@ mod tests {
         )
         .await
         .expect("graft-off control scan");
-        assert_eq!(off_verdicts, ((0, 0), (0, 0)), "graft-off renders no verdicts");
+        assert_eq!(
+            off_verdicts,
+            ((0, 0), (0, 0)),
+            "graft-off renders no verdicts"
+        );
         // Graft ON, verify_sample=0 (pure install): shard 0 must land as the
         // root-only leaf. Correctness is carried by cap equality below — caps are
         // rebuilt from shard ROOTS, so a wrong installed root cannot hide.
@@ -1612,18 +1709,30 @@ mod tests {
         // The owned note (in the BUILT shard 1) must be found on both sides.
         let owned_value = |db: &std::path::Path| -> i64 {
             let conn = rusqlite::Connection::open(db).expect("open");
-            conn.query_row("SELECT COALESCE(SUM(value),0) FROM orchard_received_notes", [], |r| {
-                r.get(0)
-            })
+            conn.query_row(
+                "SELECT COALESCE(SUM(value),0) FROM orchard_received_notes",
+                [],
+                |r| r.get(0),
+            )
             .expect("owned value")
         };
-        assert_eq!(owned_value(&doff.join("data.db")), 500_000, "control finds the owned note");
-        assert_eq!(owned_value(&don.join("data.db")), 500_000, "grafted finds the owned note");
+        assert_eq!(
+            owned_value(&doff.join("data.db")),
+            500_000,
+            "control finds the owned note"
+        );
+        assert_eq!(
+            owned_value(&don.join("data.db")),
+            500_000,
+            "grafted finds the owned note"
+        );
 
         // And the ON side's buffer is drained (post-commit cleanup ran).
         let conn = rusqlite::Connection::open(don.join("data.db")).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+                r.get(0)
+            })
             .expect("buffer count");
         assert_eq!(left, 0, "buffer rows must be cleaned after graft/finish");
     }
@@ -1653,7 +1762,7 @@ mod tests {
         };
         use zcash_client_backend::wallet::OvkPolicy;
         use zcash_client_backend::zip321::{Payment, TransactionRequest};
-        use zcash_protocol::ShieldedProtocol;
+        use zcash_protocol::ShieldedPool;
         use zcash_protocol::value::Zatoshis;
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1671,7 +1780,11 @@ mod tests {
         )
         .await
         .expect("graft-on scan");
-        assert_eq!(on_verdicts, ((0, 0), (1, 0)), "shard 0 must graft before the spend");
+        assert_eq!(
+            on_verdicts,
+            ((0, 0), (1, 0)),
+            "shard 0 must graft before the spend"
+        );
 
         // Derive the SAME spending key the account was created from, and pay to
         // the account's own default unified address.
@@ -1690,13 +1803,20 @@ mod tests {
         )
         .expect("own address round-trips");
         let request = TransactionRequest::new(vec![
-            Payment::new(addr, Some(Zatoshis::const_from_u64(100_000)), None, None, None, vec![])
-                .expect("payment"),
+            Payment::new(
+                addr,
+                Some(Zatoshis::const_from_u64(100_000)),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .expect("payment"),
         ])
         .expect("transaction request");
 
         let mut session = crate::wallet_session::WalletSession::open(
-            crate::Network::MainNetwork,
+            crate::network::SlipstreamNetwork::MAIN,
             &don.join("data.db"),
         )
         .expect("open grafted wallet");
@@ -1707,7 +1827,7 @@ mod tests {
         let change_strategy = MultiOutputChangeStrategy::new(
             StandardFeeRule::Zip317,
             None,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             DustOutputPolicy::default(),
             SplitPolicy::with_min_output_value(
                 std::num::NonZeroUsize::new(4).expect("nonzero"),
@@ -1724,6 +1844,7 @@ mod tests {
             &change_strategy,
             request,
             ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
+            &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
             None,
         )
         .expect("propose_transfer must select the owned note from the grafted wallet");
@@ -1782,7 +1903,14 @@ mod tests {
         // circuit must accept a merkle path (witness) whose cap-path crosses the
         // GRAFTED shard-0 root to reach the wallet's anchor. A corrupted graft
         // cannot pass this — the proof simply fails to construct.
-        let txids = create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+        let txids = create_proposed_transactions::<
+            _,
+            _,
+            std::convert::Infallible,
+            _,
+            std::convert::Infallible,
+            _,
+        >(
             db,
             &zcash_protocol::consensus::MAIN_NETWORK,
             &NoSapling,
@@ -1790,7 +1918,6 @@ mod tests {
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
-            None,
         )
         .expect("orchard circuit must accept the spend witness over the grafted tree");
         assert_eq!(txids.len(), 1, "exactly one spend transaction created");

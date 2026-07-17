@@ -320,6 +320,7 @@ mod tests {
     /// indices, and the REAL owned note found either way. (The toggles are
     /// process-global; concurrent tests taking a lever path stay sound —
     /// each is KAT-gated byte-identical.)
+    #[cfg(feature = "vendor-kernels")]
     fn wired_decrypt_ab(set_lever: impl Fn(bool)) {
         use orchard::keys::{PreparedIncomingViewingKey, Scope};
         use orchard::note_encryption::{CompactAction, OrchardDomain};
@@ -394,12 +395,18 @@ mod tests {
 
     /// C1 wired A/B: full batch decryption ON vs OFF is identical (incl. a
     /// real owned note) with the lockstep kernel as the lever.
+    // [IW-2b] These exercise the vendored orchard fork's batch_dh/endo seams,
+    // which are un-patched on the ironwood-support graph (vendor_shim no-ops).
+    // Re-enable by re-vendoring onto the ironwood orchard and turning the
+    // `vendor-kernels` feature on.
+    #[cfg(feature = "vendor-kernels")]
     #[test]
     fn wired_batch_decrypt_matches_per_item() {
         wired_decrypt_ab(orchard::batch_dh::set_enabled);
     }
 
     /// C2 wired A/B: same harness with the GLV endomorphism path as the lever.
+    #[cfg(feature = "vendor-kernels")]
     #[test]
     fn wired_endo_mul_matches_per_item() {
         wired_decrypt_ab(orchard::endo::set_enabled);
@@ -408,6 +415,7 @@ mod tests {
     /// C2 honest per-item bench THROUGH THE REAL SEAM: `ka_agree_dec` with the
     /// endo lever off vs on, prepared keys built once (production shape).
     /// `cargo test -p slipstream-core --release --lib -- --ignored endo_bench --nocapture`
+    #[cfg(feature = "vendor-kernels")]
     #[test]
     #[ignore = "bench probe; run explicitly with --release --nocapture"]
     fn endo_bench() {

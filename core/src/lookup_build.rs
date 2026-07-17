@@ -194,7 +194,9 @@ pub(crate) mod tests {
             let mut a = synth(n);
             let mut b = synth(n);
             let scalar = crate::persist::build_subtrees::<MerkleHashOrchard, ORCHARD_SHARD_HEIGHT>(
-                start, &mut a,
+                start,
+                &mut a,
+                crate::persist::BUILD_CHUNK_SIZE,
             );
             let batched = build_subtrees_lookup::<ORCHARD_SHARD_HEIGHT>(
                 crate::batch_sinsemilla::orchard_combine_batch_cpu,
