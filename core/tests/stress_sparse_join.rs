@@ -187,9 +187,14 @@ fn scan_sparse_once(
         time: 1,
         ..Default::default()
     };
+    let ufvk = slipstream_core::UnifiedFullViewingKey::decode(
+        &slipstream_core::Network::MainNetwork,
+        STRESS_UFVK,
+    )
+    .map_err(|e| format!("ufvk decode: {e}"))?;
     session
-        .ensure_account(STRESS_UFVK, birthday_ts.clone())
-        .map_err(|e| format!("ensure_account: {e}"))?;
+        .import_account(&ufvk, birthday_ts.clone())
+        .map_err(|e| format!("import_account: {e}"))?;
     let tip = blocks.last().map(|b| b.height).unwrap_or(SYNTH_START);
     session
         .update_chain_tip(tip)

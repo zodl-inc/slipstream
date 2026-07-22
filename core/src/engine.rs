@@ -7,6 +7,8 @@ use std::{
 };
 
 use tracing::{info, warn};
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     config::{Endpoint, EngineConfig},
@@ -127,9 +129,10 @@ pub async fn probe_tip(
     grpc::get_latest_block_height(&mut client).await
 }
 
-/// One sync pass. If `ufvk` is Some and the wallet has no accounts, imports it
-/// with a birthday at `birthday_height` (treestate fetched from the server at
-/// `birthday_height - 1`).
+/// One sync pass. `accounts` bootstraps the wallet: each `(ufvk, birthday)` is imported
+/// as a view-only account when the wallet does not already track that key (its treestate
+/// is fetched from the server at `birthday - 1`). Pass an empty slice for a keyless pass —
+/// every follow pass, and any host that provisions its own accounts into the wallet DB.
 ///
 /// `progress` — optional shared progress state for poll-based consumers (decision D8).
 /// Pass `Some(Arc::new(Progress::default()))` to receive live counter updates;
@@ -137,25 +140,28 @@ pub async fn probe_tip(
 /// The `chain_tip` and `current_range_end` fields are set by the engine;
 /// `fetched_blocks` / `scanned_blocks` / `enhanced_txs` are bumped during the pipeline.
 ///
-/// # Deviation from plan draft
-/// The plan does not guard against `birthday_height == 0`. Since `birthday_height`
-/// is u64, `birthday_height - 1` would underflow for 0. We guard here and return
-/// a Config error; a birthday of 0 is never valid for a mainnet/testnet wallet.
+/// Every birthday must be `>= 1`: the birthday-1 treestate fetch would underflow at
+/// height 0, which is never a valid mainnet/testnet wallet birthday. All birthdays are
+/// validated up front — a clean Config error — before any network or wallet I/O.
 pub async fn sync_once(
     config: &EngineConfig,
-    ufvk: Option<(&str, u64)>,
+    accounts: &[(UnifiedFullViewingKey, BlockHeight)],
     progress: Option<Arc<Progress>>,
     tor: Option<&TorConn>,
 ) -> Result<SyncOutcome, SlipstreamError> {
     config.validate()?;
 
-    // Early guard: birthday_height == 0 would underflow (birthday_height - 1) below.
-    // A birthday of 0 is never valid for mainnet/testnet. Check here, before any I/O,
-    // so the error is a clean Config failure regardless of network availability.
-    // (u64 subtraction wraps in release builds without overflow checks — guard is required.)
-    if let Some((_, 0)) = ufvk {
+    // Early guard: a birthday of 0 would underflow the `birthday - 1` treestate fetch
+    // below, and is never valid for mainnet/testnet. Validate EVERY provided account here,
+    // before any I/O, so a bad birthday is a clean Config failure regardless of network
+    // availability. (u32 subtraction wraps in release builds without overflow checks —
+    // the guard is required.)
+    if accounts
+        .iter()
+        .any(|(_, birthday)| u32::from(*birthday) == 0)
+    {
         return Err(SlipstreamError::Config(
-            "birthday_height must be >= 1 (height 0 is not a valid wallet birthday)".into(),
+            "birthday must be >= 1 (height 0 is not a valid wallet birthday)".into(),
         ));
     }
 
@@ -227,9 +233,18 @@ pub async fn sync_once(
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
     let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
 
-    if let Some((ufvk_str, birthday_height)) = ufvk {
-        let birthday_ts = grpc::get_tree_state(&mut client, birthday_height - 1).await?;
-        session.ensure_account(ufvk_str, birthday_ts)?;
+    // Per-account bootstrap (for hosts without their own account manager — the CLI and
+    // tests; production hosts import directly into the wallet DB). Each key is imported
+    // only if the wallet does not already track it, so a re-run neither re-imports nor
+    // spends a GetTreeState RPC on an account already present. An empty slice (every
+    // follow pass) skips this loop entirely.
+    for (ufvk, birthday) in accounts {
+        if session.has_account_for_ufvk(ufvk)? {
+            continue;
+        }
+        let birthday_ts =
+            grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1).await?;
+        session.import_account(ufvk, birthday_ts)?;
     }
 
     let roots = grpc::get_subtree_roots(&mut client).await?;
@@ -654,11 +669,9 @@ mod tests {
 
     #[test]
     fn birthday_height_zero_is_rejected() {
-        // This test is hermetic: we just call validate_ufvk_birthday_guard, which
-        // does not require a real network or wallet. We test the guard's logic
-        // directly by checking that birthday=0 with a ufvk is a Config error.
-        // The guard is inline in sync_once; exercise it via the public function
-        // signature in a tokio runtime.
+        // Hermetic: the birthday guard runs before any network or wallet I/O. The engine
+        // now receives an already-decoded key, so the guard inspects the BlockHeight
+        // directly (decoding is the caller's concern). A birthday of 0 is a Config error.
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
         let cfg = EngineConfig::new(
             zcash_protocol::consensus::Network::MainNetwork,
@@ -669,9 +682,15 @@ mod tests {
                 tls: false,
             },
         );
+        let ufvk = UnifiedFullViewingKey::decode(
+            &zcash_protocol::consensus::Network::MainNetwork,
+            crate::wallet_session::TEST_UFVK,
+        )
+        .expect("decode TEST_UFVK");
         // birthday=0 must fail before any network call.
-        let result =
-            rt.block_on(async { sync_once(&cfg, Some(("dummy_ufvk", 0)), None, None).await });
+        let result = rt.block_on(async {
+            sync_once(&cfg, &[(ufvk, BlockHeight::from_u32(0))], None, None).await
+        });
         assert!(
             matches!(result, Err(SlipstreamError::Config(_))),
             "expected Config error for birthday=0, got: {result:?}"

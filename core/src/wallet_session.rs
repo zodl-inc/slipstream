@@ -180,8 +180,64 @@ impl WalletSession {
         Ok(min.and_then(|v| u64::try_from(v).ok()))
     }
 
-    /// Keyless import: UFVK string + birthday treestate (server-provided at
-    /// birthday-1). No-op if any account already exists.
+    /// Whether the wallet already tracks an account for `ufvk`.
+    ///
+    /// The engine's per-account import guard: `sync_once` imports each provided key only
+    /// when this returns `false`, so a re-run — or a wallet a host already provisioned —
+    /// neither re-imports the key nor spends a `GetTreeState` RPC on it.
+    pub fn has_account_for_ufvk(
+        &self,
+        ufvk: &UnifiedFullViewingKey,
+    ) -> Result<bool, SlipstreamError> {
+        Ok(self
+            .db
+            .get_account_for_ufvk(ufvk)
+            .map_err(|e| wallet_err("get_account_for_ufvk", e))?
+            .is_some())
+    }
+
+    /// Imports `ufvk` as a view-only account with the given birthday treestate
+    /// (server-provided at birthday-1).
+    ///
+    /// The import is UNCONDITIONAL: the caller must first confirm the account is absent
+    /// (see [`has_account_for_ufvk`](Self::has_account_for_ufvk)). The engine keeps the
+    /// treestate fetch and the presence check together so a key already present costs
+    /// neither an RPC nor a redundant import.
+    pub fn import_account(
+        &mut self,
+        ufvk: &UnifiedFullViewingKey,
+        birthday_treestate: TreeState,
+    ) -> Result<(), SlipstreamError> {
+        let birthday = AccountBirthday::from_treestate(birthday_treestate, None).map_err(|e| {
+            use zcash_client_backend::data_api::BirthdayError;
+            let detail = match e {
+                BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
+                BirthdayError::Decode(io) => format!("decode: {io}"),
+            };
+            SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
+        })?;
+        self.db
+            .import_account_ufvk(
+                "slipstream",
+                ufvk,
+                &birthday,
+                AccountPurpose::ViewOnly,
+                None,
+            )
+            .map_err(|e| wallet_err("import_account_ufvk", e))?;
+        info!("account imported (view-only)");
+        Ok(())
+    }
+
+    /// Test/darkside bootstrap convenience: import `ufvk_str` (decoded here) as the
+    /// wallet's single view-only account, but NO-OP if the wallet already has ANY account.
+    ///
+    /// The whole-wallet guard exists because fixtures may pre-seed a *spending* account and
+    /// then expect this to defer (see the oracle synthetic-window harness). Production goes
+    /// through [`import_account`](Self::import_account) with an already-decoded key and a
+    /// per-account presence check; this string-decoding, single-account shape is only for
+    /// tests that pass the `TEST_UFVK` constant directly.
+    #[cfg(any(test, feature = "darkside"))]
     pub fn ensure_account(
         &mut self,
         ufvk_str: &str,
@@ -196,25 +252,7 @@ impl WalletSession {
         }
         let ufvk = UnifiedFullViewingKey::decode(&self.network, ufvk_str)
             .map_err(|e| wallet_err("ufvk decode", e))?;
-        let birthday = AccountBirthday::from_treestate(birthday_treestate, None).map_err(|e| {
-            use zcash_client_backend::data_api::BirthdayError;
-            let detail = match e {
-                BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
-                BirthdayError::Decode(io) => format!("decode: {io}"),
-            };
-            SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
-        })?;
-        self.db
-            .import_account_ufvk(
-                "slipstream",
-                &ufvk,
-                &birthday,
-                AccountPurpose::ViewOnly,
-                None,
-            )
-            .map_err(|e| wallet_err("import_account_ufvk", e))?;
-        info!("account imported (view-only)");
-        Ok(())
+        self.import_account(&ufvk, birthday_treestate)
     }
 
     pub fn put_subtree_roots(&mut self, roots: &SubtreeRoots) -> Result<(), SlipstreamError> {
@@ -509,5 +547,33 @@ mod tests {
         // Note 4: assert on account count (simpler than range-suggestion check on fresh wallet)
         let ids = s.db.get_account_ids().expect("get_account_ids");
         assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn import_account_is_guarded_by_per_ufvk_presence_check() {
+        // The typed production path: `has_account_for_ufvk` flips false→true across an
+        // `import_account`, which is how the engine imports each key at most once.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let mut s = WalletSession::open(Network::MainNetwork, &path).expect("open");
+        let net = SlipstreamNetwork::from(Network::MainNetwork);
+        let ufvk = UnifiedFullViewingKey::decode(&net, TEST_UFVK).expect("decode TEST_UFVK");
+        let ts = TreeState {
+            network: "main".into(),
+            height: 663_149,
+            hash: "0".repeat(64),
+            time: 1,
+            ..Default::default()
+        };
+        assert!(
+            !s.has_account_for_ufvk(&ufvk).expect("presence"),
+            "absent before import"
+        );
+        s.import_account(&ufvk, ts).expect("import");
+        assert!(
+            s.has_account_for_ufvk(&ufvk).expect("presence"),
+            "present after import"
+        );
+        assert_eq!(s.db.get_account_ids().expect("get_account_ids").len(), 1);
     }
 }

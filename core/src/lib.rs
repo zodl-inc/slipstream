@@ -58,6 +58,10 @@ pub use events::{Bound, Event, Progress, ProgressArc, Snapshot, SyncMode};
 pub use network::{CustomActivations, SlipstreamNetwork};
 pub use session::{SessionConfig, SessionReporter, TorSessionConfig, run_session};
 pub use zcash_protocol::consensus::Network;
+// Re-exported because they appear in the public engine surface (`engine::sync_once`,
+// `SessionConfig::accounts`): callers name the account key/birthday as typed values.
+pub use zcash_keys::keys::UnifiedFullViewingKey;
+pub use zcash_protocol::consensus::BlockHeight;
 
 /// Crate smoke marker used by the workspace smoke test.
 pub const CRATE_NAME: &str = "slipstream-core";

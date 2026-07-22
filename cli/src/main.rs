@@ -2,6 +2,8 @@
 //! Subcommands land per phase: `fetch` (P1), `sync` (P2+), `report` (P5).
 
 use clap::{Parser, Subcommand};
+use slipstream_core::{BlockHeight, UnifiedFullViewingKey};
+use zcash_protocol::consensus::Parameters;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -626,7 +628,7 @@ fn cmd_watch(
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday).unwrap_or_else(|e| {
+    let accounts = validate_sync_args(&network, ufvk.as_deref(), birthday).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2)
     });
@@ -656,7 +658,7 @@ fn cmd_watch(
         }
         let scfg = slipstream_core::SessionConfig {
             engine: cfg,
-            account: ufvk_arg.map(|(s, h)| (s.to_string(), h)),
+            accounts,
             tor: None,
         };
         let session = tokio::spawn(slipstream_core::session::run_session(
@@ -784,19 +786,36 @@ fn cmd_watch(
     });
 }
 
-fn validate_sync_args(
+/// Decode a `--ufvk` string + `--birthday` height into the engine's typed account tuple.
+/// Decoding lives at the CLI boundary so the engine only ever handles parsed keys.
+fn parse_account<P: Parameters>(
+    network: &P,
+    ufvk: &str,
+    birthday: u64,
+) -> Result<(UnifiedFullViewingKey, BlockHeight), String> {
+    let ufvk =
+        UnifiedFullViewingKey::decode(network, ufvk).map_err(|e| format!("invalid --ufvk: {e}"))?;
+    let birthday = u32::try_from(birthday)
+        .map_err(|_| format!("--birthday {birthday} exceeds the u32 block-height range"))?;
+    Ok((ufvk, BlockHeight::from_u32(birthday)))
+}
+
+/// Resolve the `--ufvk`/`--birthday` pair into the account list `sync_once` bootstraps.
+/// Returns an empty list when no key is supplied (a keyless pass over an existing wallet).
+fn validate_sync_args<P: Parameters>(
+    network: &P,
     ufvk: Option<&str>,
     birthday: Option<u64>,
-) -> Result<Option<(&str, u64)>, String> {
+) -> Result<Vec<(UnifiedFullViewingKey, BlockHeight)>, String> {
     match (ufvk, birthday) {
-        (Some(u), Some(b)) => Ok(Some((u, b))),
-        (None, None) => Ok(None),
+        (Some(u), Some(b)) => Ok(vec![parse_account(network, u, b)?]),
+        (None, None) => Ok(Vec::new()),
         (Some(_), None) => {
             Err("--ufvk requires --birthday: provide the wallet birthday height".into())
         }
         (None, Some(_)) => {
             // birthday without ufvk is silently ignored (may be used with an existing wallet)
-            Ok(None)
+            Ok(Vec::new())
         }
     }
 }
@@ -892,6 +911,13 @@ fn cmd_bench(
         .collect();
     cfg.bench_json_path = Some(json_path.clone());
 
+    let accounts = vec![
+        parse_account(&network, &ufvk, birthday).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2)
+        }),
+    ];
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let outcome = rt.block_on(async {
         let progress = std::sync::Arc::new(slipstream_core::Progress::default());
@@ -910,13 +936,8 @@ fn cmd_bench(
                 );
             }
         });
-        let result = slipstream_core::engine::sync_once(
-            &cfg,
-            Some((ufvk.as_str(), birthday)),
-            Some(progress),
-            None,
-        )
-        .await;
+        let result =
+            slipstream_core::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
         ticker.abort();
         result
     });
@@ -1001,7 +1022,7 @@ fn cmd_sync(
         eprintln!("note: --birthday without --ufvk is ignored (no import will occur)");
     }
 
-    let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday).unwrap_or_else(|e| {
+    let accounts = validate_sync_args(&network, ufvk.as_deref(), birthday).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2)
     });
@@ -1057,7 +1078,7 @@ fn cmd_sync(
         if follow {
             let scfg = slipstream_core::SessionConfig {
                 engine: cfg.clone(),
-                account: ufvk_arg.map(|(s, h)| (s.to_string(), h)),
+                accounts: accounts.clone(),
                 tor: None,
             };
             let reporter = slipstream_core::SessionReporter {
@@ -1079,7 +1100,8 @@ fn cmd_sync(
             std::process::exit(1);
         }
 
-        let result = slipstream_core::engine::sync_once(&cfg, ufvk_arg, Some(progress), None).await;
+        let result =
+            slipstream_core::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
 
         // Abort the ticker (JoinHandle::abort is fine per spec — no cleanup needed).
         ticker.abort();
@@ -1197,13 +1219,20 @@ fn cmd_oracle(
         cfg.persist_depth = persist_depth;
         cfg
     };
+    let accounts = vec![
+        parse_account(&network, &ufvk, birthday).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2)
+        }),
+    ];
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let verdict = rt.block_on(async {
         println!("oracle: run A (upstream persistence) …");
-        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), Some((ufvk.as_str(), birthday)), None, None).await?;
+        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), &accounts, None, None).await?;
         println!("oracle: run A done — tip {} in {:.1?}", a.chain_tip, a.elapsed);
         println!("oracle: run B (sparse_b={sparse_b} write_behind_b={write_behind_b} gpu_subtree_b={gpu_subtree_b} persist_depth_b={persist_depth_b}) …");
-        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), Some((ufvk.as_str(), birthday)), None, None).await?;
+        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), &accounts, None, None).await?;
         println!("oracle: run B done — tip {} in {:.1?}", b.chain_tip, b.elapsed);
         if a.chain_tip != b.chain_tip {
             eprintln!("oracle: TIP SKEW (A={} B={}) — rerun when the chain is quiet", a.chain_tip, b.chain_tip);
@@ -2037,10 +2066,22 @@ mod tests {
         assert!(result.is_err(), "should fail without --server");
     }
 
+    // A real mainnet UFVK (the repo's canonical darkside test key, copied here because
+    // `wallet_session::TEST_UFVK` is `#[cfg(any(test, feature = "darkside"))]` and so not
+    // reachable from this crate's tests). `validate_sync_args` now decodes, so the success
+    // path needs a genuinely decodable key.
+    const VALID_MAINNET_UFVK: &str = concat!(
+        "uview17fme6ux853km45g9ep07djpfzeydxxgm22xpmr7arzxyutlusalgpqlx7suga4ahzywfuwz4jclm00u7g8u65qvvdt45kttnfunvschssg3h3g06txs9ja32vx3xa8dej3unnat",
+        "gzjvd0vumk37t8es3ludldrtse3q6226ws7eq4q0ywz78nudwpepgdn7jmxz8yvp7k6gxkeynkam0f8aqf9qpeaej55zhkw39x7epayhndul0j4xjttdxxlnwcd09nr8svyx8j0zng0w6",
+        "scx3m5unpkaqxcm3hslhlfg4caz7r8d4xy9wm7klkg79w7j0uyzec5s3yje20eg946r6rmkf532nfydu26s8q9ua7mwxw2j2ag7hfcuu652gw6uta03vlm05zju3a9rwc4h367kqzfqrc",
+        "z35pdwdk2a7yqnk850un3ujxcvve45ueajgvtr6dj4ufszgqwdy0aedgmkalx2p7qed2suarwkr35dl0c8dnqp3"
+    );
+
     #[test]
     fn sync_requires_birthday_with_ufvk() {
-        // validate_sync_args is a pure function we can call directly.
-        let result = validate_sync_args(Some("uview1someufvk"), None);
+        // The (ufvk, no birthday) arm errors before any decode, so a placeholder key is fine.
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, Some("uview1someufvk"), None);
         assert!(result.is_err(), "ufvk without birthday must error");
         let msg = result.unwrap_err();
         assert!(
@@ -2051,24 +2092,38 @@ mod tests {
 
     #[test]
     fn sync_allows_no_ufvk_no_birthday() {
-        let result = validate_sync_args(None, None);
-        assert!(matches!(result, Ok(None)));
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, None, None).expect("no args is valid");
+        assert!(result.is_empty(), "no ufvk = no accounts to import");
     }
 
     #[test]
     fn sync_allows_ufvk_with_birthday() {
-        let result = validate_sync_args(Some("uview1someufvk"), Some(800_000));
-        assert!(matches!(result, Ok(Some(("uview1someufvk", 800_000)))));
+        let net = slipstream_core::Network::MainNetwork;
+        let accounts = validate_sync_args(&net, Some(VALID_MAINNET_UFVK), Some(800_000))
+            .expect("valid ufvk + birthday");
+        assert_eq!(accounts.len(), 1, "one account to bootstrap");
+        assert_eq!(
+            u32::from(accounts[0].1),
+            800_000,
+            "birthday preserved as a BlockHeight"
+        );
     }
 
     #[test]
-    fn sync_allows_birthday_without_ufvk_returns_none() {
-        // birthday with no ufvk: silently ignored (validate_sync_args returns Ok(None))
-        let result = validate_sync_args(None, Some(800_000));
-        assert!(
-            matches!(result, Ok(None)),
-            "expected Ok(None), got {result:?}"
-        );
+    fn sync_rejects_undecodable_ufvk() {
+        // Decoding now happens at the CLI boundary: a malformed --ufvk is a clean error.
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, Some("uview1someufvk"), Some(800_000));
+        assert!(result.is_err(), "an undecodable ufvk must error");
+    }
+
+    #[test]
+    fn sync_allows_birthday_without_ufvk_returns_empty() {
+        // birthday with no ufvk: silently ignored (no account to import).
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, None, Some(800_000)).expect("birthday-only is valid");
+        assert!(result.is_empty(), "expected no accounts, got {result:?}");
     }
 
     #[test]
