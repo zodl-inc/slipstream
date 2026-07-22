@@ -29,12 +29,14 @@ use zcash_client_backend::data_api::{
     TransactionsInvolvingAddress, TransparentBalances, WalletCommitmentTrees, WalletRead,
     WalletSummary, WalletWrite, Zip32Derivation,
     chain::ChainState,
-    error::FindAccountForAddressError,
+    error::{FindAccountForAddressError, LockError},
     ll::{LowLevelWalletWrite, wallet::PutBlocksError},
     scanning::ScanRange,
     wallet::{ConfirmationsPolicy, TargetHeight},
 };
-use zcash_client_backend::wallet::{NoteId, TransparentAddressMetadata, WalletTransparentOutput};
+use zcash_client_backend::wallet::{
+    LockOwner, NoteId, OutputRef, TransparentAddressMetadata, WalletTransparentOutput,
+};
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
@@ -2247,6 +2249,20 @@ impl WalletWrite for SparseFacade<'_> {
     fn set_tx_trust(&mut self, txid: TxId, trusted: bool) -> Result<(), Self::Error> {
         self.inner.set_tx_trust(txid, trusted)
     }
+    fn lock_outputs(
+        &mut self,
+        outputs: &[OutputRef],
+        owner: LockOwner,
+        lock_expiry_height: BlockHeight,
+    ) -> Result<usize, LockError<Self::Error>> {
+        self.inner.lock_outputs(outputs, owner, lock_expiry_height)
+    }
+    fn unlock_output(&mut self, output: &OutputRef, owner: LockOwner) -> Result<bool, Self::Error> {
+        self.inner.unlock_output(output, owner)
+    }
+    fn clear_locked_outputs(&mut self, account: Self::AccountId) -> Result<usize, Self::Error> {
+        self.inner.clear_locked_outputs(account)
+    }
     fn store_transactions_to_be_sent(
         &mut self,
         transactions: &[SentTransaction<Self::AccountId>],
@@ -2818,6 +2834,24 @@ impl WalletWrite for WriteBehindFacade {
     }
     fn set_tx_trust(&mut self, _txid: TxId, _trusted: bool) -> Result<(), Self::Error> {
         Err(unvirtualized("set_tx_trust"))
+    }
+    fn lock_outputs(
+        &mut self,
+        _outputs: &[OutputRef],
+        _owner: LockOwner,
+        _lock_expiry_height: BlockHeight,
+    ) -> Result<usize, LockError<Self::Error>> {
+        Err(LockError::Storage(unvirtualized("lock_outputs")))
+    }
+    fn unlock_output(
+        &mut self,
+        _output: &OutputRef,
+        _owner: LockOwner,
+    ) -> Result<bool, Self::Error> {
+        Err(unvirtualized("unlock_output"))
+    }
+    fn clear_locked_outputs(&mut self, _account: Self::AccountId) -> Result<usize, Self::Error> {
+        Err(unvirtualized("clear_locked_outputs"))
     }
     fn store_transactions_to_be_sent(
         &mut self,

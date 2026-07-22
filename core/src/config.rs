@@ -163,18 +163,6 @@ pub struct EngineConfig {
     /// +15.7% on note-bearing wallets). Kill switch: `ZCASH_BATCH_COMBINE=0`.
     pub batch_combine: bool,
 
-    /// Batched same-scalar trial-decrypt DH — the forked orchard's
-    /// lockstep-affine kernel (one shared inversion per ladder step across
-    /// the whole batch; byte-identical, KAT-gated in the fork). [v0.6 P8]
-    /// the toggle now selects the GLV-lockstep kernel for window-prepared
-    /// epks (prebuilt P7 tables + half-length digit schedule + per-call
-    /// scratch — the rebuild of v0.5 C1 on the instrument-named fixes; C1's
-    /// full-width kernel remains behind it for Wnaf-prepared epks). Default
-    /// OFF pending its own device A/B (C1's lesson: microbench wins don't
-    /// automatically survive scan concurrency). Kill/dev switch:
-    /// `ZCASH_BATCH_DECRYPT`. Process-global toggle set at pass start.
-    pub batch_decrypt: bool,
-
     /// v0.5 scan-pacer lever (2026-07-06 plan): derive chunk-boundary
     /// treestates LOCALLY (seed once per range, absorb scanned commitments
     /// into running frontiers) instead of one `GetTreeState` round-trip per
@@ -182,15 +170,6 @@ pub struct EngineConfig {
     /// scan wall (71 × ~455 ms). Default OFF until the A/B + audit gates.
     /// Kill/dev switch: `ZCASH_LOCAL_TREESTATE`.
     pub local_treestate: bool,
-
-    /// v0.5 C2: GLV endomorphism multiplication for trial-decrypt DH (the
-    /// per-item path — half-length Straus ladder, ~1.7x fewer group ops,
-    /// byte-identical, KAT-gated in the orchard fork). Default ON since
-    /// 2026-07-06, fleet-gated: A18 production +16% wall, M4 dh −25% with
-    /// zero concurrency penalty, A14/A10 100% coverage + zero errors +
-    /// clean per-lane scaling. Kill switch: `ZCASH_ENDO_MUL=0`.
-    /// Process-global toggle.
-    pub endo_mul: bool,
 
     /// Boundary-audit cadence for local treestates: every Nth locally served
     /// boundary ALSO fetches the server treestate (spawned, OFF the critical
@@ -246,10 +225,8 @@ impl EngineConfig {
             graft_verify_sample: 16,
             anchor_retention_height: None,
             batch_combine: true,
-            batch_decrypt: false,
             local_treestate: false,
             treestate_verify_sample: 1,
-            endo_mul: true,
             persist_depth: 1,
         }
     }

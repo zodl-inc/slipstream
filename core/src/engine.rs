@@ -185,17 +185,10 @@ pub async fn sync_once(
         gpu_subtree = config.gpu_subtree,
         graft_subtree = config.graft_subtree,
         batch_combine = config.batch_combine,
-        batch_decrypt = config.batch_decrypt,
-        endo_mul = config.endo_mul,
         local_treestate = config.local_treestate,
         started_at_utc = %wall_clock_utc(),
         "engine pass starting"
     );
-    // v0.5 C1: the forked orchard's batched-DH kernel is a process-global
-    // toggle (the swap point is a trait impl with no config channel).
-    crate::vendor_shim::set_batch_dh_enabled(config.batch_decrypt);
-    // v0.5 C2: GLV endomorphism per-item multiplication (same toggle pattern).
-    crate::vendor_shim::set_endo_enabled(config.endo_mul);
     // v0.6 P2: persist-lane totals are process-cumulative atomics — snapshot
     // here so the pass-end log reports THIS pass's delta.
     let persist_lane_start = crate::persist::lane_stats::totals();
@@ -508,34 +501,6 @@ pub async fn sync_once(
         "enhance split"
     );
 
-    // v0.5 C1 did-it-fire stats (the graft lever's lesson): calls proves the
-    // batched seam is reached, kernel_lanes proves the kernel engaged, dh_s
-    // is the true cross-thread production DH cost (ON/OFF pairs = real ratio).
-    let (
-        batch_dh_calls,
-        batch_dh_lanes,
-        batch_dh_kernel_lanes,
-        batch_dh_nanos,
-        batch_dh_wall_nanos,
-        batch_epk_nanos,
-    ) = crate::vendor_shim::batch_dh_stats();
-    let batch_dh_s = batch_dh_nanos as f64 / 1e9;
-    // v0.6 P5/P6: union wall over the DH + batch_epk brackets —
-    // (dh_s + epk_s)/wall = avg busy threads inside the bracketed task core.
-    let batch_dh_wall_s = batch_dh_wall_nanos as f64 / 1e9;
-    let batch_epk_s = batch_epk_nanos as f64 / 1e9;
-    info!(
-        calls = batch_dh_calls,
-        lanes = batch_dh_lanes,
-        kernel_lanes = batch_dh_kernel_lanes,
-        dh_s = batch_dh_s,
-        dh_wall_s = batch_dh_wall_s,
-        epk_s = batch_epk_s,
-        endo_calls = crate::vendor_shim::endo_calls(),
-        enabled = config.batch_decrypt,
-        "batch_dh fire stats"
-    );
-
     // v0.4 P0 (spec §3.1): the machine-readable bench artifact, host-opted via config.
     if let Some(path) = &config.bench_json_path {
         let bench = crate::census::BenchSummary {
@@ -551,12 +516,7 @@ pub async fn sync_once(
             persist_wait_s,
             persist_overlap_s: (persist_busy_s - persist_wait_s).max(0.0),
             blocks: outcome.report.scan.blocks,
-            batch_dh_calls,
-            batch_dh_lanes,
-            batch_dh_kernel_lanes,
-            batch_dh_s,
-            batch_dh_wall_s,
-            batch_epk_s,
+            batch_epk_s: 0.0,
             scan_recv_wait_s: outcome.report.scan_recv_wait.as_secs_f64(),
             scan_call_s: outcome.report.scan_call.as_secs_f64(),
             scan_prefetch_wait_s: outcome.report.scan_prefetch_wait.as_secs_f64(),
@@ -580,7 +540,6 @@ pub async fn sync_once(
             persist_insert_s: persist_lane.insert_ms as f64 / 1e3,
             persist_ensure_s: persist_lane.ensure_ms as f64 / 1e3,
             persist_downgraded: persist_lane.downgraded,
-            endo_calls: crate::vendor_shim::endo_calls(),
             enhance_fetch_s: outcome.enhance.fetch_wait.as_secs_f64(),
             enhance_store_s: outcome.enhance.store.as_secs_f64(),
             enhance_address_s: outcome.enhance.address.as_secs_f64(),

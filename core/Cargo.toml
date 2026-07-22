@@ -64,12 +64,3 @@ bls12_381 = { workspace = true }
 # deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
-
-[lints.rust]
-# `vendor-kernels` gates dormant test helpers that exercise the vendored orchard
-# fork's batch_dh/endo seams — absent on the current upstream-orchard graph (see
-# core/src/batch_ecdh.rs). Declare it as a known cfg so those `#[cfg(feature =
-# "vendor-kernels")]` blocks don't trip `unexpected_cfgs`, WITHOUT making it a real
-# feature (which `--all-features` would enable, compiling the fork-only code that
-# no longer exists on this graph). Re-vendoring promotes it to a genuine feature.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("vendor-kernels"))'] }

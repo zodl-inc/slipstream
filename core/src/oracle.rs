@@ -1846,6 +1846,7 @@ mod tests {
             ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
             &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
             None,
+            None,
         )
         .expect("propose_transfer must select the owned note from the grafted wallet");
 
@@ -1918,6 +1919,7 @@ mod tests {
             &SpendingKeys::from_unified_spending_key(usk),
             OvkPolicy::Sender,
             &proposal,
+            None,
         )
         .expect("orchard circuit must accept the spend witness over the grafted tree");
         assert_eq!(txids.len(), 1, "exactly one spend transaction created");

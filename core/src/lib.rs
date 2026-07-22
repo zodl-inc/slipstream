@@ -41,7 +41,6 @@ pub mod session;
 pub mod throttle;
 pub mod transparent;
 pub mod treestate;
-pub mod vendor_shim;
 pub mod verify;
 pub mod wallet_session;
 

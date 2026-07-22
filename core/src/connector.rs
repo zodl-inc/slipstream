@@ -113,7 +113,7 @@ impl TorConn {
             };
             match tokio::time::timeout(
                 TOR_CONNECT_TIMEOUT,
-                client.connect_to_lightwalletd(uri.clone()),
+                client.connect_to_lightwalletd(uri.clone(), false),
             )
             .await
             {

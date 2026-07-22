@@ -31,7 +31,7 @@ async fn engine_runtime_can_drive_arti_tor_lwd() {
     let isolated = client.isolated_client();
 
     let mut conn = isolated
-        .connect_to_lightwalletd("https://zec.rocks:443".parse().expect("uri"))
+        .connect_to_lightwalletd("https://zec.rocks:443".parse().expect("uri"), false)
         .await
         .expect("connect_to_lightwalletd over Tor from the engine runtime");
 
