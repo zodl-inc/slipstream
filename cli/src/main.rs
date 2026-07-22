@@ -4,7 +4,11 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "slipstream", version, about = "Slipstream sync engine dev harness")]
+#[command(
+    name = "slipstream",
+    version,
+    about = "Slipstream sync engine dev harness"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -440,7 +444,9 @@ fn parse_range(s: &str) -> Result<(u64, u64), String> {
     if s.contains("..=") {
         return Err(format!("range must be start..end (not ..=): {s}"));
     }
-    let (a, b) = s.split_once("..").ok_or_else(|| format!("range must be start..end: {s}"))?;
+    let (a, b) = s
+        .split_once("..")
+        .ok_or_else(|| format!("range must be start..end: {s}"))?;
     let start: u64 = a.trim().parse().map_err(|e| format!("bad start: {e}"))?;
     let end: u64 = b.trim().parse().map_err(|e| format!("bad end: {e}"))?;
     if end < start {
@@ -498,13 +504,18 @@ fn cmd_throttle_proxy(
             "weather machine up: http://{} -> {} (cap {})",
             proxy.local_addr(),
             target_addr,
-            if cap_kbps == 0 { "uncapped".to_string() } else { format!("{cap_kbps} KB/s") },
+            if cap_kbps == 0 {
+                "uncapped".to_string()
+            } else {
+                format!("{cap_kbps} KB/s")
+            },
         );
-        println!("point the engine at it, e.g.: --server http://{}", proxy.local_addr());
+        println!(
+            "point the engine at it, e.g.: --server http://{}",
+            proxy.local_addr()
+        );
         if collapse_after_s > 0 {
-            println!(
-                "scripted collapse: to {collapse_to_kbps} KB/s after {collapse_after_s} s"
-            );
+            println!("scripted collapse: to {collapse_to_kbps} KB/s after {collapse_after_s} s");
             tokio::time::sleep(std::time::Duration::from_secs(collapse_after_s)).await;
             proxy.set_cap(collapse_to_kbps * 1024);
             println!("collapse fired: cap now {collapse_to_kbps} KB/s");
@@ -514,8 +525,14 @@ fn cmd_throttle_proxy(
 }
 
 fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline: bool) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
-    let (start, end) = parse_range(&range).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let (start, end) = parse_range(&range).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let mut base_stats = None;
@@ -525,12 +542,18 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
                 Ok(s) => {
                     println!(
                         "  K=1: {} blocks, {:.1} MB, {:.1}s, {:.0} blk/s, {:.2} MB/s",
-                        s.blocks, s.bytes as f64 / 1048576.0, s.elapsed.as_secs_f64(),
-                        s.blocks_per_sec(), s.megabytes_per_sec()
+                        s.blocks,
+                        s.bytes as f64 / 1048576.0,
+                        s.elapsed.as_secs_f64(),
+                        s.blocks_per_sec(),
+                        s.megabytes_per_sec()
                     );
                     base_stats = Some(s);
                 }
-                Err(e) => { eprintln!("baseline failed: {e}"); std::process::exit(1) }
+                Err(e) => {
+                    eprintln!("baseline failed: {e}");
+                    std::process::exit(1)
+                }
             }
         }
         println!("measured run (streams={streams})...");
@@ -538,14 +561,23 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
             Ok(s) => {
                 println!(
                     "  K={streams}: {} blocks, {:.1} MB, {:.1}s, {:.0} blk/s, {:.2} MB/s",
-                    s.blocks, s.bytes as f64 / 1048576.0, s.elapsed.as_secs_f64(),
-                    s.blocks_per_sec(), s.megabytes_per_sec()
+                    s.blocks,
+                    s.bytes as f64 / 1048576.0,
+                    s.elapsed.as_secs_f64(),
+                    s.blocks_per_sec(),
+                    s.megabytes_per_sec()
                 );
                 if let Some(b) = base_stats {
-                    println!("  speedup vs K=1: {:.2}x", s.megabytes_per_sec() / b.megabytes_per_sec());
+                    println!(
+                        "  speedup vs K=1: {:.2}x",
+                        s.megabytes_per_sec() / b.megabytes_per_sec()
+                    );
                 }
             }
-            Err(e) => { eprintln!("fetch failed: {e}"); std::process::exit(1) }
+            Err(e) => {
+                eprintln!("fetch failed: {e}");
+                std::process::exit(1)
+            }
         }
     });
 }
@@ -805,7 +837,10 @@ fn cmd_bench(
     json: Option<std::path::PathBuf>,
     keep: bool,
 ) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     require_gpu_feature_if(gpu_subtree, "--gpu-subtree");
 
     // Wallet dir: user-supplied (must be fresh) or a temp dir (deleted unless --keep).
@@ -819,13 +854,17 @@ fn cmd_bench(
                 );
                 std::process::exit(2);
             }
-            std::fs::create_dir_all(&d)
-                .unwrap_or_else(|e| { eprintln!("error: create {}: {e}", d.display()); std::process::exit(2) });
+            std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+                eprintln!("error: create {}: {e}", d.display());
+                std::process::exit(2)
+            });
             (d, None)
         }
         None => {
-            let td = tempfile::tempdir()
-                .unwrap_or_else(|e| { eprintln!("error: tempdir: {e}"); std::process::exit(2) });
+            let td = tempfile::tempdir().unwrap_or_else(|e| {
+                eprintln!("error: tempdir: {e}");
+                std::process::exit(2)
+            });
             (td.path().to_path_buf(), Some(td))
         }
     };
@@ -844,7 +883,12 @@ fn cmd_bench(
     cfg.batch_combine = batch_combine;
     cfg.alternate_endpoints = alternate_server
         .iter()
-        .map(|a| parse_server(a).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) }))
+        .map(|a| {
+            parse_server(a).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2)
+            })
+        })
         .collect();
     cfg.bench_json_path = Some(json_path.clone());
 
@@ -877,7 +921,10 @@ fn cmd_bench(
         result
     });
 
-    let outcome = outcome.unwrap_or_else(|e| { eprintln!("bench failed: {e}"); std::process::exit(1) });
+    let outcome = outcome.unwrap_or_else(|e| {
+        eprintln!("bench failed: {e}");
+        std::process::exit(1)
+    });
 
     // Human table — same numbers the engine wrote to the JSON artifact.
     let r = &outcome.report;
@@ -893,7 +940,10 @@ fn cmd_bench(
         wait_s,
         (busy_s - wait_s).max(0.0),
     );
-    for (label, c) in [("sapling", &r.census_sapling), ("orchard", &r.census_orchard)] {
+    for (label, c) in [
+        ("sapling", &r.census_sapling),
+        ("orchard", &r.census_orchard),
+    ] {
         println!(
             "census {label}: shards {} | noted {} | graftable {:.0}%",
             c.shards(),
@@ -908,7 +958,10 @@ fn cmd_bench(
     if json_path.exists() {
         println!("json: {}", json_path.display());
     } else {
-        eprintln!("warning: engine did not write the bench JSON at {}", json_path.display());
+        eprintln!(
+            "warning: engine did not write the bench JSON at {}",
+            json_path.display()
+        );
     }
     match (tempdir_guard, keep) {
         (Some(td), true) => {
@@ -939,17 +992,21 @@ fn cmd_sync(
     follow: bool,
     anchor_retention: Option<u32>,
 ) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
 
     if ufvk.is_none() && birthday.is_some() {
         eprintln!("note: --birthday without --ufvk is ignored (no import will occur)");
     }
 
-    let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday)
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(2) });
+    let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2)
+    });
 
-    let mut cfg =
-        slipstream_core::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
+    let mut cfg = slipstream_core::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
     cfg.fetch_streams = streams;
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
@@ -1044,8 +1101,7 @@ fn cmd_sync(
                 );
                 println!(
                     "notes found: sapling {} orchard {}",
-                    outcome.report.scan.sapling_received,
-                    outcome.report.scan.orchard_received,
+                    outcome.report.scan.sapling_received, outcome.report.scan.orchard_received,
                 );
                 println!(
                     "enhanced: {} txs, {} statuses ({} skipped)",
@@ -1055,8 +1111,7 @@ fn cmd_sync(
                 );
                 println!(
                     "utxos: {} across {} accounts",
-                    outcome.transparent.utxos,
-                    outcome.transparent.accounts,
+                    outcome.transparent.utxos, outcome.transparent.accounts,
                 );
                 // Per-stage timing + bound (Decision-Log requirement for honest G5 reporting).
                 println!(
@@ -1081,7 +1136,6 @@ fn cmd_sync(
                 if outcome.report.reorgs_recovered > 0 {
                     println!("reorgs: {} recovered", outcome.report.reorgs_recovered);
                 }
-
             }
             Err(e) => {
                 eprintln!("sync failed: {e}");
@@ -1106,7 +1160,10 @@ fn cmd_oracle(
     streams: usize,
     chunk: u32,
 ) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     if write_behind_b && !sparse_b {
         eprintln!("error: --write-behind-b requires --sparse-b");
         std::process::exit(2);
@@ -1118,11 +1175,18 @@ fn cmd_oracle(
     require_gpu_feature_if(gpu_subtree_b, "--gpu-subtree-b");
     for d in [&wallet_a, &wallet_b] {
         if d.join("data.db").exists() {
-            eprintln!("error: {} already contains data.db — oracle needs fresh wallets", d.display());
+            eprintln!(
+                "error: {} already contains data.db — oracle needs fresh wallets",
+                d.display()
+            );
             std::process::exit(2);
         }
     }
-    let mk_cfg = |dir: &std::path::Path, sparse: bool, write_behind: bool, gpu_subtree: bool, persist_depth: usize| {
+    let mk_cfg = |dir: &std::path::Path,
+                  sparse: bool,
+                  write_behind: bool,
+                  gpu_subtree: bool,
+                  persist_depth: usize| {
         let mut cfg =
             slipstream_core::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
         cfg.fetch_streams = streams;
@@ -1157,7 +1221,10 @@ fn cmd_oracle(
                 std::process::exit(1);
             }
         }
-        Err(e) => { eprintln!("oracle failed: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("oracle failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1185,12 +1252,12 @@ fn cmd_send(
         ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
         input_selection::GreedyInputSelector, propose_transfer,
     };
-    use zcash_client_backend::wallet::OvkPolicy;
     use zcash_client_backend::fees::{
         DustOutputPolicy, SplitPolicy, StandardFeeRule, zip317::MultiOutputChangeStrategy,
     };
-    use zcash_protocol::{ShieldedPool, value::Zatoshis};
+    use zcash_client_backend::wallet::OvkPolicy;
     use zcash_client_backend::zip321::{Payment, TransactionRequest};
+    use zcash_protocol::{ShieldedPool, value::Zatoshis};
 
     let endpoint = match parse_server(&server) {
         Ok(e) => e,
@@ -1211,14 +1278,16 @@ fn cmd_send(
         .expect("usk derivation");
     let ufvk = usk.to_unified_full_viewing_key();
 
-    let mut session = slipstream_core::wallet_session::WalletSession::open(
-        network,
-        &wallet_dir.join("data.db"),
-    )
-    .expect("open wallet db");
+    let mut session =
+        slipstream_core::wallet_session::WalletSession::open(network, &wallet_dir.join("data.db"))
+            .expect("open wallet db");
     let db = session.db_mut();
     let accounts = db.get_account_ids().expect("account ids");
-    assert_eq!(accounts.len(), 1, "send tooling expects a single-account wallet");
+    assert_eq!(
+        accounts.len(),
+        1,
+        "send tooling expects a single-account wallet"
+    );
     let wallet_account = accounts[0];
 
     // The derived key must be THE wallet's key (guards against wrong mnemonic/account).
@@ -1249,8 +1318,15 @@ fn cmd_send(
     println!("amount: {zats} zats");
 
     let request = TransactionRequest::new(vec![
-        Payment::new(addr, Some(Zatoshis::const_from_u64(zats)), None, None, None, vec![])
-            .expect("payment"),
+        Payment::new(
+            addr,
+            Some(Zatoshis::const_from_u64(zats)),
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect("payment"),
     ])
     .expect("transaction request");
 
@@ -1337,7 +1413,14 @@ fn cmd_send(
     }
 
     println!("proving + creating transaction (orchard circuit, pool-agnostic)...");
-    let txids = create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+    let txids = create_proposed_transactions::<
+        _,
+        _,
+        std::convert::Infallible,
+        _,
+        std::convert::Infallible,
+        _,
+    >(
         db,
         &network,
         &NoSapling,
@@ -1393,32 +1476,176 @@ fn main() {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Version => {
-            println!("{} {}", slipstream_core::CRATE_NAME, env!("CARGO_PKG_VERSION"));
+            println!(
+                "{} {}",
+                slipstream_core::CRATE_NAME,
+                env!("CARGO_PKG_VERSION")
+            );
         }
-        Cmd::ThrottleProxy { target, listen, cap_kbps, collapse_after_s, collapse_to_kbps } => {
+        Cmd::ThrottleProxy {
+            target,
+            listen,
+            cap_kbps,
+            collapse_after_s,
+            collapse_to_kbps,
+        } => {
             cmd_throttle_proxy(target, listen, cap_kbps, collapse_after_s, collapse_to_kbps);
         }
-        Cmd::Fetch { server, range, streams, chunk, baseline } => {
+        Cmd::Fetch {
+            server,
+            range,
+            streams,
+            chunk,
+            baseline,
+        } => {
             cmd_fetch(server, range, streams, chunk, baseline);
         }
-        Cmd::DeriveUfvk { mnemonic, account, network } => {
+        Cmd::DeriveUfvk {
+            mnemonic,
+            account,
+            network,
+        } => {
             cmd_derive_ufvk(&mnemonic, account, network.to_network());
         }
-        Cmd::Send { network, server, wallet_dir, mnemonic, account, to, zats } => {
-            cmd_send(network.to_network(), server, wallet_dir, mnemonic, account, to, zats);
+        Cmd::Send {
+            network,
+            server,
+            wallet_dir,
+            mnemonic,
+            account,
+            to,
+            zats,
+        } => {
+            cmd_send(
+                network.to_network(),
+                server,
+                wallet_dir,
+                mnemonic,
+                account,
+                to,
+                zats,
+            );
         }
-        Cmd::Sync { network, custom_heights, server, wallet_dir, ufvk, birthday, streams, chunk, sparse,
-            anchor_retention, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow } => {
-            cmd_sync(resolve_network(network, custom_heights.as_deref()), server, wallet_dir, ufvk, birthday, streams, chunk, sparse, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow, anchor_retention);
+        Cmd::Sync {
+            network,
+            custom_heights,
+            server,
+            wallet_dir,
+            ufvk,
+            birthday,
+            streams,
+            chunk,
+            sparse,
+            anchor_retention,
+            chunk_split_bytes,
+            memory_budget_bytes,
+            write_behind,
+            gpu_subtree,
+            persist_depth,
+            follow,
+        } => {
+            cmd_sync(
+                resolve_network(network, custom_heights.as_deref()),
+                server,
+                wallet_dir,
+                ufvk,
+                birthday,
+                streams,
+                chunk,
+                sparse,
+                chunk_split_bytes,
+                memory_budget_bytes,
+                write_behind,
+                gpu_subtree,
+                persist_depth,
+                follow,
+                anchor_retention,
+            );
         }
-        Cmd::Bench { network, server, alternate_server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep } => {
-            cmd_bench(network.to_network(), server, alternate_server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep);
+        Cmd::Bench {
+            network,
+            server,
+            alternate_server,
+            ufvk,
+            birthday,
+            wallet_dir,
+            graft,
+            gpu_subtree,
+            batch_combine,
+            batch_decrypt,
+            local_treestate,
+            treestate_verify_sample,
+            endo_mul,
+            persist_depth,
+            graft_verify_sample,
+            json,
+            keep,
+        } => {
+            cmd_bench(
+                network.to_network(),
+                server,
+                alternate_server,
+                ufvk,
+                birthday,
+                wallet_dir,
+                graft,
+                gpu_subtree,
+                batch_combine,
+                batch_decrypt,
+                local_treestate,
+                treestate_verify_sample,
+                endo_mul,
+                persist_depth,
+                graft_verify_sample,
+                json,
+                keep,
+            );
         }
-        Cmd::Watch { network, server, wallet_dir, ufvk, birthday, interval_ms } => {
-            cmd_watch(network.to_network(), server, wallet_dir, ufvk, birthday, interval_ms);
+        Cmd::Watch {
+            network,
+            server,
+            wallet_dir,
+            ufvk,
+            birthday,
+            interval_ms,
+        } => {
+            cmd_watch(
+                network.to_network(),
+                server,
+                wallet_dir,
+                ufvk,
+                birthday,
+                interval_ms,
+            );
         }
-        Cmd::Oracle { network, server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk } => {
-            cmd_oracle(network.to_network(), server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk);
+        Cmd::Oracle {
+            network,
+            server,
+            wallet_a,
+            wallet_b,
+            ufvk,
+            birthday,
+            sparse_b,
+            write_behind_b,
+            gpu_subtree_b,
+            persist_depth_b,
+            streams,
+            chunk,
+        } => {
+            cmd_oracle(
+                network.to_network(),
+                server,
+                wallet_a,
+                wallet_b,
+                ufvk,
+                birthday,
+                sparse_b,
+                write_behind_b,
+                gpu_subtree_b,
+                persist_depth_b,
+                streams,
+                chunk,
+            );
         }
     }
 }
@@ -1455,22 +1682,41 @@ mod tests {
     #[test]
     fn parses_network_flag_and_defaults_to_main() {
         let cli = Cli::try_parse_from([
-            "slipstream", "sync",
-            "--network", "test",
-            "--server", "https://lwd.example:443",
-            "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--network",
+            "test",
+            "--server",
+            "https://lwd.example:443",
+            "--wallet-dir",
+            "/tmp/w",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { network: NetworkArg::Test, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                network: NetworkArg::Test,
+                ..
+            }
+        ));
 
         let cli = Cli::try_parse_from([
-            "slipstream", "sync",
-            "--server", "https://lwd.example:443",
-            "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--server",
+            "https://lwd.example:443",
+            "--wallet-dir",
+            "/tmp/w",
         ])
         .expect("parses");
         assert!(
-            matches!(cli.cmd, Cmd::Sync { network: NetworkArg::Main, .. }),
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    network: NetworkArg::Main,
+                    ..
+                }
+            ),
             "network must default to mainnet"
         );
     }
@@ -1479,7 +1725,9 @@ mod tests {
     fn derive_ufvk_produces_a_testnet_ufvk() {
         // The standard BIP-39 test mnemonic; testnet fixture derivation only.
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let seed = bip39::Mnemonic::parse(phrase).expect("valid mnemonic").to_seed("");
+        let seed = bip39::Mnemonic::parse(phrase)
+            .expect("valid mnemonic")
+            .to_seed("");
         let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
             &slipstream_core::Network::TestNetwork,
             &seed,
@@ -1498,10 +1746,14 @@ mod tests {
     #[test]
     fn parses_bench_minimal() {
         let cli = Cli::try_parse_from([
-            "slipstream", "bench",
-            "--server", "https://zec.rocks:443",
-            "--ufvk", "uview1abc",
-            "--birthday", "2500000",
+            "slipstream",
+            "bench",
+            "--server",
+            "https://zec.rocks:443",
+            "--ufvk",
+            "uview1abc",
+            "--birthday",
+            "2500000",
         ])
         .expect("parses");
         // v0.4.0: graft + batch_combine default ON; v0.5: endo_mul default ON —
@@ -1509,29 +1761,54 @@ mod tests {
         // --endo-mul false` is the baseline A/B form.
         assert!(matches!(
             cli.cmd,
-            Cmd::Bench { graft: true, batch_combine: true, endo_mul: true, gpu_subtree: false, keep: false, .. }
+            Cmd::Bench {
+                graft: true,
+                batch_combine: true,
+                endo_mul: true,
+                gpu_subtree: false,
+                keep: false,
+                ..
+            }
         ));
     }
 
     #[test]
     fn parses_bench_full_flags() {
         let cli = Cli::try_parse_from([
-            "slipstream", "bench",
-            "--server", "https://zec.rocks:443",
-            "--ufvk", "uview1abc",
-            "--birthday", "2500000",
-            "--wallet-dir", "/tmp/benchw",
-            "--graft", "true",
-            "--gpu-subtree", "true",
-            "--json", "/tmp/out.json",
+            "slipstream",
+            "bench",
+            "--server",
+            "https://zec.rocks:443",
+            "--ufvk",
+            "uview1abc",
+            "--birthday",
+            "2500000",
+            "--wallet-dir",
+            "/tmp/benchw",
+            "--graft",
+            "true",
+            "--gpu-subtree",
+            "true",
+            "--json",
+            "/tmp/out.json",
             "--keep",
         ])
         .expect("parses");
         match cli.cmd {
-            Cmd::Bench { graft, gpu_subtree, keep, json, wallet_dir, .. } => {
+            Cmd::Bench {
+                graft,
+                gpu_subtree,
+                keep,
+                json,
+                wallet_dir,
+                ..
+            } => {
                 assert!(graft && gpu_subtree && keep);
                 assert_eq!(json.as_deref(), Some(std::path::Path::new("/tmp/out.json")));
-                assert_eq!(wallet_dir.as_deref(), Some(std::path::Path::new("/tmp/benchw")));
+                assert_eq!(
+                    wallet_dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/benchw"))
+                );
             }
             other => panic!("wrong cmd: {other:?}"),
         }
@@ -1543,9 +1820,12 @@ mod tests {
         assert!(Cli::try_parse_from(["slipstream", "bench", "--server", "http://x:1"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "slipstream", "bench",
-                "--server", "http://x:1",
-                "--ufvk", "uview1abc",
+                "slipstream",
+                "bench",
+                "--server",
+                "http://x:1",
+                "--ufvk",
+                "uview1abc",
             ])
             .is_err()
         );
@@ -1627,7 +1907,10 @@ mod tests {
             "/tmp/test-wallet",
         ])
         .expect("parses default");
-        assert!(matches!(cli.cmd, Cmd::Sync { sparse: true, .. }), "default must be true");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { sparse: true, .. }),
+            "default must be true"
+        );
     }
 
     #[test]
@@ -1687,7 +1970,13 @@ mod tests {
         ])
         .expect("parses --chunk-split-bytes");
         assert!(
-            matches!(cli.cmd, Cmd::Sync { chunk_split_bytes: 2_097_152, .. }),
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    chunk_split_bytes: 2_097_152,
+                    ..
+                }
+            ),
             "--chunk-split-bytes must override the default"
         );
     }
@@ -1729,7 +2018,13 @@ mod tests {
         ])
         .expect("parses --memory-budget-bytes");
         assert!(
-            matches!(cli.cmd, Cmd::Sync { memory_budget_bytes: 67_108_864, .. }),
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    memory_budget_bytes: 67_108_864,
+                    ..
+                }
+            ),
             "--memory-budget-bytes must override the default"
         );
     }
@@ -1748,7 +2043,10 @@ mod tests {
         let result = validate_sync_args(Some("uview1someufvk"), None);
         assert!(result.is_err(), "ufvk without birthday must error");
         let msg = result.unwrap_err();
-        assert!(msg.contains("birthday"), "error message should mention birthday: {msg}");
+        assert!(
+            msg.contains("birthday"),
+            "error message should mention birthday: {msg}"
+        );
     }
 
     #[test]
@@ -1767,7 +2065,10 @@ mod tests {
     fn sync_allows_birthday_without_ufvk_returns_none() {
         // birthday with no ufvk: silently ignored (validate_sync_args returns Ok(None))
         let result = validate_sync_args(None, Some(800_000));
-        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+        assert!(
+            matches!(result, Ok(None)),
+            "expected Ok(None), got {result:?}"
+        );
     }
 
     #[test]
@@ -1787,11 +2088,16 @@ mod tests {
             "1500000",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Oracle { write_behind_b: false, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Oracle {
+                write_behind_b: false,
+                ..
+            }
+        ));
     }
 
     // ── T6.9 write-behind flags ────────────────────────────────────────────────
-
 
     #[test]
     fn sync_write_behind_defaults_on() {
@@ -1805,7 +2111,13 @@ mod tests {
             "/tmp/test-wallet",
         ])
         .expect("parses without the flag");
-        assert!(matches!(cli.cmd, Cmd::Sync { write_behind: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                write_behind: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1820,7 +2132,13 @@ mod tests {
             "--write-behind",
         ])
         .expect("parses bare --write-behind");
-        assert!(matches!(cli.cmd, Cmd::Sync { write_behind: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                write_behind: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1836,7 +2154,13 @@ mod tests {
             "false",
         ])
         .expect("parses --write-behind false");
-        assert!(matches!(cli.cmd, Cmd::Sync { write_behind: false, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                write_behind: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1860,7 +2184,11 @@ mod tests {
         .expect("parses");
         assert!(matches!(
             cli.cmd,
-            Cmd::Oracle { sparse_b: true, write_behind_b: true, .. }
+            Cmd::Oracle {
+                sparse_b: true,
+                write_behind_b: true,
+                ..
+            }
         ));
     }
 
@@ -1868,53 +2196,119 @@ mod tests {
     fn gpu_subtree_flags_parse() {
         // oracle --gpu-subtree-b (B0.4 acceptance-gate flag)
         let cli = Cli::try_parse_from([
-            "slipstream", "oracle",
-            "--server", "http://127.0.0.1:9067",
-            "--wallet-a", "/tmp/oa", "--wallet-b", "/tmp/ob",
-            "--ufvk", "uview1someufvk", "--birthday", "1500000",
-            "--sparse-b", "--gpu-subtree-b",
+            "slipstream",
+            "oracle",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-a",
+            "/tmp/oa",
+            "--wallet-b",
+            "/tmp/ob",
+            "--ufvk",
+            "uview1someufvk",
+            "--birthday",
+            "1500000",
+            "--sparse-b",
+            "--gpu-subtree-b",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Oracle { gpu_subtree_b: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Oracle {
+                gpu_subtree_b: true,
+                ..
+            }
+        ));
 
         // sync --gpu-subtree
         let cli = Cli::try_parse_from([
-            "slipstream", "sync",
-            "--server", "http://127.0.0.1:9067",
-            "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/w",
             "--gpu-subtree",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { gpu_subtree: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                gpu_subtree: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn persist_depth_flags_parse() {
         // oracle --persist-depth-b
         let cli = Cli::try_parse_from([
-            "slipstream", "oracle",
-            "--server", "http://127.0.0.1:9067",
-            "--wallet-a", "/tmp/oa", "--wallet-b", "/tmp/ob",
-            "--ufvk", "uview1someufvk", "--birthday", "1500000",
-            "--sparse-b", "--persist-depth-b", "4",
+            "slipstream",
+            "oracle",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-a",
+            "/tmp/oa",
+            "--wallet-b",
+            "/tmp/ob",
+            "--ufvk",
+            "uview1someufvk",
+            "--birthday",
+            "1500000",
+            "--sparse-b",
+            "--persist-depth-b",
+            "4",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Oracle { persist_depth_b: 4, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Oracle {
+                persist_depth_b: 4,
+                ..
+            }
+        ));
 
         // sync --persist-depth
         let cli = Cli::try_parse_from([
-            "slipstream", "sync", "--server", "http://127.0.0.1:9067",
-            "--wallet-dir", "/tmp/w", "--persist-depth", "3",
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/w",
+            "--persist-depth",
+            "3",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { persist_depth: 3, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                persist_depth: 3,
+                ..
+            }
+        ));
 
         // default depth = 1
         let cli = Cli::try_parse_from([
-            "slipstream", "sync", "--server", "http://127.0.0.1:9067", "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/w",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { persist_depth: 1, .. }), "default depth must be 1");
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    persist_depth: 1,
+                    ..
+                }
+            ),
+            "default depth must be 1"
+        );
     }
 
     #[test]
@@ -1946,7 +2340,10 @@ mod tests {
             "/tmp/test-wallet",
         ])
         .expect("parses without --follow");
-        assert!(matches!(cli.cmd, Cmd::Sync { follow: false, .. }), "default must be false");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { follow: false, .. }),
+            "default must be false"
+        );
 
         // --follow enables following.
         let cli = Cli::try_parse_from([
@@ -1959,6 +2356,9 @@ mod tests {
             "--follow",
         ])
         .expect("parses --follow");
-        assert!(matches!(cli.cmd, Cmd::Sync { follow: true, .. }), "--follow must enable following");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { follow: true, .. }),
+            "--follow must enable following"
+        );
     }
 }

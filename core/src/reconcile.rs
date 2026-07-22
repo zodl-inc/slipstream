@@ -91,7 +91,8 @@ FROM transactions t";
 /// reconciled Activity list by construction. `v_transactions` is upstream's stable view
 /// (account_uuid, account_balance_delta, mined_height are the columns the shipped SDK
 /// query already depends on).
-pub const RECOVERY_BALANCE_VIEW_SQL: &str = "CREATE VIEW IF NOT EXISTS slipstream_v_recovery_balance AS
+pub const RECOVERY_BALANCE_VIEW_SQL: &str =
+    "CREATE VIEW IF NOT EXISTS slipstream_v_recovery_balance AS
 SELECT vt.account_uuid AS account_uuid,
        SUM(vt.account_balance_delta) AS balance_zat
 FROM v_transactions vt
@@ -133,7 +134,8 @@ mod tests {
         let path = dir.path().join("data.db");
         let _session = WalletSession::open(Network::MainNetwork, &path).expect("open");
         let conn = Connection::open(&path).expect("conn");
-        conn.pragma_update(None, "foreign_keys", false).expect("fk off");
+        conn.pragma_update(None, "foreign_keys", false)
+            .expect("fk off");
         (dir, conn)
     }
 
@@ -150,7 +152,14 @@ mod tests {
     /// Record our spending tx `txid` at locator (height, 0) plus the observed
     /// shielded spend of `nf` in pool `spend_pool`. The spent note is NOT yet
     /// received — the recent-first "dangling" state.
-    fn insert_dangling_spend(conn: &Connection, id_tx: i64, txid: &[u8], height: i64, spend_pool: i64, nf: &[u8]) {
+    fn insert_dangling_spend(
+        conn: &Connection,
+        id_tx: i64,
+        txid: &[u8],
+        height: i64,
+        spend_pool: i64,
+        nf: &[u8],
+    ) {
         conn.execute(
             "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height) VALUES (?1, ?2, ?3, 0, ?3)",
             params![id_tx, txid, height],
@@ -175,7 +184,11 @@ mod tests {
         let nf = vec![0xBBu8; 32];
 
         insert_dangling_spend(&conn, 1, &txid, 200, 2, &nf);
-        assert_eq!(reconciled(&conn, &txid), Some(0), "sapling dangling spend -> unreconciled");
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(0),
+            "sapling dangling spend -> unreconciled"
+        );
 
         // The older block is scanned: the note carrying `nf` is received -> the
         // spend links -> the tx's delta is now final.
@@ -186,7 +199,11 @@ mod tests {
             params![nf],
         )
         .expect("insert sapling_received_notes");
-        assert_eq!(reconciled(&conn, &txid), Some(1), "sapling linked spend -> reconciled");
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(1),
+            "sapling linked spend -> reconciled"
+        );
     }
 
     #[test]
@@ -196,7 +213,11 @@ mod tests {
         let nf = vec![0xDDu8; 32];
 
         insert_dangling_spend(&conn, 1, &txid, 300, 3, &nf);
-        assert_eq!(reconciled(&conn, &txid), Some(0), "orchard dangling spend -> unreconciled");
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(0),
+            "orchard dangling spend -> unreconciled"
+        );
 
         conn.execute(
             "INSERT INTO orchard_received_notes
@@ -205,7 +226,11 @@ mod tests {
             params![nf],
         )
         .expect("insert orchard_received_notes");
-        assert_eq!(reconciled(&conn, &txid), Some(1), "orchard linked spend -> reconciled");
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(1),
+            "orchard linked spend -> reconciled"
+        );
     }
 
     #[test]
@@ -224,7 +249,11 @@ mod tests {
             params![txid],
         )
         .expect("insert tx_locator_map");
-        assert_eq!(reconciled(&conn, &txid), Some(1), "pure receive -> reconciled");
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(1),
+            "pure receive -> reconciled"
+        );
     }
 
     #[test]
@@ -259,7 +288,11 @@ mod tests {
         )
         .expect("insert other nullifier_map");
 
-        assert_eq!(reconciled(&conn, &ours), Some(1), "unrelated dangling spend must not taint our tx");
+        assert_eq!(
+            reconciled(&conn, &ours),
+            Some(1),
+            "unrelated dangling spend must not taint our tx"
+        );
     }
 
     // ── [API v2 §4.2] recovery-balance view ─────────────────────────────────────────────
@@ -317,7 +350,11 @@ mod tests {
             params![receive_tx],
         )
         .expect("receive tx row");
-        assert_eq!(recovery_balance(&conn, &acct), Some(400), "reconciled receive counts");
+        assert_eq!(
+            recovery_balance(&conn, &acct),
+            Some(400),
+            "reconciled receive counts"
+        );
 
         // Mined spend −100 whose spent note hasn't been scanned yet (dangling nullifier):
         // the tx is unreconciled → EXCLUDED → balance holds at 400, never over/under-shows.
@@ -356,18 +393,32 @@ mod tests {
         let b_spend = vec![0x04u8; 32];
         let nf = vec![0xCCu8; 32];
 
-        conn.execute("INSERT INTO v_transactions VALUES (?1, ?2, 500, 100)", params![a_receive, acct_a])
-            .expect("a receive");
+        conn.execute(
+            "INSERT INTO v_transactions VALUES (?1, ?2, 500, 100)",
+            params![a_receive, acct_a],
+        )
+        .expect("a receive");
         conn.execute(
             "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height) VALUES (1, ?1, 100, 0, 100)",
             params![a_receive],
         )
         .expect("a tx row");
-        conn.execute("INSERT INTO v_transactions VALUES (?1, ?2, -50, 200)", params![b_spend, acct_b])
-            .expect("b spend");
+        conn.execute(
+            "INSERT INTO v_transactions VALUES (?1, ?2, -50, 200)",
+            params![b_spend, acct_b],
+        )
+        .expect("b spend");
         insert_dangling_spend(&conn, 2, &b_spend, 200, 2, &nf);
 
-        assert_eq!(recovery_balance(&conn, &acct_a), Some(500), "A unaffected by B's dangle");
-        assert_eq!(recovery_balance(&conn, &acct_b), None, "B has no reconciled rows yet");
+        assert_eq!(
+            recovery_balance(&conn, &acct_a),
+            Some(500),
+            "A unaffected by B's dangle"
+        );
+        assert_eq!(
+            recovery_balance(&conn, &acct_b),
+            None,
+            "B has no reconciled rows yet"
+        );
     }
 }

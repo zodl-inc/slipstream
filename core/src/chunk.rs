@@ -34,7 +34,12 @@ impl Chunk {
             .flat_map(|block| &block.vtx)
             .map(|tx| (tx.outputs.len() + tx.actions.len()) as u64)
             .sum();
-        Self { index, blocks, estimated_bytes, outputs }
+        Self {
+            index,
+            blocks,
+            estimated_bytes,
+            outputs,
+        }
     }
 
     pub fn start_height(&self) -> Option<u64> {
@@ -55,8 +60,9 @@ pub struct ChunkPermit {
 /// EMITTED, so its RTT overlaps queue wait + scan + submit instead of racing
 /// one scan call (the P1 split measured that overhang at 62 % of the Mac
 /// scan wall on a slow-treestate day).
-pub type BoundaryHandle =
-    tokio::task::JoinHandle<Result<zcash_client_backend::proto::service::TreeState, SlipstreamError>>;
+pub type BoundaryHandle = tokio::task::JoinHandle<
+    Result<zcash_client_backend::proto::service::TreeState, SlipstreamError>,
+>;
 
 /// Injected at queue construction (scheduler): given a chunk's end height,
 /// spawn its boundary treestate fetch. `None` (tests, darkside) keeps the
@@ -109,8 +115,8 @@ impl ChunkQueueSender {
         };
         // Saturate: budgets beyond u32::MAX simply cap the per-chunk acquisition;
         // the semaphore itself holds the full usize budget, so backpressure stays correct.
-        let need = u32::try_from(chunk.estimated_bytes.min(self.budget_bytes).max(1))
-            .unwrap_or(u32::MAX);
+        let need =
+            u32::try_from(chunk.estimated_bytes.min(self.budget_bytes).max(1)).unwrap_or(u32::MAX);
         let permits = self
             .budget
             .clone()
@@ -135,10 +141,16 @@ impl ChunkQueueReceiver {
 mod tests {
     use super::*;
     use std::time::Duration;
-    use zcash_client_backend::proto::compact_formats::{CompactSaplingOutput, CompactOrchardAction, CompactTx};
+    use zcash_client_backend::proto::compact_formats::{
+        CompactOrchardAction, CompactSaplingOutput, CompactTx,
+    };
 
     fn block(height: u64) -> CompactBlock {
-        CompactBlock { height, hash: vec![height as u8; 32], ..Default::default() }
+        CompactBlock {
+            height,
+            hash: vec![height as u8; 32],
+            ..Default::default()
+        }
     }
 
     fn chunk_of(index: u64, heights: std::ops::RangeInclusive<u64>) -> Chunk {
@@ -148,8 +160,12 @@ mod tests {
     /// Helper to construct a CompactTx with known outputs and actions.
     fn tx_with_outputs_and_actions(outputs: u32, actions: u32) -> CompactTx {
         CompactTx {
-            outputs: (0..outputs).map(|_| CompactSaplingOutput::default()).collect(),
-            actions: (0..actions).map(|_| CompactOrchardAction::default()).collect(),
+            outputs: (0..outputs)
+                .map(|_| CompactSaplingOutput::default())
+                .collect(),
+            actions: (0..actions)
+                .map(|_| CompactOrchardAction::default())
+                .collect(),
             ..Default::default()
         }
     }
@@ -157,7 +173,10 @@ mod tests {
     #[test]
     fn estimated_bytes_counts_encoded_blocks() {
         let c = chunk_of(0, 1..=10);
-        assert!(c.estimated_bytes > 10 * 32, "must at least cover the hashes");
+        assert!(
+            c.estimated_bytes > 10 * 32,
+            "must at least cover the hashes"
+        );
         assert_eq!(c.start_height(), Some(1));
         assert_eq!(c.end_height(), Some(10));
     }
@@ -242,6 +261,9 @@ mod tests {
         ];
         // Expected: 5 + 1 + 4 = 10
         let chunk = Chunk::from_blocks(0, blocks);
-        assert_eq!(chunk.outputs, 10, "outputs must sum sapling outputs + orchard actions");
+        assert_eq!(
+            chunk.outputs, 10,
+            "outputs must sum sapling outputs + orchard actions"
+        );
     }
 }

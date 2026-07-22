@@ -55,7 +55,11 @@ pub(crate) fn reorg_backoff_ms(consecutive: u64) -> u64 {
 /// catch-up (the SDK used to mask this with its own summary-derived floor; this is that
 /// floor's engine-owned successor). `None` when the inputs cannot express a position
 /// (no tip advertised yet, no accounts, or a tip below the birthday).
-pub(crate) fn global_floor_permille(tip: u64, birthday: Option<u64>, remaining: u64) -> Option<u64> {
+pub(crate) fn global_floor_permille(
+    tip: u64,
+    birthday: Option<u64>,
+    remaining: u64,
+) -> Option<u64> {
     let birthday = birthday?;
     if tip == 0 || tip < birthday {
         return None;
@@ -275,7 +279,8 @@ pub async fn run_to_completion(
             // a cold-launch catch-up starts at ~99.9% instead of flashing 0% (the old Swift
             // summary floor), and a relaunched restore RESUMES near its true position instead of
             // 0% (the old Swift monotonic floor could not survive a relaunch).
-            if let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining) {
+            if let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining)
+            {
                 // [API v2.1 E-5] Scope-expansion re-baseline: an imported account with an
                 // older birthday (or a rewind) grows the span under the session floor —
                 // without this, the ~1000 floor from the previous scope's Done would mask
@@ -355,29 +360,28 @@ pub async fn run_to_completion(
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
-        let fetch_task = tokio::spawn(async move {
-            run_fetch(&endpoint, plan, tx, fetch_progress).await
-        });
+        let fetch_task =
+            tokio::spawn(async move { run_fetch(&endpoint, plan, tx, fetch_progress).await });
 
         // scan_chunks runs in the current task using a SEPARATE grpc client so it
         // does not contend with the fetch workers' connections.
-        let mut scan_client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
+        let mut scan_client =
+            connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
 
         let scan_started = std::time::Instant::now();
-        let scan_result: Result<ScanStats, SlipstreamError> =
-            scan_chunks(
-                session,
-                &mut scan_client,
-                start,
-                rx,
-                progress.clone(),
-                config,
-                skipped_keys,
-                tor,
-                // v0.4 Plan A: only Historic ranges buffer (accumulator rule 2).
-                range.priority() == ScanPriority::Historic,
-            )
-            .await;
+        let scan_result: Result<ScanStats, SlipstreamError> = scan_chunks(
+            session,
+            &mut scan_client,
+            start,
+            rx,
+            progress.clone(),
+            config,
+            skipped_keys,
+            tor,
+            // v0.4 Plan A: only Historic ranges buffer (accumulator rule 2).
+            range.priority() == ScanPriority::Historic,
+        )
+        .await;
         let scan_wall = scan_started.elapsed();
 
         // Error-precedence rationale (deviation from plan's draft `??` which loses nuance):
@@ -416,8 +420,7 @@ pub async fn run_to_completion(
             if consecutive_reorgs > MAX_CONSECUTIVE_REORGS {
                 warn!(
                     consecutive_reorgs,
-                    at,
-                    "too many consecutive reorg recoveries — giving up"
+                    at, "too many consecutive reorg recoveries — giving up"
                 );
                 return Err(SlipstreamError::ScanContinuity { at });
             }
@@ -562,9 +565,16 @@ pub async fn run_to_completion(
         {
             let enhance_started = std::time::Instant::now();
             let enhance_result = async {
-                let mut enhance_client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-                run_enhancement(session, &mut enhance_client, config.network, progress.clone(), skipped_keys)
-                    .await
+                let mut enhance_client =
+                    connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
+                run_enhancement(
+                    session,
+                    &mut enhance_client,
+                    config.network,
+                    progress.clone(),
+                    skipped_keys,
+                )
+                .await
             }
             .await;
             match enhance_result {
@@ -641,7 +651,10 @@ mod tests {
     fn global_floor_catch_up_seeds_near_complete() {
         // tip 2.0M, birthday 1.0M (span 1_000_001), 3_000 blocks left to scan.
         let seed = global_floor_permille(2_000_000, Some(1_000_000), 3_000).unwrap();
-        assert!((990..=1000).contains(&seed), "catch-up must seed near 1000, got {seed}");
+        assert!(
+            (990..=1000).contains(&seed),
+            "catch-up must seed near 1000, got {seed}"
+        );
     }
 
     /// A fresh from-birthday restore has (almost) the whole span in the queue — the seed
@@ -663,9 +676,21 @@ mod tests {
     /// Degenerate inputs cannot express a position: no seed (floor untouched).
     #[test]
     fn global_floor_degenerate_inputs_yield_none() {
-        assert_eq!(global_floor_permille(0, Some(1_000_000), 10), None, "no tip yet");
-        assert_eq!(global_floor_permille(2_000_000, None, 10), None, "no accounts");
-        assert_eq!(global_floor_permille(999, Some(1_000), 10), None, "tip below birthday");
+        assert_eq!(
+            global_floor_permille(0, Some(1_000_000), 10),
+            None,
+            "no tip yet"
+        );
+        assert_eq!(
+            global_floor_permille(2_000_000, None, 10),
+            None,
+            "no accounts"
+        );
+        assert_eq!(
+            global_floor_permille(999, Some(1_000), 10),
+            None,
+            "tip below birthday"
+        );
         // Remaining exceeding the span clamps to 0 rather than underflowing.
         assert_eq!(global_floor_permille(1_100, Some(1_000), 5_000), Some(0));
     }
@@ -685,7 +710,8 @@ mod tests {
             time: 1,
             ..Default::default()
         };
-        s.ensure_account(crate::wallet_session::TEST_UFVK, ts).expect("import account");
+        s.ensure_account(crate::wallet_session::TEST_UFVK, ts)
+            .expect("import account");
         s.update_chain_tip(tip).expect("update tip");
         s
     }
@@ -702,7 +728,11 @@ mod tests {
         assert_eq!(p.chain_tip.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(!p.recovering());
         assert_eq!(p.spendable(), 0);
-        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(
+            p.progress_permille_floor
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
     }
 
     /// Never-scanned restore-shaped wallet: the seed reports the persisted tip, a truthful
@@ -723,7 +753,8 @@ mod tests {
         );
         assert!(!p.recovering(), "no recover_until ⇒ not recovering");
         assert_eq!(
-            p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed),
+            p.progress_permille_floor
+                .load(std::sync::atomic::Ordering::Relaxed),
             0,
             "nothing scanned ⇒ truthful 0‰ floor (restore bar still climbs from 0)"
         );
@@ -732,7 +763,11 @@ mod tests {
         let recent_pending = ranges
             .iter()
             .any(|r| matches!(r.priority(), ScanPriority::ChainTip | ScanPriority::Verify));
-        assert_eq!(p.spendable() == 1, !recent_pending, "spendable ⇔ no recent range pending");
+        assert_eq!(
+            p.spendable() == 1,
+            !recent_pending,
+            "spendable ⇔ no recent range pending"
+        );
         // The seed must never bump the tip-REFRESH counter (persisted ≠ freshly proven).
         assert_eq!(p.tip_refreshes(), 0, "E-3 seed must not fake tip freshness");
     }
@@ -788,12 +823,20 @@ mod tests {
     /// B3 (#1755): backoff grows 500 ms per consecutive recovery and caps at 3 s.
     #[test]
     fn reorg_backoff_grows_and_caps() {
-        assert_eq!(reorg_backoff_ms(0), 0, "no recoveries -> no wait (unreachable in the arm)");
+        assert_eq!(
+            reorg_backoff_ms(0),
+            0,
+            "no recoveries -> no wait (unreachable in the arm)"
+        );
         assert_eq!(reorg_backoff_ms(1), 500, "first recovery waits 500 ms");
         assert_eq!(reorg_backoff_ms(2), 1_000);
         assert_eq!(reorg_backoff_ms(5), 2_500, "the cap budget's last step");
         assert_eq!(reorg_backoff_ms(6), 3_000, "capped at 3 s");
-        assert_eq!(reorg_backoff_ms(u64::MAX), 3_000, "saturating mul + cap, no overflow");
+        assert_eq!(
+            reorg_backoff_ms(u64::MAX),
+            3_000,
+            "saturating mul + cap, no overflow"
+        );
     }
 
     #[test]
@@ -844,9 +887,18 @@ mod tests {
         report.enhance.statuses_set += 2;
         report.enhance.skipped += 1;
 
-        assert_eq!(report.enhance.requests, 8, "requests must sum across ranges");
-        assert_eq!(report.enhance.txs_stored, 3, "txs_stored must sum across ranges");
-        assert_eq!(report.enhance.statuses_set, 3, "statuses_set must sum across ranges");
+        assert_eq!(
+            report.enhance.requests, 8,
+            "requests must sum across ranges"
+        );
+        assert_eq!(
+            report.enhance.txs_stored, 3,
+            "txs_stored must sum across ranges"
+        );
+        assert_eq!(
+            report.enhance.statuses_set, 3,
+            "statuses_set must sum across ranges"
+        );
         assert_eq!(report.enhance.skipped, 1, "skipped must sum across ranges");
     }
 }

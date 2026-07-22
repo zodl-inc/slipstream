@@ -51,7 +51,10 @@ impl TokenBucket {
     fn new(cap_bytes_per_sec: u64) -> Self {
         Self {
             cap: AtomicU64::new(cap_bytes_per_sec),
-            state: Mutex::new(BucketState { tokens: 0.0, last: Instant::now() }),
+            state: Mutex::new(BucketState {
+                tokens: 0.0,
+                last: Instant::now(),
+            }),
         }
     }
 
@@ -116,7 +119,11 @@ impl ThrottleProxy {
                 });
             }
         });
-        Ok(Self { local_addr, bucket, accept_task })
+        Ok(Self {
+            local_addr,
+            bucket,
+            accept_task,
+        })
     }
 
     /// The bound address — point the engine's `Endpoint` here (tls = false).
@@ -192,7 +199,9 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         tokio::spawn(async move {
             loop {
-                let Ok((mut sock, _)) = listener.accept().await else { return };
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
                 tokio::spawn(async move {
                     let chunk = vec![0xABu8; 64 * 1024];
                     let mut sent = 0;
@@ -228,7 +237,9 @@ mod tests {
     async fn cap_paces_downstream() {
         let total = 1_500_000usize;
         let target = blast_server(total).await;
-        let proxy = ThrottleProxy::start(0, target, 1_000_000).await.expect("proxy");
+        let proxy = ThrottleProxy::start(0, target, 1_000_000)
+            .await
+            .expect("proxy");
 
         let started = Instant::now();
         let got = read_all(proxy.local_addr()).await;
@@ -251,7 +262,9 @@ mod tests {
     async fn set_cap_bites_mid_stream() {
         let total = 2_000_000usize;
         let target = blast_server(total).await;
-        let proxy = ThrottleProxy::start(0, target, 400_000).await.expect("proxy");
+        let proxy = ThrottleProxy::start(0, target, 400_000)
+            .await
+            .expect("proxy");
         let addr = proxy.local_addr();
 
         let mut sock = TcpStream::connect(addr).await.expect("connect");
@@ -278,7 +291,10 @@ mod tests {
         let tail = started.elapsed().as_secs_f64();
         assert_eq!(got, total, "byte-transparent across retune");
         assert!(head > 1.0, "cap did not pace the head: {head:.2}s");
-        assert!(tail < head / 2.0, "lifting the cap did not bite: head {head:.2}s tail {tail:.2}s");
+        assert!(
+            tail < head / 2.0,
+            "lifting the cap did not bite: head {head:.2}s tail {tail:.2}s"
+        );
         proxy.shutdown();
     }
 
@@ -288,7 +304,9 @@ mod tests {
     async fn uncapped_is_transparent() {
         let total = 3_000_000usize;
         let target = blast_server(total).await;
-        let proxy = ThrottleProxy::start(0, target, UNCAPPED).await.expect("proxy");
+        let proxy = ThrottleProxy::start(0, target, UNCAPPED)
+            .await
+            .expect("proxy");
         let got = read_all(proxy.local_addr()).await;
         assert_eq!(got, total);
         proxy.shutdown();

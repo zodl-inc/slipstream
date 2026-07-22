@@ -22,8 +22,7 @@ use futures_util::{StreamExt, stream::FuturesUnordered};
 use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::{
     OutputStatusFilter, TransactionDataRequest, TransactionStatus, TransactionStatusFilter,
-    TransactionsInvolvingAddress, WalletRead, WalletWrite,
-    wallet::decrypt_and_store_transaction,
+    TransactionsInvolvingAddress, WalletRead, WalletWrite, wallet::decrypt_and_store_transaction,
 };
 use zcash_client_backend::proto::service::{BlockId, BlockRange, TransparentAddressBlockFilter};
 use zcash_keys::encoding::AddressCodec;
@@ -162,18 +161,36 @@ pub async fn run_enhancement(
         loop {
             // v0.5 pacer: awaiting the next fetch = the network-bound share.
             let fetch_started = std::time::Instant::now();
-            let Some((txid, want_enhance, fetched)) = pending.next().await else { break };
+            let Some((txid, want_enhance, fetched)) = pending.next().await else {
+                break;
+            };
             stats.fetch_wait += fetch_started.elapsed();
             let store_started = std::time::Instant::now();
-            apply_txid_fetch(session, txid, want_enhance, fetched, &network, &mut stats, progress.as_deref())?;
+            apply_txid_fetch(
+                session,
+                txid,
+                want_enhance,
+                fetched,
+                &network,
+                &mut stats,
+                progress.as_deref(),
+            )?;
             stats.store += store_started.elapsed();
         }
 
         // ── Phase 2: serial address-window requests ────────────────────────────
         let address_started = std::time::Instant::now();
         for tia in address_reqs {
-            apply_address_request(session, client, &network, tia, &mut stats, skipped_keys, progress.as_deref())
-                .await?;
+            apply_address_request(
+                session,
+                client,
+                &network,
+                tia,
+                &mut stats,
+                skipped_keys,
+                progress.as_deref(),
+            )
+            .await?;
         }
         stats.address += address_started.elapsed();
     }
@@ -213,7 +230,9 @@ fn apply_txid_fetch(
                 .db_mut()
                 .set_transaction_status(txid, TransactionStatus::TxidNotRecognized)
                 .map_err(|e| {
-                    SlipstreamError::Wallet(format!("set_transaction_status TxidNotRecognized: {e}"))
+                    SlipstreamError::Wallet(format!(
+                        "set_transaction_status TxidNotRecognized: {e}"
+                    ))
                 })?;
             stats.statuses_set += 1;
         }
@@ -231,8 +250,9 @@ fn apply_txid_fetch(
             if want_enhance {
                 // Branch ID is irrelevant for decrypt/serialize/txid — we use Sapling
                 // as a dummy (see rust/src/lib.rs:2045-2051 load-bearing comment).
-                let tx = Transaction::read(&raw.data[..], zcash_protocol::consensus::BranchId::Sapling)
-                    .map_err(|e| SlipstreamError::Wallet(format!("tx parse: {e}")))?;
+                let tx =
+                    Transaction::read(&raw.data[..], zcash_protocol::consensus::BranchId::Sapling)
+                        .map_err(|e| SlipstreamError::Wallet(format!("tx parse: {e}")))?;
                 decrypt_and_store_transaction(network, session.db_mut(), &tx, mined_height)
                     .map_err(|e| SlipstreamError::Wallet(format!("decrypt_and_store: {e}")))?;
                 stats.txs_stored += 1;
@@ -249,9 +269,7 @@ fn apply_txid_fetch(
                 session
                     .db_mut()
                     .set_transaction_status(txid, status)
-                    .map_err(|e| {
-                        SlipstreamError::Wallet(format!("set_transaction_status: {e}"))
-                    })?;
+                    .map_err(|e| SlipstreamError::Wallet(format!("set_transaction_status: {e}")))?;
                 stats.statuses_set += 1;
                 if let Some(p) = progress {
                     // [E-4] a status write is a tx-set UPDATE (pending → mined/expired) —
@@ -313,11 +331,9 @@ async fn apply_address_request(
     // new transparent-address leakage surface (book ch.15).
     let block_range_end = match tia.block_range_end() {
         Some(h) => h,
-        None => match session
-            .db_mut()
-            .chain_height()
-            .map_err(|e| SlipstreamError::Wallet(format!("chain_height for open-range clamp: {e}")))?
-        {
+        None => match session.db_mut().chain_height().map_err(|e| {
+            SlipstreamError::Wallet(format!("chain_height for open-range clamp: {e}"))
+        })? {
             Some(tip) => effective_range_end(None, tip),
             None => {
                 let key = format!("{}:open-no-tip", tia.address().encode(network));
@@ -389,8 +405,14 @@ async fn apply_address_request(
     let filter = TransparentAddressBlockFilter {
         address: tia.address().encode(network),
         range: Some(BlockRange {
-            start: Some(BlockId { height: start_height, hash: vec![] }),
-            end: Some(BlockId { height: end_height, hash: vec![] }),
+            start: Some(BlockId {
+                height: start_height,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: end_height,
+                hash: vec![],
+            }),
             pool_types: vec![],
         }),
     };
@@ -420,9 +442,8 @@ async fn apply_address_request(
             _ => {}
         }
 
-        let tx =
-            Transaction::read(&raw.data[..], zcash_protocol::consensus::BranchId::Sapling)
-                .map_err(|e| SlipstreamError::Wallet(format!("tx parse (taddr): {e}")))?;
+        let tx = Transaction::read(&raw.data[..], zcash_protocol::consensus::BranchId::Sapling)
+            .map_err(|e| SlipstreamError::Wallet(format!("tx parse (taddr): {e}")))?;
         decrypt_and_store_transaction(network, session.db_mut(), &tx, mined_height)
             .map_err(|e| SlipstreamError::Wallet(format!("decrypt_and_store (taddr): {e}")))?;
         stats.txs_stored += 1;
@@ -435,8 +456,7 @@ async fn apply_address_request(
     // Notify the wallet backend that the address check has completed.
     // as_of_height = block_range_end - 1 per the TransactionDataRequest contract.
     let as_of = BlockHeight::from_u32(
-        u32::try_from(u64::from(block_range_end_for_notify).saturating_sub(1))
-            .unwrap_or(u32::MAX),
+        u32::try_from(u64::from(block_range_end_for_notify).saturating_sub(1)).unwrap_or(u32::MAX),
     );
     session
         .db_mut()
@@ -478,7 +498,10 @@ mod tests {
             }
         }
         // Must be counted exactly once regardless of how many rounds re-emit it.
-        assert_eq!(skipped_count, 1, "duplicate open-range skip must count as 1 unique skip");
+        assert_eq!(
+            skipped_count, 1,
+            "duplicate open-range skip must count as 1 unique skip"
+        );
         assert_eq!(skipped_keys.len(), 1);
 
         // A different address produces a distinct key → additional unique skip.
@@ -486,7 +509,10 @@ mod tests {
         if skipped_keys.insert(key2) {
             skipped_count += 1;
         }
-        assert_eq!(skipped_count, 2, "distinct address must count as a separate skip");
+        assert_eq!(
+            skipped_count, 2,
+            "distinct address must count as a separate skip"
+        );
 
         // Range-keyed skip (requestAt guard): same address+range across 2 rounds.
         let key3 = format!("{addr}:663150-663200:request_at");
@@ -495,7 +521,10 @@ mod tests {
                 skipped_count += 1;
             }
         }
-        assert_eq!(skipped_count, 3, "requestAt skip must be counted once per unique address+range");
+        assert_eq!(
+            skipped_count, 3,
+            "requestAt skip must be counted once per unique address+range"
+        );
     }
 
     /// T8.5 — open-ended TransactionsInvolvingAddress ranges clamp to the wallet's current
@@ -511,6 +540,9 @@ mod tests {
             BlockHeight::from_u32(100)
         );
         // Open range → tip + 1 (end-exclusive ⇒ includes the tip block).
-        assert_eq!(effective_range_end(None, tip), BlockHeight::from_u32(3_375_001));
+        assert_eq!(
+            effective_range_end(None, tip),
+            BlockHeight::from_u32(3_375_001)
+        );
     }
 }

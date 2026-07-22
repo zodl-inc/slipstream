@@ -93,7 +93,10 @@ fn decode_retention(
                 2 => Marking::Reference,
                 other => return Err(corrupt(format!("graft buffer: bad marking {other}"))),
             };
-            Retention::Checkpoint { id: BlockHeight::from(h), marking }
+            Retention::Checkpoint {
+                id: BlockHeight::from(h),
+                marking,
+            }
         }
         3 => Retention::Reference,
         other => return Err(corrupt(format!("graft buffer: bad retention kind {other}"))),
@@ -122,7 +125,8 @@ pub(crate) fn append_rows<H: HashSer>(
     )?;
     for (position, hash, retention) in rows {
         let mut bytes = vec![];
-        hash.write(&mut bytes).map_err(|e| corrupt(format!("graft buffer: hash ser: {e}")))?;
+        hash.write(&mut bytes)
+            .map_err(|e| corrupt(format!("graft buffer: hash ser: {e}")))?;
         let (kind, height, marking) = encode_retention(retention);
         stmt.execute(params![
             pool_code(pool),
@@ -167,8 +171,13 @@ pub(crate) fn load_shard<H: HashSer>(
     let mut out = vec![];
     for row in rows {
         let (position, bytes, kind, height, marking) = row?;
-        let hash = H::read(&bytes[..]).map_err(|e| corrupt(format!("graft buffer: hash de: {e}")))?;
-        out.push((position as u64, hash, decode_retention(kind, height, marking)?));
+        let hash =
+            H::read(&bytes[..]).map_err(|e| corrupt(format!("graft buffer: hash de: {e}")))?;
+        out.push((
+            position as u64,
+            hash,
+            decode_retention(kind, height, marking)?,
+        ));
     }
     Ok(out)
 }
@@ -262,8 +271,8 @@ fn buffer_table_exists(conn: &Connection) -> Result<bool, SqliteClientError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use orchard::tree::MerkleHashOrchard;
     use incrementalmerkletree::Hashable as _;
+    use orchard::tree::MerkleHashOrchard;
 
     fn mem_conn() -> Connection {
         Connection::open_in_memory().expect("in-memory conn")
@@ -283,9 +292,18 @@ mod tests {
             Retention::Ephemeral,
             Retention::Marked,
             Retention::Reference,
-            Retention::Checkpoint { id: BlockHeight::from(123), marking: Marking::None },
-            Retention::Checkpoint { id: BlockHeight::from(456), marking: Marking::Marked },
-            Retention::Checkpoint { id: BlockHeight::from(789), marking: Marking::Reference },
+            Retention::Checkpoint {
+                id: BlockHeight::from(123),
+                marking: Marking::None,
+            },
+            Retention::Checkpoint {
+                id: BlockHeight::from(456),
+                marking: Marking::Marked,
+            },
+            Retention::Checkpoint {
+                id: BlockHeight::from(789),
+                marking: Marking::Reference,
+            },
         ]
     }
 
@@ -311,13 +329,18 @@ mod tests {
     fn append_is_idempotent_under_rescan() {
         let conn = mem_conn();
         ensure_buffer_table(&conn).expect("table");
-        let rows: Vec<BufferRow<MerkleHashOrchard>> =
-            vec![(5, h(1), Retention::Ephemeral), (6, h(2), Retention::Marked)];
+        let rows: Vec<BufferRow<MerkleHashOrchard>> = vec![
+            (5, h(1), Retention::Ephemeral),
+            (6, h(2), Retention::Marked),
+        ];
         append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append 1");
         append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append 2 (rescan)");
         let loaded: Vec<BufferRow<MerkleHashOrchard>> =
             load_shard(&conn, ShieldedPool::Orchard, 0).expect("load");
-        assert_eq!(loaded, rows, "REPLACE semantics — no duplicates, same content");
+        assert_eq!(
+            loaded, rows,
+            "REPLACE semantics — no duplicates, same content"
+        );
     }
 
     #[test]
@@ -372,8 +395,11 @@ mod tests {
             server_root(&conn, ShieldedPool::Orchard, 3).expect("missing row");
         assert!(none.is_none());
         // NULL root_hash (locally-built shard) → None.
-        conn.execute("INSERT INTO orchard_tree_shards (shard_index) VALUES (7)", [])
-            .expect("null row");
+        conn.execute(
+            "INSERT INTO orchard_tree_shards (shard_index) VALUES (7)",
+            [],
+        )
+        .expect("null row");
         let none: Option<MerkleHashOrchard> =
             server_root(&conn, ShieldedPool::Orchard, 7).expect("null root");
         assert!(none.is_none());
@@ -407,6 +433,9 @@ mod tests {
         delete_from_position(&conn, ShieldedPool::Orchard, 102).expect("rewind");
         let loaded: Vec<BufferRow<MerkleHashOrchard>> =
             load_shard(&conn, ShieldedPool::Orchard, 0).expect("load");
-        assert_eq!(loaded.iter().map(|r| r.0).collect::<Vec<_>>(), vec![100, 101]);
+        assert_eq!(
+            loaded.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![100, 101]
+        );
     }
 }

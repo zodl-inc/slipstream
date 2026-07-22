@@ -120,12 +120,22 @@ mod tests {
     fn block_with(height: u64, sapling: &[u64], orchard: &[u64]) -> CompactBlock {
         let mut tx = CompactTx::default();
         for &v in sapling {
-            tx.outputs.push(CompactSaplingOutput { cmu: le32(v), ..Default::default() });
+            tx.outputs.push(CompactSaplingOutput {
+                cmu: le32(v),
+                ..Default::default()
+            });
         }
         for &v in orchard {
-            tx.actions.push(CompactOrchardAction { cmx: le32(v), ..Default::default() });
+            tx.actions.push(CompactOrchardAction {
+                cmx: le32(v),
+                ..Default::default()
+            });
         }
-        CompactBlock { height, vtx: vec![tx], ..Default::default() }
+        CompactBlock {
+            height,
+            vtx: vec![tx],
+            ..Default::default()
+        }
     }
 
     /// The absorbed frontier must equal a frontier built by direct appends
@@ -134,8 +144,12 @@ mod tests {
     fn absorb_matches_direct_appends() {
         let seed = ChainState::empty(BlockHeight::from_u32(9), BlockHash([0u8; 32]));
         let mut local = LocalTreestate::seed(&seed);
-        local.absorb_block(&block_with(10, &[1, 2], &[3])).expect("b10");
-        local.absorb_block(&block_with(11, &[], &[4, 5])).expect("b11");
+        local
+            .absorb_block(&block_with(10, &[1, 2], &[3]))
+            .expect("b10");
+        local
+            .absorb_block(&block_with(11, &[], &[4, 5]))
+            .expect("b11");
 
         let mut sap = Frontier::empty();
         for v in [1u64, 2] {
@@ -155,8 +169,13 @@ mod tests {
         }
 
         let got = local.chain_state(BlockHeight::from_u32(11), BlockHash([7u8; 32]));
-        let want =
-            ChainState::new(BlockHeight::from_u32(11), BlockHash([7u8; 32]), sap, orch, Frontier::empty());
+        let want = ChainState::new(
+            BlockHeight::from_u32(11),
+            BlockHash([7u8; 32]),
+            sap,
+            orch,
+            Frontier::empty(),
+        );
         assert_eq!(got, want, "absorb order must match direct append order");
     }
 
@@ -177,7 +196,10 @@ mod tests {
             Frontier::empty(),
         );
         let local = LocalTreestate::seed(&seed);
-        assert_eq!(local.chain_state(BlockHeight::from_u32(100), BlockHash([1u8; 32])), seed);
+        assert_eq!(
+            local.chain_state(BlockHeight::from_u32(100), BlockHash([1u8; 32])),
+            seed
+        );
     }
 
     /// A malformed commitment is a hard error, not a skip — local mode must
@@ -187,7 +209,13 @@ mod tests {
         let seed = ChainState::empty(BlockHeight::from_u32(0), BlockHash([0u8; 32]));
         let mut local = LocalTreestate::seed(&seed);
         let mut bad = block_with(1, &[], &[]);
-        bad.vtx[0].actions.push(CompactOrchardAction { cmx: vec![0xFF; 32], ..Default::default() });
-        assert!(local.absorb_block(&bad).is_err(), "non-canonical cmx must error");
+        bad.vtx[0].actions.push(CompactOrchardAction {
+            cmx: vec![0xFF; 32],
+            ..Default::default()
+        });
+        assert!(
+            local.absorb_block(&bad).is_err(),
+            "non-canonical cmx must error"
+        );
     }
 }

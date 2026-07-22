@@ -41,7 +41,9 @@ struct Consts {
 
 fn affine_xy(p: &pallas::Point) -> (pallas::Base, pallas::Base) {
     let a = p.to_affine();
-    let c = a.coordinates().expect("Sinsemilla generators are never the identity");
+    let c = a
+        .coordinates()
+        .expect("Sinsemilla generators are never the identity");
     (*c.x(), *c.y())
 }
 
@@ -51,9 +53,11 @@ fn consts() -> &'static Consts {
         // HashDomain::Q() is test-gated upstream; derive it exactly the way
         // HashDomain::new does (Q = hash_to_curve(Q_PERSONALIZATION)(domain) —
         // the spike's SINSEMILLA-SPEC recipe). The KAT adjudicates.
-        let q = affine_xy(&pallas::Point::hash_to_curve(sinsemilla::Q_PERSONALIZATION)(
-            MERKLE_CRH_PERSONALIZATION.as_bytes(),
-        ));
+        let q = affine_xy(
+            &pallas::Point::hash_to_curve(sinsemilla::Q_PERSONALIZATION)(
+                MERKLE_CRH_PERSONALIZATION.as_bytes(),
+            ),
+        );
         let hasher = pallas::Point::hash_to_curve(sinsemilla::S_PERSONALIZATION);
         let s = (0u32..1 << sinsemilla::K)
             .map(|m| affine_xy(&hasher(&m.to_le_bytes())))
@@ -242,12 +246,17 @@ mod tests {
     #[test]
     fn batch_invert_matches_per_element() {
         let mut rng = StdRng::seed_from_u64(0xB471);
-        let xs: Vec<pallas::Base> =
-            (0..1000).map(|_| pallas::Base::from(rng.next_u64() | 1)).collect();
+        let xs: Vec<pallas::Base> = (0..1000)
+            .map(|_| pallas::Base::from(rng.next_u64() | 1))
+            .collect();
         let mut batched = xs.clone();
         batch_invert(&mut batched);
         for (x, inv) in xs.iter().zip(batched) {
-            assert_eq!(inv, x.invert().expect("nonzero"), "batch inversion diverged");
+            assert_eq!(
+                inv,
+                x.invert().expect("nonzero"),
+                "batch inversion diverged"
+            );
         }
     }
 

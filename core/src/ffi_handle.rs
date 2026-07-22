@@ -102,7 +102,11 @@ pub fn push_event_bounded(ring: &mut Vec<FfiSlipstreamEvent>, e: FfiSlipstreamEv
             incoming_tag = e.tag,
             critical_evicted = droppable.is_none(),
             "slipstream event ring overflow — oldest {} event dropped",
-            if droppable.is_some() { "droppable" } else { "CRITICAL" }
+            if droppable.is_some() {
+                "droppable"
+            } else {
+                "CRITICAL"
+            }
         );
     }
     ring.push(e);
@@ -241,7 +245,11 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
         // a later catch-up pass can't display below a completed pass's 100%.
         let raw_permille = {
             let total = p.pass_total();
-            if total == 0 { 0 } else { p.scanned().saturating_mul(1000) / total }
+            if total == 0 {
+                0
+            } else {
+                p.scanned().saturating_mul(1000) / total
+            }
         };
         let progress_permille = match state {
             SyncState::Done => p.permille_floor(1000) as u16,
@@ -302,14 +310,24 @@ mod tests {
             push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 5, value: i });
         }
         for i in 0..(EVENT_RING_CAP - 3) {
-            push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 2, value: i as u64 });
+            push_event_bounded(
+                &mut ring,
+                FfiSlipstreamEvent {
+                    tag: 2,
+                    value: i as u64,
+                },
+            );
         }
         assert_eq!(ring.len(), EVENT_RING_CAP);
         // Push a critical into the full ring: the oldest PROGRESS event (value 0) must go,
         // all 3 early criticals must survive, and the new critical must be at the tail.
         push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 4, value: 9 });
         assert_eq!(ring.len(), EVENT_RING_CAP);
-        assert_eq!(ring.iter().filter(|e| e.tag == 5).count(), 3, "early criticals survive");
+        assert_eq!(
+            ring.iter().filter(|e| e.tag == 5).count(),
+            3,
+            "early criticals survive"
+        );
         assert!(
             !ring.iter().any(|e| e.tag == 2 && e.value == 0),
             "oldest droppable evicted, not position 0"
@@ -323,11 +341,20 @@ mod tests {
     fn ring_overflow_all_critical_falls_back_to_oldest() {
         let mut ring: Vec<FfiSlipstreamEvent> = Vec::new();
         for i in 0..EVENT_RING_CAP {
-            push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 5, value: i as u64 });
+            push_event_bounded(
+                &mut ring,
+                FfiSlipstreamEvent {
+                    tag: 5,
+                    value: i as u64,
+                },
+            );
         }
         push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 3, value: 7 });
         assert_eq!(ring.len(), EVENT_RING_CAP);
-        assert!(!ring.iter().any(|e| e.value == 0 && e.tag == 5), "oldest critical evicted");
+        assert!(
+            !ring.iter().any(|e| e.value == 0 && e.tag == 5),
+            "oldest critical evicted"
+        );
         let last = ring.last().unwrap();
         assert_eq!((last.tag, last.value), (3, 7));
     }
@@ -341,11 +368,17 @@ mod tests {
         assert_eq!(s.enhanced_txs, 0);
         assert_eq!(s.current_range_end, 0);
         assert_eq!(s.state, 0);
-        assert_eq!(s.pass_total_blocks, 0, "pass_total_blocks default must be 0");
+        assert_eq!(
+            s.pass_total_blocks, 0,
+            "pass_total_blocks default must be 0"
+        );
         assert_eq!(s.spendable_hint, 0, "spendable_hint default must be 0");
         assert_eq!(s.ranges_completed, 0, "ranges_completed default must be 0");
         assert_eq!(s.is_recovering, 0, "is_recovering default must be 0");
-        assert_eq!(s.progress_permille, 0, "progress_permille default must be 0");
+        assert_eq!(
+            s.progress_permille, 0,
+            "progress_permille default must be 0"
+        );
         assert_eq!(s.stalled_seconds, 0, "stalled_seconds default must be 0");
         assert_eq!(s.tx_set_version, 0, "tx_set_version default must be 0");
     }
@@ -367,21 +400,27 @@ mod tests {
     /// show partial progress.
     #[test]
     fn snapshot_terminal_states_apply_v2_latches() {
-        let mk = |state: SyncState, progress: std::sync::Arc<crate::events::Progress>| SlipstreamHandle {
-            runtime: tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .enable_all()
-                .build()
-                .expect("tokio runtime"),
-            progress,
-            state: std::sync::Arc::new(Mutex::new(state)),
-            events: std::sync::Arc::new(Mutex::new(Vec::new())),
-            task: None,
-            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-            endpoint: Endpoint { host: "localhost".into(), port: 9067, tls: false },
-            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
-            network: zcash_protocol::consensus::Network::TestNetwork,
-            total_memory_bytes: 0,
+        let mk = |state: SyncState, progress: std::sync::Arc<crate::events::Progress>| {
+            SlipstreamHandle {
+                runtime: tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime"),
+                progress,
+                state: std::sync::Arc::new(Mutex::new(state)),
+                events: std::sync::Arc::new(Mutex::new(Vec::new())),
+                task: None,
+                pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+                endpoint: Endpoint {
+                    host: "localhost".into(),
+                    port: 9067,
+                    tls: false,
+                },
+                wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+                network: zcash_protocol::consensus::Network::TestNetwork,
+                total_memory_bytes: 0,
+            }
         };
 
         // Syncing + recovering flag set → surfaces as recovering, permille from counters.
@@ -395,13 +434,22 @@ mod tests {
 
         // Error → latch forces NOT recovering even though the live flag is still true.
         let snap = mk(SyncState::Error(2), p1.clone()).snapshot();
-        assert_eq!(snap.is_recovering, 0, "Error must release the recovery gate");
-        assert_eq!(snap.stalled_seconds, 0, "stall clock only ticks while Syncing");
+        assert_eq!(
+            snap.is_recovering, 0,
+            "Error must release the recovery gate"
+        );
+        assert_eq!(
+            snap.stalled_seconds, 0,
+            "stall clock only ticks while Syncing"
+        );
 
         // Done → recovery off AND progress forced to (and floored at) 1000.
         let snap = mk(SyncState::Done, p1).snapshot();
         assert_eq!(snap.is_recovering, 0, "Done must clear recovering");
-        assert_eq!(snap.progress_permille, 1000, "Done must complete the progress");
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "Done must complete the progress"
+        );
     }
 
     #[test]
@@ -420,7 +468,11 @@ mod tests {
             events: std::sync::Arc::new(Mutex::new(Vec::new())),
             task: None,
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-            endpoint: Endpoint { host: "localhost".into(), port: 9067, tls: false },
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
             wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
             network: zcash_protocol::consensus::Network::TestNetwork,
             total_memory_bytes: 0,
@@ -437,15 +489,23 @@ mod tests {
         progress.add_ranges_completed(); // range 2 done
 
         let snap = handle.snapshot();
-        assert_eq!(snap.pass_total_blocks, 15_000,
-                   "pass_total_blocks must equal set_pass_total value (F1 store semantics)");
-        assert_eq!(snap.spendable_hint, 1,
-                   "spendable_hint must be 1 after set_spendable()");
-        assert_eq!(snap.scanned_blocks, 7_500,
-                   "scanned_blocks must equal add_scanned total");
+        assert_eq!(
+            snap.pass_total_blocks, 15_000,
+            "pass_total_blocks must equal set_pass_total value (F1 store semantics)"
+        );
+        assert_eq!(
+            snap.spendable_hint, 1,
+            "spendable_hint must be 1 after set_spendable()"
+        );
+        assert_eq!(
+            snap.scanned_blocks, 7_500,
+            "scanned_blocks must equal add_scanned total"
+        );
         assert_eq!(snap.state, 1, "state must be 1 (Syncing)");
-        assert_eq!(snap.ranges_completed, 2,
-                   "ranges_completed must reflect add_ranges_completed calls (F2)");
+        assert_eq!(
+            snap.ranges_completed, 2,
+            "ranges_completed must reflect add_ranges_completed calls (F2)"
+        );
     }
 
     #[test]
@@ -464,18 +524,34 @@ mod tests {
             events: std::sync::Arc::new(Mutex::new(Vec::new())),
             task: None,
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-            endpoint: Endpoint { host: "localhost".into(), port: 9067, tls: false },
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
             wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
             network: zcash_protocol::consensus::Network::TestNetwork,
             total_memory_bytes: 0,
         };
 
-        assert_eq!(handle.snapshot().ranges_completed, 0, "initial value must be 0");
+        assert_eq!(
+            handle.snapshot().ranges_completed,
+            0,
+            "initial value must be 0"
+        );
         progress.add_ranges_completed();
-        assert_eq!(handle.snapshot().ranges_completed, 1, "must be 1 after first range");
+        assert_eq!(
+            handle.snapshot().ranges_completed,
+            1,
+            "must be 1 after first range"
+        );
         progress.add_ranges_completed();
         progress.add_ranges_completed();
-        assert_eq!(handle.snapshot().ranges_completed, 3, "must be 3 after three ranges");
+        assert_eq!(
+            handle.snapshot().ranges_completed,
+            3,
+            "must be 3 after three ranges"
+        );
     }
 
     #[test]
@@ -493,7 +569,11 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             task: None,
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-            endpoint: Endpoint { host: "localhost".into(), port: 9067, tls: false },
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
             wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
             network: zcash_protocol::consensus::Network::TestNetwork,
             total_memory_bytes: 0,
@@ -584,8 +664,15 @@ mod tests {
         // Give the supervisor time to observe the cancellation; the state and the
         // event ring must remain untouched.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        assert_eq!(*state.lock().unwrap(), SyncState::Syncing, "cancel must not write state");
-        assert!(events.lock().unwrap().is_empty(), "cancel must not push events");
+        assert_eq!(
+            *state.lock().unwrap(),
+            SyncState::Syncing,
+            "cancel must not write state"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "cancel must not push events"
+        );
     }
 
     /// Normal completion writes nothing — the task body owns Done/Error.
@@ -617,8 +704,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         std::thread::sleep(std::time::Duration::from_millis(200)); // let the supervisor settle
-        assert_eq!(*state.lock().unwrap(), SyncState::Syncing, "completion must not write state");
-        assert!(events.lock().unwrap().is_empty(), "completion must not push events");
+        assert_eq!(
+            *state.lock().unwrap(),
+            SyncState::Syncing,
+            "completion must not write state"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "completion must not push events"
+        );
     }
 
     #[test]
@@ -636,7 +730,11 @@ mod tests {
             events: Arc::new(Mutex::new(Vec::new())),
             task: None,
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-            endpoint: Endpoint { host: "localhost".into(), port: 9067, tls: false },
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
             wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
             network: zcash_protocol::consensus::Network::TestNetwork,
             total_memory_bytes: 0,

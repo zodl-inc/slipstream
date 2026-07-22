@@ -12,33 +12,33 @@ pub mod census;
 pub mod chunk;
 pub mod config;
 pub mod connector;
-pub mod enhance;
 pub mod engine;
+pub mod enhance;
 pub mod error;
 pub mod events;
-pub mod ffi_handle;
 pub mod fetch;
+pub mod ffi_handle;
 // dead_code: consumed by the sparse build path in v0.4 plan Task 7 — this allow
 // is deleted in that diff (buffer CRUD lands first so Task 6/7 build on green).
+#[cfg(feature = "gpu")]
+mod gpu_subtree;
 #[allow(dead_code)]
 pub(crate) mod graft;
 #[allow(dead_code)]
 pub(crate) mod graft_accumulator;
 pub mod grpc;
+pub(crate) mod lookup_build;
 pub mod mempool;
 pub mod network;
 pub mod oracle;
 pub mod persist;
 pub mod probe;
 pub mod reconcile;
-#[cfg(feature = "gpu")]
-mod gpu_subtree;
-pub(crate) mod lookup_build;
 pub mod scan;
 pub mod scan_queue;
-pub mod throttle;
 pub mod scheduler;
 pub mod session;
+pub mod throttle;
 pub mod transparent;
 pub mod treestate;
 pub mod vendor_shim;
@@ -46,13 +46,13 @@ pub mod verify;
 pub mod wallet_session;
 
 #[cfg(feature = "darkside")]
+pub mod darkside;
+#[cfg(feature = "darkside")]
 #[allow(clippy::all, missing_docs)]
 #[path = "grpc_generated/darkside.rs"]
 pub mod darkside_generated;
-#[cfg(feature = "darkside")]
-pub mod darkside;
 
-pub use config::{EngineConfig, Endpoint};
+pub use config::{Endpoint, EngineConfig};
 pub use error::SlipstreamError;
 pub use events::{Bound, Event, Progress, ProgressArc, Snapshot, SyncMode};
 pub use network::{CustomActivations, SlipstreamNetwork};

@@ -278,9 +278,8 @@ pub struct GetAddressUtxosArg {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetAddressUtxosReplyList {
     #[prost(message, repeated, tag = "1")]
-    pub address_utxos: ::prost::alloc::vec::Vec<
-        ::zcash_client_backend::proto::service::GetAddressUtxosReply,
-    >,
+    pub address_utxos:
+        ::prost::alloc::vec::Vec<::zcash_client_backend::proto::service::GetAddressUtxosReply>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -315,10 +314,10 @@ pub mod compact_tx_streamer_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     #[derive(Debug, Clone)]
     pub struct CompactTxStreamerClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -357,14 +356,13 @@ pub mod compact_tx_streamer_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             CompactTxStreamerClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -407,84 +405,56 @@ pub mod compact_tx_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::BlockId>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestBlock",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetLatestBlock",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetLatestBlock",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Return the compact block corresponding to the given block identifier
         pub async fn get_block(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::BlockId,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::BlockId>,
         ) -> std::result::Result<tonic::Response<super::CompactBlock>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlock",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetBlock",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetBlock",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Same as GetBlock except actions contain only nullifiers
         pub async fn get_block_nullifiers(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::BlockId,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::BlockId>,
         ) -> std::result::Result<tonic::Response<super::CompactBlock>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockNullifiers",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetBlockNullifiers",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetBlockNullifiers",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Return a list of consecutive compact blocks
@@ -495,26 +465,18 @@ pub mod compact_tx_streamer_client {
             tonic::Response<tonic::codec::Streaming<super::CompactBlock>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetBlockRange",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetBlockRange",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// Same as GetBlockRange except actions contain only nullifiers
@@ -525,26 +487,18 @@ pub mod compact_tx_streamer_client {
             tonic::Response<tonic::codec::Streaming<super::CompactBlock>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRangeNullifiers",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetBlockRangeNullifiers",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetBlockRangeNullifiers",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// Return the requested full (not compact) transaction (as from zcashd)
@@ -555,55 +509,37 @@ pub mod compact_tx_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::RawTransaction>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTransaction",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetTransaction",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetTransaction",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Submit the given transaction to the Zcash network
         pub async fn send_transaction(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::RawTransaction,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::RawTransaction>,
         ) -> std::result::Result<tonic::Response<super::SendResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "SendTransaction",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "SendTransaction",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Return the transactions corresponding to the given t-address within the given block range
@@ -613,84 +549,58 @@ pub mod compact_tx_streamer_client {
             request: impl tonic::IntoRequest<super::TransparentAddressBlockFilter>,
         ) -> std::result::Result<
             tonic::Response<
-                tonic::codec::Streaming<
-                    ::zcash_client_backend::proto::service::RawTransaction,
-                >,
+                tonic::codec::Streaming<::zcash_client_backend::proto::service::RawTransaction>,
             >,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressTxids",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetTaddressTxids",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetTaddressTxids",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         pub async fn get_taddress_balance(
             &mut self,
             request: impl tonic::IntoRequest<super::AddressList>,
         ) -> std::result::Result<tonic::Response<super::Balance>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalance",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetTaddressBalance",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetTaddressBalance",
+            ));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_taddress_balance_stream(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::Address>,
         ) -> std::result::Result<tonic::Response<super::Balance>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTaddressBalanceStream",
             );
             let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetTaddressBalanceStream",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetTaddressBalanceStream",
+            ));
             self.inner.client_streaming(req, path, codec).await
         }
         /// Return the compact transactions currently in the mempool; the results
@@ -709,63 +619,43 @@ pub mod compact_tx_streamer_client {
             tonic::Response<tonic::codec::Streaming<super::CompactTx>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolTx",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetMempoolTx",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetMempoolTx",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// Return a stream of current Mempool transactions. This will keep the output stream open while
         /// there are mempool transactions. It will close the returned stream when a new block is mined.
         pub async fn get_mempool_stream(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<
             tonic::Response<
-                tonic::codec::Streaming<
-                    ::zcash_client_backend::proto::service::RawTransaction,
-                >,
+                tonic::codec::Streaming<::zcash_client_backend::proto::service::RawTransaction>,
             >,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetMempoolStream",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetMempoolStream",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// GetTreeState returns the note commitment tree state corresponding to the given block.
@@ -774,64 +664,44 @@ pub mod compact_tx_streamer_client {
         /// The block can be specified by either height or hash.
         pub async fn get_tree_state(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::BlockId,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::BlockId>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::TreeState>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetTreeState",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetTreeState",
+            ));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_latest_tree_state(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::TreeState>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLatestTreeState",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetLatestTreeState",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetLatestTreeState",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Returns a stream of information about roots of subtrees of the note commitment tree
@@ -843,55 +713,37 @@ pub mod compact_tx_streamer_client {
             tonic::Response<tonic::codec::Streaming<super::SubtreeRoot>>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetSubtreeRoots",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetSubtreeRoots",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetSubtreeRoots",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         pub async fn get_address_utxos(
             &mut self,
             request: impl tonic::IntoRequest<super::GetAddressUtxosArg>,
-        ) -> std::result::Result<
-            tonic::Response<super::GetAddressUtxosReplyList>,
-            tonic::Status,
-        > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+        ) -> std::result::Result<tonic::Response<super::GetAddressUtxosReplyList>, tonic::Status>
+        {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxos",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetAddressUtxos",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetAddressUtxos",
+            ));
             self.inner.unary(req, path, codec).await
         }
         pub async fn get_address_utxos_stream(
@@ -905,55 +757,37 @@ pub mod compact_tx_streamer_client {
             >,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetAddressUtxosStream",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetAddressUtxosStream",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetAddressUtxosStream",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// Return information about this lightwalletd instance and the blockchain
         pub async fn get_lightd_info(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<tonic::Response<super::LightdInfo>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetLightdInfo",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.CompactTxStreamer",
-                        "GetLightdInfo",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "GetLightdInfo",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Testing-only, requires lightwalletd --ping-very-insecure (do not enable in production)
@@ -961,23 +795,18 @@ pub mod compact_tx_streamer_client {
             &mut self,
             request: impl tonic::IntoRequest<super::Duration>,
         ) -> std::result::Result<tonic::Response<super::PingResponse>, tonic::Status> {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.CompactTxStreamer/Ping",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("cash.z.wallet.sdk.rpc.CompactTxStreamer", "Ping"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.CompactTxStreamer",
+                "Ping",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }
@@ -1048,10 +877,10 @@ pub mod darkside_streamer_client {
         dead_code,
         missing_docs,
         clippy::wildcard_imports,
-        clippy::let_unit_value,
+        clippy::let_unit_value
     )]
-    use tonic::codegen::*;
     use tonic::codegen::http::Uri;
+    use tonic::codegen::*;
     /// Darksidewalletd maintains two staging areas, blocks and transactions. The
     /// Stage\*() gRPCs add items to the staging area; ApplyStaged() "applies" everything
     /// in the staging area to the working (operational) state that the mock zcashd
@@ -1094,14 +923,13 @@ pub mod darkside_streamer_client {
             F: tonic::service::Interceptor,
             T::ResponseBody: Default,
             T: tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-                Response = http::Response<
-                    <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    http::Request<tonic::body::Body>,
+                    Response = http::Response<
+                        <T as tonic::client::GrpcService<tonic::body::Body>>::ResponseBody,
+                    >,
                 >,
-            >,
-            <T as tonic::codegen::Service<
-                http::Request<tonic::body::Body>,
-            >>::Error: Into<StdError> + std::marker::Send + std::marker::Sync,
+            <T as tonic::codegen::Service<http::Request<tonic::body::Body>>>::Error:
+                Into<StdError> + std::marker::Send + std::marker::Sync,
         {
             DarksideStreamerClient::new(InterceptedService::new(inner, interceptor))
         }
@@ -1150,23 +978,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/Reset",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new("cash.z.wallet.sdk.rpc.DarksideStreamer", "Reset"),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "Reset",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// StageBlocksStream accepts a list of blocks and saves them into the blocks
@@ -1179,26 +1002,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/StageBlocksStream",
             );
             let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "StageBlocksStream",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "StageBlocksStream",
+            ));
             self.inner.client_streaming(req, path, codec).await
         }
         /// StageBlocks is the same as StageBlocksStream() except the blocks are fetched
@@ -1210,26 +1025,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/StageBlocks",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "StageBlocks",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "StageBlocks",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// StageBlocksCreate is like the previous two, except it creates 'count'
@@ -1244,26 +1051,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/StageBlocksCreate",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "StageBlocksCreate",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "StageBlocksCreate",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// StageTransactionsStream stores the given transaction-height pairs in the
@@ -1280,26 +1079,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/StageTransactionsStream",
             );
             let mut req = request.into_streaming_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "StageTransactionsStream",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "StageTransactionsStream",
+            ));
             self.inner.client_streaming(req, path, codec).await
         }
         /// StageTransactions is the same except the transactions are fetched from
@@ -1312,26 +1103,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/StageTransactions",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "StageTransactions",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "StageTransactions",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// ApplyStaged iterates the list of blocks that were staged by the
@@ -1357,26 +1140,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/ApplyStaged",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "ApplyStaged",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "ApplyStaged",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Calls to the production gRPC SendTransaction() store the transaction in
@@ -1388,69 +1163,47 @@ pub mod darkside_streamer_client {
         /// into a specified block on the next ApplyStaged().
         pub async fn get_incoming_transactions(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<
             tonic::Response<
-                tonic::codec::Streaming<
-                    ::zcash_client_backend::proto::service::RawTransaction,
-                >,
+                tonic::codec::Streaming<::zcash_client_backend::proto::service::RawTransaction>,
             >,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/GetIncomingTransactions",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "GetIncomingTransactions",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "GetIncomingTransactions",
+            ));
             self.inner.server_streaming(req, path, codec).await
         }
         /// Clear the incoming transaction pool.
         pub async fn clear_incoming_transactions(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/ClearIncomingTransactions",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "ClearIncomingTransactions",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "ClearIncomingTransactions",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Add a GetAddressUtxosReply entry to be returned by GetAddressUtxos().
@@ -1464,154 +1217,106 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/AddAddressUtxo",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "AddAddressUtxo",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "AddAddressUtxo",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Clear the list of GetAddressUtxos entries (can't fail)
         pub async fn clear_address_utxo(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/ClearAddressUtxo",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "ClearAddressUtxo",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "ClearAddressUtxo",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Adds a GetTreeState to the tree state cache
         pub async fn add_tree_state(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::TreeState,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::TreeState>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/AddTreeState",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "AddTreeState",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "AddTreeState",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Removes a GetTreeState for the given height from cache if present (can't fail)
         pub async fn remove_tree_state(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::BlockId,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::BlockId>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/RemoveTreeState",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "RemoveTreeState",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "RemoveTreeState",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Clear the list of GetTreeStates entries (can't fail)
         pub async fn clear_all_tree_states(
             &mut self,
-            request: impl tonic::IntoRequest<
-                ::zcash_client_backend::proto::service::Empty,
-            >,
+            request: impl tonic::IntoRequest<::zcash_client_backend::proto::service::Empty>,
         ) -> std::result::Result<
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/ClearAllTreeStates",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "ClearAllTreeStates",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "ClearAllTreeStates",
+            ));
             self.inner.unary(req, path, codec).await
         }
         /// Sets the subtree roots cache (for GetSubtreeRoots),
@@ -1623,26 +1328,18 @@ pub mod darkside_streamer_client {
             tonic::Response<::zcash_client_backend::proto::service::Empty>,
             tonic::Status,
         > {
-            self.inner
-                .ready()
-                .await
-                .map_err(|e| {
-                    tonic::Status::unknown(
-                        format!("Service was not ready: {}", e.into()),
-                    )
-                })?;
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
             let codec = tonic_prost::ProstCodec::default();
             let path = http::uri::PathAndQuery::from_static(
                 "/cash.z.wallet.sdk.rpc.DarksideStreamer/SetSubtreeRoots",
             );
             let mut req = request.into_request();
-            req.extensions_mut()
-                .insert(
-                    GrpcMethod::new(
-                        "cash.z.wallet.sdk.rpc.DarksideStreamer",
-                        "SetSubtreeRoots",
-                    ),
-                );
+            req.extensions_mut().insert(GrpcMethod::new(
+                "cash.z.wallet.sdk.rpc.DarksideStreamer",
+                "SetSubtreeRoots",
+            ));
             self.inner.unary(req, path, codec).await
         }
     }

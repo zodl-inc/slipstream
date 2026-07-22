@@ -47,13 +47,13 @@ use futures_util::StreamExt;
 use rusqlite::Connection;
 use slipstream_core::{
     chunk::chunk_queue,
-    config::{EngineConfig, Endpoint},
+    config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
     error::SlipstreamError,
     fetch::{FetchPlan, run_fetch},
     grpc,
     scan::scan_chunks_from_treestate,
-    wallet_session::{WalletSession, TEST_UFVK},
+    wallet_session::{TEST_UFVK, WalletSession},
 };
 use zcash_client_backend::data_api::WalletWrite;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
@@ -65,7 +65,11 @@ use zcash_protocol::consensus::{BlockHeight, Network};
 
 /// The canonical darkside endpoint (plaintext, port 9067).
 fn darkside_endpoint() -> Endpoint {
-    Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false }
+    Endpoint {
+        host: "127.0.0.1".into(),
+        port: 9067,
+        tls: false,
+    }
 }
 
 /// Birthday = sapling activation height.
@@ -74,13 +78,11 @@ const BIRTHDAY_HEIGHT: u64 = 663_150;
 
 /// `beforeReOrg` dataset URL — the chain before the reorg.
 /// Source: DarkSideWalletService.swift:15 (`.beforeReOrg` case)
-const BEFORE_REORG_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/before-reorg.txt";
+const BEFORE_REORG_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/before-reorg.txt";
 
 /// `afterSmallReorg` dataset URL — the forked chain.
 /// Source: DarkSideWalletService.swift:14 (`.afterSmallReorg` case)
-const AFTER_SMALL_REORG_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/after-small-reorg.txt";
+const AFTER_SMALL_REORG_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/after-small-reorg.txt";
 
 /// Height at which the before-reorg chain is applied (first sync).
 /// Source: ReOrgTests.swift:101 (`let mockLatestHeight = BlockHeight(663200)`)
@@ -97,25 +99,38 @@ const START_SAPLING_TREE_SIZE: u32 = 128_607;
 /// Hex-encoded `CommitmentTree<sapling::Node, 32>` for 128607 leaves.
 /// Identical to the constant in darkside_sync.rs (see that file for full derivation).
 const SAPLING_TREE_128607: &str = concat!(
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
     "10",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
 );
 
 // ---------------------------------------------------------------------------
@@ -124,10 +139,7 @@ const SAPLING_TREE_128607: &str = concat!(
 
 /// Pre-seed the wallet with account + block 663149 metadata.
 /// Identical to the pattern used in darkside_sync.rs.
-async fn setup_wallet(
-    session: &mut WalletSession,
-    client: &mut slipstream_core::grpc::LwdClient,
-) {
+async fn setup_wallet(session: &mut WalletSession, client: &mut slipstream_core::grpc::LwdClient) {
     let birthday_ts = TreeState {
         network: "main".into(),
         height: BIRTHDAY_HEIGHT - 1,
@@ -136,12 +148,20 @@ async fn setup_wallet(
         sapling_tree: SAPLING_TREE_128607.into(),
         ..Default::default()
     };
-    session.ensure_account(TEST_UFVK, birthday_ts).expect("ensure_account");
+    session
+        .ensure_account(TEST_UFVK, birthday_ts)
+        .expect("ensure_account");
 
     // Fetch prev_hash of the birthday block to seed block 663149 metadata.
     let req = BlockRange {
-        start: Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
-        end:   Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
+        start: Some(BlockId {
+            height: BIRTHDAY_HEIGHT,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: BIRTHDAY_HEIGHT,
+            hash: vec![],
+        }),
         ..Default::default()
     };
     let mut stream = client
@@ -149,14 +169,20 @@ async fn setup_wallet(
         .await
         .expect("get_block_range for birthday")
         .into_inner();
-    let first_block = stream.next().await
+    let first_block = stream
+        .next()
+        .await
         .expect("stream should yield birthday block")
         .expect("block 663150 ok");
     let block_663149_hash = first_block.prev_hash;
     assert_eq!(block_663149_hash.len(), 32, "prev_hash should be 32 bytes");
 
     session
-        .seed_block_metadata(BIRTHDAY_HEIGHT - 1, START_SAPLING_TREE_SIZE, &block_663149_hash)
+        .seed_block_metadata(
+            BIRTHDAY_HEIGHT - 1,
+            START_SAPLING_TREE_SIZE,
+            &block_663149_hash,
+        )
         .expect("seed_block_metadata");
 }
 
@@ -193,12 +219,23 @@ async fn direct_pipeline_scan(
         ..Default::default()
     };
 
-    let scan_stats =
-        scan_chunks_from_treestate(session, scan_start, initial_scan_state, rx, sparse, write_behind, false, false)
-            .await
-            .expect("scan_chunks_from_treestate");
+    let scan_stats = scan_chunks_from_treestate(
+        session,
+        scan_start,
+        initial_scan_state,
+        rx,
+        sparse,
+        write_behind,
+        false,
+        false,
+    )
+    .await
+    .expect("scan_chunks_from_treestate");
 
-    let _ = fetch_task.await.expect("fetch task join").expect("fetch stats");
+    let _ = fetch_task
+        .await
+        .expect("fetch task join")
+        .expect("fetch stats");
     scan_stats.blocks
 }
 
@@ -258,7 +295,9 @@ async fn reorg_recovery_produces_correct_tip() {
 
     // Apply staged blocks up to FIRST_APPLY_HEIGHT (663200).
     // Source: ReOrgTests.swift:152 (`coordinator.applyStaged(blockheight: firstLatestHeight)`)
-    ctl.apply_staged(FIRST_APPLY_HEIGHT).await.expect("apply before-reorg");
+    ctl.apply_staged(FIRST_APPLY_HEIGHT)
+        .await
+        .expect("apply before-reorg");
 
     // Wait for darkside to propagate — mirrors Swift DarksideTests sleep(1).
     // Source: ReOrgTests.swift:153 (`sleep(1)`)
@@ -273,15 +312,24 @@ async fn reorg_recovery_produces_correct_tip() {
         .await
         .expect("get chain tip (before-reorg)");
     assert_eq!(
-        chain_tip_1,
-        FIRST_APPLY_HEIGHT as u64,
+        chain_tip_1, FIRST_APPLY_HEIGHT as u64,
         "chain_tip_1 must equal FIRST_APPLY_HEIGHT ({FIRST_APPLY_HEIGHT})"
     );
 
-    session.update_chain_tip(chain_tip_1).expect("update_chain_tip (before-reorg)");
+    session
+        .update_chain_tip(chain_tip_1)
+        .expect("update_chain_tip (before-reorg)");
 
     // Initial sync: direct-pipeline scan (T2.7 style, bypasses GetTreeState).
-    let blocks_scanned_1 = direct_pipeline_scan(&mut session, &cfg, BIRTHDAY_HEIGHT, chain_tip_1, false, false).await;
+    let blocks_scanned_1 = direct_pipeline_scan(
+        &mut session,
+        &cfg,
+        BIRTHDAY_HEIGHT,
+        chain_tip_1,
+        false,
+        false,
+    )
+    .await;
     let expected_initial_blocks = FIRST_APPLY_HEIGHT as u64 - BIRTHDAY_HEIGHT + 1;
     assert!(
         blocks_scanned_1 >= expected_initial_blocks,
@@ -304,7 +352,9 @@ async fn reorg_recovery_produces_correct_tip() {
 
     // Apply staged blocks up to TARGET_APPLY_HEIGHT (663202).
     // Source: ReOrgTests.swift:195 (`coordinator.applyStaged(blockheight: targetHeight)`)
-    ctl.apply_staged(TARGET_APPLY_HEIGHT).await.expect("apply after-small-reorg");
+    ctl.apply_staged(TARGET_APPLY_HEIGHT)
+        .await
+        .expect("apply after-small-reorg");
 
     // sleep(2) mirrors Swift DarksideTests sleep(2) before second sync.
     // Source: ReOrgTests.swift:205 (`sleep(2)`)
@@ -314,13 +364,14 @@ async fn reorg_recovery_produces_correct_tip() {
         .await
         .expect("get chain tip (after-small-reorg)");
     assert_eq!(
-        chain_tip_2,
-        TARGET_APPLY_HEIGHT as u64,
+        chain_tip_2, TARGET_APPLY_HEIGHT as u64,
         "chain_tip_2 must equal TARGET_APPLY_HEIGHT ({TARGET_APPLY_HEIGHT})"
     );
 
     // Update chain tip so the scan queue includes the new tip blocks.
-    session.update_chain_tip(chain_tip_2).expect("update_chain_tip (after-small-reorg)");
+    session
+        .update_chain_tip(chain_tip_2)
+        .expect("update_chain_tip (after-small-reorg)");
 
     // ==========================================================================
     // Phase 3: Detect the reorg — expect ScanContinuity error
@@ -339,7 +390,8 @@ async fn reorg_recovery_produces_correct_tip() {
         cfg.fetch_streams,
     );
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
+    let fetch_task =
+        tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
 
     // from_state for 663201: height=663200, sapling_tree=SAPLING_TREE_128607.
     // The tree size in SAPLING_TREE_128607 is 128607, but the actual tree at 663200 is
@@ -429,8 +481,15 @@ async fn reorg_recovery_produces_correct_tip() {
     // from 663150..=663202 are from the new chain. Pre-fork blocks (663150..=663194 roughly)
     // are identical in both chains, so the UPSERT writes the same values. Post-fork blocks
     // (663195..=663202) are from the new chain and inserted fresh.
-    let blocks_scanned_recovery =
-        direct_pipeline_scan(&mut session, &cfg, BIRTHDAY_HEIGHT, chain_tip_2, false, false).await;
+    let blocks_scanned_recovery = direct_pipeline_scan(
+        &mut session,
+        &cfg,
+        BIRTHDAY_HEIGHT,
+        chain_tip_2,
+        false,
+        false,
+    )
+    .await;
 
     // Verify the recovery scan covered the full range.
     let expected_recovery_blocks = TARGET_APPLY_HEIGHT as u64 - BIRTHDAY_HEIGHT + 1;
@@ -508,7 +567,9 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         .await
         .expect("stage before-reorg blocks");
 
-    ctl.apply_staged(FIRST_APPLY_HEIGHT).await.expect("apply before-reorg");
+    ctl.apply_staged(FIRST_APPLY_HEIGHT)
+        .await
+        .expect("apply before-reorg");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -521,15 +582,24 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         .await
         .expect("get chain tip (before-reorg)");
     assert_eq!(
-        chain_tip_1,
-        FIRST_APPLY_HEIGHT as u64,
+        chain_tip_1, FIRST_APPLY_HEIGHT as u64,
         "chain_tip_1 must equal FIRST_APPLY_HEIGHT ({FIRST_APPLY_HEIGHT})"
     );
 
-    session.update_chain_tip(chain_tip_1).expect("update_chain_tip (before-reorg)");
+    session
+        .update_chain_tip(chain_tip_1)
+        .expect("update_chain_tip (before-reorg)");
 
     // Initial sync — sparse=true.
-    let blocks_scanned_1 = direct_pipeline_scan(&mut session, &cfg, BIRTHDAY_HEIGHT, chain_tip_1, true, false).await;
+    let blocks_scanned_1 = direct_pipeline_scan(
+        &mut session,
+        &cfg,
+        BIRTHDAY_HEIGHT,
+        chain_tip_1,
+        true,
+        false,
+    )
+    .await;
     let expected_initial_blocks = FIRST_APPLY_HEIGHT as u64 - BIRTHDAY_HEIGHT + 1;
     assert!(
         blocks_scanned_1 >= expected_initial_blocks,
@@ -544,7 +614,9 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         .await
         .expect("stage after-small-reorg blocks");
 
-    ctl.apply_staged(TARGET_APPLY_HEIGHT).await.expect("apply after-small-reorg");
+    ctl.apply_staged(TARGET_APPLY_HEIGHT)
+        .await
+        .expect("apply after-small-reorg");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -552,12 +624,13 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         .await
         .expect("get chain tip (after-small-reorg)");
     assert_eq!(
-        chain_tip_2,
-        TARGET_APPLY_HEIGHT as u64,
+        chain_tip_2, TARGET_APPLY_HEIGHT as u64,
         "chain_tip_2 must equal TARGET_APPLY_HEIGHT ({TARGET_APPLY_HEIGHT})"
     );
 
-    session.update_chain_tip(chain_tip_2).expect("update_chain_tip (after-small-reorg)");
+    session
+        .update_chain_tip(chain_tip_2)
+        .expect("update_chain_tip (after-small-reorg)");
 
     // ==========================================================================
     // Phase 3: Detect the reorg (sparse=false on the probe scan — the continuity
@@ -574,7 +647,8 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         cfg.fetch_streams,
     );
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
+    let fetch_task =
+        tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
 
     let from_state_663200 = TreeState {
         network: "main".into(),
@@ -620,7 +694,10 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
     // ==========================================================================
 
     let rewind_height = continuity_at.saturating_sub(10);
-    assert_eq!(rewind_height, 663_191u32, "sparse: rewind_height must be 663191");
+    assert_eq!(
+        rewind_height, 663_191u32,
+        "sparse: rewind_height must be 663191"
+    );
     println!("sparse: rewinding to height {rewind_height}");
 
     session
@@ -629,8 +706,15 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         .expect("truncate_to_height");
 
     // Recovery re-scan with sparse=true.
-    let blocks_scanned_recovery =
-        direct_pipeline_scan(&mut session, &cfg, BIRTHDAY_HEIGHT, chain_tip_2, true, false).await;
+    let blocks_scanned_recovery = direct_pipeline_scan(
+        &mut session,
+        &cfg,
+        BIRTHDAY_HEIGHT,
+        chain_tip_2,
+        true,
+        false,
+    )
+    .await;
 
     let expected_recovery_blocks = TARGET_APPLY_HEIGHT as u64 - BIRTHDAY_HEIGHT + 1;
     assert!(
@@ -705,7 +789,9 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
         .await
         .expect("stage before-reorg blocks");
 
-    ctl.apply_staged(FIRST_APPLY_HEIGHT).await.expect("apply before-reorg");
+    ctl.apply_staged(FIRST_APPLY_HEIGHT)
+        .await
+        .expect("apply before-reorg");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -718,12 +804,13 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
         .await
         .expect("get chain tip (before-reorg)");
     assert_eq!(
-        chain_tip_1,
-        FIRST_APPLY_HEIGHT as u64,
+        chain_tip_1, FIRST_APPLY_HEIGHT as u64,
         "chain_tip_1 must equal FIRST_APPLY_HEIGHT ({FIRST_APPLY_HEIGHT})"
     );
 
-    session.update_chain_tip(chain_tip_1).expect("update_chain_tip (before-reorg)");
+    session
+        .update_chain_tip(chain_tip_1)
+        .expect("update_chain_tip (before-reorg)");
 
     // Initial sync — sparse + write-behind.
     let blocks_scanned_1 =
@@ -742,7 +829,9 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
         .await
         .expect("stage after-small-reorg blocks");
 
-    ctl.apply_staged(TARGET_APPLY_HEIGHT).await.expect("apply after-small-reorg");
+    ctl.apply_staged(TARGET_APPLY_HEIGHT)
+        .await
+        .expect("apply after-small-reorg");
 
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -750,12 +839,13 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
         .await
         .expect("get chain tip (after-small-reorg)");
     assert_eq!(
-        chain_tip_2,
-        TARGET_APPLY_HEIGHT as u64,
+        chain_tip_2, TARGET_APPLY_HEIGHT as u64,
         "chain_tip_2 must equal TARGET_APPLY_HEIGHT ({TARGET_APPLY_HEIGHT})"
     );
 
-    session.update_chain_tip(chain_tip_2).expect("update_chain_tip (after-small-reorg)");
+    session
+        .update_chain_tip(chain_tip_2)
+        .expect("update_chain_tip (after-small-reorg)");
 
     // ==========================================================================
     // Phase 3: Detect the reorg THROUGH the write-behind path. The probe scan
@@ -773,7 +863,8 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
         cfg.fetch_streams,
     );
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
+    let fetch_task =
+        tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
 
     let from_state_663200 = TreeState {
         network: "main".into(),
@@ -817,7 +908,10 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
     // ==========================================================================
 
     let rewind_height = continuity_at.saturating_sub(10);
-    assert_eq!(rewind_height, 663_191u32, "write-behind: rewind_height must be 663191");
+    assert_eq!(
+        rewind_height, 663_191u32,
+        "write-behind: rewind_height must be 663191"
+    );
     println!("write-behind: rewinding to height {rewind_height}");
 
     session

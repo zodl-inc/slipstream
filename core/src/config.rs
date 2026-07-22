@@ -34,7 +34,9 @@ impl Endpoint {
         } else if let Some(r) = s.strip_prefix("http://") {
             (false, r)
         } else {
-            return Err(format!("endpoint URI must start with http:// or https://: {s:?}"));
+            return Err(format!(
+                "endpoint URI must start with http:// or https://: {s:?}"
+            ));
         };
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         let (host, port) = rest
@@ -43,9 +45,14 @@ impl Endpoint {
         if host.is_empty() {
             return Err(format!("endpoint URI has empty host: {s:?}"));
         }
-        let port: u16 =
-            port.parse().map_err(|e| format!("endpoint URI port ({e}): {s:?}"))?;
-        Ok(Endpoint { host: host.to_string(), port, tls })
+        let port: u16 = port
+            .parse()
+            .map_err(|e| format!("endpoint URI port ({e}): {s:?}"))?;
+        Ok(Endpoint {
+            host: host.to_string(),
+            port,
+            tls,
+        })
     }
 }
 
@@ -255,13 +262,19 @@ impl EngineConfig {
             return Err(SlipstreamError::Config("fetch_streams must be >= 1".into()));
         }
         if self.chunk_blocks < 100 {
-            return Err(SlipstreamError::Config("chunk_blocks must be >= 100".into()));
+            return Err(SlipstreamError::Config(
+                "chunk_blocks must be >= 100".into(),
+            ));
         }
         if self.memory_budget_bytes < 16 * 1024 * 1024 {
-            return Err(SlipstreamError::Config("memory_budget_bytes must be >= 16 MiB".into()));
+            return Err(SlipstreamError::Config(
+                "memory_budget_bytes must be >= 16 MiB".into(),
+            ));
         }
         if self.chunk_split_bytes < 1024 * 1024 {
-            return Err(SlipstreamError::Config("chunk_split_bytes must be >= 1 MiB".into()));
+            return Err(SlipstreamError::Config(
+                "chunk_split_bytes must be >= 1 MiB".into(),
+            ));
         }
         if let Some(ms) = self.scan_batch_target_ms
             && ms < 500
@@ -334,11 +347,19 @@ mod tests {
     use super::*;
 
     fn endpoint() -> Endpoint {
-        Endpoint { host: "zec.rocks".into(), port: 443, tls: true }
+        Endpoint {
+            host: "zec.rocks".into(),
+            port: 443,
+            tls: true,
+        }
     }
 
     fn config() -> EngineConfig {
-        EngineConfig::new(crate::Network::MainNetwork, PathBuf::from("/tmp/data.db"), endpoint())
+        EngineConfig::new(
+            crate::Network::MainNetwork,
+            PathBuf::from("/tmp/data.db"),
+            endpoint(),
+        )
     }
 
     // ── v0.7 P1b: Endpoint::parse_uri (the FFI alternate-server wire format) ──
@@ -346,8 +367,16 @@ mod tests {
     #[test]
     fn parse_uri_round_trips_uri() {
         for ep in [
-            Endpoint { host: "zec.rocks".into(), port: 443, tls: true },
-            Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false },
+            Endpoint {
+                host: "zec.rocks".into(),
+                port: 443,
+                tls: true,
+            },
+            Endpoint {
+                host: "127.0.0.1".into(),
+                port: 9067,
+                tls: false,
+            },
         ] {
             assert_eq!(Endpoint::parse_uri(&ep.uri()).unwrap(), ep);
         }
@@ -366,7 +395,14 @@ mod tests {
     #[test]
     fn parse_uri_tolerates_trailing_slash() {
         let ep = Endpoint::parse_uri("https://zec.rocks:443/").unwrap();
-        assert_eq!(ep, Endpoint { host: "zec.rocks".into(), port: 443, tls: true });
+        assert_eq!(
+            ep,
+            Endpoint {
+                host: "zec.rocks".into(),
+                port: 443,
+                tls: true
+            }
+        );
     }
 
     #[test]
@@ -501,13 +537,32 @@ mod tests {
     fn device_memory_scaling_derates_small_devices() {
         let c = config();
         // Unknown (0) and big devices keep defaults.
-        assert_eq!(c.clone().scaled_for_device_memory(0).memory_budget_bytes, EngineConfig::DEFAULT_MEMORY_BUDGET);
-        assert_eq!(c.clone().scaled_for_device_memory(8 << 30).chunk_split_bytes, EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES);
-        assert_eq!(c.clone().scaled_for_device_memory(3 << 30).memory_budget_bytes, EngineConfig::DEFAULT_MEMORY_BUDGET);
+        assert_eq!(
+            c.clone().scaled_for_device_memory(0).memory_budget_bytes,
+            EngineConfig::DEFAULT_MEMORY_BUDGET
+        );
+        assert_eq!(
+            c.clone()
+                .scaled_for_device_memory(8 << 30)
+                .chunk_split_bytes,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES
+        );
+        assert_eq!(
+            c.clone()
+                .scaled_for_device_memory(3 << 30)
+                .memory_budget_bytes,
+            EngineConfig::DEFAULT_MEMORY_BUDGET
+        );
         // Sub-3 GiB devices (A10 iPad = 2 GiB) derate to the Blockers sizing.
         let small = c.clone().scaled_for_device_memory((3 << 30) - 1);
-        assert_eq!(small.memory_budget_bytes, EngineConfig::SMALL_DEVICE_MEMORY_BUDGET);
-        assert_eq!(small.chunk_split_bytes, EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES);
+        assert_eq!(
+            small.memory_budget_bytes,
+            EngineConfig::SMALL_DEVICE_MEMORY_BUDGET
+        );
+        assert_eq!(
+            small.chunk_split_bytes,
+            EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES
+        );
         small.validate().expect("derated config must validate");
     }
 }

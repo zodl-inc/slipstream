@@ -19,9 +19,9 @@ use crate::connector::TorConn;
 use crate::engine::{SyncOutcome, probe_tip, should_resync, sync_once, wall_clock_utc};
 use crate::error::SlipstreamError;
 use crate::events::Progress;
-use crate::ffi_handle::{FfiSlipstreamEvent, SyncState};
 #[cfg(test)]
 use crate::ffi_handle::EVENT_RING_CAP;
+use crate::ffi_handle::{FfiSlipstreamEvent, SyncState};
 
 /// Per-session configuration: the per-pass engine config + optional account import + optional Tor.
 #[derive(Clone, Debug)]
@@ -368,8 +368,7 @@ async fn follow_loop(
     // mempool on every reconnect (Deviation D6).
     let mut mempool_enabled = true;
     let mut mempool_failures: u32 = 0;
-    let mut seen_txids: std::collections::HashSet<[u8; 32]> =
-        std::collections::HashSet::new();
+    let mut seen_txids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     loop {
         // Between passes: hold a mempool session (surfaces 0-conf incoming) or jitter-sleep
         // if mempool is disabled. A live session blocks until the server closes the stream
@@ -467,7 +466,11 @@ async fn follow_loop(
             continue;
         }
 
-        tracing::info!(last_tip, observed, "follow: tip advanced, running catch-up pass");
+        tracing::info!(
+            last_tip,
+            observed,
+            "follow: tip advanced, running catch-up pass"
+        );
 
         // New block(s): Syncing for the pass duration, then Done. Follow passes are ALWAYS
         // keyless (ufvk=None) — the account is already imported; passing Some would waste a
@@ -539,7 +542,10 @@ mod tests {
 
     #[test]
     fn pass_retry_max_is_two() {
-        assert_eq!(PASS_RETRY_MAX, 2, "PASS_RETRY_MAX must be 2 (3 total attempts)");
+        assert_eq!(
+            PASS_RETRY_MAX, 2,
+            "PASS_RETRY_MAX must be 2 (3 total attempts)"
+        );
         assert_eq!(pass_retry_sleep(1), Duration::from_secs(5));
         assert_eq!(pass_retry_sleep(2), Duration::from_secs(15));
         assert_eq!(pass_retry_sleep(3), Duration::from_secs(15)); // default arm
@@ -549,7 +555,10 @@ mod tests {
 
     #[test]
     fn follow_poll_jitter_min_sample_yields_min_secs() {
-        assert_eq!(follow_poll_jitter(0.0), Duration::from_secs(FOLLOW_POLL_MIN_SECS));
+        assert_eq!(
+            follow_poll_jitter(0.0),
+            Duration::from_secs(FOLLOW_POLL_MIN_SECS)
+        );
     }
 
     #[test]
@@ -607,19 +616,34 @@ mod tests {
 
     #[test]
     fn follow_poll_is_in_old_sdk_band() {
-        assert!(FOLLOW_POLL_MIN_SECS >= 10, "min must be >= 10 (old-SDK floor)");
-        assert!(FOLLOW_POLL_MAX_SECS <= 30, "max must be <= 30 (old-SDK ceiling)");
-        assert!(FOLLOW_POLL_MIN_SECS <= FOLLOW_POLL_MAX_SECS, "min must be <= max");
+        assert!(
+            FOLLOW_POLL_MIN_SECS >= 10,
+            "min must be >= 10 (old-SDK floor)"
+        );
+        assert!(
+            FOLLOW_POLL_MAX_SECS <= 30,
+            "max must be <= 30 (old-SDK ceiling)"
+        );
+        assert!(
+            FOLLOW_POLL_MIN_SECS <= FOLLOW_POLL_MAX_SECS,
+            "min must be <= max"
+        );
     }
 
     #[test]
     fn follow_failure_cap_is_sane() {
-        assert!(FOLLOW_FAILURE_CAP >= 3, "must tolerate transient server weather");
+        assert!(
+            FOLLOW_FAILURE_CAP >= 3,
+            "must tolerate transient server weather"
+        );
     }
 
     #[test]
     fn mempool_failure_cap_is_sane() {
-        assert!(MEMPOOL_FAILURE_CAP >= 1, "one failure must not disable mempool");
+        assert!(
+            MEMPOOL_FAILURE_CAP >= 1,
+            "one failure must not disable mempool"
+        );
         assert!(
             MEMPOOL_FAILURE_CAP < FOLLOW_FAILURE_CAP,
             "mempool (non-essential) must give up before the essential tip poll"

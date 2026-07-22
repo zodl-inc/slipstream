@@ -46,7 +46,9 @@ fn err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
 /// accounts or nothing qualifies (the common case — a read-only probe, no write lock).
 pub fn prune_orphaned_historic_ranges(conn: &Connection) -> Result<u64, SlipstreamError> {
     let floor: Option<i64> = conn
-        .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| row.get(0))
+        .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| {
+            row.get(0)
+        })
         .map_err(|e| err("min birthday", e))?;
     let Some(floor) = floor else { return Ok(0) };
 
@@ -109,7 +111,8 @@ mod tests {
         s.ensure_account(TEST_UFVK, ts).expect("import account");
         drop(s);
         let conn = Connection::open(&path).expect("conn");
-        conn.execute("DELETE FROM scan_queue", []).expect("clear queue");
+        conn.execute("DELETE FROM scan_queue", [])
+            .expect("clear queue");
         (dir, conn)
     }
 

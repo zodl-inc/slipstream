@@ -9,8 +9,7 @@ use crate::{
     config::Endpoint,
     darkside_generated::{
         DarksideBlocksUrl, DarksideEmptyBlocks, DarksideHeight, DarksideMetaState,
-        DarksideTransactionsUrl,
-        darkside_streamer_client::DarksideStreamerClient,
+        DarksideTransactionsUrl, darkside_streamer_client::DarksideStreamerClient,
     },
     error::SlipstreamError,
 };
@@ -36,7 +35,9 @@ impl DarksideCtl {
             .connect()
             .await
             .map_err(|e| err("connect", e))?;
-        Ok(Self { client: DarksideStreamerClient::new(channel) })
+        Ok(Self {
+            client: DarksideStreamerClient::new(channel),
+        })
     }
 
     pub async fn reset(&mut self) -> Result<(), SlipstreamError> {
@@ -71,7 +72,11 @@ impl DarksideCtl {
         count: i32,
     ) -> Result<(), SlipstreamError> {
         self.client
-            .stage_blocks_create(DarksideEmptyBlocks { height, nonce: 0, count })
+            .stage_blocks_create(DarksideEmptyBlocks {
+                height,
+                nonce: 0,
+                count,
+            })
             .await
             .map_err(|e| err("stage_blocks_create", e))?;
         Ok(())
@@ -104,7 +109,10 @@ impl DarksideCtl {
         height: i32,
     ) -> Result<(), SlipstreamError> {
         self.client
-            .stage_transactions(DarksideTransactionsUrl { url: url.into(), height })
+            .stage_transactions(DarksideTransactionsUrl {
+                url: url.into(),
+                height,
+            })
             .await
             .map_err(|e| err("stage_transactions_url", e))?;
         Ok(())

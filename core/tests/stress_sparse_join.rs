@@ -100,7 +100,9 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
             index: 0,
             txid: h32(0x77, height),
             fee: 0,
-            spends: vec![CompactSaplingSpend { nf: h32(0x4F, height) }],
+            spends: vec![CompactSaplingSpend {
+                nf: h32(0x4F, height),
+            }],
             outputs,
             actions: vec![],
             ..Default::default()
@@ -108,7 +110,11 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
         blocks.push(CompactBlock {
             height,
             hash: h32(0xBB, height),
-            prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
+            prev_hash: if i == 0 {
+                vec![0u8; 32]
+            } else {
+                h32(0xBB, height - 1)
+            },
             time: height as u32,
             header: vec![],
             vtx: vec![tx],
@@ -185,7 +191,9 @@ fn scan_sparse_once(
         .ensure_account(STRESS_UFVK, birthday_ts.clone())
         .map_err(|e| format!("ensure_account: {e}"))?;
     let tip = blocks.last().map(|b| b.height).unwrap_or(SYNTH_START);
-    session.update_chain_tip(tip).map_err(|e| format!("update_chain_tip: {e}"))?;
+    session
+        .update_chain_tip(tip)
+        .map_err(|e| format!("update_chain_tip: {e}"))?;
 
     let mut sparse_state = SparseTreeState::default();
     sparse_state.set_anchor_retention_height(anchor_floor.map(BlockHeight::from)); // [B6]
@@ -205,8 +213,10 @@ fn scan_sparse_once(
         // The production layering: synchronous scan inside block_in_place.
         let mut scan = || {
             let source = MemBlockSource::new(&chunk);
-            let mut facade =
-                SparseFacade { inner: session.db_mut(), sparse: &mut sparse_state };
+            let mut facade = SparseFacade {
+                inner: session.db_mut(),
+                sparse: &mut sparse_state,
+            };
             scan_cached_blocks(
                 &network,
                 &source,
@@ -264,7 +274,8 @@ fn run_all_variants() -> Result<(), String> {
             let empty_chain = synth_blocks(200, 0);
             for i in 0..20 {
                 let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-                scan_sparse_once(dir.path(), &empty_chain, 100, Some(&pool1), None).map_err(|e| format!("variant1 iter {i}: {e}"))?;
+                scan_sparse_once(dir.path(), &empty_chain, 100, Some(&pool1), None)
+                    .map_err(|e| format!("variant1 iter {i}: {e}"))?;
             }
 
             // Variant 2 — local pool, TWO threads, real outputs: the full
@@ -273,7 +284,8 @@ fn run_all_variants() -> Result<(), String> {
             let real_chain = synth_blocks(100, 2);
             for i in 0..20 {
                 let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-                scan_sparse_once(dir.path(), &real_chain, 50, Some(&pool2), None).map_err(|e| format!("variant2 iter {i}: {e}"))?;
+                scan_sparse_once(dir.path(), &real_chain, 50, Some(&pool2), None)
+                    .map_err(|e| format!("variant2 iter {i}: {e}"))?;
             }
 
             // Variant 3 — NO install: production layering. The scan runs on
@@ -282,7 +294,8 @@ fn run_all_variants() -> Result<(), String> {
             // spawn_fifo tasks land on the same constrained pool.
             for i in 0..20 {
                 let dir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-                scan_sparse_once(dir.path(), &real_chain, 50, None, None).map_err(|e| format!("variant3 iter {i}: {e}"))?;
+                scan_sparse_once(dir.path(), &real_chain, 50, None, None)
+                    .map_err(|e| format!("variant3 iter {i}: {e}"))?;
             }
 
             Ok::<(), String>(())
@@ -325,7 +338,10 @@ fn run_anchor_retention_pair() -> Result<(), String> {
     // so both grid heights sit 200–500 blocks below it.
     let blocks = synth_blocks(800, 1);
     let first_grid = SYNTH_START.div_ceil(288) * 288;
-    assert!(first_grid + 288 < SYNTH_START + 650, "grid must fall well below the window");
+    assert!(
+        first_grid + 288 < SYNTH_START + 650,
+        "grid must fall well below the window"
+    );
 
     let query = |dir: &Path, id: u64| -> Result<bool, String> {
         let conn = rusqlite::Connection::open(dir.join("data.db"))
@@ -355,7 +371,9 @@ fn run_anchor_retention_pair() -> Result<(), String> {
                 )
                 .map_err(|e| format!("debug q: {e}"))?;
             let count: u64 = conn
-                .query_row("SELECT COUNT(*) FROM sapling_tree_checkpoints", [], |r| r.get(0))
+                .query_row("SELECT COUNT(*) FROM sapling_tree_checkpoints", [], |r| {
+                    r.get(0)
+                })
                 .map_err(|e| format!("debug c: {e}"))?;
             return Err(format!(
                 "retained anchor {grid} missing with retention ON (n={count}, oldest 12: {survivors})"
@@ -368,7 +386,9 @@ fn run_anchor_retention_pair() -> Result<(), String> {
     scan_sparse_once(dir_off.path(), &blocks, 800, None, None)?;
     for grid in [first_grid, first_grid + 288] {
         if query(dir_off.path(), grid)? {
-            return Err(format!("anchor {grid} unexpectedly survived with retention OFF"));
+            return Err(format!(
+                "anchor {grid} unexpectedly survived with retention OFF"
+            ));
         }
     }
     Ok(())
@@ -381,7 +401,8 @@ fn anchor_retention_survives_sparse_scan() {
         .enable_all()
         .build()
         .expect("runtime");
-    let result = rt.block_on(async { tokio::task::spawn(async { run_anchor_retention_pair() }).await });
+    let result =
+        rt.block_on(async { tokio::task::spawn(async { run_anchor_retention_pair() }).await });
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => panic!("B6 anchor retention: {e}"),

@@ -91,7 +91,10 @@ fn precompute_shard_map(
         let parents = batch(&layers, &lefts, &rights);
         let mut next = Vec::with_capacity(pairs);
         for i in 0..pairs {
-            map.insert(combine_key(Level::from(lvl), &level[2 * i], &level[2 * i + 1]), parents[i]);
+            map.insert(
+                combine_key(Level::from(lvl), &level[2 * i], &level[2 * i + 1]),
+                parents[i],
+            );
             let p = Option::from(MerkleHashOrchard::from_bytes(&parents[i])).unwrap_or_else(|| {
                 MerkleHashOrchard::combine(Level::from(lvl), &level[2 * i], &level[2 * i + 1])
             });
@@ -124,15 +127,20 @@ pub(crate) fn build_subtrees_lookup<const SHARD_HEIGHT: u8>(
     batch: BatchCombineFn,
     start_position: Position,
     commitments: &mut [Option<(MerkleHashOrchard, Retention<BlockHeight>)>],
-) -> Vec<(LocatedPrunableTree<MerkleHashOrchard>, BTreeMap<BlockHeight, Position>)> {
+) -> Vec<(
+    LocatedPrunableTree<MerkleHashOrchard>,
+    BTreeMap<BlockHeight, Position>,
+)> {
     commitments
         .par_chunks_mut(BUILD_CHUNK_SIZE)
         .enumerate()
         .filter_map(|(i, chunk)| {
             let start = start_position + (i * BUILD_CHUNK_SIZE) as u64;
             let end = start + chunk.len() as u64;
-            let leaves: Vec<MerkleHashOrchard> =
-                chunk.iter().map(|n| n.as_ref().expect("always Some").0).collect();
+            let leaves: Vec<MerkleHashOrchard> = chunk
+                .iter()
+                .map(|n| n.as_ref().expect("always Some").0)
+                .collect();
             let map = precompute_shard_map(batch, &leaves);
 
             PRECOMP.with(|p| *p.borrow_mut() = Some(map));
@@ -203,7 +211,10 @@ pub(crate) mod tests {
                 start,
                 &mut b,
             );
-            assert_eq!(scalar, batched, "batch-affine build diverged from scalar at n={n}");
+            assert_eq!(
+                scalar, batched,
+                "batch-affine build diverged from scalar at n={n}"
+            );
         }
     }
 }

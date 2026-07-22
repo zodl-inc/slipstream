@@ -60,7 +60,11 @@ mod tests {
             .map(|h| CompactBlock {
                 height: h,
                 hash: vec![h as u8; 32],
-                prev_hash: if h == from { vec![] } else { vec![(h - 1) as u8; 32] },
+                prev_hash: if h == from {
+                    vec![]
+                } else {
+                    vec![(h - 1) as u8; 32]
+                },
                 ..Default::default()
             })
             .collect()
@@ -83,7 +87,10 @@ mod tests {
         let mut c = Continuity::default();
         c.verify_blocks(&linked(100, 3)).expect("ok");
         let err = c.verify_blocks(&linked(105, 1)).unwrap_err();
-        assert!(matches!(err, SlipstreamError::Discontinuity { at: 105, .. }));
+        assert!(matches!(
+            err,
+            SlipstreamError::Discontinuity { at: 105, .. }
+        ));
     }
 
     #[test]
@@ -93,6 +100,9 @@ mod tests {
         let mut bad = linked(102, 1);
         bad[0].prev_hash = vec![0xEE; 32];
         let err = c.verify_blocks(&bad).unwrap_err();
-        assert!(matches!(err, SlipstreamError::Discontinuity { at: 102, .. }));
+        assert!(matches!(
+            err,
+            SlipstreamError::Discontinuity { at: 102, .. }
+        ));
     }
 }

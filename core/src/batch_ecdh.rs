@@ -291,8 +291,7 @@ mod tests {
     #[test]
     #[ignore = "heavy: 100k lanes; run explicitly with --release"]
     fn kernel_matches_pasta_mul_100k() {
-        let k = pallas::Scalar::from(0x1357_9BDF_2468_ACE0u64).square()
-            + pallas::Scalar::from(3);
+        let k = pallas::Scalar::from(0x1357_9BDF_2468_ACE0u64).square() + pallas::Scalar::from(3);
         let points = synth_points(100_000, 11);
         let ours = batch_mul_same_scalar(&k, &points);
         for (p, o) in points.iter().zip(&ours) {
@@ -306,13 +305,18 @@ mod tests {
     fn degenerates_are_poisoned_not_wrong() {
         let points = synth_points(4, 23);
         assert!(
-            batch_mul_same_scalar(&pallas::Scalar::ZERO, &points).iter().all(Option::is_none),
+            batch_mul_same_scalar(&pallas::Scalar::ZERO, &points)
+                .iter()
+                .all(Option::is_none),
             "k = 0 has no affine representation — every lane degenerate"
         );
         let with_identity = vec![pallas::Affine::identity(), points[1]];
         let out = batch_mul_same_scalar(&pallas::Scalar::from(5), &with_identity);
         assert!(out[0].is_none(), "identity input is degenerate");
-        assert!(out[1].is_some(), "live lanes are unaffected by dead neighbors");
+        assert!(
+            out[1].is_some(),
+            "live lanes are unaffected by dead neighbors"
+        );
     }
 
     /// Shared wiring A/B harness: FULL upstream batch decryption with a fork
@@ -347,8 +351,10 @@ mod tests {
                 actions.push(CompactAction::from_parts(
                     Option::from(orchard::note::Nullifier::from_bytes(&owned.nullifier))
                         .expect("owned nf"),
-                    Option::from(orchard::note::ExtractedNoteCommitment::from_bytes(&owned.cmx))
-                        .expect("owned cmx"),
+                    Option::from(orchard::note::ExtractedNoteCommitment::from_bytes(
+                        &owned.cmx,
+                    ))
+                    .expect("owned cmx"),
                     EphemeralKeyBytes(owned.ephemeral_key),
                     owned.ciphertext.as_slice().try_into().expect("52 bytes"),
                 ));
@@ -389,8 +395,14 @@ mod tests {
                 _ => panic!("hit/miss pattern differs at action {i}"),
             }
         }
-        assert!(off[250].is_some(), "the owned action must decrypt (lever off)");
-        assert!(on[250].is_some(), "the owned action must decrypt (lever on)");
+        assert!(
+            off[250].is_some(),
+            "the owned action must decrypt (lever off)"
+        );
+        assert!(
+            on[250].is_some(),
+            "the owned action must decrypt (lever on)"
+        );
     }
 
     /// C1 wired A/B: full batch decryption ON vs OFF is identical (incl. a
@@ -431,7 +443,11 @@ mod tests {
             zip32::AccountId::ZERO,
         )
         .expect("usk");
-        let fvk = usk.to_unified_full_viewing_key().orchard().expect("orchard fvk").clone();
+        let fvk = usk
+            .to_unified_full_viewing_key()
+            .orchard()
+            .expect("orchard fvk")
+            .clone();
         let pivk = PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External));
 
         let n = 2_000usize;
@@ -491,7 +507,11 @@ mod tests {
             zip32::AccountId::ZERO,
         )
         .expect("usk");
-        let fvk = usk.to_unified_full_viewing_key().orchard().expect("orchard fvk").clone();
+        let fvk = usk
+            .to_unified_full_viewing_key()
+            .orchard()
+            .expect("orchard fvk")
+            .clone();
         let pivk = PreparedIncomingViewingKey::new(&fvk.to_ivk(Scope::External));
 
         // HONEST comparison (v2 — the first version bundled prepare_epk + TWO
@@ -528,8 +548,7 @@ mod tests {
             let projective: Vec<pallas::Point> =
                 points.iter().map(|p| pallas::Point::from(*p)).collect();
             let t = Instant::now();
-            let affine: Vec<pallas::Affine> =
-                projective.iter().map(|p| p.to_affine()).collect();
+            let affine: Vec<pallas::Affine> = projective.iter().map(|p| p.to_affine()).collect();
             let out = batch_mul_same_scalar(&k, &affine);
             let kernel_wired = t.elapsed();
             assert!(out.iter().all(Option::is_some));

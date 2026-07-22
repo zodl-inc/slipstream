@@ -100,7 +100,8 @@ impl WalletSession {
         // (which diffs `type='table'` only). Idempotent, so every host inherits it
         // with no FFI change. WAL (set above) permits this short side connection.
         {
-            let conn = Connection::open(db_path).map_err(|e| wallet_err("reconcile view open", e))?;
+            let conn =
+                Connection::open(db_path).map_err(|e| wallet_err("reconcile view open", e))?;
             // [audit ENG-1] same per-connection timeout as the pre-open connection above.
             conn.busy_timeout(std::time::Duration::from_secs(5))
                 .map_err(|e| wallet_err("set busy_timeout (reconcile)", e))?;
@@ -136,7 +137,11 @@ impl WalletSession {
                 }
             }
         }
-        Ok(Self { network, db, db_path: db_path.to_path_buf() })
+        Ok(Self {
+            network,
+            db,
+            db_path: db_path.to_path_buf(),
+        })
     }
 
     /// [API v2 §4.4] The wallet's recovery ceiling: MAX(`accounts.recover_until_height`), or
@@ -145,11 +150,16 @@ impl WalletSession {
     /// `is_recovering`. Read through a short side connection (same pattern as the reconcile view;
     /// WAL permits it) so it needs no upstream API surface.
     pub fn max_recover_until(&self) -> Result<Option<u64>, SlipstreamError> {
-        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("recover_until open", e))?;
+        let conn =
+            Connection::open(&self.db_path).map_err(|e| wallet_err("recover_until open", e))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| wallet_err("recover_until busy_timeout", e))?;
         let max: Option<i64> = conn
-            .query_row("SELECT MAX(recover_until_height) FROM accounts", [], |row| row.get(0))
+            .query_row(
+                "SELECT MAX(recover_until_height) FROM accounts",
+                [],
+                |row| row.get(0),
+            )
             .map_err(|e| wallet_err("recover_until query", e))?;
         Ok(max.and_then(|v| u64::try_from(v).ok()))
     }
@@ -163,7 +173,9 @@ impl WalletSession {
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| wallet_err("birthday busy_timeout", e))?;
         let min: Option<i64> = conn
-            .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| row.get(0))
+            .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| wallet_err("birthday query", e))?;
         Ok(min.and_then(|v| u64::try_from(v).ok()))
     }
@@ -184,17 +196,22 @@ impl WalletSession {
         }
         let ufvk = UnifiedFullViewingKey::decode(&self.network, ufvk_str)
             .map_err(|e| wallet_err("ufvk decode", e))?;
-        let birthday = AccountBirthday::from_treestate(birthday_treestate, None)
-            .map_err(|e| {
-                use zcash_client_backend::data_api::BirthdayError;
-                let detail = match e {
-                    BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
-                    BirthdayError::Decode(io) => format!("decode: {io}"),
-                };
-                SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
-            })?;
+        let birthday = AccountBirthday::from_treestate(birthday_treestate, None).map_err(|e| {
+            use zcash_client_backend::data_api::BirthdayError;
+            let detail = match e {
+                BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
+                BirthdayError::Decode(io) => format!("decode: {io}"),
+            };
+            SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
+        })?;
         self.db
-            .import_account_ufvk("slipstream", &ufvk, &birthday, AccountPurpose::ViewOnly, None)
+            .import_account_ufvk(
+                "slipstream",
+                &ufvk,
+                &birthday,
+                AccountPurpose::ViewOnly,
+                None,
+            )
             .map_err(|e| wallet_err("import_account_ufvk", e))?;
         info!("account imported (view-only)");
         Ok(())
@@ -257,7 +274,10 @@ impl WalletSession {
                 |row| row.get(0),
             )
             .map_err(|e| wallet_err("tx sig unreconciled", e))?;
-        Ok((u64::try_from(total).unwrap_or(0), u64::try_from(unreconciled).unwrap_or(0)))
+        Ok((
+            u64::try_from(total).unwrap_or(0),
+            u64::try_from(unreconciled).unwrap_or(0),
+        ))
     }
 
     /// Exclusive access for the scan driver (scan_cached_blocks needs &mut).
@@ -376,10 +396,12 @@ mod tests {
                 .prepare("INSERT INTO orchard_tree_checkpoints (checkpoint_id, position) VALUES (?1, ?2)")
                 .expect("prepare");
             for id in (1_687_103..1_990_103).step_by(100) {
-                stmt.execute(rusqlite::params![id, 1_000]).expect("insert flood");
+                stmt.execute(rusqlite::params![id, 1_000])
+                    .expect("insert flood");
             }
             for id in 3_402_885..3_402_985 {
-                stmt.execute(rusqlite::params![id, 2_000_000]).expect("insert window");
+                stmt.execute(rusqlite::params![id, 2_000_000])
+                    .expect("insert window");
             }
         }
         // Second open runs the heal.
@@ -393,7 +415,10 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 100, "only the tip window survives the heal");
-        assert!(min_id >= 3_402_985 - 10_000, "flood rows below the margin are gone");
+        assert!(
+            min_id >= 3_402_985 - 10_000,
+            "flood rows below the margin are gone"
+        );
     }
 
     #[test]
@@ -406,7 +431,8 @@ mod tests {
 
         let conn = Connection::open(&path).expect("side conn");
         // Same as reconcile.rs's fixture: raw fixture rows without full FK graphs.
-        conn.pragma_update(None, "foreign_keys", false).expect("fk off");
+        conn.pragma_update(None, "foreign_keys", false)
+            .expect("fk off");
         // A pure receive (no observed spends) is reconciled immediately: count moves, not unreconciled.
         conn.execute(
             "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height)
@@ -414,7 +440,11 @@ mod tests {
             params![vec![0x01u8; 32]],
         )
         .expect("insert pure receive");
-        assert_eq!(s.tx_set_signature().expect("sig"), (1, 0), "insert moves the count");
+        assert_eq!(
+            s.tx_set_signature().expect("sig"),
+            (1, 0),
+            "insert moves the count"
+        );
 
         // A dangling shielded spend (nullifier observed, note not yet received) flips unreconciled.
         let txid2 = vec![0x02u8; 32];
@@ -435,7 +465,11 @@ mod tests {
             params![nf],
         )
         .expect("insert nullifier");
-        assert_eq!(s.tx_set_signature().expect("sig"), (2, 1), "dangling spend flips unreconciled");
+        assert_eq!(
+            s.tx_set_signature().expect("sig"),
+            (2, 1),
+            "dangling spend flips unreconciled"
+        );
 
         // Scanning the origin block receives the note -> the spend LINKS with NO new tx row:
         // exactly the change class only the signature (not the enhance counter) can see.
@@ -446,7 +480,11 @@ mod tests {
             params![nf],
         )
         .expect("link note");
-        assert_eq!(s.tx_set_signature().expect("sig"), (2, 0), "linkage moves the signature");
+        assert_eq!(
+            s.tx_set_signature().expect("sig"),
+            (2, 0),
+            "linkage moves the signature"
+        );
     }
 
     #[test]
@@ -465,7 +503,8 @@ mod tests {
             time: 1,
             ..Default::default()
         };
-        s.ensure_account(TEST_UFVK, ts.clone()).expect("first import");
+        s.ensure_account(TEST_UFVK, ts.clone())
+            .expect("first import");
         s.ensure_account(TEST_UFVK, ts).expect("idempotent");
         // Note 4: assert on account count (simpler than range-suggestion check on fresh wallet)
         let ids = s.db.get_account_ids().expect("get_account_ids");

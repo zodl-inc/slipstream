@@ -30,13 +30,13 @@ use futures_util::StreamExt;
 use rusqlite::Connection;
 use slipstream_core::{
     chunk::chunk_queue,
-    config::{EngineConfig, Endpoint},
+    config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
     fetch::{FetchPlan, run_fetch},
     grpc,
     oracle::semantic_diff,
     scan::scan_chunks_from_treestate,
-    wallet_session::{WalletSession, TEST_UFVK},
+    wallet_session::{TEST_UFVK, WalletSession},
 };
 use zcash_client_backend::data_api::WalletWrite;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
@@ -47,19 +47,20 @@ use zcash_protocol::consensus::{BlockHeight, Network};
 // ---------------------------------------------------------------------------
 
 fn darkside_endpoint() -> Endpoint {
-    Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false }
+    Endpoint {
+        host: "127.0.0.1".into(),
+        port: 9067,
+        tls: false,
+    }
 }
 
 const BIRTHDAY_HEIGHT: u64 = 663_150;
 
-const TX_MAINNET_BLOCK_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/663150.txt";
+const TX_MAINNET_BLOCK_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/663150.txt";
 
-const TX_663174_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/8f064d23c66dc36e32445e5f3b50e0f32ac3ddb78cff21fb521eb6c19c07c99a.txt";
+const TX_663174_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/8f064d23c66dc36e32445e5f3b50e0f32ac3ddb78cff21fb521eb6c19c07c99a.txt";
 
-const TX_663188_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/15a677b6770c5505fb47439361d3d3a7c21238ee1a6874fdedad18ae96850590.txt";
+const TX_663188_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/15a677b6770c5505fb47439361d3d3a7c21238ee1a6874fdedad18ae96850590.txt";
 
 const APPLY_HEIGHT: i32 = 663_188;
 const START_SAPLING_TREE_SIZE: u32 = 128_607;
@@ -69,25 +70,38 @@ const EXPECTED_BALANCE_ZATOSHI: i64 = 200_000;
 
 /// Hex-encoded CommitmentTree for 128607 leaves — identical to darkside_sync.rs.
 const SAPLING_TREE_128607: &str = concat!(
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
     "10",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
 );
 
 // ---------------------------------------------------------------------------
@@ -141,19 +155,29 @@ async fn run_pipeline(
         sapling_tree: SAPLING_TREE_128607.into(),
         ..Default::default()
     };
-    session.ensure_account(TEST_UFVK, birthday_ts).expect("ensure_account");
+    session
+        .ensure_account(TEST_UFVK, birthday_ts)
+        .expect("ensure_account");
 
     let mut client = grpc::connect(ep).await.expect("grpc connect");
     let chain_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
-    session.update_chain_tip(chain_tip).expect("update_chain_tip");
+    session
+        .update_chain_tip(chain_tip)
+        .expect("update_chain_tip");
 
     // Pre-seed block 663149 metadata (v0.4.9 workaround).
     let block_663149_hash: Vec<u8> = {
         let req = BlockRange {
-            start: Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
-            end:   Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
+            start: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
             ..Default::default()
         };
         let mut stream = client
@@ -161,14 +185,20 @@ async fn run_pipeline(
             .await
             .expect("get_block_range for birthday")
             .into_inner();
-        let first_block = stream.next().await
+        let first_block = stream
+            .next()
+            .await
             .expect("stream should yield birthday block")
             .expect("block 663150 ok");
         first_block.prev_hash
     };
     assert_eq!(block_663149_hash.len(), 32, "prev_hash should be 32 bytes");
     session
-        .seed_block_metadata(BIRTHDAY_HEIGHT - 1, START_SAPLING_TREE_SIZE, &block_663149_hash)
+        .seed_block_metadata(
+            BIRTHDAY_HEIGHT - 1,
+            START_SAPLING_TREE_SIZE,
+            &block_663149_hash,
+        )
         .expect("seed_block_metadata");
 
     let initial_scan_state = TreeState {
@@ -181,15 +211,32 @@ async fn run_pipeline(
     };
 
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
-    let plan = FetchPlan::new(BIRTHDAY_HEIGHT, chain_tip, cfg.chunk_blocks, cfg.fetch_streams);
+    let plan = FetchPlan::new(
+        BIRTHDAY_HEIGHT,
+        chain_tip,
+        cfg.chunk_blocks,
+        cfg.fetch_streams,
+    );
     let fetch_ep = ep.clone();
     let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
 
-    scan_chunks_from_treestate(&mut session, BIRTHDAY_HEIGHT, initial_scan_state, rx, sparse, write_behind, gpu_subtree, false)
-        .await
-        .expect("scan_chunks_from_treestate");
+    scan_chunks_from_treestate(
+        &mut session,
+        BIRTHDAY_HEIGHT,
+        initial_scan_state,
+        rx,
+        sparse,
+        write_behind,
+        gpu_subtree,
+        false,
+    )
+    .await
+    .expect("scan_chunks_from_treestate");
 
-    let _ = fetch_task.await.expect("fetch task join").expect("fetch stats");
+    let _ = fetch_task
+        .await
+        .expect("fetch task join")
+        .expect("fetch stats");
 }
 
 // ---------------------------------------------------------------------------
@@ -470,8 +517,8 @@ async fn truncate_rescan_oracle_is_clean() {
     // ── Truncate both wallets; assert they snap to the same height ────────────
     let truncated_a_height: u32;
     {
-        let mut session_a = WalletSession::open(Network::MainNetwork, &db_a)
-            .expect("open wallet A for truncation");
+        let mut session_a =
+            WalletSession::open(Network::MainNetwork, &db_a).expect("open wallet A for truncation");
         let truncated_a = session_a
             .db_mut()
             .truncate_to_height(BlockHeight::from(TRUNCATE_REQUEST))
@@ -481,8 +528,8 @@ async fn truncate_rescan_oracle_is_clean() {
     }
     let truncated_b_height: u32;
     {
-        let mut session_b = WalletSession::open(Network::MainNetwork, &db_b)
-            .expect("open wallet B for truncation");
+        let mut session_b =
+            WalletSession::open(Network::MainNetwork, &db_b).expect("open wallet B for truncation");
         let truncated_b = session_b
             .db_mut()
             .truncate_to_height(BlockHeight::from(TRUNCATE_REQUEST))
@@ -501,13 +548,17 @@ async fn truncate_rescan_oracle_is_clean() {
 
     // ── Re-stage the fixture chain so both re-scans see the same server ───────
     {
-        let mut ctl = DarksideCtl::connect(&ep).await.expect("darkside connect (re-stage)");
+        let mut ctl = DarksideCtl::connect(&ep)
+            .await
+            .expect("darkside connect (re-stage)");
         stage_fixture_chain(&mut ctl).await;
     }
 
     // ── Re-stage so both re-scans hit the same server state ──────────────────
     {
-        let mut ctl = DarksideCtl::connect(&ep).await.expect("darkside connect (re-stage)");
+        let mut ctl = DarksideCtl::connect(&ep)
+            .await
+            .expect("darkside connect (re-stage)");
         stage_fixture_chain(&mut ctl).await;
     }
 
@@ -526,14 +577,16 @@ async fn truncate_rescan_oracle_is_clean() {
         cfg.chunk_blocks = 100;
         cfg.fetch_streams = 2;
 
-        let mut session_a = WalletSession::open(Network::MainNetwork, &db_a)
-            .expect("open wallet A for re-scan");
+        let mut session_a =
+            WalletSession::open(Network::MainNetwork, &db_a).expect("open wallet A for re-scan");
 
         let mut client_a = grpc::connect(&ep).await.expect("grpc connect A");
         let chain_tip_a = grpc::get_latest_block_height(&mut client_a)
             .await
             .expect("get_latest_block_height A");
-        session_a.update_chain_tip(chain_tip_a).expect("update_chain_tip A");
+        session_a
+            .update_chain_tip(chain_tip_a)
+            .expect("update_chain_tip A");
 
         let initial_state_a = TreeState {
             network: "main".into(),
@@ -568,7 +621,10 @@ async fn truncate_rescan_oracle_is_clean() {
         .await
         .expect("re-scan wallet A from birthday");
 
-        let _ = fetch_task_a.await.expect("fetch join A").expect("fetch stats A");
+        let _ = fetch_task_a
+            .await
+            .expect("fetch join A")
+            .expect("fetch stats A");
     }
 
     {
@@ -576,14 +632,16 @@ async fn truncate_rescan_oracle_is_clean() {
         cfg.chunk_blocks = 100;
         cfg.fetch_streams = 2;
 
-        let mut session_b = WalletSession::open(Network::MainNetwork, &db_b)
-            .expect("open wallet B for re-scan");
+        let mut session_b =
+            WalletSession::open(Network::MainNetwork, &db_b).expect("open wallet B for re-scan");
 
         let mut client_b = grpc::connect(&ep).await.expect("grpc connect B");
         let chain_tip_b = grpc::get_latest_block_height(&mut client_b)
             .await
             .expect("get_latest_block_height B");
-        session_b.update_chain_tip(chain_tip_b).expect("update_chain_tip B");
+        session_b
+            .update_chain_tip(chain_tip_b)
+            .expect("update_chain_tip B");
 
         let initial_state_b = TreeState {
             network: "main".into(),
@@ -618,7 +676,10 @@ async fn truncate_rescan_oracle_is_clean() {
         .await
         .expect("re-scan wallet B (sparse) from birthday");
 
-        let _ = fetch_task_b.await.expect("fetch join B").expect("fetch stats B");
+        let _ = fetch_task_b
+            .await
+            .expect("fetch join B")
+            .expect("fetch stats B");
     }
 
     // ── Oracle: semantic diff after truncate+reflush ───────────────────────────
