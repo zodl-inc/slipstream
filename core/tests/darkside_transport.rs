@@ -60,7 +60,7 @@ async fn parallel_fetch_5000_blocks_in_order() {
     let consumer = tokio::spawn(async move {
         let mut total = 0u64;
         let mut last_height = None::<u64>;
-        while let Some((chunk, permit)) = rx.recv().await {
+        while let Some((chunk, permit, _treestate)) = rx.recv().await {
             if let (Some(prev), Some(start)) = (last_height, chunk.start_height()) {
                 assert_eq!(start, prev + 1, "chunks must arrive in order");
             }

@@ -707,7 +707,7 @@ async fn sync_enhancement_stores_raw_fields() {
     let enhance_stats = run_enhancement(
         &mut session,
         &mut client,
-        Network::MainNetwork,
+        Network::MainNetwork.into(),
         None,
         &mut std::collections::HashSet::new(),
     )
