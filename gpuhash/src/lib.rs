@@ -282,8 +282,30 @@ mod tests {
     use orchard::tree::MerkleHashOrchard;
     use rand::{RngCore, SeedableRng, rngs::StdRng};
 
+    /// Whether a wgpu adapter can be acquired. The GPU test skips (rather than
+    /// panicking in `Gpu::new`) where there is none — e.g. a GPU-less CI runner.
+    fn gpu_available() -> bool {
+        pollster::block_on(async {
+            wgpu::Instance::default()
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .is_ok()
+        })
+    }
+
     #[test]
     fn orchard_combine_batch_matches_orchard() {
+        if !gpu_available() {
+            eprintln!(
+                "skipping orchard_combine_batch_matches_orchard: no GPU adapter available \
+                 (e.g. a GPU-less CI runner)"
+            );
+            return;
+        }
         let mut rng = StdRng::seed_from_u64(0x0B01);
         let n = 10_000;
         // deterministic valid nodes: fold combine from empties
