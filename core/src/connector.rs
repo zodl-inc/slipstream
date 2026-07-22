@@ -234,7 +234,7 @@ where
 }
 
 /// Direct (non-Tor) lightwalletd connect with bounded transient-failure retry (see
-/// [`DIRECT_CONNECT_ATTEMPTS`]). Drop-in for `grpc::connect` at the sites that must survive a brief
+/// `DIRECT_CONNECT_ATTEMPTS`). Drop-in for `grpc::connect` at the sites that must survive a brief
 /// server outage without restarting the sync pass: the bulk-fetch workers and the direct branch of
 /// [`connect_via`].
 pub async fn connect_direct_with_retry(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {

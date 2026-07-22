@@ -49,7 +49,7 @@ pub struct ProbeOutcome {
     pub elapsed: Duration,
 }
 
-/// Pure ranking, TDD'd: endpoints with a tip within [`TIP_FRESHNESS_SLACK`]
+/// Pure ranking, TDD'd: endpoints with a tip within `TIP_FRESHNESS_SLACK`
 /// of the best observed tip qualify; among qualified, the highest sampled
 /// rate wins (a missing sample ranks below any measured one); ties keep
 /// configured order (index 0 = the host's preferred endpoint). Nothing

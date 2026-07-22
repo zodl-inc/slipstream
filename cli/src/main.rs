@@ -47,7 +47,7 @@ enum Cmd {
     },
     /// Fetch a block range into memory and report throughput (G1 benchmark).
     Fetch {
-        /// lightwalletd URL, e.g. https://zec.rocks:443 or http://127.0.0.1:9067
+        /// lightwalletd URL, e.g. <https://zec.rocks:443> or <http://127.0.0.1:9067>
         #[arg(long)]
         server: String,
         /// Inclusive range, e.g. 2500000..2600000 (start..end)
@@ -77,7 +77,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = NetworkArg::Test)]
         network: NetworkArg,
     },
-    /// [B7] Send funds from a synced wallet (testnet spike tooling — the
+    /// \[B7\] Send funds from a synced wallet (testnet spike tooling — the
     /// mnemonic lands in shell history, so use it for TESTNET seeds only).
     /// Defaults to a SELF-send (the account's own unified address).
     Send {
@@ -117,7 +117,7 @@ enum Cmd {
         /// `--network main --custom-heights genesis,nu6_2=5000`.
         #[arg(long)]
         custom_heights: Option<String>,
-        /// lightwalletd URL, e.g. https://zec.rocks:443 or http://127.0.0.1:9067
+        /// lightwalletd URL, e.g. <https://zec.rocks:443> or <http://127.0.0.1:9067>
         #[arg(long)]
         server: String,
         /// Wallet directory (data.db lives inside).
@@ -139,7 +139,7 @@ enum Cmd {
         /// Pass `--sparse false` to disable (kill switch — reverts to upstream path).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         sparse: bool,
-        /// [B6] Anchor-retention floor: checkpoints at heights >= this on the
+        /// \[B6\] Anchor-retention floor: checkpoints at heights >= this on the
         /// 288-block grid become durable anchors (exempt from checkpoint
         /// downgrade/pruning) — the migration crate's pre-signed-transfer
         /// anchors. Off when omitted.
@@ -184,7 +184,7 @@ enum Cmd {
         /// Network the wallet database belongs to.
         #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
         network: NetworkArg,
-        /// lightwalletd URL, e.g. https://zec.rocks:443
+        /// lightwalletd URL, e.g. <https://zec.rocks:443>
         #[arg(long)]
         server: String,
         /// [v0.7 P1] Alternate lightwalletd URLs (repeatable). With any
@@ -260,7 +260,7 @@ enum Cmd {
         /// Network the wallet database belongs to.
         #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
         network: NetworkArg,
-        /// lightwalletd URL, e.g. https://zec.rocks:443
+        /// lightwalletd URL, e.g. <https://zec.rocks:443>
         #[arg(long)]
         server: String,
         /// Wallet directory (data.db lives inside).
@@ -1247,7 +1247,7 @@ fn cmd_oracle(
     }
 }
 
-/// [B7] Propose, prove, and broadcast a spend from a synced wallet. The
+/// \[B7\] Propose, prove, and broadcast a spend from a synced wallet. The
 /// proposal runs upstream's production shapes (greedy selector, ZIP-317
 /// multi-output change, `SpendPolicy::default()` = every shielded pool the
 /// chain has activated, Ironwood included), the transaction is proved with

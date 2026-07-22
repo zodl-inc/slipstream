@@ -17,7 +17,7 @@ pub struct MemBlockSource<'a> {
     /// call — pass 1 feeds the batch runners (walk wall = feed + task
     /// spawning), pass 2 re-walks doing the wallet-side processing (walk
     /// wall = extract recv + nullifier checks + ScannedBlock assembly) —
-    /// so after the scan call, [0] = pass 1 and [1] = pass 2. The A18 P5
+    /// so after the scan call, \[0\] = pass 1 and \[1\] = pass 2. The A18 P5
     /// readout showed the wall lives in ONE of these; this names which.
     /// RefCell: `with_blocks` takes `&self` and the producer is
     /// single-threaded.

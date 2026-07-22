@@ -31,7 +31,7 @@ pub enum SessionEnd {
 }
 
 /// Idle bound per session. 60 s ≈ block cadence; deliberately NOT the
-/// hardening1 [`grpc::STREAM_IDLE_TIMEOUT`] (30 s) — an empty mempool is
+/// hardening1 `grpc::STREAM_IDLE_TIMEOUT` (30 s) — an empty mempool is
 /// legitimate silence, not a stalled connection (Deviation D6).
 pub const MEMPOOL_SESSION_IDLE: Duration = Duration::from_secs(60);
 

@@ -10,9 +10,6 @@ name: CI
 # The two slipstream features (`darkside`, `gpu`) are compile-only in CI: the darkside
 # integration tests need a live lightwalletd and the gpu tests need a GPU, so they are
 # built (to catch API drift) but not run — see `check-all-features`.
-#
-# NOTE: `doc-links` gates but is currently RED against pre-existing broken
-# intra-doc links; it is fixed in a follow-up commit on this branch.
 
 permissions: {}
 

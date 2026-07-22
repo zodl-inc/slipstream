@@ -35,7 +35,7 @@ const CHUNKS: usize = 52;
 struct Consts {
     /// Q affine (x, y) for the MerkleCRH hash domain.
     q: (pallas::Base, pallas::Base),
-    /// S[m] affine for every 10-bit chunk value.
+    /// S\[m\] affine for every 10-bit chunk value.
     s: Vec<(pallas::Base, pallas::Base)>,
 }
 

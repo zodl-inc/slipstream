@@ -80,7 +80,7 @@ pub(crate) fn global_floor_permille(
 ///     the last `update_chain_tip` recorded). The live pass overwrites it on its first fetch.
 ///   - `recovering` — any suggested range still starts below MAX(`accounts.recover_until_height`)
 ///     (identical to the per-round computation in [`run_to_completion`]).
-///   - permille floor — [`global_floor_permille`] over (persisted tip, MIN(birthday),
+///   - permille floor — `global_floor_permille` over (persisted tip, MIN(birthday),
 ///     Σ remaining queue), folded via `fetch_max` (a seed can only raise the floor).
 ///   - `spendable`  — latched when NO ChainTip/Verify-priority range remains pending: the
 ///     recent window is fully scanned, which is exactly what the in-pass latch records.

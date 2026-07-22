@@ -166,7 +166,7 @@ pub async fn get_lightd_info(client: &mut LwdClient) -> Result<LightdInfo, Slips
     with_unary_timeout("get_lightd_info", client.get_lightd_info(Empty {})).await
 }
 
-/// Broadcast a raw transaction ([B7] send tooling). Returns the server's
+/// Broadcast a raw transaction (\[B7\] send tooling). Returns the server's
 /// `(error_code, error_message)`; code 0 = accepted into the mempool.
 pub async fn send_transaction(
     client: &mut LwdClient,
@@ -322,7 +322,7 @@ pub async fn get_taddress_txids(
 /// (lightwalletd contract, `service.proto:188-192`). Unlike the other stream
 /// helpers this returns the RAW stream — the caller reacts per-message.
 ///
-/// Deliberately NOT wrapped in [`with_unary_timeout`]: `GetMempoolStream` is
+/// Deliberately NOT wrapped in `with_unary_timeout`: `GetMempoolStream` is
 /// server-streaming and lightwalletd sends its response HEADERS lazily — only
 /// with the first mempool tx, or when it closes the stream on a new block. On a
 /// quiet mempool the `.await` here legitimately blocks well past the 30 s unary

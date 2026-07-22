@@ -113,13 +113,13 @@ const _: () = assert!(
 /// is deliberately enormous next to the reorg depth (100).
 const DEEP_HISTORY_CHECKPOINT_MARGIN: u32 = 10_000;
 
-/// [B6] The interval, in blocks, at which checkpoints are retained as durable
+/// \[B6\] The interval, in blocks, at which checkpoints are retained as durable
 /// "anchors" once anchor retention is active — mirrors upstream ll/wallet.rs's
 /// `ANCHOR_RETENTION_INTERVAL` exactly (the migration crate pre-signs
 /// transfers against these; at 75-second blocks ≈ every 6 hours).
 const ANCHOR_RETENTION_INTERVAL: u32 = 288;
 
-/// [B6] Whether the checkpoint at `height` must be retained as a durable
+/// \[B6\] Whether the checkpoint at `height` must be retained as a durable
 /// anchor — upstream's `should_retain_anchor` predicate verbatim: retention is
 /// active when a floor is configured and `height` is at or above it, and
 /// `height` falls on the [`ANCHOR_RETENTION_INTERVAL`] grid.
@@ -187,7 +187,7 @@ fn persist_pool() -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Open-time self-heal for wallets damaged by the pre-fix sandblasting-era
-/// checkpoint flood (see [`DEEP_HISTORY_CHECKPOINT_MARGIN`]): builds that ran
+/// checkpoint flood (see `DEEP_HISTORY_CHECKPOINT_MARGIN`): builds that ran
 /// v0.4/v0.5 before the fix persisted THOUSANDS of deep-history checkpoint
 /// rows (a poisoned specimen: 3,174 orchard rows spanning the whole spam era
 /// vs the healthy 100-row tip window). Every later pass — even a 10-block tip
@@ -264,7 +264,7 @@ pub struct SparseShardStore<H> {
     checkpoints: BTreeMap<BlockHeight, Checkpoint>,
     /// Mirror of the checkpoint rows in SQLite (for flush diffing).
     db_checkpoints: BTreeMap<BlockHeight, Checkpoint>,
-    /// [B6] Checkpoint ids pinned against automatic pruning (the migration
+    /// \[B6\] Checkpoint ids pinned against automatic pruning (the migration
     /// crate's 288-block durable anchors). In-memory only: re-derived at seed
     /// time from the retention predicate — see `should_retain_anchor`.
     retained: BTreeSet<BlockHeight>,
@@ -511,7 +511,7 @@ type IronwoodSparseTree = OrchardSparseTree;
 pub struct SparseTreeState {
     sapling: Option<SaplingSparseTree>,
     orchard: Option<OrchardSparseTree>,
-    /// [B6] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
+    /// \[B6\] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
     /// when `Some(h)`, checkpoints at heights ≥ h on the 288-block grid are durable
     /// anchors — exempt from the T6.3b downgrade, the deep-history dooming, and
     /// (via `ensure_retained`) shardtree's excess-checkpoint pruning. `None` (the
@@ -548,7 +548,7 @@ pub struct SparseTreeState {
 }
 
 impl SparseTreeState {
-    /// [B6] Set the anchor-retention floor (see the field docs). Public for
+    /// \[B6\] Set the anchor-retention floor (see the field docs). Public for
     /// integration tests and direct hosts; production plumbs it from
     /// `EngineConfig::anchor_retention_height`.
     pub fn set_anchor_retention_height(&mut self, floor: Option<BlockHeight>) {
@@ -2901,7 +2901,7 @@ type PersistTaskOutput = (
 /// through the task — serialization is structural, not advisory).
 ///
 /// Thread-pool isolation: the lane's rayon work runs on the dedicated
-/// [`persist_pool`], installed at the sap∥orch join inside
+/// `persist_pool`, installed at the sap∥orch join inside
 /// `sparse_put_blocks` itself (v0.6 P4c/P4d — the policy, sizing, and full
 /// A10/A18/Mac evidence live on that fn). Write-behind and inline
 /// (write_behind=false) paths both route through it, since the install site
