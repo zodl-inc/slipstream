@@ -272,10 +272,12 @@ mod tests {
     /// timeout that gives a healthy circuit room (>=5s) while cutting a stuck one promptly (<=30s).
     #[test]
     fn tor_connect_retry_constants_are_sane() {
-        assert!(
-            TOR_CONNECT_ATTEMPTS >= 2,
-            "need at least one retry on a fresh circuit"
-        );
+        const {
+            assert!(
+                TOR_CONNECT_ATTEMPTS >= 2,
+                "need at least one retry on a fresh circuit"
+            )
+        };
         let secs = TOR_CONNECT_TIMEOUT.as_secs();
         assert!(
             (5..=30).contains(&secs),
@@ -362,9 +364,11 @@ mod tests {
             16,
             "held at the 16s cap, never overflows"
         );
-        assert!(
-            DIRECT_CONNECT_ATTEMPTS >= 2,
-            "need at least one retry to absorb a blip"
-        );
+        const {
+            assert!(
+                DIRECT_CONNECT_ATTEMPTS >= 2,
+                "need at least one retry to absorb a blip"
+            )
+        };
     }
 }

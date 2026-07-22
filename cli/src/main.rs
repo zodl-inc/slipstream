@@ -584,12 +584,6 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
     });
 }
 
-/// Validate sync argument combinations. Extracted as a pure function to stay testable
-/// without any I/O or network — specifically validates that a UFVK is not supplied
-/// without a birthday height.
-///
-/// Returns `Ok(Some((ufvk_str, birthday)))` if both are present, `Ok(None)` if neither,
-/// and `Err(String)` if the combination is invalid.
 // ── `watch` (API v2 Phase C acceptance) ────────────────────────────────────────────────────
 
 fn event_tag_name(tag: u8) -> &'static str {
@@ -649,13 +643,11 @@ fn cmd_watch(
         // that no host needs pre-first-suggest compensation. Failure = cold snapshot.
         if let Ok(session) =
             slipstream_core::wallet_session::WalletSession::open(network, &db_path)
-        {
-            if let Err(e) =
+            && let Err(e) =
                 slipstream_core::scheduler::seed_progress_from_wallet(&reporter.progress, &session)
             {
                 eprintln!("warn: E-3 open-time snapshot seed failed ({e}) — starting cold");
             }
-        }
         let scfg = slipstream_core::SessionConfig {
             engine: cfg,
             accounts,
@@ -695,15 +687,13 @@ fn cmd_watch(
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
                     if let Ok(mut stmt) = conn
                         .prepare("SELECT account_uuid, balance_zat FROM slipstream_v_recovery_balance")
-                    {
-                        if let Ok(rows) = stmt.query_map([], |r| {
+                        && let Ok(rows) = stmt.query_map([], |r| {
                             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
                         }) {
                             for row in rows.flatten() {
                                 out.push((uuid_prefix(&row.0), row.1, "Σ reconciled (recovering)"));
                             }
                         }
-                    }
                 }
                 out
             } else {

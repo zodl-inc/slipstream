@@ -526,10 +526,9 @@ mod tests {
             let pepks: Vec<_> = points
                 .iter()
                 .map(|p| {
-                    let epk = Option::from(OrchardDomain::epk(
-                        &zcash_note_encryption::EphemeralKeyBytes(p.to_bytes()),
-                    ))
-                    .expect("valid epk");
+                    let epk =
+                        OrchardDomain::epk(&zcash_note_encryption::EphemeralKeyBytes(p.to_bytes()))
+                            .expect("valid epk");
                     OrchardDomain::prepare_epk(epk)
                 })
                 .collect();

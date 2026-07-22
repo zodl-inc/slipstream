@@ -243,14 +243,11 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
         // Blessed progress: raw pass ratio folded into the session-monotonic floor (reported
         // progress never regresses while the handle lives). Done folds 1000 into the floor so
         // a later catch-up pass can't display below a completed pass's 100%.
-        let raw_permille = {
-            let total = p.pass_total();
-            if total == 0 {
-                0
-            } else {
-                p.scanned().saturating_mul(1000) / total
-            }
-        };
+        let raw_permille = p
+            .scanned()
+            .saturating_mul(1000)
+            .checked_div(p.pass_total())
+            .unwrap_or(0);
         let progress_permille = match state {
             SyncState::Done => p.permille_floor(1000) as u16,
             _ => p.permille_floor(raw_permille) as u16,

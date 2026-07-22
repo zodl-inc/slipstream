@@ -284,7 +284,7 @@ mod tests {
 
     #[test]
     fn orchard_combine_batch_matches_orchard() {
-        let mut rng = StdRng::seed_from_u64(0xB0_1);
+        let mut rng = StdRng::seed_from_u64(0x0B01);
         let n = 10_000;
         // deterministic valid nodes: fold combine from empties
         let mut pool = Vec::with_capacity(2 * n);

@@ -636,38 +636,44 @@ mod tests {
 
     #[test]
     fn follow_poll_is_in_old_sdk_band() {
-        assert!(
-            FOLLOW_POLL_MIN_SECS >= 10,
-            "min must be >= 10 (old-SDK floor)"
-        );
-        assert!(
-            FOLLOW_POLL_MAX_SECS <= 30,
-            "max must be <= 30 (old-SDK ceiling)"
-        );
-        assert!(
-            FOLLOW_POLL_MIN_SECS <= FOLLOW_POLL_MAX_SECS,
-            "min must be <= max"
-        );
+        const {
+            assert!(
+                FOLLOW_POLL_MIN_SECS >= 10,
+                "min must be >= 10 (old-SDK floor)"
+            );
+            assert!(
+                FOLLOW_POLL_MAX_SECS <= 30,
+                "max must be <= 30 (old-SDK ceiling)"
+            );
+            assert!(
+                FOLLOW_POLL_MIN_SECS <= FOLLOW_POLL_MAX_SECS,
+                "min must be <= max"
+            );
+        }
     }
 
     #[test]
     fn follow_failure_cap_is_sane() {
-        assert!(
-            FOLLOW_FAILURE_CAP >= 3,
-            "must tolerate transient server weather"
-        );
+        const {
+            assert!(
+                FOLLOW_FAILURE_CAP >= 3,
+                "must tolerate transient server weather"
+            )
+        };
     }
 
     #[test]
     fn mempool_failure_cap_is_sane() {
-        assert!(
-            MEMPOOL_FAILURE_CAP >= 1,
-            "one failure must not disable mempool"
-        );
-        assert!(
-            MEMPOOL_FAILURE_CAP < FOLLOW_FAILURE_CAP,
-            "mempool (non-essential) must give up before the essential tip poll"
-        );
+        const {
+            assert!(
+                MEMPOOL_FAILURE_CAP >= 1,
+                "one failure must not disable mempool"
+            );
+            assert!(
+                MEMPOOL_FAILURE_CAP < FOLLOW_FAILURE_CAP,
+                "mempool (non-essential) must give up before the essential tip poll"
+            );
+        }
     }
 
     // ── SessionReporter ──────────────────────────────────────────────────────

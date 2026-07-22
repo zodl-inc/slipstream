@@ -55,6 +55,7 @@ pub const RECONCILE_VIEW_NAME: &str = "slipstream_v_tx_reconciled";
 ///      spends, whose notes are never ours;
 ///   2. spends of pre-birthday notes — the origin block is below the wallet
 ///      birthday and will never be scanned.
+///
 /// Mid-restore these are indistinguishable (from the DB alone) from "our note,
 /// origin not yet scanned" — the case this view exists for. Consumers must
 /// therefore apply the unreconciled set only WHILE recovery is active (the SDK

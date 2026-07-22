@@ -599,12 +599,16 @@ impl GraftCtx {
     }
 }
 
+/// One contiguous build segment: its start position and per-row payload
+/// (`None` = a passthrough gap; `Some((hash, retention))` = a row to build).
+type BuildSegment<H> = (Position, Vec<Option<(H, Retention<BlockHeight>)>>);
+
 /// One pool's build plan for one put_blocks call: contiguous row segments to
 /// build inside the main txn (passthrough spans, eager note flushes, and — in
 /// Task 7, where the verdict is still always-build — closed clean shards), plus
 /// the shards whose buffer rows die once the txn commits.
 struct PoolPlan<H> {
-    segments: Vec<(Position, Vec<Option<(H, Retention<BlockHeight>)>>)>,
+    segments: Vec<BuildSegment<H>>,
     /// Task 8: clean shards with a server root — installed as root-only shards
     /// (upstream's own put_shard_roots shape), ZERO combines.
     grafts: Vec<(u64, H)>,
@@ -623,9 +627,7 @@ struct PoolPlan<H> {
 /// MUST carry them. Stale (below-window) ones are handled by the SAME
 /// doomed-cutoff downgrade every build already applies (the first fixture run
 /// stripped them instead and lost 97 of 100 checkpoint rows vs the OFF path).
-fn rows_to_segment<H>(
-    rows: Vec<crate::graft_accumulator::AccRow<H>>,
-) -> Option<(Position, Vec<Option<(H, Retention<BlockHeight>)>>)> {
+fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<BuildSegment<H>> {
     let first = rows.first()?.0;
     let seg = rows.into_iter().map(|(_, h, r)| Some((h, r))).collect();
     Some((Position::from(first), seg))
@@ -1757,7 +1759,7 @@ pub fn sparse_put_blocks(
 /// Orchard subtree build routing. Priority: batch-affine (v0.4 Plan B, always
 /// available, ~12× the scalar combine) > GPU offload (banked B0, feature `gpu`)
 /// > scalar. Output is byte-identical on every path (lookup_build gate + the
-/// gpu equality test + the engine oracle).
+/// > gpu equality test + the engine oracle).
 fn build_orchard_subtrees(
     gpu: bool,
     batch: bool,

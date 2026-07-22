@@ -96,9 +96,8 @@ pub fn seed_progress_from_wallet(
     };
     let ranges = session.suggest_scan_ranges()?;
     let recover_until = session.max_recover_until()?;
-    let recovering = recover_until.map_or(false, |ru| {
-        ranges.iter().any(|r| u64::from(r.block_range().start) < ru)
-    });
+    let recovering = recover_until
+        .is_some_and(|ru| ranges.iter().any(|r| u64::from(r.block_range().start) < ru));
     progress.set_recovering(recovering);
 
     let recent_pending = ranges
@@ -245,9 +244,8 @@ pub async fn run_to_completion(
         // queue entirely above the ceiling flips it false — recovery is over even though the
         // pass may keep scanning newer ranges.
         if let Some(ref p) = progress {
-            let recovering = recover_until.map_or(false, |ru| {
-                ranges.iter().any(|r| u64::from(r.block_range().start) < ru)
-            });
+            let recovering = recover_until
+                .is_some_and(|ru| ranges.iter().any(|r| u64::from(r.block_range().start) < ru));
             p.set_recovering(recovering);
         }
         let Some(range) = ranges.first() else {
@@ -606,13 +604,13 @@ pub async fn run_to_completion(
             // note that LINKS an already-stored dangling spend (reconciled flips with no new
             // tx). Direct writes (enhance/mempool) bump the version at their own sites; this
             // closes the scan-driven linkage class. Read failure = skip (presentation state).
-            if let Ok(sig) = session.tx_set_signature() {
-                if last_tx_sig != Some(sig) {
-                    if last_tx_sig.is_some() {
-                        p.bump_tx_set_version();
-                    }
-                    last_tx_sig = Some(sig);
+            if let Ok(sig) = session.tx_set_signature()
+                && last_tx_sig != Some(sig)
+            {
+                if last_tx_sig.is_some() {
+                    p.bump_tx_set_version();
                 }
+                last_tx_sig = Some(sig);
             }
         }
     }
