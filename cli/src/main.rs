@@ -884,8 +884,6 @@ fn cmd_bench(
             })
         })
         .collect();
-    cfg.bench_json_path = Some(json_path.clone());
-
     let accounts = vec![
         parse_account(&network, &ufvk, birthday).unwrap_or_else(|e| {
             eprintln!("error: {e}");
@@ -922,7 +920,10 @@ fn cmd_bench(
         std::process::exit(1)
     });
 
-    // Human table — same numbers the engine wrote to the JSON artifact.
+    // The engine no longer presents the pass itself — emit its tracing summary here.
+    slipstream_core::report::log_pass_summary(&outcome, &cfg);
+
+    // Human table — same numbers as the JSON artifact written below.
     let r = &outcome.report;
     let wait_s = r.persist_wait_elapsed.as_secs_f64();
     let busy_s = r.persist_busy_elapsed.as_secs_f64();
@@ -951,13 +952,12 @@ fn cmd_bench(
         "Plan A ceiling (orchard, the dominant combine cost): skip ~{:.0}% of shard builds on this wallet",
         r.census_orchard.graftable_fraction() * 100.0
     );
-    if json_path.exists() {
-        println!("json: {}", json_path.display());
-    } else {
-        eprintln!(
-            "warning: engine did not write the bench JSON at {}",
+    match slipstream_core::report::bench_summary(&outcome).write_json(&json_path) {
+        Ok(()) => println!("json: {}", json_path.display()),
+        Err(e) => eprintln!(
+            "warning: bench JSON write failed at {}: {e}",
             json_path.display()
-        );
+        ),
     }
     match (tempdir_guard, keep) {
         (Some(td), true) => {
@@ -1083,6 +1083,9 @@ fn cmd_sync(
 
         match result {
             Ok(outcome) => {
+                // Engine returns a bare result; emit its tracing summary here
+                // (the --follow path gets this via session::run_pass_with_retry).
+                slipstream_core::report::log_pass_summary(&outcome, &cfg);
                 let mb = outcome.report.fetch.bytes as f64 / 1_048_576.0;
                 println!(
                     "synced to tip {} in {:.1}s",

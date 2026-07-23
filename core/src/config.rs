@@ -130,11 +130,6 @@ pub struct EngineConfig {
     /// is byte-for-byte identical when off (kill switch: `--gpu-subtree false`).
     pub gpu_subtree: bool,
 
-    /// v0.4 P0 bench (spec §3.1): when set, the engine writes a machine-readable
-    /// end-of-pass `BenchSummary` JSON (stage split + shard census) to this path —
-    /// consumed by `slipstream-cli bench` and bench-ios. `None` (default) = off.
-    pub bench_json_path: Option<PathBuf>,
-
     /// v0.4 Plan A (spec §4): graft server-provided subtree roots for note-free
     /// shards instead of computing them locally. Requires `sparse_persistence`.
     /// **Default ON since 2026-07-05** — P3 device gates passed 100% (4-device
@@ -220,7 +215,6 @@ impl EngineConfig {
             sparse_persistence: true,
             write_behind: true,
             gpu_subtree: false,
-            bench_json_path: None,
             graft_subtree: true,
             graft_verify_sample: 16,
             anchor_retention_height: None,

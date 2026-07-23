@@ -179,7 +179,13 @@ pub(crate) async fn run_pass_with_retry(
     loop {
         let result = sync_once(cfg, accounts, Some(progress.clone()), tor).await;
         match result {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                // The engine returns a bare result; the orchestration layer owns
+                // presentation — emit the per-pass tracing summary here (covers the
+                // production/FFI initial pass and every follow-loop catch-up pass).
+                crate::report::log_pass_summary(&outcome, cfg);
+                return Ok(outcome);
+            }
             Err(err) => {
                 attempt += 1;
                 match should_retry(&err, attempt) {

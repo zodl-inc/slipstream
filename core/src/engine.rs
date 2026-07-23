@@ -78,6 +78,13 @@ pub struct SyncOutcome {
     pub enhance_elapsed: std::time::Duration,
     pub elapsed: std::time::Duration,
     pub chain_tip: u64,
+    /// Wire-probe cost (ms) for this pass; 0 when no alternates were probed.
+    /// Reporting input (see `crate::report`), not consumed by the sync itself.
+    pub wire_probe_ms: f64,
+    /// Mid-pass wire failovers that occurred this pass. Reporting input.
+    pub wire_switches: u32,
+    /// This pass's persist-lane telemetry (delta over the pass). Reporting input.
+    pub persist_lane: crate::persist::lane_stats::Totals,
 }
 
 impl SyncOutcome {
@@ -373,6 +380,10 @@ pub async fn sync_once(
     let enhance = report.enhance.clone();
     let enhance_elapsed = total_enhance_elapsed;
 
+    // v0.6 P2: this pass's persist-lane delta over the pass-start snapshot
+    // (process-cumulative atomics; see the snapshot at pass start).
+    let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
+
     let outcome = SyncOutcome {
         report,
         enhance,
@@ -380,176 +391,10 @@ pub async fn sync_once(
         enhance_elapsed,
         elapsed: started.elapsed(),
         chain_tip: tip,
+        wire_probe_ms,
+        wire_switches,
+        persist_lane,
     };
-
-    // Log the stage split: total time + per-stage breakdown + bound.
-    // F3: enhance_s is now the SUM of all per-range runs + the final post-loop run.
-    // T6.6: sparse field added so log clearly shows which persistence path ran.
-    // T6.9 (write-behind semantics): scan_s stays the HONEST scan-loop wall time —
-    // with write_behind=true it still INCLUDES persist_wait_s (time the loop
-    // blocked on a previous deferred commit). The two added fields keep the split
-    // interpretable: persist_wait_s ≈ 0 means perfect overlap; persist_overlap_s
-    // = persist_busy − persist_wait (clamped ≥0) is the commit work that ran
-    // HIDDEN under decryption instead of serialized after it. Both are 0 with
-    // the flag off. The per-chunk rows/tree/flush attribution stays inside the
-    // deferred commit's own "sparse put_blocks" line (persist.rs), unchanged.
-    let persist_wait_s = outcome.report.persist_wait_elapsed.as_secs_f64();
-    let persist_busy_s = outcome.report.persist_busy_elapsed.as_secs_f64();
-    info!(
-        total_s = outcome.elapsed.as_secs_f64(),
-        fetch_s = outcome.report.fetch_elapsed.as_secs_f64(),
-        scan_s = outcome.report.scan_elapsed.as_secs_f64(),
-        enhance_s = outcome.enhance_elapsed.as_secs_f64(),
-        persist_wait_s,
-        persist_overlap_s = (persist_busy_s - persist_wait_s).max(0.0),
-        blocks = outcome.report.scan.blocks,
-        bound = outcome.bound(),
-        engine_build = ENGINE_BUILD,
-        finished_at_utc = %wall_clock_utc(),
-        sparse = config.sparse_persistence,
-        write_behind = config.write_behind,
-        "sync stage split"
-    );
-
-    // [v0.7 P0] Wire health: the server's side of the ledger. avg = pass
-    // bytes over fetch wall; worst_5s = the deepest sustained trough across
-    // ranges (the collapse-detection signal P2 will act on). The 2026-07-08
-    // ship-day evidence this instruments: a 10× same-morning provider swing
-    // (1.5 → 14.7 MB/s) with the engine's own variance at ±3%.
-    let wire_fetch_s = outcome.report.fetch_elapsed.as_secs_f64();
-    let wire_mbps_avg = if wire_fetch_s > 0.0 {
-        outcome.report.wire_bytes as f64 / (1024.0 * 1024.0) / wire_fetch_s
-    } else {
-        0.0
-    };
-    info!(
-        wire_mbps_avg = format!("{wire_mbps_avg:.2}").as_str(),
-        wire_worst_5s_mbps = format!("{:.2}", outcome.report.wire_worst_window_mbps).as_str(),
-        wire_mb = outcome.report.wire_bytes / (1024 * 1024),
-        "wire health"
-    );
-
-    // v0.4 P0 (spec §3): shard census on the pass record — `graftable` PREDICTS
-    // Plan A's ceiling for this wallet before the graft exists.
-    info!(
-        sapling_shards = outcome.report.census_sapling.shards(),
-        sapling_noted = outcome.report.census_sapling.noted_shards(),
-        sapling_graftable = outcome.report.census_sapling.graftable_fraction(),
-        orchard_shards = outcome.report.census_orchard.shards(),
-        orchard_noted = outcome.report.census_orchard.noted_shards(),
-        orchard_graftable = outcome.report.census_orchard.graftable_fraction(),
-        "shard census"
-    );
-
-    // v0.5 pacer split (plan §3): the scan lane's wall decomposed. The residue
-    // (scan_s minus everything measured) is bookkeeping between the timed spans
-    // — a large residue is itself a finding.
-    let scan_split = &outcome.report;
-    let scan_split_sum = scan_split.scan_recv_wait
-        + scan_split.scan_call
-        + scan_split.scan_prefetch_wait
-        + scan_split.scan_interleave_drain
-        + scan_split.scan_final_drain
-        + scan_split.scan_absorb
-        + scan_split.scan_state_prep
-        + scan_split.scan_prefetch_spawn
-        + scan_split.scan_submit_wait
-        + scan_split.scan_submit_extra
-        + scan_split.scan_reseed;
-    info!(
-        recv_wait_s = scan_split.scan_recv_wait.as_secs_f64(),
-        scan_call_s = scan_split.scan_call.as_secs_f64(),
-        prefetch_wait_s = scan_split.scan_prefetch_wait.as_secs_f64(),
-        interleave_drain_s = scan_split.scan_interleave_drain.as_secs_f64(),
-        final_drain_s = scan_split.scan_final_drain.as_secs_f64(),
-        absorb_s = scan_split.scan_absorb.as_secs_f64(),
-        // v0.6 P1: the residue named — state prep, spawn, in-loop submit
-        // wait/extra, post-enhance reseed. residue_s is what remains unnamed.
-        state_prep_s = scan_split.scan_state_prep.as_secs_f64(),
-        prefetch_spawn_s = scan_split.scan_prefetch_spawn.as_secs_f64(),
-        submit_wait_s = scan_split.scan_submit_wait.as_secs_f64(),
-        submit_extra_s = scan_split.scan_submit_extra.as_secs_f64(),
-        reseed_s = scan_split.scan_reseed.as_secs_f64(),
-        // v0.6 P6: scan_call's two-pass interior (pass1 = feed runners,
-        // pass2 = wallet-side processing; pass1 + pass2 ≈ scan_call).
-        pass1_s = scan_split.scan_pass1.as_secs_f64(),
-        pass2_s = scan_split.scan_pass2.as_secs_f64(),
-        residue_s =
-            (outcome.report.scan_elapsed.as_secs_f64() - scan_split_sum.as_secs_f64()).max(0.0),
-        "scan lane split"
-    );
-    // v0.6 P2: the persist lane's pass delta — PERF_LEDGER #1's decomposition.
-    let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
-    info!(
-        calls = persist_lane.calls,
-        rows_s = persist_lane.rows_ms as f64 / 1e3,
-        tree_join_s = persist_lane.tree_join_ms as f64 / 1e3,
-        flush_s = persist_lane.flush_ms as f64 / 1e3,
-        downgrade_s = persist_lane.downgrade_ms as f64 / 1e3,
-        build_s = persist_lane.build_ms as f64 / 1e3,
-        frontier_s = persist_lane.frontier_ms as f64 / 1e3,
-        insert_s = persist_lane.insert_ms as f64 / 1e3,
-        ensure_s = persist_lane.ensure_ms as f64 / 1e3,
-        downgraded = persist_lane.downgraded,
-        "persist lane split"
-    );
-    info!(
-        fetch_wait_s = outcome.enhance.fetch_wait.as_secs_f64(),
-        store_s = outcome.enhance.store.as_secs_f64(),
-        address_s = outcome.enhance.address.as_secs_f64(),
-        requests = outcome.enhance.requests,
-        "enhance split"
-    );
-
-    // v0.4 P0 (spec §3.1): the machine-readable bench artifact, host-opted via config.
-    if let Some(path) = &config.bench_json_path {
-        let bench = crate::census::BenchSummary {
-            engine_build: ENGINE_BUILD,
-            total_s: outcome.elapsed.as_secs_f64(),
-            fetch_s: outcome.report.fetch_elapsed.as_secs_f64(),
-            wire_mbps_avg,
-            wire_worst_5s_mbps: outcome.report.wire_worst_window_mbps,
-            wire_probe_ms,
-            wire_switches: u64::from(wire_switches),
-            scan_s: outcome.report.scan_elapsed.as_secs_f64(),
-            enhance_s: outcome.enhance_elapsed.as_secs_f64(),
-            persist_wait_s,
-            persist_overlap_s: (persist_busy_s - persist_wait_s).max(0.0),
-            blocks: outcome.report.scan.blocks,
-            batch_epk_s: 0.0,
-            scan_recv_wait_s: outcome.report.scan_recv_wait.as_secs_f64(),
-            scan_call_s: outcome.report.scan_call.as_secs_f64(),
-            scan_prefetch_wait_s: outcome.report.scan_prefetch_wait.as_secs_f64(),
-            scan_interleave_drain_s: outcome.report.scan_interleave_drain.as_secs_f64(),
-            scan_final_drain_s: outcome.report.scan_final_drain.as_secs_f64(),
-            scan_absorb_s: outcome.report.scan_absorb.as_secs_f64(),
-            scan_state_prep_s: outcome.report.scan_state_prep.as_secs_f64(),
-            scan_prefetch_spawn_s: outcome.report.scan_prefetch_spawn.as_secs_f64(),
-            scan_submit_wait_s: outcome.report.scan_submit_wait.as_secs_f64(),
-            scan_submit_extra_s: outcome.report.scan_submit_extra.as_secs_f64(),
-            scan_reseed_s: outcome.report.scan_reseed.as_secs_f64(),
-            scan_pass1_s: outcome.report.scan_pass1.as_secs_f64(),
-            scan_pass2_s: outcome.report.scan_pass2.as_secs_f64(),
-            persist_calls: persist_lane.calls,
-            persist_rows_s: persist_lane.rows_ms as f64 / 1e3,
-            persist_tree_join_s: persist_lane.tree_join_ms as f64 / 1e3,
-            persist_flush_s: persist_lane.flush_ms as f64 / 1e3,
-            persist_downgrade_s: persist_lane.downgrade_ms as f64 / 1e3,
-            persist_build_s: persist_lane.build_ms as f64 / 1e3,
-            persist_frontier_s: persist_lane.frontier_ms as f64 / 1e3,
-            persist_insert_s: persist_lane.insert_ms as f64 / 1e3,
-            persist_ensure_s: persist_lane.ensure_ms as f64 / 1e3,
-            persist_downgraded: persist_lane.downgraded,
-            enhance_fetch_s: outcome.enhance.fetch_wait.as_secs_f64(),
-            enhance_store_s: outcome.enhance.store.as_secs_f64(),
-            enhance_address_s: outcome.enhance.address.as_secs_f64(),
-            sapling: (&outcome.report.census_sapling).into(),
-            orchard: (&outcome.report.census_orchard).into(),
-        };
-        if let Err(e) = bench.write_json(path) {
-            tracing::warn!(path = %path.display(), %e, "bench JSON write failed");
-        }
-    }
 
     Ok(outcome)
 }
@@ -593,6 +438,9 @@ mod tests {
             enhance_elapsed: Duration::from_secs_f64(enhance_s),
             elapsed: Duration::from_secs_f64(fetch_s + scan_s + enhance_s),
             chain_tip: 0,
+            wire_probe_ms: 0.0,
+            wire_switches: 0,
+            persist_lane: crate::persist::lane_stats::Totals::default(),
         }
     }
 

@@ -34,6 +34,7 @@ pub mod oracle;
 pub mod persist;
 pub mod probe;
 pub mod reconcile;
+pub mod report;
 pub mod scan;
 pub mod scan_queue;
 pub mod scheduler;
