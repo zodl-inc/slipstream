@@ -19,6 +19,10 @@ use crate::{
     grpc::{self, LwdClient},
 };
 
+/// Default shared wall-clock budget for one [`probe_endpoints`] race (tip
+/// query + timed sample across all candidates).
+pub const DEFAULT_PROBE_BUDGET: Duration = Duration::from_millis(1200);
+
 /// Blocks in the timed throughput sample (ending at the endpoint's tip —
 /// tip-region blocks are small, but ranking is RELATIVE so only fairness
 /// across endpoints matters, not absolute MB/s).

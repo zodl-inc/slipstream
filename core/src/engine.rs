@@ -1,10 +1,7 @@
 //! Engine v0: one full sync pass (preflight → chain state → scheduler → enhancement).
 //! P3 adds enhancement/transparent/events; P4 wraps this behind FFI.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use tracing::{info, warn};
 use zcash_keys::keys::UnifiedFullViewingKey;
@@ -150,6 +147,11 @@ pub async fn probe_tip(
 /// Every birthday must be `>= 1`: the birthday-1 treestate fetch would underflow at
 /// height 0, which is never a valid mainnet/testnet wallet birthday. All birthdays are
 /// validated up front — a clean Config error — before any network or wallet I/O.
+///
+/// Endpoint selection is a property of the config: with `alternate_endpoints`
+/// configured (and Tor off), the pass opens by racing them and committing the
+/// winner ([`EngineConfig::with_selected_endpoint`]); with none, `config.endpoint`
+/// is used as-is at zero cost.
 pub async fn sync_once(
     config: &EngineConfig,
     accounts: &[(UnifiedFullViewingKey, BlockHeight)],
@@ -200,35 +202,14 @@ pub async fn sync_once(
     // here so the pass-end log reports THIS pass's delta.
     let persist_lane_start = crate::persist::lane_stats::totals();
 
-    // [v0.7 P1] Probe-then-commit: with alternates configured, race every
-    // endpoint (~1 s shared budget: tip + timed ~100-block sample) and
-    // commit the winner for THIS pass. The rest of the engine reads the
-    // chosen endpoint through a config clone, so every downstream consumer
-    // (metadata client, scheduler fetch, treestate prefetch, enhance)
-    // transparently follows. No alternates = the pre-v0.7 single-server
-    // path, zero cost. Tor passes SKIP the probe: `probe_endpoints` dials
-    // direct, which would bypass the Tor circuit — a privacy leak, not a
-    // ranking.
-    let probed_config;
-    let (config, wire_probe_ms) = if config.alternate_endpoints.is_empty() || tor.is_some() {
-        (config, 0.0)
-    } else {
-        let mut endpoints = Vec::with_capacity(1 + config.alternate_endpoints.len());
-        endpoints.push(config.endpoint.clone());
-        endpoints.extend(config.alternate_endpoints.iter().cloned());
-        let outcome = crate::probe::probe_endpoints(&endpoints, Duration::from_millis(1200)).await;
-        info!(
-            chosen = outcome.chosen,
-            host = endpoints[outcome.chosen].host.as_str(),
-            port = endpoints[outcome.chosen].port,
-            probe_ms = outcome.elapsed.as_millis() as u64,
-            "wire probe committed"
-        );
-        let mut c = config.clone();
-        c.endpoint = endpoints[outcome.chosen].clone();
-        probed_config = c;
-        (&probed_config, outcome.elapsed.as_secs_f64() * 1e3)
-    };
+    // [v0.7 P1] Probe-then-commit (`EngineConfig::with_selected_endpoint`):
+    // with alternates configured, race every endpoint and commit the winner
+    // for THIS pass; the rest of the pass reads the winner through the
+    // returned config. Skipped — config unchanged, zero cost — with no
+    // alternates, and on Tor passes (the probe dials direct, which would
+    // bypass the circuit).
+    let (config, probe_elapsed) = config.clone().with_selected_endpoint(tor.is_some()).await;
+    let wire_probe_ms = probe_elapsed.as_secs_f64() * 1e3;
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
     let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
@@ -325,9 +306,11 @@ pub async fn sync_once(
                 let next = if candidates.len() == 1 {
                     candidates.remove(0)
                 } else {
-                    let outcome =
-                        crate::probe::probe_endpoints(&candidates, Duration::from_millis(1200))
-                            .await;
+                    let outcome = crate::probe::probe_endpoints(
+                        &candidates,
+                        crate::probe::DEFAULT_PROBE_BUDGET,
+                    )
+                    .await;
                     candidates.swap_remove(outcome.chosen)
                 };
                 info!(

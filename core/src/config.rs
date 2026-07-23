@@ -2,6 +2,9 @@
 //! docs/SLIPSTREAM_DESIGN.md §4; modes adjust them later (P8).
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+use tracing::info;
 
 use crate::error::SlipstreamError;
 use crate::network::SlipstreamNetwork;
@@ -311,6 +314,41 @@ impl EngineConfig {
         }
         self
     }
+
+    /// [v0.7 P1] Probe-then-commit: race the preferred + alternate endpoints
+    /// ([`crate::probe::probe_endpoints`], ~1 s shared budget: tip + timed
+    /// ~100-block sample) and return this config with the winner committed as
+    /// its `endpoint`, plus the wall-clock cost of the probe. Every consumer
+    /// of the returned config (metadata client, scheduler fetch, treestate
+    /// prefetch, enhance) transparently follows the winner.
+    ///
+    /// With no alternates there is nothing to choose, and with `via_tor` set
+    /// the probe is SKIPPED entirely — it dials direct, which would bypass
+    /// the Tor circuit (a privacy leak, not a ranking). Both cases return
+    /// the config unchanged at zero cost, the pre-v0.7 single-server
+    /// behavior.
+    pub async fn with_selected_endpoint(self, via_tor: bool) -> (Self, Duration) {
+        if self.alternate_endpoints.is_empty() || via_tor {
+            return (self, Duration::ZERO);
+        }
+        let mut endpoints = Vec::with_capacity(1 + self.alternate_endpoints.len());
+        endpoints.push(self.endpoint.clone());
+        endpoints.extend(self.alternate_endpoints.iter().cloned());
+        let outcome =
+            crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
+        info!(
+            chosen = outcome.chosen,
+            host = endpoints[outcome.chosen].host.as_str(),
+            port = endpoints[outcome.chosen].port,
+            probe_ms = outcome.elapsed.as_millis() as u64,
+            "wire probe committed"
+        );
+        let committed = Self {
+            endpoint: endpoints.swap_remove(outcome.chosen),
+            ..self
+        };
+        (committed, outcome.elapsed)
+    }
 }
 
 #[cfg(test)]
@@ -331,6 +369,34 @@ mod tests {
             PathBuf::from("/tmp/data.db"),
             endpoint(),
         )
+    }
+
+    fn alt(host: &str) -> Endpoint {
+        Endpoint {
+            host: host.into(),
+            port: 443,
+            tls: true,
+        }
+    }
+
+    // ── EngineConfig::with_selected_endpoint (probe-then-commit) ──
+    // Only the skip paths are unit-testable — the probing path dials real
+    // endpoints and is exercised by live syncs. Both skips return without any
+    // I/O, so these tests are hermetic.
+
+    #[test]
+    fn endpoint_selection_skipped_without_alternates_and_under_tor() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
+        // No alternates: nothing to choose, no probe.
+        let (committed, elapsed) = rt.block_on(config().with_selected_endpoint(false));
+        assert_eq!(committed.endpoint, endpoint());
+        assert_eq!(elapsed, Duration::ZERO);
+        // Tor: the probe dials direct and must be skipped even with alternates.
+        let mut cfg = config();
+        cfg.alternate_endpoints = vec![alt("alt-1")];
+        let (committed, elapsed) = rt.block_on(cfg.with_selected_endpoint(true));
+        assert_eq!(committed.endpoint, endpoint());
+        assert_eq!(elapsed, Duration::ZERO);
     }
 
     // ── v0.7 P1b: Endpoint::parse_uri (the FFI alternate-server wire format) ──
