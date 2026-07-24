@@ -89,8 +89,7 @@ FROM transactions t";
 /// reconciled Activity list by construction. `v_transactions` is upstream's stable view
 /// (account_uuid, account_balance_delta, mined_height are the columns the shipped SDK
 /// query already depends on).
-pub const RECOVERY_BALANCE_VIEW_SQL: &str =
-    "CREATE VIEW ext_slipstream_v_recovery_balance AS
+pub const RECOVERY_BALANCE_VIEW_SQL: &str = "CREATE VIEW ext_slipstream_v_recovery_balance AS
 SELECT vt.account_uuid AS account_uuid,
        SUM(vt.account_balance_delta) AS balance_zat
 FROM v_transactions vt

@@ -1261,9 +1261,11 @@ mod tests {
         // The buffer table must be fully drained on the ON side...
         let conn = rusqlite::Connection::open(don.join("data.db")).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM ext_slipstream_graft_buffer",
+                [],
+                |r| r.get(0),
+            )
             .expect("buffer count");
         assert_eq!(left, 0, "buffer rows must be cleaned after build/finish");
         // ...and must be EMPTY on the OFF side. (The table itself exists on
@@ -1336,9 +1338,11 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(restarted.join("data.db")).expect("open");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM ext_slipstream_graft_buffer",
+                [],
+                |r| r.get(0),
+            )
             .expect("buffer count");
         assert_eq!(left, 0, "resume must drain the buffer");
     }
@@ -1397,9 +1401,11 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(&dbs[1]).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM ext_slipstream_graft_buffer",
+                [],
+                |r| r.get(0),
+            )
             .expect("buffer count");
         assert_eq!(left, 0, "rewind + rescan must leave the buffer drained");
     }
@@ -1732,9 +1738,11 @@ mod tests {
         // And the ON side's buffer is drained (post-commit cleanup ran).
         let conn = rusqlite::Connection::open(don.join("data.db")).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
-                r.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM ext_slipstream_graft_buffer",
+                [],
+                |r| r.get(0),
+            )
             .expect("buffer count");
         assert_eq!(left, 0, "buffer rows must be cleaned after graft/finish");
     }

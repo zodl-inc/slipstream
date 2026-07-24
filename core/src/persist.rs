@@ -211,6 +211,9 @@ fn persist_pool() -> Option<&'static rayon::ThreadPool> {
 /// checkpoint API — the engine holds no direct SQL against upstream tables.
 ///
 /// Returns checkpoints removed across all pools.
+// The heal_pool_checkpoints closures below look redundant, but a bare fn item
+// is "not general enough" for the for<'a> callback lifetime these methods need.
+#[allow(clippy::redundant_closure)]
 pub fn heal_flooded_checkpoints(db: &mut Db) -> Result<u64, crate::error::SlipstreamError> {
     let heal_err = |pool: &str, e: &dyn std::fmt::Display| {
         crate::error::SlipstreamError::Wallet(format!("checkpoint heal ({pool}): {e}"))
@@ -266,7 +269,9 @@ where
         })
         .map_err(ShardTreeError::Storage)?;
     for id in &doomed {
-        store.remove_checkpoint(id).map_err(ShardTreeError::Storage)?;
+        store
+            .remove_checkpoint(id)
+            .map_err(ShardTreeError::Storage)?;
     }
     Ok(doomed.len() as u64)
 }
@@ -681,6 +686,7 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
     stream: Vec<(H, Retention<BlockHeight>)>,
     note_positions: &[u64],
     store_has_shard: impl Fn(u64) -> bool,
+    mut server_root: impl FnMut(u64) -> Result<Option<H>, SqliteClientError>,
     anchor_retention_floor: Option<BlockHeight>,
 ) -> Result<PoolPlan<H>, SqliteClientError> {
     use crate::graft_accumulator::{FeedAction, ShardAccumulator};
@@ -736,7 +742,7 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
                     plan.segments.extend(rows_to_segment(rows));
                     continue;
                 }
-                match crate::graft::server_root::<H>(conn, pool, shard_index)? {
+                match server_root(shard_index)? {
                     Some(root) => {
                         // Task 10: deterministic 1-in-N audit — build it anyway
                         // and compare roots after insertion (reproducible; the
@@ -1119,6 +1125,11 @@ pub fn sparse_put_blocks(
             sap_stream,
             &sap_notes,
             |s| sap_tree.store().shard_has_interior(s),
+            |s| {
+                inner
+                    .get_sapling_subtree_root(s)
+                    .map_err(SqliteClientError::CommitmentTree)
+            },
             anchor_floor,
         )?;
         let op = plan_pool(
@@ -1130,6 +1141,11 @@ pub fn sparse_put_blocks(
             orch_stream,
             &orch_notes,
             |s| orch_tree.store().shard_has_interior(s),
+            |s| {
+                inner
+                    .get_orchard_subtree_root(s)
+                    .map_err(SqliteClientError::CommitmentTree)
+            },
             anchor_floor,
         )?;
         let cleanup = (sp.cleanup_shards.clone(), op.cleanup_shards.clone());
@@ -2080,6 +2096,9 @@ impl WalletRead for SparseFacade<'_> {
     fn get_wallet_birthday(&self) -> Result<Option<BlockHeight>, Self::Error> {
         self.inner.get_wallet_birthday()
     }
+    fn get_wallet_recover_until(&self) -> Result<Option<BlockHeight>, Self::Error> {
+        self.inner.get_wallet_recover_until()
+    }
     fn get_wallet_summary(
         &self,
         confirmations_policy: ConfirmationsPolicy,
@@ -2253,6 +2272,14 @@ impl WalletWrite for SparseFacade<'_> {
     }
     fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error> {
         WalletWrite::update_chain_tip(self.inner, tip_height)
+    }
+
+    fn prune_scan_queue_below(
+        &mut self,
+        height: BlockHeight,
+        retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
+    ) -> Result<u64, Self::Error> {
+        WalletWrite::prune_scan_queue_below(self.inner, height, retain_with_priority)
     }
 
     // THE INTERCEPT.
@@ -2622,6 +2649,9 @@ impl WalletRead for WriteBehindFacade {
     fn get_wallet_birthday(&self) -> Result<Option<BlockHeight>, Self::Error> {
         Err(unvirtualized("get_wallet_birthday"))
     }
+    fn get_wallet_recover_until(&self) -> Result<Option<BlockHeight>, Self::Error> {
+        Err(unvirtualized("get_wallet_recover_until"))
+    }
     fn get_wallet_summary(
         &self,
         _confirmations_policy: ConfirmationsPolicy,
@@ -2849,6 +2879,13 @@ impl WalletWrite for WriteBehindFacade {
     }
     fn update_chain_tip(&mut self, _tip_height: BlockHeight) -> Result<(), Self::Error> {
         Err(unvirtualized("update_chain_tip"))
+    }
+    fn prune_scan_queue_below(
+        &mut self,
+        _height: BlockHeight,
+        _retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
+    ) -> Result<u64, Self::Error> {
+        Err(unvirtualized("prune_scan_queue_below"))
     }
     fn put_received_transparent_utxo(
         &mut self,

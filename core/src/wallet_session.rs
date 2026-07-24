@@ -107,21 +107,13 @@ impl WalletSession {
         // pass start too), so wedged wallets heal at launch and an in-app delete →
         // restart heals immediately. Warn-and-continue: a failed prune must not block
         // opening — sync still runs correctly without it, just wastefully.
-        // Still direct SQL over a short side connection (WAL permits it) — the
-        // upstream traits expose no scan-queue pruning yet (issue #4 phase 2b).
-        {
-            let conn = Connection::open(db_path).map_err(|e| wallet_err("prune open", e))?;
-            // [audit ENG-1] same per-connection timeout as the pre-open connection above.
-            conn.busy_timeout(std::time::Duration::from_secs(5))
-                .map_err(|e| wallet_err("set busy_timeout (prune)", e))?;
-            match crate::scan_queue::prune_orphaned_historic_ranges(&conn) {
-                Ok(0) => {}
-                Ok(n) => info!(
-                    pruned = n,
-                    "scan queue: dropped orphaned historic ranges (below every account birthday)"
-                ),
-                Err(e) => tracing::warn!(%e, "scan queue prune failed (non-fatal) — continuing"),
-            }
+        match crate::scan_queue::prune_orphaned_historic_ranges(&mut db) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                pruned = n,
+                "scan queue: dropped orphaned historic ranges (below every account birthday)"
+            ),
+            Err(e) => tracing::warn!(%e, "scan queue prune failed (non-fatal) — continuing"),
         }
         // Sandblasting-era flood heal (2026-07-06): wallets that scanned the
         // spam era on a pre-fix build carry thousands of deep-history
@@ -146,24 +138,16 @@ impl WalletSession {
         })
     }
 
-    /// [API v2 §4.4] The wallet's recovery ceiling: MAX(`accounts.recover_until_height`), or
-    /// `None` when no account has one (new wallets / fully non-restore imports). The scheduler
-    /// compares suggested ranges against this once per suggest round to drive the snapshot's
-    /// `is_recovering`. Read through a short side connection (same pattern as the reconcile view;
-    /// WAL permits it) so it needs no upstream API surface.
+    /// [API v2 §4.4] The wallet's recovery ceiling, or `None` when no account has one
+    /// (new wallets / fully non-restore imports). The scheduler compares suggested ranges
+    /// against this once per suggest round to drive the snapshot's `is_recovering`.
+    /// Issue #4: reads via [`WalletRead::get_wallet_recover_until`] — no direct SQL.
     pub fn max_recover_until(&self) -> Result<Option<u64>, SlipstreamError> {
-        let conn =
-            Connection::open(&self.db_path).map_err(|e| wallet_err("recover_until open", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| wallet_err("recover_until busy_timeout", e))?;
-        let max: Option<i64> = conn
-            .query_row(
-                "SELECT MAX(recover_until_height) FROM accounts",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| wallet_err("recover_until query", e))?;
-        Ok(max.and_then(|v| u64::try_from(v).ok()))
+        Ok(self
+            .db
+            .get_wallet_recover_until()
+            .map_err(|e| wallet_err("wallet recover_until", e))?
+            .map(|h| u64::from(u32::from(h))))
     }
 
     /// [API v2 §4.4 / Phase E] The wallet's oldest account birthday, or `None` when no

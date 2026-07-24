@@ -215,18 +215,13 @@ mod tests {
                  FROM ext_slipstream_graft_buffer ORDER BY position",
             )
             .expect("prepare")
-            .query_map([], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-            })
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .expect("query")
             .collect::<Result<_, _>>()
             .expect("rows");
         assert_eq!(
             rows,
-            vec![
-                (3, 7, 100, vec![0x01]),
-                (3, 7, 101, vec![0x02]),
-            ],
+            vec![(3, 7, 100, vec![0x01]), (3, 7, 101, vec![0x02]),],
             "legacy buffer rows must be carried into the ext_ table"
         );
         assert_eq!(
