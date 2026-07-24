@@ -15,13 +15,9 @@ pub mod error;
 pub mod events;
 pub mod fetch;
 pub mod ffi_handle;
-// dead_code: consumed by the sparse build path in v0.4 plan Task 7 — this allow
-// is deleted in that diff (buffer CRUD lands first so Task 6/7 build on green).
 #[cfg(feature = "gpu")]
 mod gpu_subtree;
-#[allow(dead_code)]
 pub(crate) mod graft;
-#[allow(dead_code)]
 pub(crate) mod graft_accumulator;
 pub mod grpc;
 pub(crate) mod lookup_build;
