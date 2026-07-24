@@ -137,7 +137,7 @@ fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, Slipstre
 /// disagree on which below-window rows linger. The contract compared here is
 /// therefore WINDOWED: both sides are normalized to rows at or above
 /// `max(block_height across A∪B) − NULLIFIER_MAP_RETENTION_BLOCKS` — everything
-/// any read (`detect_*_spend`, `slipstream_v_tx_reconciled`) can ever consult —
+/// any read (`detect_*_spend`, `ext_slipstream_v_tx_reconciled`) can ever consult —
 /// and STRICT equality is required inside that window. The skip-below-window
 /// tracking lives INSIDE upstream `put_blocks_rows` since #2604, keyed on the
 /// same public retention constant used here.
@@ -1261,21 +1261,23 @@ mod tests {
         // The buffer table must be fully drained on the ON side...
         let conn = rusqlite::Connection::open(don.join("data.db")).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
                 r.get(0)
             })
             .expect("buffer count");
         assert_eq!(left, 0, "buffer rows must be cleaned after build/finish");
-        // ...and must not EXIST on the OFF side (flag-off writes nothing new).
+        // ...and must be EMPTY on the OFF side. (The table itself exists on
+        // both sides since issue #4: schema is owned by the ext_slipstream_*
+        // migration, unconditionally; only its CONTENTS are graft-flag-gated.)
         let conn = rusqlite::Connection::open(doff.join("data.db")).expect("open off");
         let n: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE name='slipstream_graft_buffer'",
+                "SELECT COUNT(*) FROM ext_slipstream_graft_buffer",
                 [],
                 |r| r.get(0),
             )
-            .expect("master probe");
-        assert_eq!(n, 0, "graft-off must not create the buffer table");
+            .expect("off-side buffer count");
+        assert_eq!(n, 0, "graft-off must not write buffer rows");
     }
 
     /// v0.4 Task 9(a): a process restart MID-RANGE (and mid-shard) with graft on —
@@ -1334,7 +1336,7 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(restarted.join("data.db")).expect("open");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
                 r.get(0)
             })
             .expect("buffer count");
@@ -1395,7 +1397,7 @@ mod tests {
         }
         let conn = rusqlite::Connection::open(&dbs[1]).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
                 r.get(0)
             })
             .expect("buffer count");
@@ -1730,7 +1732,7 @@ mod tests {
         // And the ON side's buffer is drained (post-commit cleanup ran).
         let conn = rusqlite::Connection::open(don.join("data.db")).expect("open on");
         let left: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slipstream_graft_buffer", [], |r| {
+            .query_row("SELECT COUNT(*) FROM ext_slipstream_graft_buffer", [], |r| {
                 r.get(0)
             })
             .expect("buffer count");

@@ -25,6 +25,11 @@ zcash_client_sqlite = { workspace = true }
 zcash_keys = { workspace = true }
 zcash_primitives = { workspace = true }
 rusqlite = { workspace = true }
+# Issue #4: the ext_slipstream_* schema is created/evolved by schemerz migrations
+# registered with the wallet DB's own migrator (see migrations.rs).
+schemerz = { workspace = true }
+schemerz-rusqlite = { workspace = true }
+uuid = { workspace = true }
 secrecy = { workspace = true }
 rand = { workspace = true }
 sapling = { workspace = true }

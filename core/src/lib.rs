@@ -22,6 +22,7 @@ pub(crate) mod graft_accumulator;
 pub mod grpc;
 pub(crate) mod lookup_build;
 pub mod mempool;
+pub mod migrations;
 pub mod network;
 pub mod oracle;
 pub mod persist;

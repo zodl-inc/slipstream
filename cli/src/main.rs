@@ -241,7 +241,7 @@ enum Cmd {
     },
     /// [API v2 Phase C acceptance] Live wallet console rendered ONLY from the v2 contract:
     /// the derived engine snapshot (state/permille/recovering/stalled), the engine-owned SQL
-    /// views (`slipstream_v_recovery_balance`, `slipstream_v_tx_reconciled`), and the two
+    /// views (`ext_slipstream_v_recovery_balance`, `ext_slipstream_v_tx_reconciled`), and the two
     /// DOCUMENTED one-line host rules (balance = recovering ? view : upstream summary;
     /// visible = reconciled OR NOT recovering). ZERO wallet math lives in this command — if
     /// it ever needs any, the engine API is wrong and must grow instead (ENGINE_API_V2.md §8).
@@ -669,13 +669,13 @@ fn cmd_watch(
             }
 
             // v2 channel 2 — the DOCUMENTED host rules, verbatim:
-            //   balance = is_recovering ? SELECT slipstream_v_recovery_balance : upstream summary
+            //   balance = is_recovering ? SELECT ext_slipstream_v_recovery_balance : upstream summary
             let balances: Vec<(String, i64, &'static str)> = if snap.is_recovering == 1 {
                 let mut out = Vec::new();
                 if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
                     if let Ok(mut stmt) = conn
-                        .prepare("SELECT account_uuid, balance_zat FROM slipstream_v_recovery_balance")
+                        .prepare("SELECT account_uuid, balance_zat FROM ext_slipstream_v_recovery_balance")
                         && let Ok(rows) = stmt.query_map([], |r| {
                             Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
                         }) {
@@ -720,7 +720,7 @@ fn cmd_watch(
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
                     let sql = if snap.is_recovering == 1 {
                         "SELECT COUNT(*) FROM transactions t WHERE t.mined_height IS NOT NULL \
-                         AND NOT EXISTS (SELECT 1 FROM slipstream_v_tx_reconciled r \
+                         AND NOT EXISTS (SELECT 1 FROM ext_slipstream_v_tx_reconciled r \
                                          WHERE r.txid = t.txid AND r.reconciled = 0)"
                     } else {
                         "SELECT COUNT(*) FROM transactions t WHERE t.mined_height IS NOT NULL"

@@ -1,10 +1,11 @@
 //! v0.4 Plan A — the graft buffer (spec §4, plan Task 5).
 //!
-//! `slipstream_graft_buffer` holds the raw commitments of still-open, note-free
-//! shards so their build can be deferred to the shard-close verdict (graft the
-//! server root / build). It is a slipstream-owned side table in `data.db`,
-//! written over a SIDE connection (the established engine-owned-table pattern —
-//! upstream `WalletDb` never exposes its connection).
+//! `ext_slipstream_graft_buffer` holds the raw commitments of still-open,
+//! note-free shards so their build can be deferred to the shard-close verdict
+//! (graft the server root / build). It is a slipstream-owned `ext_` table in
+//! `data.db` — created by the engine's schemerz migration (`migrations.rs`,
+//! issue #4), written over a SIDE connection (upstream `WalletDb` never
+//! exposes its connection).
 //!
 //! ## Restart-safety contract (ordering + idempotency, NOT shared-transaction)
 //! Appends run BEFORE the chunk's main `put_blocks` transaction commits, keyed
@@ -41,23 +42,19 @@ fn corrupt(msg: impl Into<String>) -> SqliteClientError {
     SqliteClientError::CorruptedData(msg.into())
 }
 
-/// Lazily create the buffer table. Called only on graft-ON paths so flag-OFF
-/// runs leave the database byte-identical.
-pub(crate) fn ensure_buffer_table(conn: &Connection) -> Result<(), SqliteClientError> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS slipstream_graft_buffer (
-            pool INTEGER NOT NULL,
-            shard_index INTEGER NOT NULL,
-            position INTEGER NOT NULL,
-            commitment BLOB NOT NULL,
-            retention_kind INTEGER NOT NULL,
-            checkpoint_height INTEGER,
-            marking INTEGER,
-            PRIMARY KEY (pool, shard_index, position)
-        ) WITHOUT ROWID",
-    )?;
-    Ok(())
-}
+/// DDL of the graft buffer. Executed ONLY by the `ext_slipstream_*` schema
+/// migration ([`crate::migrations`]) — production code may assume the table
+/// exists in any opened wallet database.
+pub(crate) const GRAFT_BUFFER_DDL: &str = "CREATE TABLE ext_slipstream_graft_buffer (
+    pool INTEGER NOT NULL,
+    shard_index INTEGER NOT NULL,
+    position INTEGER NOT NULL,
+    commitment BLOB NOT NULL,
+    retention_kind INTEGER NOT NULL,
+    checkpoint_height INTEGER,
+    marking INTEGER,
+    PRIMARY KEY (pool, shard_index, position)
+) WITHOUT ROWID";
 
 fn encode_retention(r: &Retention<BlockHeight>) -> (i64, Option<i64>, Option<i64>) {
     match r {
@@ -119,7 +116,7 @@ pub(crate) fn append_rows<H: HashSer>(
     // holds another open txn (all its other uses are single statements).
     let tx = conn.unchecked_transaction()?;
     let mut stmt = tx.prepare_cached(
-        "INSERT OR REPLACE INTO slipstream_graft_buffer
+        "INSERT OR REPLACE INTO ext_slipstream_graft_buffer
          (pool, shard_index, position, commitment, retention_kind, checkpoint_height, marking)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
     )?;
@@ -144,18 +141,15 @@ pub(crate) fn append_rows<H: HashSer>(
 }
 
 /// Load one shard's buffered rows, ordered by position. Empty vec when the
-/// table doesn't exist yet (flag just turned on) or holds nothing for the shard.
+/// buffer holds nothing for the shard.
 pub(crate) fn load_shard<H: HashSer>(
     conn: &Connection,
     pool: ShieldedPool,
     shard_index: u64,
 ) -> Result<Vec<BufferRow<H>>, SqliteClientError> {
-    if !buffer_table_exists(conn)? {
-        return Ok(vec![]);
-    }
     let mut stmt = conn.prepare_cached(
         "SELECT position, commitment, retention_kind, checkpoint_height, marking
-         FROM slipstream_graft_buffer
+         FROM ext_slipstream_graft_buffer
          WHERE pool = ?1 AND shard_index = ?2
          ORDER BY position ASC",
     )?;
@@ -188,11 +182,8 @@ pub(crate) fn delete_shard(
     pool: ShieldedPool,
     shard_index: u64,
 ) -> Result<(), SqliteClientError> {
-    if !buffer_table_exists(conn)? {
-        return Ok(());
-    }
     conn.execute(
-        "DELETE FROM slipstream_graft_buffer WHERE pool = ?1 AND shard_index = ?2",
+        "DELETE FROM ext_slipstream_graft_buffer WHERE pool = ?1 AND shard_index = ?2",
         params![pool_code(pool), shard_index as i64],
     )?;
     Ok(())
@@ -213,11 +204,8 @@ pub(crate) fn delete_from_position(
     pool: ShieldedPool,
     min_position: u64,
 ) -> Result<(), SqliteClientError> {
-    if !buffer_table_exists(conn)? {
-        return Ok(());
-    }
     conn.execute(
-        "DELETE FROM slipstream_graft_buffer WHERE pool = ?1 AND position >= ?2",
+        "DELETE FROM ext_slipstream_graft_buffer WHERE pool = ?1 AND position >= ?2",
         params![pool_code(pool), min_position as i64],
     )?;
     Ok(())
@@ -268,15 +256,6 @@ pub(crate) fn server_root<H: HashSer>(
     }
 }
 
-fn buffer_table_exists(conn: &Connection) -> Result<bool, SqliteClientError> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='slipstream_graft_buffer'",
-        [],
-        |r| r.get(0),
-    )?;
-    Ok(n > 0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,7 +298,7 @@ mod tests {
     #[test]
     fn append_load_round_trip_ordered_all_retentions() {
         let conn = mem_conn();
-        ensure_buffer_table(&conn).expect("table");
+        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
         let rows: Vec<BufferRow<MerkleHashOrchard>> = all_retentions()
             .into_iter()
             .enumerate()
@@ -337,7 +316,7 @@ mod tests {
     #[test]
     fn append_is_idempotent_under_rescan() {
         let conn = mem_conn();
-        ensure_buffer_table(&conn).expect("table");
+        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
         let rows: Vec<BufferRow<MerkleHashOrchard>> = vec![
             (5, h(1), Retention::Ephemeral),
             (6, h(2), Retention::Marked),
@@ -355,7 +334,7 @@ mod tests {
     #[test]
     fn pools_and_shards_are_disjoint_and_delete_is_scoped() {
         let conn = mem_conn();
-        ensure_buffer_table(&conn).expect("table");
+        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
         let row = |p: u64| vec![(p, h(0), Retention::Ephemeral)];
         append_rows(&conn, ShieldedPool::Orchard, 1, &row(10)).expect("o1");
         append_rows(&conn, ShieldedPool::Orchard, 2, &row(70_000)).expect("o2");
@@ -370,16 +349,6 @@ mod tests {
         assert!(o1.is_empty());
         assert_eq!(o2.len(), 1);
         assert_eq!(s1.len(), 1, "sapling shard 1 untouched by orchard delete");
-    }
-
-    #[test]
-    fn missing_table_reads_as_empty_and_deletes_noop() {
-        let conn = mem_conn();
-        let loaded: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedPool::Orchard, 3).expect("load");
-        assert!(loaded.is_empty());
-        delete_shard(&conn, ShieldedPool::Orchard, 3).expect("delete noop");
-        delete_from_position(&conn, ShieldedPool::Orchard, 0).expect("rewind noop");
     }
 
     #[test]
@@ -434,7 +403,7 @@ mod tests {
     #[test]
     fn rewind_deletes_at_and_above_position() {
         let conn = mem_conn();
-        ensure_buffer_table(&conn).expect("table");
+        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
         let rows: Vec<BufferRow<MerkleHashOrchard>> = (0..4u64)
             .map(|i| (100 + i, h(0), Retention::Ephemeral))
             .collect();

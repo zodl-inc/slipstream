@@ -9,28 +9,25 @@
 //! that a spend exists but is not yet linked lives in `nullifier_map` (the
 //! observed nullifier) with no matching `*_received_notes.nf`.
 //!
-//! `slipstream_v_tx_reconciled` exposes, per wallet txid, whether the tx still
-//! has such a dangling shielded spend. A consumer (the SDK) can hold an
+//! `ext_slipstream_v_tx_reconciled` exposes, per wallet txid, whether the tx
+//! still has such a dangling shielded spend. A consumer (the SDK) can hold an
 //! unreconciled tx out of the Activity list until its delta is final, then
 //! reveal it — surfacing genuine receives and already-linked sends *sooner*
 //! while keeping the ambiguous change-vs-receive tx hidden until it is *correct*.
 //!
 //! This is a VIEW (computed on read): it adds NO rows to `data.db`, never runs
 //! on the scan/persist hot path, and is invisible to the golden oracle (which
-//! diffs `type='table'` only — see `oracle::semantic_diff`). It is created
-//! idempotently at every wallet open, so any host of the engine (iOS, Android,
-//! CLI) inherits it with no FFI surface change. A fully-synced wallet has no
-//! dangling spends, so every tx reads `reconciled = 1` — correct at cold start
-//! with the engine not even running.
-
-use rusqlite::Connection;
-
-use crate::error::SlipstreamError;
+//! diffs `type='table'` only — see `oracle::semantic_diff`). It is created by
+//! the `ext_slipstream_*` schema migration (`migrations.rs`, issue #4), so any
+//! host of the engine (iOS, Android, CLI) inherits it with no FFI surface
+//! change. A fully-synced wallet has no dangling spends, so every tx reads
+//! `reconciled = 1` — correct at cold start with the engine not even running.
 
 /// Name of the reconciliation view (kept in sync with [`RECONCILE_VIEW_SQL`]).
-pub const RECONCILE_VIEW_NAME: &str = "slipstream_v_tx_reconciled";
+pub const RECONCILE_VIEW_NAME: &str = "ext_slipstream_v_tx_reconciled";
 
-/// `CREATE VIEW IF NOT EXISTS` for the per-tx reconciliation signal.
+/// `CREATE VIEW` for the per-tx reconciliation signal (run by the
+/// `ext_slipstream_*` schema migration).
 ///
 /// `reconciled = 0` iff the tx has an observed shielded spend (a `nullifier_map`
 /// row at the tx's locator) whose note has not yet been received (no
@@ -63,7 +60,7 @@ pub const RECONCILE_VIEW_NAME: &str = "slipstream_v_tx_reconciled";
 /// link, and permanently-dangling rows are expected residue, not an error.
 /// (nf-NULL on imported/UFVK accounts was ruled out on the same field DB: all
 /// notes, including the hardware-wallet account's, had `nf` populated.)
-pub const RECONCILE_VIEW_SQL: &str = "CREATE VIEW IF NOT EXISTS slipstream_v_tx_reconciled AS
+pub const RECONCILE_VIEW_SQL: &str = "CREATE VIEW ext_slipstream_v_tx_reconciled AS
 SELECT t.txid AS txid,
        NOT EXISTS (
            SELECT 1
@@ -93,23 +90,22 @@ FROM transactions t";
 /// (account_uuid, account_balance_delta, mined_height are the columns the shipped SDK
 /// query already depends on).
 pub const RECOVERY_BALANCE_VIEW_SQL: &str =
-    "CREATE VIEW IF NOT EXISTS slipstream_v_recovery_balance AS
+    "CREATE VIEW ext_slipstream_v_recovery_balance AS
 SELECT vt.account_uuid AS account_uuid,
        SUM(vt.account_balance_delta) AS balance_zat
 FROM v_transactions vt
 WHERE vt.mined_height IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM slipstream_v_tx_reconciled r
+  AND NOT EXISTS (SELECT 1 FROM ext_slipstream_v_tx_reconciled r
                   WHERE r.txid = vt.txid AND r.reconciled = 0)
 GROUP BY vt.account_uuid";
 
-/// Create (idempotently) the slipstream read-side views on an already-migrated wallet
-/// database: the reconciliation primitive and, layered on it, the recovery balance
-/// ([API v2 §4.2]). Called once per [`crate::wallet_session::WalletSession::open`].
-pub fn create_reconcile_view(conn: &Connection) -> Result<(), SlipstreamError> {
-    conn.execute_batch(RECONCILE_VIEW_SQL)
-        .map_err(|e| SlipstreamError::Wallet(format!("create reconcile view: {e}")))?;
+/// Install both read-side views on a bare test fixture (stub upstream tables,
+/// no migrator). Production databases get them from the `ext_slipstream_*`
+/// schema migration ([`crate::migrations`]) instead.
+#[cfg(test)]
+pub(crate) fn create_reconcile_view(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(RECONCILE_VIEW_SQL)?;
     conn.execute_batch(RECOVERY_BALANCE_VIEW_SQL)
-        .map_err(|e| SlipstreamError::Wallet(format!("create recovery balance view: {e}")))
 }
 
 // NOTE: an earlier `slipstream_v_balance_overcount` view (subtract a per-account nf-based
@@ -117,14 +113,14 @@ pub fn create_reconcile_view(conn: &Connection) -> Result<(), SlipstreamError> {
 // inert: during the recent-first gap the spend's block is unscanned, so its nullifier is
 // not yet in `nullifier_map`, so the view found nothing while the balance still read ~2×.
 // The working recovery balance (Σ reconciled deltas) was first shipped SDK-side and is now
-// engine-owned as `slipstream_v_recovery_balance` above (API v2 §4.2); the SDK's copy
+// engine-owned as `ext_slipstream_v_recovery_balance` above (API v2 §4.2); the SDK's copy
 // retires in boundary-review Phase D.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wallet_session::WalletSession;
-    use rusqlite::{OptionalExtension, params};
+    use rusqlite::{Connection, OptionalExtension, params};
     use zcash_protocol::consensus::Network;
 
     /// Open a migrated wallet DB (which also installs the reconcile view), and
@@ -142,7 +138,7 @@ mod tests {
 
     fn reconciled(conn: &Connection, txid: &[u8]) -> Option<i64> {
         conn.query_row(
-            "SELECT reconciled FROM slipstream_v_tx_reconciled WHERE txid = ?1",
+            "SELECT reconciled FROM ext_slipstream_v_tx_reconciled WHERE txid = ?1",
             params![txid],
             |r| r.get(0),
         )
@@ -321,7 +317,7 @@ mod tests {
 
     fn recovery_balance(conn: &Connection, account: &[u8]) -> Option<i64> {
         conn.query_row(
-            "SELECT balance_zat FROM slipstream_v_recovery_balance WHERE account_uuid = ?1",
+            "SELECT balance_zat FROM ext_slipstream_v_recovery_balance WHERE account_uuid = ?1",
             params![account],
             |r| r.get(0),
         )

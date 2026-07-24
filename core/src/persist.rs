@@ -727,7 +727,6 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
             }
             FeedAction::Buffer(rows) => {
                 if let Some(first) = rows.first() {
-                    crate::graft::ensure_buffer_table(conn)?;
                     crate::graft::append_rows(conn, pool, first.0 >> 16, &rows)?;
                 }
             }

@@ -92,20 +92,21 @@ impl WalletSession {
             zcash_client_sqlite::util::SystemClock,
             rand::rngs::OsRng,
         );
-        zcash_client_sqlite::wallet::init::init_wallet_db(&mut db, None)
+        // Issue #4: the engine's own `ext_slipstream_*` schema (graft buffer,
+        // reconciliation views — see `migrations.rs`) rides the wallet's
+        // migrator as external schemerz migrations, so it is created and
+        // versioned exactly like the upstream schema (seedless — keyless engine).
+        zcash_client_sqlite::wallet::init::WalletMigrator::new()
+            .with_external_migrations(crate::migrations::external_migrations())
+            .init_or_migrate(&mut db)
             .map_err(|e| wallet_err("init/migrations", e))?;
-        // [#1755] Install the slipstream-owned, read-side reconciliation view
-        // (additive; see `reconcile.rs`). It is a VIEW — adds no rows to data.db,
-        // never runs on the scan hot path, and is invisible to the golden oracle
-        // (which diffs `type='table'` only). Idempotent, so every host inherits it
-        // with no FFI change. WAL (set above) permits this short side connection.
+        // Open-time healing runs over a short side connection (WAL, set above,
+        // permits it).
         {
-            let conn =
-                Connection::open(db_path).map_err(|e| wallet_err("reconcile view open", e))?;
+            let conn = Connection::open(db_path).map_err(|e| wallet_err("healing open", e))?;
             // [audit ENG-1] same per-connection timeout as the pre-open connection above.
             conn.busy_timeout(std::time::Duration::from_secs(5))
-                .map_err(|e| wallet_err("set busy_timeout (reconcile)", e))?;
-            crate::reconcile::create_reconcile_view(&conn)?;
+                .map_err(|e| wallet_err("set busy_timeout (healing)", e))?;
             // [B4-16] Queue hygiene: drop Historic ranges no remaining account justifies.
             // An account deleted mid-restore leaves its deep ranges queued (upstream
             // `delete_account` never touches scan_queue) — without this, the engine grinds
@@ -292,7 +293,7 @@ impl WalletSession {
     }
 
     /// [API v2.1 E-4] Cheap signature of the wallet's transaction set:
-    /// `(COUNT(transactions), COUNT(unreconciled per slipstream_v_tx_reconciled))`.
+    /// `(COUNT(transactions), COUNT(unreconciled per ext_slipstream_v_tx_reconciled))`.
     /// The scheduler compares it across range boundaries and bumps `tx_set_version` when it
     /// moved — catching set changes that arrive WITHOUT an enhancement write (the classic
     /// case: scanning a historic block stores the received note that LINKS an
@@ -307,7 +308,7 @@ impl WalletSession {
             .map_err(|e| wallet_err("tx sig count", e))?;
         let unreconciled: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM slipstream_v_tx_reconciled WHERE reconciled = 0",
+                "SELECT COUNT(*) FROM ext_slipstream_v_tx_reconciled WHERE reconciled = 0",
                 [],
                 |row| row.get(0),
             )
