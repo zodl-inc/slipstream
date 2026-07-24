@@ -197,47 +197,78 @@ fn persist_pool() -> Option<&'static rayon::ThreadPool> {
 /// dies in shardtree's "Tree state inconsistent with checkpoints" panic arm,
 /// wedging the wallet in the revival loop.
 ///
-/// The heal deletes checkpoint rows (and their marks-removed satellites)
-/// deeper than the margin below each pool's own max checkpoint id. For
-/// healthy wallets this is a no-op (upstream-equivalent pruning never leaves
-/// deep rows); for flooded wallets it restores exactly the state upstream's
-/// own `prune_excess_checkpoints` would have converged to. The flooded rows'
-/// retention flags were never materialized in the tree (their commitments
-/// were buffered), so store-row deletion needs no tree-side flag cleanup;
-/// stale flags from any legitimately-built deep checkpoints merely keep a
-/// node alive (bloat, not breakage).
+/// The heal removes checkpoints (their marks-removed satellites cascade in
+/// the store) deeper than the margin below each pool's own max checkpoint id.
+/// For healthy wallets this is a no-op (upstream-equivalent pruning never
+/// leaves deep rows); for flooded wallets it restores exactly the state
+/// upstream's own `prune_excess_checkpoints` would have converged to. The
+/// flooded rows' retention flags were never materialized in the tree (their
+/// commitments were buffered), so store-row deletion needs no tree-side flag
+/// cleanup; stale flags from any legitimately-built deep checkpoints merely
+/// keep a node alive (bloat, not breakage).
 ///
-/// Returns rows deleted across both pools.
-pub fn heal_flooded_checkpoints(conn: &rusqlite::Connection) -> Result<u64, rusqlite::Error> {
-    let mut deleted = 0u64;
-    // [IW-2c]/[B6] third pool included; heights on the ANCHOR_RETENTION_INTERVAL
-    // grid are spared UNCONDITIONALLY — the heal has no retention-floor context
-    // at open time, and over-exempting 1/288 of flood rows (~0.35%) is nothing
-    // next to destroying a durable anchor a migration pre-signed against.
-    for pool in ["sapling", "orchard", "ironwood"] {
-        let max_id: Option<i64> = conn.query_row(
-            &format!("SELECT MAX(checkpoint_id) FROM {pool}_tree_checkpoints"),
-            [],
-            |r| r.get(0),
-        )?;
-        let Some(max_id) = max_id else { continue };
-        let cutoff = max_id - i64::from(DEEP_HISTORY_CHECKPOINT_MARGIN);
-        deleted += conn.execute(
-            &format!(
-                "DELETE FROM {pool}_tree_checkpoint_marks_removed
-                 WHERE checkpoint_id < :cutoff AND checkpoint_id % :interval != 0"
-            ),
-            rusqlite::named_params! { ":cutoff": cutoff, ":interval": i64::from(ANCHOR_RETENTION_INTERVAL) },
-        )? as u64;
-        deleted += conn.execute(
-            &format!(
-                "DELETE FROM {pool}_tree_checkpoints
-                 WHERE checkpoint_id < :cutoff AND checkpoint_id % :interval != 0"
-            ),
-            rusqlite::named_params! { ":cutoff": cutoff, ":interval": i64::from(ANCHOR_RETENTION_INTERVAL) },
-        )? as u64;
+/// Issue #4: runs through `WalletCommitmentTrees` + the pool stores' own
+/// checkpoint API — the engine holds no direct SQL against upstream tables.
+///
+/// Returns checkpoints removed across all pools.
+pub fn heal_flooded_checkpoints(db: &mut Db) -> Result<u64, crate::error::SlipstreamError> {
+    let heal_err = |pool: &str, e: &dyn std::fmt::Display| {
+        crate::error::SlipstreamError::Wallet(format!("checkpoint heal ({pool}): {e}"))
+    };
+    // [IW-2c]/[B6] third pool included (absent stores heal zero); heights on
+    // the ANCHOR_RETENTION_INTERVAL grid are spared UNCONDITIONALLY — the heal
+    // has no retention-floor context at open time, and over-exempting 1/288 of
+    // flood rows (~0.35%) is nothing next to destroying a durable anchor a
+    // migration pre-signed against.
+    let mut removed = 0u64;
+    removed += db
+        .with_sapling_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
+        .map_err(|e| heal_err("sapling", &e))?;
+    removed += db
+        .with_orchard_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
+        .map_err(|e| heal_err("orchard", &e))?;
+    removed += db
+        .with_ironwood_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
+        .map_err(|e| heal_err("ironwood", &e))?
+        .unwrap_or(0);
+    Ok(removed)
+}
+
+/// One pool's flood heal: drop every checkpoint deeper than
+/// `DEEP_HISTORY_CHECKPOINT_MARGIN` below the pool's max checkpoint id, except
+/// ids on the `ANCHOR_RETENTION_INTERVAL` grid.
+fn heal_pool_checkpoints<S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<S, DEPTH, SHARD_HEIGHT>,
+) -> Result<u64, ShardTreeError<S::Error>>
+where
+    S: ShardStore<CheckpointId = BlockHeight>,
+    S::H: incrementalmerkletree::Hashable + Clone + PartialEq,
+{
+    let store = tree.store_mut();
+    let Some((max_id, _)) = store
+        .get_checkpoint_at_depth(0)
+        .map_err(ShardTreeError::Storage)?
+    else {
+        return Ok(0);
+    };
+    let cutoff = u32::from(max_id).saturating_sub(DEEP_HISTORY_CHECKPOINT_MARGIN);
+    // The store binds `limit` as an SQL parameter (i64), so `usize::MAX` is
+    // NOT a valid "no limit" sentinel — pass the actual row count.
+    let count = store.checkpoint_count().map_err(ShardTreeError::Storage)?;
+    let mut doomed = vec![];
+    store
+        .for_each_checkpoint(count, |id, _| {
+            let h = u32::from(*id);
+            if h < cutoff && !h.is_multiple_of(ANCHOR_RETENTION_INTERVAL) {
+                doomed.push(*id);
+            }
+            Ok(())
+        })
+        .map_err(ShardTreeError::Storage)?;
+    for id in &doomed {
+        store.remove_checkpoint(id).map_err(ShardTreeError::Storage)?;
     }
-    Ok(deleted)
+    Ok(doomed.len() as u64)
 }
 
 // ── In-memory shard store ──────────────────────────────────────────────────────

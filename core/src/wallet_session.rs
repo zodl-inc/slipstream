@@ -100,20 +100,20 @@ impl WalletSession {
             .with_external_migrations(crate::migrations::external_migrations())
             .init_or_migrate(&mut db)
             .map_err(|e| wallet_err("init/migrations", e))?;
-        // Open-time healing runs over a short side connection (WAL, set above,
-        // permits it).
+        // [B4-16] Queue hygiene: drop Historic ranges no remaining account justifies.
+        // An account deleted mid-restore leaves its deep ranges queued (upstream
+        // `delete_account` never touches scan_queue) — without this, the engine grinds
+        // a full deep restore for keys that no longer exist. Runs at every open (= every
+        // pass start too), so wedged wallets heal at launch and an in-app delete →
+        // restart heals immediately. Warn-and-continue: a failed prune must not block
+        // opening — sync still runs correctly without it, just wastefully.
+        // Still direct SQL over a short side connection (WAL permits it) — the
+        // upstream traits expose no scan-queue pruning yet (issue #4 phase 2b).
         {
-            let conn = Connection::open(db_path).map_err(|e| wallet_err("healing open", e))?;
+            let conn = Connection::open(db_path).map_err(|e| wallet_err("prune open", e))?;
             // [audit ENG-1] same per-connection timeout as the pre-open connection above.
             conn.busy_timeout(std::time::Duration::from_secs(5))
-                .map_err(|e| wallet_err("set busy_timeout (healing)", e))?;
-            // [B4-16] Queue hygiene: drop Historic ranges no remaining account justifies.
-            // An account deleted mid-restore leaves its deep ranges queued (upstream
-            // `delete_account` never touches scan_queue) — without this, the engine grinds
-            // a full deep restore for keys that no longer exist. Runs at every open (= every
-            // pass start too), so wedged wallets heal at launch and an in-app delete →
-            // restart heals immediately. Warn-and-continue: a failed prune must not block
-            // opening — sync still runs correctly without it, just wastefully.
+                .map_err(|e| wallet_err("set busy_timeout (prune)", e))?;
             match crate::scan_queue::prune_orphaned_historic_ranges(&conn) {
                 Ok(0) => {}
                 Ok(n) => info!(
@@ -122,20 +122,21 @@ impl WalletSession {
                 ),
                 Err(e) => tracing::warn!(%e, "scan queue prune failed (non-fatal) — continuing"),
             }
-            // Sandblasting-era flood heal (2026-07-06): wallets that scanned the
-            // spam era on a pre-fix build carry thousands of deep-history
-            // checkpoint rows that panic every subsequent pass — delete them at
-            // open so damaged wallets self-repair without a reset. No-op on
-            // healthy wallets. Warn-and-continue, same policy as the prune above.
-            match crate::persist::heal_flooded_checkpoints(&conn) {
-                Ok(0) => {}
-                Ok(n) => info!(
-                    healed = n,
-                    "checkpoint store: deleted flooded deep-history checkpoint rows (pre-fix sandblasting damage)"
-                ),
-                Err(e) => {
-                    tracing::warn!(%e, "checkpoint flood heal failed (non-fatal) — continuing")
-                }
+        }
+        // Sandblasting-era flood heal (2026-07-06): wallets that scanned the
+        // spam era on a pre-fix build carry thousands of deep-history
+        // checkpoint rows that panic every subsequent pass — remove them at
+        // open (via the pools' own checkpoint stores) so damaged wallets
+        // self-repair without a reset. No-op on healthy wallets.
+        // Warn-and-continue, same policy as the prune above.
+        match crate::persist::heal_flooded_checkpoints(&mut db) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                healed = n,
+                "checkpoint store: removed flooded deep-history checkpoints (pre-fix sandblasting damage)"
+            ),
+            Err(e) => {
+                tracing::warn!(%e, "checkpoint flood heal failed (non-fatal) — continuing")
             }
         }
         Ok(Self {
@@ -165,20 +166,17 @@ impl WalletSession {
         Ok(max.and_then(|v| u64::try_from(v).ok()))
     }
 
-    /// [API v2 §4.4 / Phase E] The wallet's oldest account birthday: MIN(`accounts.birthday_height`),
-    /// or `None` when no accounts exist. With the chain tip and the remaining scan queue it seeds the
-    /// global permille floor once per suggest round (`scheduler::global_floor_permille`). Same
-    /// short-side-connection pattern as `max_recover_until`.
+    /// [API v2 §4.4 / Phase E] The wallet's oldest account birthday, or `None` when no
+    /// accounts exist. With the chain tip and the remaining scan queue it seeds the
+    /// global permille floor once per suggest round (`scheduler::global_floor_permille`).
+    /// Issue #4: reads via [`WalletRead::get_wallet_birthday`] (whose contract is exactly
+    /// the minimum account birthday) — no direct SQL.
     pub fn min_birthday(&self) -> Result<Option<u64>, SlipstreamError> {
-        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("birthday open", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| wallet_err("birthday busy_timeout", e))?;
-        let min: Option<i64> = conn
-            .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| {
-                row.get(0)
-            })
-            .map_err(|e| wallet_err("birthday query", e))?;
-        Ok(min.and_then(|v| u64::try_from(v).ok()))
+        Ok(self
+            .db
+            .get_wallet_birthday()
+            .map_err(|e| wallet_err("wallet birthday", e))?
+            .map(|h| u64::from(u32::from(h))))
     }
 
     /// Whether the wallet already tracks an account for `ufvk`.
@@ -293,26 +291,26 @@ impl WalletSession {
     }
 
     /// [API v2.1 E-4] Cheap signature of the wallet's transaction set:
-    /// `(COUNT(transactions), COUNT(unreconciled per ext_slipstream_v_tx_reconciled))`.
+    /// `(COUNT(tx rows), COUNT(unreconciled))`, both read from the slipstream-owned
+    /// `ext_slipstream_v_tx_reconciled` view (one row per wallet tx by construction).
     /// The scheduler compares it across range boundaries and bumps `tx_set_version` when it
     /// moved — catching set changes that arrive WITHOUT an enhancement write (the classic
     /// case: scanning a historic block stores the received note that LINKS an
     /// already-stored dangling spend, flipping it reconciled). Same short-side-connection
-    /// pattern as `max_recover_until`; both counts are over wallet-sized tables (cheap).
+    /// pattern as `max_recover_until`; the counts are over wallet-sized tables (cheap).
     pub fn tx_set_signature(&self) -> Result<(u64, u64), SlipstreamError> {
         let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("tx sig open", e))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| wallet_err("tx sig busy_timeout", e))?;
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
-            .map_err(|e| wallet_err("tx sig count", e))?;
-        let unreconciled: i64 = conn
+        let (total, unreconciled): (i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*) FROM ext_slipstream_v_tx_reconciled WHERE reconciled = 0",
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN reconciled = 0 THEN 1 ELSE 0 END), 0)
+                 FROM ext_slipstream_v_tx_reconciled",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|e| wallet_err("tx sig unreconciled", e))?;
+            .map_err(|e| wallet_err("tx sig counts", e))?;
         Ok((
             u64::try_from(total).unwrap_or(0),
             u64::try_from(unreconciled).unwrap_or(0),
