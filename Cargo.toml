@@ -66,11 +66,12 @@ ff = "0.13"
 
 # The Ironwood-era librustzcash family is not fully released to crates.io yet, so
 # the whole family rides [patch.crates-io] against the canonical repo — never
-# direct git+branch deps. `=x.y.z` pins on the patched crates (above) stop a
-# future crates.io patch release from out-resolving the [patch] block. The rev
-# is current zcash/librustzcash main — the same rev upstream zcash_voting rides,
-# so SDK-side consumers resolve one family instance; bump deliberately, with the
-# engine gates re-run. The whole block dies at the 0.24-era crates.io release.
+# direct git+branch deps. The rev is current zcash/librustzcash main — the same
+# rev upstream zcash_voting rides, so SDK-side consumers resolve one family
+# instance; bump deliberately, with the engine gates re-run. The whole block
+# dies at the 0.24-era crates.io release — at that point restore `=x.y.z` exact
+# pins on the patched crates (above) so a crates.io patch release can't
+# out-resolve the [patch] block once this section is gone.
 [patch.crates-io]
 zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
 zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
