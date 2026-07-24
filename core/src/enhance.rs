@@ -2,11 +2,13 @@
 //! fetching full tx data from lightwalletd.
 //!
 //! ## Concurrency model
-//! Fetches run with bounded concurrency via `futures_util::stream::FuturesUnordered`.
-//! Up to `FETCH_CONCURRENCY` requests are in-flight at once. DB applies are serial
-//! (driven by `&mut WalletSession`). Unordered application is correct because each
-//! txid write is independent — there are no cross-txid ordering constraints in the
-//! `WalletWrite` API.
+//! Fetches run concurrently via `futures_util::stream::FuturesUnordered`: every
+//! request in a round is pushed at once, with the gRPC channel's HTTP/2 stream
+//! multiplexing providing the practical concurrency bound (no explicit cap is
+//! applied — see the note at the `FuturesUnordered` construction site if one is
+//! ever needed). DB applies are serial (driven by `&mut WalletSession`).
+//! Unordered application is correct because each txid write is independent —
+//! there are no cross-txid ordering constraints in the `WalletWrite` API.
 //!
 //! ## Variant semantics
 //! Mirrors `Sources/ZcashLightClientKit/Block/Enhance/BlockEnhancer.swift:94-171`
@@ -60,15 +62,6 @@ pub struct EnhanceStats {
     pub address: std::time::Duration,
 }
 
-/// Maximum concurrent in-flight gRPC `GetTransaction` calls.
-/// Used as the documented concurrency bound; see the concurrency-model note in
-/// `run_enhancement` for the implementation choice.
-// NOTE: the value is a documented design constant; future implementations that
-// add explicit buffering (e.g. stream::iter(futs).buffered(FETCH_CONCURRENCY))
-// will use it directly.
-#[allow(dead_code)]
-const FETCH_CONCURRENCY: usize = 8;
-
 /// Drain all `TransactionDataRequest` items from the wallet.
 ///
 /// Loops up to 3 rounds because applying one batch of responses can cause
@@ -113,9 +106,9 @@ pub async fn run_enhancement(
         // (backed by a shared `Channel` — no new TCP connections per clone).
         // All fetch futures are pushed into FuturesUnordered at once; the gRPC
         // channel's HTTP/2 stream multiplexing provides the practical concurrency
-        // bound. FETCH_CONCURRENCY = 8 is reserved for a future
-        // stream::iter(futs).buffered(N) upgrade. DB applies are serial below —
-        // `session` is never held across an await point.
+        // bound. An explicit bound (e.g. stream::iter(futs).buffered(N)) is a
+        // future upgrade if unbounded concurrency ever needs capping. DB applies
+        // are serial below — `session` is never held across an await point.
         //
         // Each future yields `(TxId, bool, Result<Option<RawTransaction>, SlipstreamError>)`.
         // The two arms of the match produce different anonymous `async` block types, so
