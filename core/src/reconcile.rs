@@ -9,28 +9,25 @@
 //! that a spend exists but is not yet linked lives in `nullifier_map` (the
 //! observed nullifier) with no matching `*_received_notes.nf`.
 //!
-//! `slipstream_v_tx_reconciled` exposes, per wallet txid, whether the tx still
-//! has such a dangling shielded spend. A consumer (the SDK) can hold an
+//! `ext_slipstream_v_tx_reconciled` exposes, per wallet txid, whether the tx
+//! still has such a dangling shielded spend. A consumer (the SDK) can hold an
 //! unreconciled tx out of the Activity list until its delta is final, then
 //! reveal it — surfacing genuine receives and already-linked sends *sooner*
 //! while keeping the ambiguous change-vs-receive tx hidden until it is *correct*.
 //!
 //! This is a VIEW (computed on read): it adds NO rows to `data.db`, never runs
 //! on the scan/persist hot path, and is invisible to the golden oracle (which
-//! diffs `type='table'` only — see `oracle::semantic_diff`). It is created
-//! idempotently at every wallet open, so any host of the engine (iOS, Android,
-//! CLI) inherits it with no FFI surface change. A fully-synced wallet has no
-//! dangling spends, so every tx reads `reconciled = 1` — correct at cold start
-//! with the engine not even running.
-
-use rusqlite::Connection;
-
-use crate::error::SlipstreamError;
+//! diffs `type='table'` only — see `oracle::semantic_diff`). It is created by
+//! the `ext_slipstream_*` schema migration (`migrations.rs`, issue #4), so any
+//! host of the engine (iOS, Android, CLI) inherits it with no FFI surface
+//! change. A fully-synced wallet has no dangling spends, so every tx reads
+//! `reconciled = 1` — correct at cold start with the engine not even running.
 
 /// Name of the reconciliation view (kept in sync with [`RECONCILE_VIEW_SQL`]).
-pub const RECONCILE_VIEW_NAME: &str = "slipstream_v_tx_reconciled";
+pub const RECONCILE_VIEW_NAME: &str = "ext_slipstream_v_tx_reconciled";
 
-/// `CREATE VIEW IF NOT EXISTS` for the per-tx reconciliation signal.
+/// `CREATE VIEW` for the per-tx reconciliation signal (run by the
+/// `ext_slipstream_*` schema migration).
 ///
 /// `reconciled = 0` iff the tx has an observed shielded spend (a `nullifier_map`
 /// row at the tx's locator) whose note has not yet been received (no
@@ -63,8 +60,9 @@ pub const RECONCILE_VIEW_NAME: &str = "slipstream_v_tx_reconciled";
 /// link, and permanently-dangling rows are expected residue, not an error.
 /// (nf-NULL on imported/UFVK accounts was ruled out on the same field DB: all
 /// notes, including the hardware-wallet account's, had `nf` populated.)
-pub const RECONCILE_VIEW_SQL: &str = "CREATE VIEW IF NOT EXISTS slipstream_v_tx_reconciled AS
+pub const RECONCILE_VIEW_SQL: &str = "CREATE VIEW ext_slipstream_v_tx_reconciled AS
 SELECT t.txid AS txid,
+       t.mined_height AS mined_height,
        NOT EXISTS (
            SELECT 1
            FROM nullifier_map nm
@@ -92,24 +90,53 @@ FROM transactions t";
 /// reconciled Activity list by construction. `v_transactions` is upstream's stable view
 /// (account_uuid, account_balance_delta, mined_height are the columns the shipped SDK
 /// query already depends on).
-pub const RECOVERY_BALANCE_VIEW_SQL: &str =
-    "CREATE VIEW IF NOT EXISTS slipstream_v_recovery_balance AS
+pub const RECOVERY_BALANCE_VIEW_SQL: &str = "CREATE VIEW ext_slipstream_v_recovery_balance AS
 SELECT vt.account_uuid AS account_uuid,
        SUM(vt.account_balance_delta) AS balance_zat
 FROM v_transactions vt
 WHERE vt.mined_height IS NOT NULL
-  AND NOT EXISTS (SELECT 1 FROM slipstream_v_tx_reconciled r
+  AND NOT EXISTS (SELECT 1 FROM ext_slipstream_v_tx_reconciled r
                   WHERE r.txid = vt.txid AND r.reconciled = 0)
 GROUP BY vt.account_uuid";
 
-/// Create (idempotently) the slipstream read-side views on an already-migrated wallet
-/// database: the reconciliation primitive and, layered on it, the recovery balance
-/// ([API v2 §4.2]). Called once per [`crate::wallet_session::WalletSession::open`].
-pub fn create_reconcile_view(conn: &Connection) -> Result<(), SlipstreamError> {
-    conn.execute_batch(RECONCILE_VIEW_SQL)
-        .map_err(|e| SlipstreamError::Wallet(format!("create reconcile view: {e}")))?;
+/// Install both read-side views on a bare test fixture (stub upstream tables,
+/// no migrator). Production databases get them from the `ext_slipstream_*`
+/// schema migration ([`crate::migrations`]) instead.
+#[cfg(test)]
+pub(crate) fn create_reconcile_view(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(RECONCILE_VIEW_SQL)?;
     conn.execute_batch(RECOVERY_BALANCE_VIEW_SQL)
-        .map_err(|e| SlipstreamError::Wallet(format!("create recovery balance view: {e}")))
+}
+
+/// Per-account recovery balances: every row of `ext_slipstream_v_recovery_balance`
+/// as `(account_uuid bytes, balance_zat)`. The read side of [API v2 §4.2] for hosts
+/// (the CLI monitor) — reads ONLY the slipstream-owned view.
+pub fn recovery_balances(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<(Vec<u8>, i64)>, rusqlite::Error> {
+    let mut stmt =
+        conn.prepare("SELECT account_uuid, balance_zat FROM ext_slipstream_v_recovery_balance")?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    rows.collect()
+}
+
+/// Count of MINED wallet transactions under the host display rule
+/// ("visible = reconciled OR NOT recovering", mined txs only): all mined txs, or —
+/// with `reconciled_only` — just those with no dangling shielded spend. Reads ONLY
+/// the slipstream-owned view.
+pub fn visible_mined_tx_count(
+    conn: &rusqlite::Connection,
+    reconciled_only: bool,
+) -> Result<u64, rusqlite::Error> {
+    let sql = if reconciled_only {
+        "SELECT COUNT(*) FROM ext_slipstream_v_tx_reconciled
+         WHERE mined_height IS NOT NULL AND reconciled = 1"
+    } else {
+        "SELECT COUNT(*) FROM ext_slipstream_v_tx_reconciled
+         WHERE mined_height IS NOT NULL"
+    };
+    conn.query_row(sql, [], |r| r.get::<_, i64>(0))
+        .map(|n| u64::try_from(n).unwrap_or(0))
 }
 
 // NOTE: an earlier `slipstream_v_balance_overcount` view (subtract a per-account nf-based
@@ -117,14 +144,14 @@ pub fn create_reconcile_view(conn: &Connection) -> Result<(), SlipstreamError> {
 // inert: during the recent-first gap the spend's block is unscanned, so its nullifier is
 // not yet in `nullifier_map`, so the view found nothing while the balance still read ~2×.
 // The working recovery balance (Σ reconciled deltas) was first shipped SDK-side and is now
-// engine-owned as `slipstream_v_recovery_balance` above (API v2 §4.2); the SDK's copy
+// engine-owned as `ext_slipstream_v_recovery_balance` above (API v2 §4.2); the SDK's copy
 // retires in boundary-review Phase D.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wallet_session::WalletSession;
-    use rusqlite::{OptionalExtension, params};
+    use rusqlite::{Connection, OptionalExtension, params};
     use zcash_protocol::consensus::Network;
 
     /// Open a migrated wallet DB (which also installs the reconcile view), and
@@ -142,7 +169,7 @@ mod tests {
 
     fn reconciled(conn: &Connection, txid: &[u8]) -> Option<i64> {
         conn.query_row(
-            "SELECT reconciled FROM slipstream_v_tx_reconciled WHERE txid = ?1",
+            "SELECT reconciled FROM ext_slipstream_v_tx_reconciled WHERE txid = ?1",
             params![txid],
             |r| r.get(0),
         )
@@ -321,7 +348,7 @@ mod tests {
 
     fn recovery_balance(conn: &Connection, account: &[u8]) -> Option<i64> {
         conn.query_row(
-            "SELECT balance_zat FROM slipstream_v_recovery_balance WHERE account_uuid = ?1",
+            "SELECT balance_zat FROM ext_slipstream_v_recovery_balance WHERE account_uuid = ?1",
             params![account],
             |r| r.get(0),
         )
@@ -420,6 +447,63 @@ mod tests {
             recovery_balance(&conn, &acct_b),
             None,
             "B has no reconciled rows yet"
+        );
+    }
+
+    /// The CLI display rule reads: all-mined vs reconciled-only counts and the
+    /// per-account recovery balances — all served by the slipstream-owned views.
+    #[test]
+    fn visible_counts_and_recovery_balances_read_the_views() {
+        let conn = stub_fixture();
+        // txid1: mined, reconciled (no observed spends).
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height) VALUES (1, ?1, 400, 0, 400)",
+            params![vec![0x01u8; 32]],
+        )
+        .expect("tx1");
+        // txid2: mined, dangling shielded spend (nullifier observed, note not received).
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height) VALUES (2, ?1, 500, 0, 500)",
+            params![vec![0x02u8; 32]],
+        )
+        .expect("tx2");
+        conn.execute(
+            "INSERT INTO tx_locator_map (block_height, tx_index, txid) VALUES (500, 0, ?1)",
+            params![vec![0x02u8; 32]],
+        )
+        .expect("locator");
+        conn.execute(
+            "INSERT INTO nullifier_map (spend_pool, nf, block_height, tx_index) VALUES (2, ?1, 500, 0)",
+            params![vec![0xBBu8; 32]],
+        )
+        .expect("nullifier");
+        // txid3: UNMINED — excluded from both counts.
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height) VALUES (3, ?1, NULL, 0, 600)",
+            params![vec![0x03u8; 32]],
+        )
+        .expect("tx3");
+
+        assert_eq!(
+            visible_mined_tx_count(&conn, false).expect("all mined"),
+            2,
+            "not recovering: every mined tx is visible"
+        );
+        assert_eq!(
+            visible_mined_tx_count(&conn, true).expect("reconciled only"),
+            1,
+            "recovering: the dangling-spend tx is held back"
+        );
+
+        // Recovery balance rows surface via the view (v_transactions stub).
+        conn.execute(
+            "INSERT INTO v_transactions (txid, account_uuid, account_balance_delta, mined_height) VALUES (?1, ?2, 700, 400)",
+            params![vec![0x01u8; 32], vec![0xAAu8; 16]],
+        )
+        .expect("vtx");
+        assert_eq!(
+            recovery_balances(&conn).expect("balances"),
+            vec![(vec![0xAAu8; 16], 700)]
         );
     }
 }

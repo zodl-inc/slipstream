@@ -34,12 +34,18 @@ zcash_client_backend = { version = "0.24.0-rc.1", features = [
 zcash_client_sqlite = { version = "0.22.0-rc.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_keys = { version = "0.15.0", features = ["orchard"] }
 rusqlite = "0.37"
+# Issue #4: slipstream's own `ext_slipstream_*` schema rides the wallet DB's
+# schemerz migrator (WalletMigrator::with_external_migrations) — versions match
+# the ones zcash_client_sqlite itself resolves.
+schemerz = "0.2"
+schemerz-rusqlite = "0.370"
+uuid = "1"
 secrecy = "0.8"
 rand = "0.8"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
 orchard = { version = "0.15.4", features = ["unstable-voting-circuits"] }
-zcash_primitives = "0.29.0"
-transparent = { package = "zcash_transparent", version = "0.9.0", default-features = false }
+zcash_primitives = "0.30.0"
+transparent = { package = "zcash_transparent", version = "0.10.0", default-features = false }
 zcash_script = "0.4"
 tempfile = "3"          # dev-only usage; listed here for version unity
 incrementalmerkletree = { version = "0.8", default-features = false }
@@ -66,21 +72,21 @@ ff = "0.13"
 
 # The Ironwood-era librustzcash family is not fully released to crates.io yet, so
 # the whole family rides [patch.crates-io] against the canonical repo — never
-# direct git+branch deps. The rev is current zcash/librustzcash main — the same
-# rev upstream zcash_voting rides, so SDK-side consumers resolve one family
-# instance; bump deliberately, with the engine gates re-run. The whole block
-# dies at the 0.24-era crates.io release — at that point restore `=x.y.z` exact
-# pins on the patched crates (above) so a crates.io patch release can't
-# out-resolve the [patch] block once this section is gone.
+# direct git+branch deps. The rev is the `slipstream-storage-trait-additions`
+# branch (issue #4 phase 2b: the storage-trait additions the engine consumes),
+# which is post-release librustzcash main (0ee8797) + one commit; retarget to
+# main once that branch merges. Bump deliberately, with the engine gates re-run.
+# The whole block dies at the 0.24-era crates.io release — at that point restore
+# `=x.y.z` exact pins on the patched crates (above) so a crates.io patch release
+# can't out-resolve the [patch] block once this section is gone.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "3a10e7fec7afd3a9748cb4fa7f7db853f4537eeb" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "ab87e6a7f50300340e18aab41660306698d811d6" }
