@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use tracing::info;
+use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 
 use crate::error::SlipstreamError;
 use crate::network::SlipstreamNetwork;
@@ -146,12 +147,21 @@ pub struct EngineConfig {
     /// 1 = verify every graft (the full-audit mode used for validation runs).
     /// Deterministic by shard index (reproducible; no RNG in the hot path).
     pub graft_verify_sample: u32,
-    /// \[B6\] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
-    /// when `Some(h)`, checkpoints at heights ≥ h on the 288-block grid are durable
-    /// anchors, exempt from checkpoint downgrade/dooming and excess-checkpoint
-    /// pruning — the migration crate (MOB-1455) pre-signs transfers against them.
+    /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
+    /// when `Some`, the checkpoints it retains — those at or above its floor that
+    /// fall on its grid — are durable anchors, exempt from checkpoint
+    /// downgrade/dooming and excess-checkpoint pruning. The migration crate
+    /// (MOB-1455) pre-signs transfers against them.
+    ///
+    /// The grid MUST match the one the wallet's own retention uses, or a transfer
+    /// anchored to a boundary this engine did not retain becomes unprovable. Build
+    /// it from the wallet's `AnchorRetentionInterval` rather than choosing a value
+    /// here: on mainnet that is `AnchorRetentionInterval::ZIP_318`, and a host
+    /// running a shortened test-network grid must pass the same one it configured
+    /// on the wallet.
+    ///
     /// `None` (default) = retention off, byte-identical to pre-B6 behavior.
-    pub anchor_retention_height: Option<u32>,
+    pub anchor_retention: Option<AnchorRetention>,
 
     /// v0.4 Plan B (spec §5): batch-affine Orchard combine — all of a fragment's
     /// combines computed level-synchronously with shared Montgomery inversions
@@ -220,7 +230,7 @@ impl EngineConfig {
             gpu_subtree: false,
             graft_subtree: true,
             graft_verify_sample: 16,
-            anchor_retention_height: None,
+            anchor_retention: None,
             batch_combine: true,
             local_treestate: false,
             treestate_verify_sample: 1,

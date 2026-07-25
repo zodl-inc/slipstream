@@ -140,11 +140,17 @@ enum Cmd {
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         sparse: bool,
         /// \[B6\] Anchor-retention floor: checkpoints at heights >= this on the
-        /// 288-block grid become durable anchors (exempt from checkpoint
+        /// anchor-bucket grid become durable anchors (exempt from checkpoint
         /// downgrade/pruning) — the migration crate's pre-signed-transfer
         /// anchors. Off when omitted.
         #[arg(long)]
         anchor_retention: Option<u32>,
+        /// \[B6\] Anchor-bucket grid, in blocks (default 144, the ZIP 318 value).
+        /// MUST match the interval the wallet itself retains on, or a migration
+        /// transfer anchored to a boundary this engine did not retain becomes
+        /// unprovable. Only meaningful with `--anchor-retention`.
+        #[arg(long, default_value_t = 144)]
+        anchor_retention_interval: u32,
         /// Byte budget per fetch sub-chunk (T6.8-S adaptive split; makes dense
         /// "sandblasting" eras traversable). Must be >= 1 MiB.
         #[arg(long, default_value_t = slipstream_core::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES)]
@@ -984,6 +990,7 @@ fn cmd_sync(
     persist_depth: usize,
     follow: bool,
     anchor_retention: Option<u32>,
+    anchor_retention_interval: u32,
 ) {
     let endpoint = parse_server(&server).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -1005,7 +1012,21 @@ fn cmd_sync(
     cfg.sparse_persistence = sparse;
     cfg.chunk_split_bytes = chunk_split_bytes;
     cfg.memory_budget_bytes = memory_budget_bytes;
-    cfg.anchor_retention_height = anchor_retention; // [B6]
+    // [B6] The floor and the grid together are the retention policy; an interval
+    // of zero is not a grid, so it is rejected rather than silently defaulted.
+    cfg.anchor_retention = match anchor_retention {
+        Some(floor) => {
+            let Some(blocks) = std::num::NonZeroU32::new(anchor_retention_interval) else {
+                eprintln!("error: --anchor-retention-interval must be greater than zero");
+                std::process::exit(2)
+            };
+            Some(slipstream_core::AnchorRetention::new(
+                zcash_protocol::consensus::BlockHeight::from(floor),
+                slipstream_core::AnchorRetentionInterval::custom(blocks),
+            ))
+        }
+        None => None,
+    };
     require_gpu_feature_if(gpu_subtree, "--gpu-subtree");
     // `--sparse false` (the sparse kill switch) implies write-behind off: the
     // deferred commit runs the sparse put_blocks path, so it cannot outlive it.
@@ -1543,6 +1564,7 @@ fn main() {
             chunk,
             sparse,
             anchor_retention,
+            anchor_retention_interval,
             chunk_split_bytes,
             memory_budget_bytes,
             write_behind,
@@ -1566,6 +1588,7 @@ fn main() {
                 persist_depth,
                 follow,
                 anchor_retention,
+                anchor_retention_interval,
             );
         }
         Cmd::Bench {

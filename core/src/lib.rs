@@ -76,6 +76,12 @@ pub use events::{Bound, Event, Progress, ProgressArc, Snapshot, SyncMode};
 pub use network::{CustomActivations, SlipstreamNetwork};
 #[cfg(feature = "zcash_client_sqlite")]
 pub use session::{SessionConfig, SessionReporter, TorSessionConfig, run_session};
+/// Re-exported so hosts configure the anchor-retention policy from the same types
+/// the wallet itself is configured with — the grid must match or a migration
+/// transfer anchored to a boundary this engine did not retain becomes unprovable.
+pub use zcash_client_backend::data_api::anchor_retention::{
+    AnchorRetention, AnchorRetentionInterval,
+};
 pub use zcash_protocol::consensus::Network;
 // Re-exported because they appear in the public engine surface (`engine::sync_once`,
 // `SessionConfig::accounts`): callers name the account key/birthday as typed values.

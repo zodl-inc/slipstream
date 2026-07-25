@@ -20,6 +20,7 @@ use tracing::info;
 use transparent::address::TransparentAddress;
 use zip32::DiversifierIndex;
 
+use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 pub(crate) use zcash_client_backend::data_api::ll::wallet::build_subtrees;
 use zcash_client_backend::data_api::ll::wallet::{ensure_checkpoints, put_blocks_rows};
 use zcash_client_backend::data_api::{
@@ -115,16 +116,17 @@ const _: () = assert!(
 /// is deliberately enormous next to the reorg depth (100).
 const DEEP_HISTORY_CHECKPOINT_MARGIN: u32 = 10_000;
 
-/// \[B6\] The interval, in blocks, at which checkpoints are retained as durable
-/// "anchors" once anchor retention is active — mirrors upstream ll/wallet.rs's
-/// `ANCHOR_RETENTION_INTERVAL` exactly (the migration crate pre-signs
-/// transfers against these; at 75-second blocks ≈ every 6 hours).
-const ANCHOR_RETENTION_INTERVAL: u32 = 288;
-
 /// \[B6\] Whether the checkpoint at `height` must be retained as a durable
-/// anchor — upstream's `should_retain_anchor` predicate verbatim: retention is
-/// active when a floor is configured and `height` is at or above it, and
-/// `height` falls on the [`ANCHOR_RETENTION_INTERVAL`] grid.
+/// anchor, delegated to upstream's [`AnchorRetention::retains`].
+///
+/// The grid used to be mirrored here as a local `ANCHOR_RETENTION_INTERVAL`
+/// constant, because upstream declared its own `pub(crate)`. That mirror was a
+/// standing correctness hazard and did in fact drift — it sat at 288 while
+/// upstream was 144, so this engine retained only every OTHER upstream anchor,
+/// and a transfer pre-signed against an odd multiple of 144 would have lost
+/// the checkpoint it proves against. Upstream now publishes the grid as a type
+/// that owns the arithmetic, so there is one implementation and nothing left to
+/// drift.
 ///
 /// Every exemption in the sparse mirror (checkpoint downgrade, deep-history
 /// dooming, shardtree's retention-aware prune via `ensure_retained`) keys on
@@ -134,9 +136,8 @@ const ANCHOR_RETENTION_INTERVAL: u32 = 288;
 /// `remove_retained_checkpoint` release API: we re-derive from the predicate
 /// at seed time and never release, which retains a SUPERSET — the safe
 /// direction (a few extra checkpoint rows; never a destroyed anchor).
-fn should_retain_anchor(anchor_retention_floor: Option<BlockHeight>, height: BlockHeight) -> bool {
-    anchor_retention_floor.is_some_and(|floor| height >= floor)
-        && u32::from(height) % ANCHOR_RETENTION_INTERVAL == 0
+fn should_retain_anchor(anchor_retention: Option<&AnchorRetention>, height: BlockHeight) -> bool {
+    anchor_retention.is_some_and(|retention| retention.retains(height))
 }
 
 /// v0.6 P4c/P4d (subsumes T6.9b): the persist lane's dedicated rayon pool —
@@ -218,11 +219,8 @@ pub fn heal_flooded_checkpoints(db: &mut Db) -> Result<u64, crate::error::Slipst
     let heal_err = |pool: &str, e: &dyn std::fmt::Display| {
         crate::error::SlipstreamError::Wallet(format!("checkpoint heal ({pool}): {e}"))
     };
-    // [IW-2c]/[B6] third pool included (absent stores heal zero); heights on
-    // the ANCHOR_RETENTION_INTERVAL grid are spared UNCONDITIONALLY — the heal
-    // has no retention-floor context at open time, and over-exempting 1/288 of
-    // flood rows (~0.35%) is nothing next to destroying a durable anchor a
-    // migration pre-signed against.
+    // [IW-2c]/[B6] third pool included (absent stores heal zero); durable
+    // anchors are spared by consulting each store's RETAINED checkpoint set.
     let mut removed = 0u64;
     removed += db
         .with_sapling_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
@@ -239,7 +237,17 @@ pub fn heal_flooded_checkpoints(db: &mut Db) -> Result<u64, crate::error::Slipst
 
 /// One pool's flood heal: drop every checkpoint deeper than
 /// `DEEP_HISTORY_CHECKPOINT_MARGIN` below the pool's max checkpoint id, except
-/// ids on the `ANCHOR_RETENTION_INTERVAL` grid.
+/// those the store records as RETAINED durable anchors.
+///
+/// The retained set is read from the store rather than re-derived from the
+/// anchor grid. The heal has no retention-floor context at open time, so it
+/// used to spare every height on a hard-coded grid — which stops being possible
+/// once the grid is configurable, and was in any case a guess. `ensure_retained`
+/// has already recorded exactly which checkpoints are durable anchors, so
+/// reading that set spares precisely the right ones at whatever interval they
+/// were established under, including an interval a previous run was configured
+/// with. The flooded rows were never retained (their commitments were
+/// buffered), so they are unaffected by the exemption and still swept.
 fn heal_pool_checkpoints<S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
     tree: &mut ShardTree<S, DEPTH, SHARD_HEIGHT>,
 ) -> Result<u64, ShardTreeError<S::Error>>
@@ -255,14 +263,16 @@ where
         return Ok(0);
     };
     let cutoff = u32::from(max_id).saturating_sub(DEEP_HISTORY_CHECKPOINT_MARGIN);
+    let retained = store
+        .retained_checkpoints()
+        .map_err(ShardTreeError::Storage)?;
     // The store binds `limit` as an SQL parameter (i64), so `usize::MAX` is
     // NOT a valid "no limit" sentinel — pass the actual row count.
     let count = store.checkpoint_count().map_err(ShardTreeError::Storage)?;
     let mut doomed = vec![];
     store
         .for_each_checkpoint(count, |id, _| {
-            let h = u32::from(*id);
-            if h < cutoff && !h.is_multiple_of(ANCHOR_RETENTION_INTERVAL) {
+            if u32::from(*id) < cutoff && !retained.contains(id) {
                 doomed.push(*id);
             }
             Ok(())
@@ -549,12 +559,13 @@ type IronwoodSparseTree = OrchardSparseTree;
 pub struct SparseTreeState {
     sapling: Option<SaplingSparseTree>,
     orchard: Option<OrchardSparseTree>,
-    /// \[B6\] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
-    /// when `Some(h)`, checkpoints at heights ≥ h on the 288-block grid are durable
-    /// anchors — exempt from the T6.3b downgrade, the deep-history dooming, and
-    /// (via `ensure_retained`) shardtree's excess-checkpoint pruning. `None` (the
-    /// default) = today's behavior byte-for-byte.
-    pub(crate) anchor_retention_height: Option<BlockHeight>,
+    /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
+    /// when `Some`, checkpoints the policy retains — those at or above its floor
+    /// that fall on its grid — are durable anchors, exempt from the T6.3b
+    /// downgrade, the deep-history dooming, and (via `ensure_retained`)
+    /// shardtree's excess-checkpoint pruning. `None` (the default) = today's
+    /// behavior byte-for-byte.
+    pub(crate) anchor_retention: Option<AnchorRetention>,
     /// [IW-2c] Third pool. No graft/census/GPU lane: the ironwood tree starts
     /// at activation (tiny for years), stock lightwalletd serves no ironwood
     /// subtree roots to graft from, and the build cost is microseconds.
@@ -586,11 +597,11 @@ pub struct SparseTreeState {
 }
 
 impl SparseTreeState {
-    /// \[B6\] Set the anchor-retention floor (see the field docs). Public for
+    /// \[B6\] Set the anchor-retention policy (see the field docs). Public for
     /// integration tests and direct hosts; production plumbs it from
-    /// `EngineConfig::anchor_retention_height`.
-    pub fn set_anchor_retention_height(&mut self, floor: Option<BlockHeight>) {
-        self.anchor_retention_height = floor;
+    /// `EngineConfig::anchor_retention`.
+    pub fn set_anchor_retention(&mut self, anchor_retention: Option<AnchorRetention>) {
+        self.anchor_retention = anchor_retention;
     }
 
     /// v0.4 census read-out (spec §3.2) — (sapling, orchard). Production reads
@@ -687,7 +698,7 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
     note_positions: &[u64],
     store_has_shard: impl Fn(u64) -> bool,
     mut server_root: impl FnMut(u64) -> Result<Option<H>, SqliteClientError>,
-    anchor_retention_floor: Option<BlockHeight>,
+    anchor_retention: Option<&AnchorRetention>,
 ) -> Result<PoolPlan<H>, SqliteClientError> {
     use crate::graft_accumulator::{FeedAction, ShardAccumulator};
 
@@ -735,7 +746,7 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
                 // back to the built path (retentions travel, anchors exempted).
                 let contains_anchor = rows.iter().any(|(_, _, r)| {
                     matches!(r, Retention::Checkpoint { id, .. }
-                        if should_retain_anchor(anchor_retention_floor, *id))
+                        if should_retain_anchor(anchor_retention, *id))
                 });
                 if contains_anchor {
                     plan.fallbacks += 1;
@@ -775,7 +786,7 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
 fn seed_sapling(
     db: &mut Db,
     _from_state: &ChainState,
-    anchor_floor: Option<BlockHeight>,
+    anchor_floor: Option<&AnchorRetention>,
 ) -> Result<SaplingSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
     db.with_sapling_tree_mut::<_, _, SqliteClientError>(|tree| {
@@ -819,7 +830,7 @@ fn seed_sapling(
 fn seed_orchard(
     db: &mut Db,
     _from_state: &ChainState,
-    anchor_floor: Option<BlockHeight>,
+    anchor_floor: Option<&AnchorRetention>,
 ) -> Result<OrchardSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
     db.with_orchard_tree_mut::<_, _, SqliteClientError>(|tree| {
@@ -863,7 +874,7 @@ fn seed_orchard(
 fn seed_ironwood(
     db: &mut Db,
     _from_state: &ChainState,
-    anchor_floor: Option<BlockHeight>,
+    anchor_floor: Option<&AnchorRetention>,
 ) -> Result<IronwoodSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
     db.with_ironwood_tree_mut::<_, _, SqliteClientError>(|tree| {
@@ -1050,28 +1061,28 @@ pub fn sparse_put_blocks(
         sparse.sapling = Some(seed_sapling(
             inner,
             from_state,
-            sparse.anchor_retention_height,
+            sparse.anchor_retention.as_ref(),
         )?);
     }
     if sparse.orchard.is_none() {
         sparse.orchard = Some(seed_orchard(
             inner,
             from_state,
-            sparse.anchor_retention_height,
+            sparse.anchor_retention.as_ref(),
         )?);
     }
     if sparse.ironwood.is_none() {
         sparse.ironwood = Some(seed_ironwood(
             inner,
             from_state,
-            sparse.anchor_retention_height,
+            sparse.anchor_retention.as_ref(),
         )?);
     }
     let gpu_on = sparse.gpu_subtree;
     let batch_on = sparse.batch_combine;
     // [B6] Copy the retention floor out before the split-borrow: every downgrade
     // site and the per-lane ensure_retained calls key on it.
-    let anchor_floor = sparse.anchor_retention_height;
+    let anchor_floor = sparse.anchor_retention.as_ref();
     let SparseTreeState {
         sapling: Some(sap_tree),
         orchard: Some(orch_tree),
@@ -1760,9 +1771,17 @@ pub fn sparse_put_blocks(
         orch_tree_ms,
         flush_ms,
         downgraded,
-        // [B6] retention observability: the active floor + how many anchors the
-        // orchard store currently pins (0/None = retention off).
-        anchor_floor = anchor_floor.map(u32::from),
+        // [B6] retention observability: the active floor and grid, plus how many
+        // anchors the orchard store currently pins (None = retention off).
+        anchor_floor = anchor_floor.map(|r| u32::from(r.from_height())),
+        anchor_grid = anchor_floor
+            .map(|r| {
+                r.intervals()
+                    .iter()
+                    .map(|i| i.block_count().get())
+                    .collect::<Vec<_>>()
+            })
+            .map(|g| format!("{g:?}")),
         retained = orch_tree.store().retained.len(),
         "sparse put_blocks"
     );
@@ -2004,13 +2023,13 @@ struct PoolTimers {
 fn downgrade_doomed_checkpoints<H>(
     commitments: &mut [Option<(H, Retention<BlockHeight>)>],
     cutoff: BlockHeight,
-    anchor_retention_floor: Option<BlockHeight>,
+    anchor_retention: Option<&AnchorRetention>,
 ) -> u64 {
     let mut downgraded = 0u64;
     for slot in commitments.iter_mut().flatten() {
         if let Retention::Checkpoint { id, marking } = &slot.1
             && *id < cutoff
-            && !should_retain_anchor(anchor_retention_floor, *id)
+            && !should_retain_anchor(anchor_retention, *id)
         {
             slot.1 = match marking {
                 Marking::Marked => Retention::Marked,
@@ -3060,7 +3079,7 @@ impl PersistLane {
         graft_buffering: bool,
         graft_verify_sample: u32,
         batch_combine: bool,
-        anchor_retention_height: Option<BlockHeight>,
+        anchor_retention: Option<AnchorRetention>,
     ) -> Result<Self, crate::error::SlipstreamError> {
         // [B4-16] Same wait-not-die posture as the main connection (wallet_session.rs): a
         // host write (importAccount landing mid-pass) holding the lock made the lane's
@@ -3092,7 +3111,7 @@ impl PersistLane {
             graft_buffering,
             graft,
             batch_combine,
-            anchor_retention_height,
+            anchor_retention,
             ..Default::default()
         };
         Ok(Self {
@@ -3161,7 +3180,7 @@ impl PersistLane {
             sapling,
             orchard,
             graft: Some(ctx),
-            anchor_retention_height: anchor_floor,
+            anchor_retention: anchor_floor,
             ..
         } = sparse
         else {
@@ -3216,7 +3235,7 @@ impl PersistLane {
                 if let Some(cutoff) =
                     finish_cutoff(sap_tree.store().checkpoints.keys().copied(), &rows)
                 {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, *anchor_floor);
+                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
                 }
                 for (subtree, checkpoints) in build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
                     seg_start,
@@ -3233,7 +3252,7 @@ impl PersistLane {
                 if let Some(cutoff) =
                     finish_cutoff(orch_tree.store().checkpoints.keys().copied(), &rows)
                 {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, *anchor_floor);
+                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
                 }
                 for (subtree, checkpoints) in build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
                     seg_start,
@@ -3406,6 +3425,7 @@ impl PersistLane {
 mod store_tests {
     use super::*;
     use incrementalmerkletree::{Address, Hashable as _};
+    use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
 
     type Store = SparseShardStore<sapling::Node>;
 
@@ -3587,8 +3607,9 @@ mod store_tests {
         };
 
         // Retention ON, floor below the anchors: grid ids survive, off-grid is doomed.
+        let zip318 = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
         let mut commitments = fresh(&[1152, 1300, 1440]);
-        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(h(1000)));
+        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&zip318(1000)));
         assert_eq!(n, 1, "only the off-grid checkpoint is doomed");
         assert!(matches!(
             commitments[0].as_ref().unwrap().1,
@@ -3610,22 +3631,54 @@ mod store_tests {
 
         // Grid id BELOW the floor: retention is not active there — doomed.
         let mut commitments = fresh(&[1152]);
-        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(h(1200)));
+        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&zip318(1200)));
         assert_eq!(n, 1);
+
+        // A CONFIGURED grid, not a compiled-in one: under a 12-block interval the
+        // off-ZIP-318 height 1300 is itself a boundary and survives. This is what a
+        // test network needs, and what a mirrored constant could never express.
+        let short = AnchorRetention::new(
+            h(1000),
+            AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
+        );
+        let mut commitments = fresh(&[1152, 1300, 1440]);
+        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&short));
+        assert_eq!(n, 1, "1300 is off the 12-grid; 1152 and 1440 are on it");
+        assert!(matches!(
+            commitments[1].as_ref().unwrap().1,
+            Retention::Ephemeral
+        ));
     }
 
-    /// [B6] The predicate is upstream's `should_retain_anchor` verbatim.
+    /// [B6] The predicate delegates to upstream's `AnchorRetention::retains`, so
+    /// this engine's surviving anchor set is upstream's by construction rather
+    /// than by a mirrored constant that has to be kept in step by hand.
     #[test]
     fn should_retain_anchor_matches_upstream_predicate() {
         let h = |n: u32| BlockHeight::from(n);
-        assert!(should_retain_anchor(Some(h(1000)), h(1152)));
-        assert!(should_retain_anchor(Some(h(1152)), h(1152)), "at the floor");
-        assert!(!should_retain_anchor(Some(h(1000)), h(1300)), "off-grid");
+        let at = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
+        assert!(should_retain_anchor(Some(&at(1000)), h(1152)));
         assert!(
-            !should_retain_anchor(Some(h(1200)), h(1152)),
+            should_retain_anchor(Some(&at(1152)), h(1152)),
+            "at the floor"
+        );
+        assert!(!should_retain_anchor(Some(&at(1000)), h(1300)), "off-grid");
+        assert!(
+            !should_retain_anchor(Some(&at(1200)), h(1152)),
             "below the floor"
         );
         assert!(!should_retain_anchor(None, h(1152)), "retention off");
+
+        // The grid is whatever was configured. 1308 is a 12-block boundary but not
+        // a ZIP 318 one, so a host on a shortened test-network grid retains a
+        // height the default grid discards — which is the entire point of making
+        // the interval configurable rather than mirroring a constant.
+        let short = AnchorRetention::new(
+            h(1000),
+            AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
+        );
+        assert!(should_retain_anchor(Some(&short), h(1308)));
+        assert!(!should_retain_anchor(Some(&at(1000)), h(1308)));
     }
 
     #[test]

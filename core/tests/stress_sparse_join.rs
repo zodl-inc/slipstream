@@ -33,6 +33,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use zcash_client_backend::data_api::anchor_retention::{AnchorRetention, AnchorRetentionInterval};
 use zcash_client_backend::data_api::chain::{ChainState, scan_cached_blocks};
 use zcash_client_backend::proto::compact_formats::{
     ChainMetadata, CompactBlock, CompactSaplingOutput, CompactSaplingSpend, CompactTx,
@@ -175,7 +176,7 @@ fn scan_sparse_once(
     blocks: &[CompactBlock],
     chunk_size: usize,
     pool: Option<&rayon::ThreadPool>,
-    anchor_floor: Option<u32>,
+    anchor_retention: Option<AnchorRetention>,
 ) -> Result<(), String> {
     let db_path = dir.join("data.db");
     let mut session = WalletSession::open(slipstream_core::Network::MainNetwork, &db_path)
@@ -201,7 +202,7 @@ fn scan_sparse_once(
         .map_err(|e| format!("update_chain_tip: {e}"))?;
 
     let mut sparse_state = SparseTreeState::default();
-    sparse_state.set_anchor_retention_height(anchor_floor.map(BlockHeight::from)); // [B6]
+    sparse_state.set_anchor_retention(anchor_retention.clone()); // [B6]
     let mut from_state = birthday_ts
         .to_chain_state()
         .map_err(|e| format!("chain state: {e}"))?;
@@ -334,19 +335,25 @@ fn sparse_join_stress_no_deadlock_under_constrained_pools() {
 /// [B6] Anchor retention through the FULL sparse path, deterministically: a
 /// synthetic chain where EVERY block carries a sapling output (so every height
 /// has an in-stream per-block checkpoint — the quiet-public-testnet artifact of
-/// empty blocks having nothing to checkpoint doesn't apply). A 288-grid height
-/// far below the 100-checkpoint window must survive with the retention floor
-/// set, and be pruned like any other checkpoint without it.
+/// empty blocks having nothing to checkpoint doesn't apply). A grid height far
+/// below the 100-checkpoint window must survive with retention configured, and
+/// be pruned like any other checkpoint without it.
+///
+/// The grid is derived from the CONFIGURED interval rather than a literal, so
+/// the test tracks whatever the policy is set to instead of pinning a constant
+/// that could drift away from it.
 fn run_anchor_retention_pair() -> Result<(), String> {
-    // 800 blocks from SYNTH_START (1_500_000): grid heights = 1_500_192 (288·5209)
-    // and 1_500_480. The final window covers roughly the last 100 heights only,
-    // so both grid heights sit 200–500 blocks below it.
+    let interval = AnchorRetentionInterval::ZIP_318;
+    let grid = u64::from(interval.block_count().get());
+    // 800 blocks from SYNTH_START (1_500_000). The final window covers roughly
+    // the last 100 heights only, so both grid heights sit well below it.
     let blocks = synth_blocks(800, 1);
-    let first_grid = SYNTH_START.div_ceil(288) * 288;
+    let first_grid = SYNTH_START.div_ceil(grid) * grid;
     assert!(
-        first_grid + 288 < SYNTH_START + 650,
+        first_grid + grid < SYNTH_START + 650,
         "grid must fall well below the window"
     );
+    let retention = AnchorRetention::new(BlockHeight::from(SYNTH_START as u32), interval);
 
     let query = |dir: &Path, id: u64| -> Result<bool, String> {
         let conn = rusqlite::Connection::open(dir.join("data.db"))
@@ -363,8 +370,8 @@ fn run_anchor_retention_pair() -> Result<(), String> {
 
     // Retention ON (floor at SYNTH_START): the grid heights survive.
     let dir_on = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
-    scan_sparse_once(dir_on.path(), &blocks, 800, None, Some(SYNTH_START as u32))?;
-    for grid in [first_grid, first_grid + 288] {
+    scan_sparse_once(dir_on.path(), &blocks, 800, None, Some(retention))?;
+    for grid in [first_grid, first_grid + grid] {
         if !query(dir_on.path(), grid)? {
             let conn = rusqlite::Connection::open(dir_on.path().join("data.db"))
                 .map_err(|e| format!("debug open: {e}"))?;
@@ -389,7 +396,7 @@ fn run_anchor_retention_pair() -> Result<(), String> {
     // Retention OFF: the same heights are pruned with the rest of the deep window.
     let dir_off = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
     scan_sparse_once(dir_off.path(), &blocks, 800, None, None)?;
-    for grid in [first_grid, first_grid + 288] {
+    for grid in [first_grid, first_grid + grid] {
         if query(dir_off.path(), grid)? {
             return Err(format!(
                 "anchor {grid} unexpectedly survived with retention OFF"
