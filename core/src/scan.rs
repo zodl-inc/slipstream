@@ -302,7 +302,7 @@ pub async fn scan_chunks(
             graft_buffering,
             config.graft_verify_sample,
             config.batch_combine,
-            config.anchor_retention_height.map(BlockHeight::from),
+            config.anchor_retention.clone(),
         )?;
         // [B4-16 drain] Every deferred commit holds the writer gate so the FFI
         // stop()/start() drain can wait out an orphan commit abort() can't cancel.
@@ -397,7 +397,7 @@ async fn scan_chunks_inner(
     sparse_state.gpu_subtree = config.gpu_subtree; // B0: route Orchard build to GPU when set
     sparse_state.graft_buffering = graft_buffering; // v0.4: only used on the inline path (wb's lane carries its own)
     sparse_state.batch_combine = config.batch_combine; // v0.4 Plan B (inline path)
-    sparse_state.anchor_retention_height = config.anchor_retention_height.map(BlockHeight::from); // [B6]
+    sparse_state.anchor_retention = config.anchor_retention.clone(); // [B6]
     // Read config fields once.
     let batch_target_ms = config.scan_batch_target_ms;
     let network = config.network;
