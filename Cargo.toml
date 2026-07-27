@@ -23,15 +23,14 @@ futures-util = "0.3"
 thiserror = "2"
 tracing = "0.1"
 zcash_protocol = "0.10.0"
-zcash_client_backend = { version = "0.24.0-rc.2", features = [
+zcash_client_backend = { version = "0.24.0-rc.4", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
-    "pczt",
     "tor",
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.2", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.4", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_keys = { version = "0.16.0", features = ["orchard"] }
 rusqlite = "0.37"
 # Issue #4: slipstream's own `ext_slipstream_*` schema rides the wallet DB's
