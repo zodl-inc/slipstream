@@ -25,10 +25,10 @@ pub(crate) use zcash_client_backend::data_api::ll::wallet::build_subtrees;
 use zcash_client_backend::data_api::ll::wallet::{ensure_checkpoints, put_blocks_rows};
 use zcash_client_backend::data_api::{
     AccountBirthday, AccountPurpose, AddressInfo, BlockMetadata, DecryptedTransaction,
-    NullifierQuery, ORCHARD_SHARD_HEIGHT, ReceivedTransactionOutput, SAPLING_SHARD_HEIGHT,
-    ScannedBlock, SeedRelevance, SentTransaction, TransactionDataRequest, TransactionStatus,
-    TransactionsInvolvingAddress, TransparentBalances, WalletCommitmentTrees, WalletRead,
-    WalletSummary, WalletWrite, Zip32Derivation,
+    NullifierQuery, ORCHARD_SHARD_HEIGHT, OutputLockStore, ReceivedTransactionOutput,
+    SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance, SentTransaction, TransactionDataRequest,
+    TransactionStatus, TransactionsInvolvingAddress, TransparentBalances, WalletCommitmentTrees,
+    WalletRead, WalletSummary, WalletWrite, Zip32Derivation,
     chain::ChainState,
     error::{FindAccountForAddressError, LockError},
     ll::{LowLevelWalletWrite, wallet::PutBlocksError},
@@ -2235,96 +2235,12 @@ impl WalletRead for SparseFacade<'_> {
     }
 }
 
-impl WalletWrite for SparseFacade<'_> {
-    type UtxoRef = <Db as WalletWrite>::UtxoRef;
+// Output locking is a `WalletWrite` supertrait rather than part of `WalletWrite` itself;
+// the facade holds no lock state of its own, so every method delegates verbatim.
+impl OutputLockStore for SparseFacade<'_> {
+    type Error = SqliteClientError;
+    type AccountId = <Db as WalletRead>::AccountId;
 
-    fn create_account(
-        &mut self,
-        account_name: &str,
-        seed: &SecretVec<u8>,
-        birthday: &AccountBirthday,
-        key_source: Option<&str>,
-    ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error> {
-        self.inner
-            .create_account(account_name, seed, birthday, key_source)
-    }
-    fn import_account_hd(
-        &mut self,
-        account_name: &str,
-        seed: &SecretVec<u8>,
-        account_index: zip32::AccountId,
-        birthday: &AccountBirthday,
-        key_source: Option<&str>,
-    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error> {
-        self.inner
-            .import_account_hd(account_name, seed, account_index, birthday, key_source)
-    }
-    fn import_account_ufvk(
-        &mut self,
-        account_name: &str,
-        unified_key: &UnifiedFullViewingKey,
-        birthday: &AccountBirthday,
-        purpose: AccountPurpose,
-        key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error> {
-        self.inner
-            .import_account_ufvk(account_name, unified_key, birthday, purpose, key_source)
-    }
-    fn delete_account(&mut self, account: Self::AccountId) -> Result<(), Self::Error> {
-        self.inner.delete_account(account)
-    }
-    fn get_next_available_address(
-        &mut self,
-        account: Self::AccountId,
-        request: UnifiedAddressRequest,
-    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, Self::Error> {
-        self.inner.get_next_available_address(account, request)
-    }
-    fn get_address_for_index(
-        &mut self,
-        account: Self::AccountId,
-        diversifier_index: DiversifierIndex,
-        request: UnifiedAddressRequest,
-    ) -> Result<Option<UnifiedAddress>, Self::Error> {
-        self.inner
-            .get_address_for_index(account, diversifier_index, request)
-    }
-    fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error> {
-        WalletWrite::update_chain_tip(self.inner, tip_height)
-    }
-
-    fn prune_scan_queue_below(
-        &mut self,
-        height: BlockHeight,
-        retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
-    ) -> Result<u64, Self::Error> {
-        WalletWrite::prune_scan_queue_below(self.inner, height, retain_with_priority)
-    }
-
-    // THE INTERCEPT.
-    fn put_blocks(
-        &mut self,
-        from_state: &ChainState,
-        blocks: Vec<ScannedBlock<Self::AccountId>>,
-    ) -> Result<(), Self::Error> {
-        sparse_put_blocks(self.inner, self.sparse, from_state, blocks)
-    }
-
-    fn put_received_transparent_utxo(
-        &mut self,
-        output: &WalletTransparentOutput<Self::AccountId>,
-    ) -> Result<Self::UtxoRef, Self::Error> {
-        self.inner.put_received_transparent_utxo(output)
-    }
-    fn store_decrypted_tx(
-        &mut self,
-        received_tx: DecryptedTransaction<Transaction, Self::AccountId>,
-    ) -> Result<(), Self::Error> {
-        self.inner.store_decrypted_tx(received_tx)
-    }
-    fn set_tx_trust(&mut self, txid: TxId, trusted: bool) -> Result<(), Self::Error> {
-        self.inner.set_tx_trust(txid, trusted)
-    }
     fn lock_outputs(
         &mut self,
         outputs: &[OutputRef],
@@ -2339,59 +2255,174 @@ impl WalletWrite for SparseFacade<'_> {
     fn clear_locked_outputs(&mut self, account: Self::AccountId) -> Result<usize, Self::Error> {
         self.inner.clear_locked_outputs(account)
     }
+}
+
+impl WalletWrite for SparseFacade<'_> {
+    type UtxoRef = <Db as WalletWrite>::UtxoRef;
+
+    fn create_account(
+        &mut self,
+        account_name: &str,
+        seed: &SecretVec<u8>,
+        birthday: &AccountBirthday,
+        key_source: Option<&str>,
+    ) -> Result<(<Self as WalletRead>::AccountId, UnifiedSpendingKey), <Self as WalletRead>::Error>
+    {
+        self.inner
+            .create_account(account_name, seed, birthday, key_source)
+    }
+    fn import_account_hd(
+        &mut self,
+        account_name: &str,
+        seed: &SecretVec<u8>,
+        account_index: zip32::AccountId,
+        birthday: &AccountBirthday,
+        key_source: Option<&str>,
+    ) -> Result<(Self::Account, UnifiedSpendingKey), <Self as WalletRead>::Error> {
+        self.inner
+            .import_account_hd(account_name, seed, account_index, birthday, key_source)
+    }
+    fn import_account_ufvk(
+        &mut self,
+        account_name: &str,
+        unified_key: &UnifiedFullViewingKey,
+        birthday: &AccountBirthday,
+        purpose: AccountPurpose,
+        key_source: Option<&str>,
+    ) -> Result<Self::Account, <Self as WalletRead>::Error> {
+        self.inner
+            .import_account_ufvk(account_name, unified_key, birthday, purpose, key_source)
+    }
+    fn delete_account(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.inner.delete_account(account)
+    }
+    fn get_next_available_address(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+        request: UnifiedAddressRequest,
+    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, <Self as WalletRead>::Error> {
+        self.inner.get_next_available_address(account, request)
+    }
+    fn get_address_for_index(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+        diversifier_index: DiversifierIndex,
+        request: UnifiedAddressRequest,
+    ) -> Result<Option<UnifiedAddress>, <Self as WalletRead>::Error> {
+        self.inner
+            .get_address_for_index(account, diversifier_index, request)
+    }
+    fn update_chain_tip(
+        &mut self,
+        tip_height: BlockHeight,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        WalletWrite::update_chain_tip(self.inner, tip_height)
+    }
+
+    fn prune_scan_queue_below(
+        &mut self,
+        height: BlockHeight,
+        retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
+    ) -> Result<u64, <Self as WalletRead>::Error> {
+        WalletWrite::prune_scan_queue_below(self.inner, height, retain_with_priority)
+    }
+
+    // THE INTERCEPT.
+    fn put_blocks(
+        &mut self,
+        from_state: &ChainState,
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        sparse_put_blocks(self.inner, self.sparse, from_state, blocks)
+    }
+
+    fn put_received_transparent_utxo(
+        &mut self,
+        output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
+    ) -> Result<Self::UtxoRef, <Self as WalletRead>::Error> {
+        self.inner.put_received_transparent_utxo(output)
+    }
+    fn store_decrypted_tx(
+        &mut self,
+        received_tx: DecryptedTransaction<Transaction, <Self as WalletRead>::AccountId>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.inner.store_decrypted_tx(received_tx)
+    }
+    fn set_tx_trust(
+        &mut self,
+        txid: TxId,
+        trusted: bool,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.inner.set_tx_trust(txid, trusted)
+    }
     fn store_transactions_to_be_sent(
         &mut self,
-        transactions: &[SentTransaction<Self::AccountId>],
-    ) -> Result<(), Self::Error> {
+        transactions: &[SentTransaction<<Self as WalletRead>::AccountId>],
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.store_transactions_to_be_sent(transactions)
     }
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, <Self as WalletRead>::Error> {
         self.inner.truncate_to_height(max_height)
     }
-    fn truncate_to_chain_state(&mut self, chain_state: ChainState) -> Result<(), Self::Error> {
+    fn truncate_to_chain_state(
+        &mut self,
+        chain_state: ChainState,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.truncate_to_chain_state(chain_state)
     }
     fn rewind_to_chain_state(
         &mut self,
         chain_state: ChainState,
-        reset_account_birthdays: std::collections::HashSet<Self::AccountId>,
-    ) -> Result<(), zcash_client_backend::data_api::error::RewindError<Self::AccountId, Self::Error>>
-    {
+        reset_account_birthdays: std::collections::HashSet<<Self as WalletRead>::AccountId>,
+    ) -> Result<
+        (),
+        zcash_client_backend::data_api::error::RewindError<
+            <Self as WalletRead>::AccountId,
+            <Self as WalletRead>::Error,
+        >,
+    > {
         self.inner
             .rewind_to_chain_state(chain_state, reset_account_birthdays)
     }
     fn reserve_next_n_ephemeral_addresses(
         &mut self,
-        account_id: Self::AccountId,
+        account_id: <Self as WalletRead>::AccountId,
         n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, <Self as WalletRead>::Error>
+    {
         self.inner.reserve_next_n_ephemeral_addresses(account_id, n)
     }
     fn set_transaction_status(
         &mut self,
         txid: TxId,
         status: TransactionStatus,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         WalletWrite::set_transaction_status(self.inner, txid, status)
     }
     fn schedule_next_check(
         &mut self,
         address: &TransparentAddress,
         offset_seconds: u32,
-    ) -> Result<Option<SystemTime>, Self::Error> {
+    ) -> Result<Option<SystemTime>, <Self as WalletRead>::Error> {
         self.inner.schedule_next_check(address, offset_seconds)
     }
     fn mark_transparent_addresses_exposed(
         &mut self,
         exposures: &[(TransparentAddress, BlockHeight)],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.mark_transparent_addresses_exposed(exposures)
     }
     fn notify_address_checked(
         &mut self,
         request: TransactionsInvolvingAddress,
         as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.notify_address_checked(request, as_of_height)
     }
 }
@@ -2757,6 +2788,33 @@ impl WalletRead for WriteBehindFacade {
     }
 }
 
+// Outside the virtualized read surface (see the module note above): the write-behind
+// facade never serves lock state, so every method fails loudly rather than silently
+// answering from the un-merged view.
+impl OutputLockStore for WriteBehindFacade {
+    type Error = SqliteClientError;
+    type AccountId = <Db as WalletRead>::AccountId;
+
+    fn lock_outputs(
+        &mut self,
+        _outputs: &[OutputRef],
+        _owner: LockOwner,
+        _lock_expiry_height: BlockHeight,
+    ) -> Result<usize, LockError<Self::Error>> {
+        Err(LockError::Storage(unvirtualized("lock_outputs")))
+    }
+    fn unlock_output(
+        &mut self,
+        _output: &OutputRef,
+        _owner: LockOwner,
+    ) -> Result<bool, Self::Error> {
+        Err(unvirtualized("unlock_output"))
+    }
+    fn clear_locked_outputs(&mut self, _account: Self::AccountId) -> Result<usize, Self::Error> {
+        Err(unvirtualized("clear_locked_outputs"))
+    }
+}
+
 impl WalletWrite for WriteBehindFacade {
     type UtxoRef = <Db as WalletWrite>::UtxoRef;
 
@@ -2764,8 +2822,8 @@ impl WalletWrite for WriteBehindFacade {
     fn put_blocks(
         &mut self,
         from_state: &ChainState,
-        blocks: Vec<ScannedBlock<Self::AccountId>>,
-    ) -> Result<(), Self::Error> {
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         // Depth-1 invariant FIRST: an occupied stash means the scan loop failed
         // to submit the previous unit — a loop bug, never tolerated silently.
         if self.stash.is_some() {
@@ -2794,7 +2852,7 @@ impl WalletWrite for WriteBehindFacade {
                 .iter()
                 .flat_map(|tx| tx.sapling_spends().iter().map(|s| *s.nf()))
                 .collect();
-            let sap_found: Vec<(Self::AccountId, sapling::Nullifier)> = b
+            let sap_found: Vec<(<Self as WalletRead>::AccountId, sapling::Nullifier)> = b
                 .transactions()
                 .iter()
                 .flat_map(|tx| {
@@ -2810,7 +2868,7 @@ impl WalletWrite for WriteBehindFacade {
                 .iter()
                 .flat_map(|tx| tx.orchard_spends().iter().map(|s| *s.nf()))
                 .collect();
-            let orch_found: Vec<(Self::AccountId, orchard::note::Nullifier)> = b
+            let orch_found: Vec<(<Self as WalletRead>::AccountId, orchard::note::Nullifier)> = b
                 .transactions()
                 .iter()
                 .flat_map(|tx| {
@@ -2827,7 +2885,7 @@ impl WalletWrite for WriteBehindFacade {
                 .iter()
                 .flat_map(|tx| tx.ironwood_spends().iter().map(|s| *s.nf()))
                 .collect();
-            let iw_found: Vec<(Self::AccountId, orchard::note::Nullifier)> = b
+            let iw_found: Vec<(<Self as WalletRead>::AccountId, orchard::note::Nullifier)> = b
                 .transactions()
                 .iter()
                 .flat_map(|tx| {
@@ -2855,7 +2913,8 @@ impl WalletWrite for WriteBehindFacade {
         _seed: &SecretVec<u8>,
         _birthday: &AccountBirthday,
         _key_source: Option<&str>,
-    ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error> {
+    ) -> Result<(<Self as WalletRead>::AccountId, UnifiedSpendingKey), <Self as WalletRead>::Error>
+    {
         Err(unvirtualized("create_account"))
     }
     fn import_account_hd(
@@ -2865,7 +2924,7 @@ impl WalletWrite for WriteBehindFacade {
         _account_index: zip32::AccountId,
         _birthday: &AccountBirthday,
         _key_source: Option<&str>,
-    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error> {
+    ) -> Result<(Self::Account, UnifiedSpendingKey), <Self as WalletRead>::Error> {
         Err(unvirtualized("import_account_hd"))
     }
     fn import_account_ufvk(
@@ -2875,88 +2934,91 @@ impl WalletWrite for WriteBehindFacade {
         _birthday: &AccountBirthday,
         _purpose: AccountPurpose,
         _key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error> {
+    ) -> Result<Self::Account, <Self as WalletRead>::Error> {
         Err(unvirtualized("import_account_ufvk"))
     }
-    fn delete_account(&mut self, _account: Self::AccountId) -> Result<(), Self::Error> {
+    fn delete_account(
+        &mut self,
+        _account: <Self as WalletRead>::AccountId,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("delete_account"))
     }
     fn get_next_available_address(
         &mut self,
-        _account: Self::AccountId,
+        _account: <Self as WalletRead>::AccountId,
         _request: UnifiedAddressRequest,
-    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, Self::Error> {
+    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, <Self as WalletRead>::Error> {
         Err(unvirtualized("get_next_available_address"))
     }
     fn get_address_for_index(
         &mut self,
-        _account: Self::AccountId,
+        _account: <Self as WalletRead>::AccountId,
         _diversifier_index: DiversifierIndex,
         _request: UnifiedAddressRequest,
-    ) -> Result<Option<UnifiedAddress>, Self::Error> {
+    ) -> Result<Option<UnifiedAddress>, <Self as WalletRead>::Error> {
         Err(unvirtualized("get_address_for_index"))
     }
-    fn update_chain_tip(&mut self, _tip_height: BlockHeight) -> Result<(), Self::Error> {
+    fn update_chain_tip(
+        &mut self,
+        _tip_height: BlockHeight,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("update_chain_tip"))
     }
     fn prune_scan_queue_below(
         &mut self,
         _height: BlockHeight,
         _retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
-    ) -> Result<u64, Self::Error> {
+    ) -> Result<u64, <Self as WalletRead>::Error> {
         Err(unvirtualized("prune_scan_queue_below"))
     }
     fn put_received_transparent_utxo(
         &mut self,
-        _output: &WalletTransparentOutput<Self::AccountId>,
-    ) -> Result<Self::UtxoRef, Self::Error> {
+        _output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
+    ) -> Result<Self::UtxoRef, <Self as WalletRead>::Error> {
         Err(unvirtualized("put_received_transparent_utxo"))
     }
     fn store_decrypted_tx(
         &mut self,
-        _received_tx: DecryptedTransaction<Transaction, Self::AccountId>,
-    ) -> Result<(), Self::Error> {
+        _received_tx: DecryptedTransaction<Transaction, <Self as WalletRead>::AccountId>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("store_decrypted_tx"))
     }
-    fn set_tx_trust(&mut self, _txid: TxId, _trusted: bool) -> Result<(), Self::Error> {
+    fn set_tx_trust(
+        &mut self,
+        _txid: TxId,
+        _trusted: bool,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("set_tx_trust"))
-    }
-    fn lock_outputs(
-        &mut self,
-        _outputs: &[OutputRef],
-        _owner: LockOwner,
-        _lock_expiry_height: BlockHeight,
-    ) -> Result<usize, LockError<Self::Error>> {
-        Err(LockError::Storage(unvirtualized("lock_outputs")))
-    }
-    fn unlock_output(
-        &mut self,
-        _output: &OutputRef,
-        _owner: LockOwner,
-    ) -> Result<bool, Self::Error> {
-        Err(unvirtualized("unlock_output"))
-    }
-    fn clear_locked_outputs(&mut self, _account: Self::AccountId) -> Result<usize, Self::Error> {
-        Err(unvirtualized("clear_locked_outputs"))
     }
     fn store_transactions_to_be_sent(
         &mut self,
-        _transactions: &[SentTransaction<Self::AccountId>],
-    ) -> Result<(), Self::Error> {
+        _transactions: &[SentTransaction<<Self as WalletRead>::AccountId>],
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("store_transactions_to_be_sent"))
     }
-    fn truncate_to_height(&mut self, _max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height(
+        &mut self,
+        _max_height: BlockHeight,
+    ) -> Result<BlockHeight, <Self as WalletRead>::Error> {
         Err(unvirtualized("truncate_to_height"))
     }
-    fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), Self::Error> {
+    fn truncate_to_chain_state(
+        &mut self,
+        _chain_state: ChainState,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("truncate_to_chain_state"))
     }
     fn rewind_to_chain_state(
         &mut self,
         _chain_state: ChainState,
-        _reset_account_birthdays: std::collections::HashSet<Self::AccountId>,
-    ) -> Result<(), zcash_client_backend::data_api::error::RewindError<Self::AccountId, Self::Error>>
-    {
+        _reset_account_birthdays: std::collections::HashSet<<Self as WalletRead>::AccountId>,
+    ) -> Result<
+        (),
+        zcash_client_backend::data_api::error::RewindError<
+            <Self as WalletRead>::AccountId,
+            <Self as WalletRead>::Error,
+        >,
+    > {
         Err(
             zcash_client_backend::data_api::error::RewindError::DataSource(unvirtualized(
                 "rewind_to_chain_state",
@@ -2965,36 +3027,37 @@ impl WalletWrite for WriteBehindFacade {
     }
     fn reserve_next_n_ephemeral_addresses(
         &mut self,
-        _account_id: Self::AccountId,
+        _account_id: <Self as WalletRead>::AccountId,
         _n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, <Self as WalletRead>::Error>
+    {
         Err(unvirtualized("reserve_next_n_ephemeral_addresses"))
     }
     fn set_transaction_status(
         &mut self,
         _txid: TxId,
         _status: TransactionStatus,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("set_transaction_status"))
     }
     fn schedule_next_check(
         &mut self,
         _address: &TransparentAddress,
         _offset_seconds: u32,
-    ) -> Result<Option<SystemTime>, Self::Error> {
+    ) -> Result<Option<SystemTime>, <Self as WalletRead>::Error> {
         Err(unvirtualized("schedule_next_check"))
     }
     fn mark_transparent_addresses_exposed(
         &mut self,
         _exposures: &[(TransparentAddress, BlockHeight)],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("mark_transparent_addresses_exposed"))
     }
     fn notify_address_checked(
         &mut self,
         _request: TransactionsInvolvingAddress,
         _as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("notify_address_checked"))
     }
 }

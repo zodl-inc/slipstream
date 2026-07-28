@@ -68,3 +68,15 @@ sinsemilla = "0.1"
 group = "0.13"
 pasta_curves = "0.5"
 ff = "0.13"
+
+[patch.crates-io]
+## Uncomment and modify the following block to use librustzcash crates at a pinned revision.
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "a00f4a7a88647bc5a0af532c1a23aafa576f0b53" }

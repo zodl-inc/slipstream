@@ -196,6 +196,9 @@ impl WalletSession {
             let detail = match e {
                 BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
                 BirthdayError::Decode(io) => format!("decode: {io}"),
+                // `BirthdayError` is `#[non_exhaustive]` and implements neither `Debug` nor
+                // `Display`, so a variant added upstream can only be reported generically.
+                _ => "unrecognized birthday error".to_string(),
             };
             SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
         })?;
