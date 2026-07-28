@@ -89,6 +89,72 @@ impl RusqliteMigration for ExtSchemaInit {
     }
 }
 
+/// Identifier of the migration that rebuilds the reconciliation views with an
+/// Ironwood arm (issue #9).
+pub const MIGRATION_ID_EXT_RECONCILE_IRONWOOD: Uuid =
+    Uuid::from_u128(0x9b1c2f04_7d3a_4c58_bf16_2a0e5c8d41e7);
+
+/// Rebuilds both read-side reconciliation views so that a dangling **Ironwood**
+/// spend (`nullifier_map.spend_pool = 4`) is detected like its Sapling and
+/// Orchard siblings ([`crate::reconcile::RECONCILE_VIEW_SQL`], issue #9).
+///
+/// The views hold no state, so the fix is a plain drop-and-recreate; wallets
+/// created before this migration carry the two-pool view and are corrected in
+/// place on the next open.
+struct ExtReconcileIronwood;
+
+impl schemerz::Migration<Uuid> for ExtReconcileIronwood {
+    fn id(&self) -> Uuid {
+        MIGRATION_ID_EXT_RECONCILE_IRONWOOD
+    }
+
+    fn dependencies(&self) -> HashSet<Uuid> {
+        // Our own initial migration, plus the newest RELEASED upstream leaf set
+        // that has `ironwood_received_notes` — the table this migration's view
+        // names. 0.22.0-rc.2 is the first state whose leaves (`note_locking`,
+        // `orchard_ironwood_migration_tables`) both descend from it, so the table
+        // is guaranteed to exist before the view is created rather than merely
+        // likely to: SQLite resolves view bodies lazily, so an earlier anchor
+        // would leave the view referencing a table that upstream had not created
+        // yet, and only upstream's convention of wrapping table renames in
+        // `PRAGMA legacy_alter_table = ON` (which suppresses the re-parse that
+        // would then fail) would keep the migration run working.
+        //
+        // Release constants are the anchor to prefer: they name states of the
+        // graph that a published crate release exposed, so they are unaffected by
+        // the migrations later releases add.
+        upstream_migrations::V_0_22_0_RC2
+            .iter()
+            .copied()
+            .chain([MIGRATION_ID_EXT_SCHEMA_INIT])
+            .collect()
+    }
+
+    fn description(&self) -> &'static str {
+        "Rebuilds the ext_slipstream_* reconciliation views to detect dangling Ironwood spends."
+    }
+}
+
+impl RusqliteMigration for ExtReconcileIronwood {
+    type Error = WalletMigrationError;
+
+    fn up(&self, transaction: &Transaction) -> Result<(), WalletMigrationError> {
+        transaction.execute_batch(
+            "DROP VIEW IF EXISTS ext_slipstream_v_recovery_balance;
+             DROP VIEW IF EXISTS ext_slipstream_v_tx_reconciled;",
+        )?;
+        transaction.execute_batch(crate::reconcile::RECONCILE_VIEW_SQL)?;
+        transaction.execute_batch(crate::reconcile::RECOVERY_BALANCE_VIEW_SQL)?;
+        Ok(())
+    }
+
+    fn down(&self, _transaction: &Transaction) -> Result<(), WalletMigrationError> {
+        Err(WalletMigrationError::CannotRevert(
+            MIGRATION_ID_EXT_RECONCILE_IRONWOOD,
+        ))
+    }
+}
+
 /// The slipstream external migration graph, for registration via
 /// [`WalletMigrator::with_external_migrations`] by any opener of a slipstream
 /// wallet database (the engine's own `WalletSession::open`, or a host that
@@ -96,7 +162,7 @@ impl RusqliteMigration for ExtSchemaInit {
 ///
 /// [`WalletMigrator::with_external_migrations`]: zcash_client_sqlite::wallet::init::WalletMigrator::with_external_migrations
 pub fn external_migrations() -> Vec<Box<dyn RusqliteMigration<Error = WalletMigrationError>>> {
-    vec![Box::new(ExtSchemaInit)]
+    vec![Box::new(ExtSchemaInit), Box::new(ExtReconcileIronwood)]
 }
 
 #[cfg(test)]
@@ -156,6 +222,117 @@ mod tests {
         assert_eq!(registered, 1, "migration id must be recorded");
         // No un-prefixed legacy objects remain.
         assert_eq!(legacy_object_count(&conn), 0);
+    }
+
+    fn view_sql(conn: &Connection, name: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'view' AND name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .expect("view sql")
+    }
+
+    fn migration_applied(conn: &Connection, id: super::Uuid) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM schemer_migrations WHERE id = ?1",
+                [id.as_bytes().as_slice()],
+                |r| r.get(0),
+            )
+            .expect("schemer_migrations query");
+        n > 0
+    }
+
+    /// [issue #9] The reconcile view must name every shielded pool's notes table —
+    /// against the REAL upstream schema, so this also pins that the view body
+    /// resolves after a full migration run at the pinned upstream revision.
+    #[test]
+    fn fresh_open_installs_the_ironwood_aware_views() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("data.db");
+        WalletSession::open(Network::MainNetwork, &db_path).expect("open");
+
+        let conn = Connection::open(&db_path).expect("conn");
+        assert!(migration_applied(
+            &conn,
+            super::MIGRATION_ID_EXT_RECONCILE_IRONWOOD
+        ));
+        let sql = view_sql(&conn, "ext_slipstream_v_tx_reconciled");
+        for table in [
+            "sapling_received_notes",
+            "orchard_received_notes",
+            "ironwood_received_notes",
+        ] {
+            assert!(sql.contains(table), "view must test {table}");
+        }
+        // The body resolves against the real schema (a view over a missing table
+        // only fails when queried).
+        conn.query_row(
+            "SELECT COUNT(*) FROM ext_slipstream_v_tx_reconciled",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("reconcile view resolves");
+        conn.query_row(
+            "SELECT COUNT(*) FROM ext_slipstream_v_recovery_balance",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .expect("recovery balance view resolves");
+    }
+
+    /// [issue #9] A wallet migrated by a build that predates the fix carries the
+    /// two-pool view; reopening with this build must rebuild it. Simulated by
+    /// restoring the old view bodies and un-recording the new migration.
+    #[test]
+    fn stale_two_pool_views_are_rebuilt_on_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("data.db");
+        WalletSession::open(Network::MainNetwork, &db_path).expect("open");
+        {
+            let conn = Connection::open(&db_path).expect("conn");
+            conn.execute_batch(
+                "DROP VIEW ext_slipstream_v_recovery_balance;
+                 DROP VIEW ext_slipstream_v_tx_reconciled;
+                 CREATE VIEW ext_slipstream_v_tx_reconciled AS
+                     SELECT t.txid AS txid, t.mined_height AS mined_height,
+                            NOT EXISTS (
+                                SELECT 1 FROM nullifier_map nm
+                                JOIN tx_locator_map tl
+                                    ON tl.block_height = nm.block_height
+                                   AND tl.tx_index = nm.tx_index
+                                WHERE tl.txid = t.txid
+                                  AND ((nm.spend_pool = 2
+                                        AND NOT EXISTS (SELECT 1 FROM sapling_received_notes s WHERE s.nf = nm.nf))
+                                    OR (nm.spend_pool = 3
+                                        AND NOT EXISTS (SELECT 1 FROM orchard_received_notes o WHERE o.nf = nm.nf)))
+                            ) AS reconciled
+                     FROM transactions t;
+                 CREATE VIEW ext_slipstream_v_recovery_balance AS SELECT NULL AS account_uuid, 0 AS balance_zat;",
+            )
+            .expect("restore pre-fix views");
+            conn.execute(
+                "DELETE FROM schemer_migrations WHERE id = ?1",
+                [super::MIGRATION_ID_EXT_RECONCILE_IRONWOOD
+                    .as_bytes()
+                    .as_slice()],
+            )
+            .expect("un-record migration");
+        }
+
+        WalletSession::open(Network::MainNetwork, &db_path).expect("reopen");
+
+        let conn = Connection::open(&db_path).expect("conn");
+        assert!(
+            view_sql(&conn, "ext_slipstream_v_tx_reconciled").contains("ironwood_received_notes"),
+            "the stale two-pool view must be rebuilt with the Ironwood arm"
+        );
+        assert!(
+            view_sql(&conn, "ext_slipstream_v_recovery_balance")
+                .contains("ext_slipstream_v_tx_reconciled"),
+            "the recovery-balance view must be rebuilt over the reconcile view"
+        );
     }
 
     #[test]

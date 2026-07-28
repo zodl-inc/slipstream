@@ -33,9 +33,14 @@ pub const RECONCILE_VIEW_NAME: &str = "ext_slipstream_v_tx_reconciled";
 /// row at the tx's locator) whose note has not yet been received (no
 /// `*_received_notes` row carries that nullifier). `spend_pool` follows upstream
 /// `pool_code` (zcash_client_sqlite `wallet/encoding.rs:34`): 2 = Sapling,
-/// 3 = Orchard. Transparent spends never produce this transient (their inputs
-/// are linked by outpoint at scan time, not by a later-scanned origin block), so
-/// they are intentionally not considered here.
+/// 3 = Orchard, 4 = Ironwood. Every shielded pool needs its own arm: a
+/// `spend_pool` value with no arm matches nothing, so the tx would read
+/// `reconciled = 1` with that spend still unlinked — and after NU6.3 activation
+/// essentially every received note lands in Ironwood, so an Ironwood-blind view
+/// degrades toward "always reconciled" exactly for the wallets it protects
+/// (issue #9). Transparent spends never produce this transient (their inputs are
+/// linked by outpoint at scan time, not by a later-scanned origin block), so they
+/// are intentionally not considered here.
 ///
 /// The `FROM transactions t` anchor keeps the result to *our* wallet's txs:
 /// `nullifier_map` records every nullifier in a scanned block (including other
@@ -76,6 +81,9 @@ SELECT t.txid AS txid,
                  OR
                  (nm.spend_pool = 3
                   AND NOT EXISTS (SELECT 1 FROM orchard_received_notes o WHERE o.nf = nm.nf))
+                 OR
+                 (nm.spend_pool = 4
+                  AND NOT EXISTS (SELECT 1 FROM ironwood_received_notes i WHERE i.nf = nm.nf))
              )
        ) AS reconciled
 FROM transactions t";
@@ -261,6 +269,37 @@ mod tests {
         );
     }
 
+    /// [issue #9] Ironwood ([ZIP 2005], NU6.3) is the pool every note lands in after
+    /// activation, so this is the arm a post-activation restore leans on hardest.
+    ///
+    /// [ZIP 2005]: https://zips.z.cash/zip-2005
+    #[test]
+    fn ironwood_spend_dangling_then_linked() {
+        let (_dir, conn) = fixture();
+        let txid = vec![0x77u8; 32];
+        let nf = vec![0x88u8; 32];
+
+        insert_dangling_spend(&conn, 1, &txid, 350, 4, &nf);
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(0),
+            "ironwood dangling spend -> unreconciled"
+        );
+
+        conn.execute(
+            "INSERT INTO ironwood_received_notes
+                (transaction_id, action_index, account_id, diversifier, value, rho, rseed, nf, is_change, note_version)
+             VALUES (1, 0, 1, x'00', 0, x'00', x'00', ?1, 0, 3)",
+            params![nf],
+        )
+        .expect("insert ironwood_received_notes");
+        assert_eq!(
+            reconciled(&conn, &txid),
+            Some(1),
+            "ironwood linked spend -> reconciled"
+        );
+    }
+
     #[test]
     fn pure_receive_with_no_spends_is_reconciled_immediately() {
         let (_dir, conn) = fixture();
@@ -339,6 +378,7 @@ mod tests {
              CREATE TABLE nullifier_map (spend_pool INTEGER, nf BLOB, block_height INTEGER, tx_index INTEGER);
              CREATE TABLE sapling_received_notes (id INTEGER PRIMARY KEY, tx INTEGER, account_id INTEGER, nf BLOB);
              CREATE TABLE orchard_received_notes (id INTEGER PRIMARY KEY, tx INTEGER, account_id INTEGER, nf BLOB);
+             CREATE TABLE ironwood_received_notes (id INTEGER PRIMARY KEY, tx INTEGER, account_id INTEGER, nf BLOB);
              CREATE TABLE v_transactions (txid BLOB, account_uuid BLOB, account_balance_delta INTEGER, mined_height INTEGER);",
         )
         .expect("stub schema");
@@ -408,6 +448,53 @@ mod tests {
             recovery_balance(&conn, &acct),
             Some(300),
             "linked spend folds into the balance"
+        );
+    }
+
+    /// [issue #9] The same replay with the spend in IRONWOOD — the pool every note a
+    /// wallet receives after NU6.3 lands in, so post-activation this is the ordinary
+    /// case, not an edge case. Before the Ironwood arm existed the tx read
+    /// `reconciled = 1` and its provisional delta was counted, so the restore balance
+    /// over-showed and then dropped when the origin block was scanned.
+    #[test]
+    fn recovery_balance_excludes_dangling_ironwood_spend() {
+        let conn = stub_fixture();
+        let acct = vec![0xA7u8; 16];
+        let receive_tx = vec![0x05u8; 32];
+        let spend_tx = vec![0x06u8; 32];
+        let nf = vec![0xEEu8; 32];
+
+        conn.execute(
+            "INSERT INTO v_transactions VALUES (?1, ?2, 400, 100)",
+            params![receive_tx, acct],
+        )
+        .expect("receive row");
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height) VALUES (1, ?1, 100, 0, 100)",
+            params![receive_tx],
+        )
+        .expect("receive tx row");
+        conn.execute(
+            "INSERT INTO v_transactions VALUES (?1, ?2, -100, 200)",
+            params![spend_tx, acct],
+        )
+        .expect("spend row");
+        insert_dangling_spend(&conn, 2, &spend_tx, 200, 4, &nf);
+        assert_eq!(
+            recovery_balance(&conn, &acct),
+            Some(400),
+            "dangling ironwood spend excluded while its delta is provisional"
+        );
+
+        conn.execute(
+            "INSERT INTO ironwood_received_notes (tx, account_id, nf) VALUES (1, 1, ?1)",
+            params![nf],
+        )
+        .expect("link note");
+        assert_eq!(
+            recovery_balance(&conn, &acct),
+            Some(300),
+            "linked ironwood spend folds into the balance"
         );
     }
 
