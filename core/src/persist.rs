@@ -2255,6 +2255,9 @@ impl OutputLockStore for SparseFacade<'_> {
     fn clear_locked_outputs(&mut self, account: Self::AccountId) -> Result<usize, Self::Error> {
         self.inner.clear_locked_outputs(account)
     }
+    fn get_locked_outputs(&self, account: Self::AccountId) -> Result<Vec<OutputRef>, Self::Error> {
+        self.inner.get_locked_outputs(account)
+    }
 }
 
 impl WalletWrite for SparseFacade<'_> {
@@ -2812,6 +2815,9 @@ impl OutputLockStore for WriteBehindFacade {
     }
     fn clear_locked_outputs(&mut self, _account: Self::AccountId) -> Result<usize, Self::Error> {
         Err(unvirtualized("clear_locked_outputs"))
+    }
+    fn get_locked_outputs(&self, _account: Self::AccountId) -> Result<Vec<OutputRef>, Self::Error> {
+        Err(unvirtualized("get_locked_outputs"))
     }
 }
 

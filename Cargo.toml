@@ -22,16 +22,16 @@ tonic-prost = "0.14"
 futures-util = "0.3"
 thiserror = "2"
 tracing = "0.1"
-zcash_protocol = "0.10.0"
-zcash_client_backend = { version = "0.24.0-rc.4", features = [
+zcash_protocol = "0.10.2"
+zcash_client_backend = { version = "0.24.0-rc.5", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "tor",
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.4", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
-zcash_keys = { version = "0.16.0", features = ["orchard"] }
+zcash_client_sqlite = { version = "0.22.0-rc.5", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_keys = { version = "0.16.1", features = ["orchard"] }
 rusqlite = "0.37"
 # Issue #4: slipstream's own `ext_slipstream_*` schema rides the wallet DB's
 # schemerz migrator (WalletMigrator::with_external_migrations) — versions match
@@ -68,15 +68,3 @@ sinsemilla = "0.1"
 group = "0.13"
 pasta_curves = "0.5"
 ff = "0.13"
-
-[patch.crates-io]
-## Uncomment and modify the following block to use librustzcash crates at a pinned revision.
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "b6910ec59e5d7ab5eb56e35581806e6d58e0e1e0" }
