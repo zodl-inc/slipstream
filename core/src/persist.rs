@@ -22,7 +22,9 @@ use zip32::DiversifierIndex;
 
 use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 pub(crate) use zcash_client_backend::data_api::ll::wallet::build_subtrees;
-use zcash_client_backend::data_api::ll::wallet::{ensure_checkpoints, put_blocks_rows};
+use zcash_client_backend::data_api::ll::wallet::{
+    batch_ensure_heights, ensure_checkpoints, put_blocks_rows,
+};
 use zcash_client_backend::data_api::{
     AccountBirthday, AccountPurpose, AddressInfo, BlockMetadata, DecryptedTransaction,
     NullifierQuery, ORCHARD_SHARD_HEIGHT, OutputLockStore, ReceivedTransactionOutput,
@@ -1271,18 +1273,41 @@ pub fn sparse_put_blocks(
             // only ids ≥ cutoff can reach the checkpoint tables.
             // [IW-2c] ll/wallet.rs:496-517 — three-way: each pool ensures at the
             // OTHER TWO pools' checkpoint heights so anchors align across trees.
+            //
+            // [B6-fix, field-caught 2026-08-01] This set is TWO obligations, and
+            // this lane long carried only the first. The second — every height
+            // `anchor_retention` retains in this batch's range — is what makes a
+            // ZIP 318 boundary exist at all: scanning checkpoints a block at its
+            // LAST note commitment, so a grid boundary landing on a block with no
+            // shielded output in any pool is not supplied by the cross-pool union
+            // either, and `ensure_retained` (which this lane does call, six times
+            // over) only PROMISES to preserve a checkpoint — it never creates one.
+            // The engine therefore marked boundary heights that never materialized,
+            // and every committed migration transfer anchored to one was permanently
+            // unprovable: `prove_transfer` -> AnchorNotFound -> transient defer ->
+            // retried forever. Invisible to the dual-path byte-equality seals, too,
+            // since a missing checkpoint at a commitment-free height changes no shard
+            // bytes. `batch_ensure_heights` is upstream's composition of both, so
+            // this lane can no longer half-implement the rule.
+            let [ensure_sapling, ensure_orchard, ensure_ironwood] = batch_ensure_heights(
+                &sapling_cp_pos.keys().copied().collect(),
+                &orchard_cp_pos.keys().copied().collect(),
+                &ironwood_cp_pos.keys().copied().collect(),
+                anchor_floor,
+                from_state.block_height() + 1..=last_scanned_height,
+            );
             let missing_sapling = ensure_checkpoints(
-                orchard_cp_pos.keys().chain(ironwood_cp_pos.keys()),
+                ensure_sapling.iter(),
                 &sapling_cp_pos,
                 from_state.final_sapling_tree(),
             );
             let missing_orchard = ensure_checkpoints(
-                sapling_cp_pos.keys().chain(ironwood_cp_pos.keys()),
+                ensure_orchard.iter(),
                 &orchard_cp_pos,
                 from_state.final_orchard_tree(),
             );
             let missing_ironwood = ensure_checkpoints(
-                sapling_cp_pos.keys().chain(orchard_cp_pos.keys()),
+                ensure_ironwood.iter(),
                 &ironwood_cp_pos,
                 from_state.final_ironwood_tree(),
             );
