@@ -68,3 +68,22 @@ sinsemilla = "0.1"
 group = "0.13"
 pasta_curves = "0.5"
 ff = "0.13"
+
+# The unreleased librustzcash generation this engine builds against: the anchor-checkpoint
+# ensure/retention seam (`batch_ensure_heights`) is not in any crates.io release yet, so a
+# standalone `cargo test -p slipstream-core` cannot resolve without these. Every family crate
+# is patched to the SAME rev so the graph stays a single family instance. Consumers embedding
+# slipstream-core in their own workspace (the iOS SDK) carry an equivalent patch set at the
+# workspace root — root patches govern there, and this section is ignored. Re-pin to
+# crates.io at the first release that carries the seam.
+[patch.crates-io]
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "d5b665cf876af62462134915c1f2c731c21dd454" }
