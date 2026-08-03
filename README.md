@@ -110,9 +110,23 @@ development tree (the Zodl wallet SDK's `slipstream` branch).
 
 ## License
 
-MIT © 2026 Lukas Korba. Chosen deliberately so the engine can be adopted, or moved into
-another org, without friction.
+Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
 
-The `vendor/` directory carries minimally-patched forks of the upstream `orchard` and
-`zcash_note_encryption` crates (the v0.5 DH seam + endomorphism ladder); they retain
-their upstream MIT/Apache-2.0 dual licenses — see the LICENSE files inside each fork.
+ZODL Slipstream is free software, licensed under the GNU Affero General
+Public License, version 3 only (AGPL-3.0-only). See [LICENSE](LICENSE).
+
+In short: you may use, study, modify, and redistribute ZODL Slipstream, but
+if you incorporate it into an application, the complete source of that
+application must be made available under the AGPL to its users,
+including users who interact with it over a network.
+
+If those terms don't fit your project, **commercial licenses are
+available** — see [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+Official Zodl builds distributed through the Apple App Store are
+released by Znewco under separate terms; no App Store distribution
+permission is granted to AGPL licensees — see
+[LICENSE-EXCEPTIONS.md](LICENSE-EXCEPTIONS.md).
+
+ZODL Slipstream depends on the Zcash Rust crates (librustzcash and
+related), which are separately licensed under MIT/Apache-2.0 by their
+respective copyright holders and are not covered by this notice.

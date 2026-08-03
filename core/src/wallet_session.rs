@@ -1,3 +1,19 @@
+// Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// This file is part of ZODL Slipstream.
+//
+// ZODL Slipstream is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License,
+// version 3 only, as published by the Free Software Foundation.
+//
+// ZODL Slipstream is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// Affero General Public License for more details.
+//
+// Commercial licensing: see COMMERCIAL-LICENSE.md.
+
 //! Persistent wallet session: ONE WalletDb for the whole sync (decision D2/D3 —
 //! unchanged zcash_client_sqlite data model), WAL set on the file before open,
 //! migrations run once, chain-state ops (subtree roots, chain tip, scan ranges)

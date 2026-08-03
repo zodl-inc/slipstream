@@ -1,3 +1,19 @@
+// Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// This file is part of ZODL Slipstream.
+//
+// ZODL Slipstream is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License,
+// version 3 only, as published by the Free Software Foundation.
+//
+// ZODL Slipstream is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// Affero General Public License for more details.
+//
+// Commercial licensing: see COMMERCIAL-LICENSE.md.
+
 //! GPU-OFFLOAD Orchard subtree build (feature `gpu`, Phase B0 — PARKED, default-off;
 //! device matrix 2026-06-15: ~1.1× A14/iPhone, −25% M4, A10 pathological; see STATE.md).
 //! Since Task 13 the shared lookup-map machinery lives in `lookup_build.rs`; this is
