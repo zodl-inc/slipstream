@@ -22,7 +22,9 @@ use zip32::DiversifierIndex;
 
 use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 pub(crate) use zcash_client_backend::data_api::ll::wallet::build_subtrees;
-use zcash_client_backend::data_api::ll::wallet::{ensure_checkpoints, put_blocks_rows};
+use zcash_client_backend::data_api::ll::wallet::{
+    batch_ensure_heights, ensure_checkpoints, put_blocks_rows,
+};
 use zcash_client_backend::data_api::{
     AccountBirthday, AccountPurpose, AddressInfo, BlockMetadata, DecryptedTransaction,
     NullifierQuery, ORCHARD_SHARD_HEIGHT, OutputLockStore, ReceivedTransactionOutput,
@@ -937,6 +939,31 @@ where
     }
     let cap = tree.store().cap_dirty.then(|| tree.store().cap.clone());
     wdb.put_sapling_shards(&shards, cap.as_ref(), &remove, &add)?;
+    // [B6, flush half] Persist the retained-anchor marks alongside the checkpoint rows they
+    // protect, inside the same transaction. The in-memory `retained` set (predicate-derived
+    // at seed time and during the batch) shields boundary checkpoints from the IN-MEMORY
+    // excess-checkpoint prune, but until now it died with the buffer: the sqlite store never
+    // learned the marks, so the open-time deep-history heal — which spares exactly the ids
+    // the SQLITE store's retained set names — would doom every boundary anchor older than
+    // its margin, leaving pre-signed migration transfers permanently unprovable
+    // (AnchorNotFound on every prove, forever). Add-delta only: a height flushed earlier got
+    // its mark in its own flush, and a removed checkpoint was never retained (retained ids
+    // are exempt from the prune, and a state-changed re-add reappears in `add`), so there is
+    // nothing to unmark. Wallets whose checkpoints predate this fix are backfilled by the
+    // consumer's open-time reconcile.
+    let marks: Vec<BlockHeight> = add
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| tree.store().retained.contains(h))
+        .collect();
+    if !marks.is_empty() {
+        wdb.with_sapling_tree_mut::<_, _, SqliteClientError>(|db_tree| {
+            for h in &marks {
+                db_tree.ensure_retained(*h)?;
+            }
+            Ok(())
+        })?;
+    }
     let store = tree.store_mut();
     store.db_checkpoints = store.checkpoints.clone();
     // NOTE: do NOT insert dirty shard indices into db_shard_indices here.
@@ -974,6 +1001,21 @@ where
     }
     let cap = tree.store().cap_dirty.then(|| tree.store().cap.clone());
     wdb.put_orchard_shards(&shards, cap.as_ref(), &remove, &add)?;
+    // [B6, flush half] Persist retained-anchor marks for the added checkpoints — see the
+    // flush_sapling comment for the full reasoning; same transaction, add-delta only.
+    let marks: Vec<BlockHeight> = add
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| tree.store().retained.contains(h))
+        .collect();
+    if !marks.is_empty() {
+        wdb.with_orchard_tree_mut::<_, _, SqliteClientError>(|db_tree| {
+            for h in &marks {
+                db_tree.ensure_retained(*h)?;
+            }
+            Ok(())
+        })?;
+    }
     let store = tree.store_mut();
     store.db_checkpoints = store.checkpoints.clone();
     // NOTE: do NOT insert dirty shard indices into db_shard_indices here.
@@ -1004,6 +1046,21 @@ where
     }
     let cap = tree.store().cap_dirty.then(|| tree.store().cap.clone());
     wdb.put_ironwood_shards(&shards, cap.as_ref(), &remove, &add)?;
+    // [B6, flush half] Persist retained-anchor marks for the added checkpoints — see the
+    // flush_sapling comment for the full reasoning; same transaction, add-delta only.
+    let marks: Vec<BlockHeight> = add
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| tree.store().retained.contains(h))
+        .collect();
+    if !marks.is_empty() {
+        wdb.with_ironwood_tree_mut::<_, _, SqliteClientError>(|db_tree| {
+            for h in &marks {
+                db_tree.ensure_retained(*h)?;
+            }
+            Ok(())
+        })?;
+    }
     let store = tree.store_mut();
     store.db_checkpoints = store.checkpoints.clone();
     // NOTE: do NOT insert dirty shard indices into db_shard_indices here.
@@ -1271,18 +1328,41 @@ pub fn sparse_put_blocks(
             // only ids ≥ cutoff can reach the checkpoint tables.
             // [IW-2c] ll/wallet.rs:496-517 — three-way: each pool ensures at the
             // OTHER TWO pools' checkpoint heights so anchors align across trees.
+            //
+            // [B6-fix, field-caught 2026-08-01] This set is TWO obligations, and
+            // this lane long carried only the first. The second — every height
+            // `anchor_retention` retains in this batch's range — is what makes a
+            // ZIP 318 boundary exist at all: scanning checkpoints a block at its
+            // LAST note commitment, so a grid boundary landing on a block with no
+            // shielded output in any pool is not supplied by the cross-pool union
+            // either, and `ensure_retained` (which this lane does call, six times
+            // over) only PROMISES to preserve a checkpoint — it never creates one.
+            // The engine therefore marked boundary heights that never materialized,
+            // and every committed migration transfer anchored to one was permanently
+            // unprovable: `prove_transfer` -> AnchorNotFound -> transient defer ->
+            // retried forever. Invisible to the dual-path byte-equality seals, too,
+            // since a missing checkpoint at a commitment-free height changes no shard
+            // bytes. `batch_ensure_heights` is upstream's composition of both, so
+            // this lane can no longer half-implement the rule.
+            let [ensure_sapling, ensure_orchard, ensure_ironwood] = batch_ensure_heights(
+                &sapling_cp_pos.keys().copied().collect(),
+                &orchard_cp_pos.keys().copied().collect(),
+                &ironwood_cp_pos.keys().copied().collect(),
+                anchor_floor,
+                from_state.block_height() + 1..=last_scanned_height,
+            );
             let missing_sapling = ensure_checkpoints(
-                orchard_cp_pos.keys().chain(ironwood_cp_pos.keys()),
+                ensure_sapling.iter(),
                 &sapling_cp_pos,
                 from_state.final_sapling_tree(),
             );
             let missing_orchard = ensure_checkpoints(
-                sapling_cp_pos.keys().chain(ironwood_cp_pos.keys()),
+                ensure_orchard.iter(),
                 &orchard_cp_pos,
                 from_state.final_orchard_tree(),
             );
             let missing_ironwood = ensure_checkpoints(
-                sapling_cp_pos.keys().chain(orchard_cp_pos.keys()),
+                ensure_ironwood.iter(),
                 &ironwood_cp_pos,
                 from_state.final_ironwood_tree(),
             );
@@ -4156,5 +4236,147 @@ mod write_behind_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("lane unusable"), "got: {err}");
+    }
+}
+
+/// [B6, flush half] The retained-anchor marks a flush persists — see the fix in
+/// `flush_sapling`/`flush_orchard`/`flush_ironwood`: the in-memory store's `retained` set
+/// protects boundary checkpoints from the in-memory prune, but the sqlite store must learn the
+/// marks too, or the open-time deep-history heal (which spares exactly the ids the SQLITE
+/// retained set names) dooms every boundary anchor older than its margin.
+#[cfg(test)]
+mod flush_retained_tests {
+    use super::*;
+    use zcash_client_sqlite::WalletDb;
+    use zcash_client_sqlite::util::SystemClock;
+    use zcash_client_sqlite::wallet::init::init_wallet_db;
+
+    fn fresh_db(
+        dir: &std::path::Path,
+    ) -> WalletDb<
+        rusqlite::Connection,
+        crate::network::SlipstreamNetwork,
+        SystemClock,
+        rand::rngs::OsRng,
+    > {
+        let conn = rusqlite::Connection::open(dir.join("wallet.sqlite")).expect("opens");
+        rusqlite::vtab::array::load_module(&conn).expect("array vtab");
+        let mut db = WalletDb::from_connection(
+            conn,
+            crate::network::SlipstreamNetwork::MAIN,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        init_wallet_db(&mut db, None).expect("initializes the wallet schema");
+        db
+    }
+
+    fn table_heights(dir: &std::path::Path, table: &str) -> Vec<u32> {
+        let conn = rusqlite::Connection::open(dir.join("wallet.sqlite")).expect("re-opens");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT checkpoint_id FROM {table} ORDER BY checkpoint_id"
+            ))
+            .expect("prepares");
+        stmt.query_map([], |r| r.get::<_, u32>(0))
+            .expect("queries")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collects")
+    }
+
+    /// The flush persists a retained mark for every ADDED checkpoint the in-memory store
+    /// retains — in the same transaction as the checkpoint rows — and no mark for an added
+    /// checkpoint that is not retained.
+    #[test]
+    fn flush_persists_retained_marks_for_added_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
+        store
+            .checkpoints
+            .insert(BlockHeight::from(1_000u32), Checkpoint::tree_empty());
+        store
+            .checkpoints
+            .insert(BlockHeight::from(1_002u32), Checkpoint::tree_empty());
+        store.retained.insert(BlockHeight::from(1_000u32));
+        let mut tree = ShardTree::new(store, MAX_CHECKPOINTS);
+
+        db.transactionally::<_, _, SqliteClientError>(|wdb| flush_sapling(wdb, &mut tree))
+            .expect("flushes");
+        drop(db);
+
+        assert_eq!(
+            table_heights(dir.path(), "sapling_tree_checkpoints"),
+            vec![1_000, 1_002],
+            "both added checkpoints land as rows"
+        );
+        assert_eq!(
+            table_heights(dir.path(), "sapling_tree_retained_checkpoints"),
+            vec![1_000],
+            "exactly the retained added checkpoint is marked durable in sqlite"
+        );
+    }
+
+    /// Orchard and ironwood mirror the sapling behavior into their own tables.
+    #[test]
+    fn flush_marks_mirror_in_orchard_and_ironwood() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut orch_store =
+            SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
+        orch_store
+            .checkpoints
+            .insert(BlockHeight::from(2_000u32), Checkpoint::tree_empty());
+        orch_store.retained.insert(BlockHeight::from(2_000u32));
+        let mut orch_tree: OrchardSparseTree = ShardTree::new(orch_store, MAX_CHECKPOINTS);
+
+        let mut iron_store =
+            SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
+        iron_store
+            .checkpoints
+            .insert(BlockHeight::from(3_000u32), Checkpoint::tree_empty());
+        iron_store.retained.insert(BlockHeight::from(3_000u32));
+        let mut iron_tree: IronwoodSparseTree = ShardTree::new(iron_store, MAX_CHECKPOINTS);
+
+        db.transactionally::<_, _, SqliteClientError>(|wdb| {
+            flush_orchard(wdb, &mut orch_tree)?;
+            flush_ironwood(wdb, &mut iron_tree)
+        })
+        .expect("flushes");
+        drop(db);
+
+        assert_eq!(
+            table_heights(dir.path(), "orchard_tree_retained_checkpoints"),
+            vec![2_000]
+        );
+        assert_eq!(
+            table_heights(dir.path(), "ironwood_tree_retained_checkpoints"),
+            vec![3_000]
+        );
+    }
+
+    /// A flush with nothing retained among its adds writes no marks — the fix never marks
+    /// indiscriminately.
+    #[test]
+    fn flush_without_retained_adds_writes_no_marks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
+        store
+            .checkpoints
+            .insert(BlockHeight::from(4_000u32), Checkpoint::tree_empty());
+        let mut tree = ShardTree::new(store, MAX_CHECKPOINTS);
+
+        db.transactionally::<_, _, SqliteClientError>(|wdb| flush_sapling(wdb, &mut tree))
+            .expect("flushes");
+        drop(db);
+
+        assert!(
+            table_heights(dir.path(), "sapling_tree_retained_checkpoints").is_empty(),
+            "no retained adds, no marks"
+        );
     }
 }

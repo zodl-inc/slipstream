@@ -25,7 +25,23 @@ use crate::{
 /// tag in the log doesn't match HEAD's value, the device is running a stale
 /// XCFramework (the three-layer gotcha, consuming side). Probe a built slice with:
 /// `strings <slice>/libzcashlc.framework/libzcashlc | grep <tag>`.
-pub const ENGINE_BUILD: &str = "2026-07-08.v07-wire-p2";
+///
+/// IT WENT STALE, and cost real diagnostic time (2026-08-02). A device log reading
+/// `engine_build="2026-07-08.v07-wire-p2"` was taken as evidence that the phone was
+/// running a month-old engine — the single most likely explanation for a migration
+/// that would not prove — when in fact the binary was current and only this constant
+/// was a month behind. Two minutes were spent chasing a stale-slice hypothesis that
+/// the binary itself refuted (`strings` showed BOTH this tag and the current
+/// `zcashlc_build`, which is how the mistake was caught).
+///
+/// A freshness marker that can silently go stale is worse than no marker: it does not
+/// merely fail to inform, it actively misinforms, and it does so precisely when
+/// someone is under pressure and reaching for it. Every ironwood/migration change
+/// since 07-08 shipped without touching this line. If the discipline of bumping it by
+/// hand cannot be relied on — and this is the evidence that it cannot — it should be
+/// derived from something that moves on its own (git describe at build time) rather
+/// than maintained.
+pub const ENGINE_BUILD: &str = "2026-08-02.v0.8-ironwood-migration";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick
