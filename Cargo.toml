@@ -30,7 +30,7 @@ zcash_client_backend = { version = "0.24.0-rc.7", features = [
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "0.22.0-rc.7", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_client_sqlite = { version = "0.22.0-rc.8", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
 zcash_keys = { version = "0.16.1", features = ["orchard"] }
 rusqlite = "0.37"
 # Issue #4: slipstream's own `ext_slipstream_*` schema rides the wallet DB's
