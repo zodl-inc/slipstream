@@ -10,21 +10,42 @@ license = "MIT"
 publish = false
 
 [features]
+default = ["zcash_client_sqlite"]
+# Issue #4: the zcash_client_sqlite wallet-storage backend (this SPECIFIC sqlite
+# backend, hence the crate-named feature). Gates the storage-consuming half of
+# the crate — WalletSession, the sparse persistence lanes, the ext_slipstream_*
+# schema/migrations, and the engine loop that is (today) hard-wired to them.
+# Without it the crate compiles the storage-independent transport/planning
+# layer only; a future non-sqlite backend slots in beside this gate.
+zcash_client_sqlite = [
+    "dep:zcash_client_sqlite",
+    "dep:rusqlite",
+    "dep:schemerz",
+    "dep:schemerz-rusqlite",
+    "dep:uuid",
+]
 # Hermetic integration tests against a local darkside lightwalletd (see CONVENTIONS).
-darkside = []
+# The darkside harness drives WalletSession, so it requires the sqlite backend.
+darkside = ["zcash_client_sqlite"]
 # Phase B: GPU-accelerated Orchard subtree-build (B0). Pulls slipstream-gpuhash + wgpu.
-# OFF by default → the default libzcashlc build never compiles wgpu.
-gpu = ["dep:slipstream-gpuhash"]
+# OFF by default → the default libzcashlc build never compiles wgpu. The GPU lane
+# exists solely for the sqlite persistence path, so it requires that backend.
+gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
 
 [dependencies]
 thiserror = { workspace = true }
 tracing = { workspace = true } # logging policy per CONVENTIONS.md
 zcash_protocol = { workspace = true }
 zcash_client_backend = { workspace = true }
-zcash_client_sqlite = { workspace = true }
+zcash_client_sqlite = { workspace = true, optional = true }
 zcash_keys = { workspace = true }
 zcash_primitives = { workspace = true }
-rusqlite = { workspace = true }
+rusqlite = { workspace = true, optional = true }
+# Issue #4: the ext_slipstream_* schema is created/evolved by schemerz migrations
+# registered with the wallet DB's own migrator (see migrations.rs).
+schemerz = { workspace = true, optional = true }
+schemerz-rusqlite = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true }
 secrecy = { workspace = true }
 rand = { workspace = true }
 sapling = { workspace = true }
@@ -64,3 +85,35 @@ bls12_381 = { workspace = true }
 # deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
+
+# Integration-test binaries that require the sqlite backend are declared with
+# `required-features`, so `cargo test --no-default-features` SKIPS them instead
+# of failing to build — a non-sqlite backend must keep a runnable test suite
+# (issue #4). The darkside binaries additionally self-gate on `#![cfg]`.
+[[test]]
+name = "census_scan"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
+name = "stress_sparse_join"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
+name = "darkside_follow"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_oracle"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_reorg"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_sync"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_transport"
+required-features = ["darkside"]

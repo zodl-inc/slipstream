@@ -36,21 +36,26 @@ use tracing::info;
 use transparent::address::TransparentAddress;
 use zip32::DiversifierIndex;
 
+use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 pub(crate) use zcash_client_backend::data_api::ll::wallet::build_subtrees;
-use zcash_client_backend::data_api::ll::wallet::{ensure_checkpoints, put_blocks_rows};
+use zcash_client_backend::data_api::ll::wallet::{
+    batch_ensure_heights, ensure_checkpoints, put_blocks_rows,
+};
 use zcash_client_backend::data_api::{
     AccountBirthday, AccountPurpose, AddressInfo, BlockMetadata, DecryptedTransaction,
-    NullifierQuery, ORCHARD_SHARD_HEIGHT, ReceivedTransactionOutput, SAPLING_SHARD_HEIGHT,
-    ScannedBlock, SeedRelevance, SentTransaction, TransactionDataRequest, TransactionStatus,
-    TransactionsInvolvingAddress, TransparentBalances, WalletCommitmentTrees, WalletRead,
-    WalletSummary, WalletWrite, Zip32Derivation,
+    NullifierQuery, ORCHARD_SHARD_HEIGHT, OutputLockStore, ReceivedTransactionOutput,
+    SAPLING_SHARD_HEIGHT, ScannedBlock, SeedRelevance, SentTransaction, TransactionDataRequest,
+    TransactionStatus, TransactionsInvolvingAddress, TransparentBalances, WalletCommitmentTrees,
+    WalletRead, WalletSummary, WalletWrite, Zip32Derivation,
     chain::ChainState,
-    error::FindAccountForAddressError,
+    error::{FindAccountForAddressError, LockError},
     ll::{LowLevelWalletWrite, wallet::PutBlocksError},
     scanning::ScanRange,
     wallet::{ConfirmationsPolicy, TargetHeight},
 };
-use zcash_client_backend::wallet::{NoteId, TransparentAddressMetadata, WalletTransparentOutput};
+use zcash_client_backend::wallet::{
+    LockOwner, NoteId, OutputRef, TransparentAddressMetadata, WalletTransparentOutput,
+};
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::keys::transparent::gap_limits::GapLimits;
@@ -129,16 +134,17 @@ const _: () = assert!(
 /// is deliberately enormous next to the reorg depth (100).
 const DEEP_HISTORY_CHECKPOINT_MARGIN: u32 = 10_000;
 
-/// [B6] The interval, in blocks, at which checkpoints are retained as durable
-/// "anchors" once anchor retention is active — mirrors upstream ll/wallet.rs's
-/// `ANCHOR_RETENTION_INTERVAL` exactly (the migration crate pre-signs
-/// transfers against these; at 75-second blocks ≈ every 6 hours).
-const ANCHOR_RETENTION_INTERVAL: u32 = 288;
-
-/// [B6] Whether the checkpoint at `height` must be retained as a durable
-/// anchor — upstream's `should_retain_anchor` predicate verbatim: retention is
-/// active when a floor is configured and `height` is at or above it, and
-/// `height` falls on the [`ANCHOR_RETENTION_INTERVAL`] grid.
+/// \[B6\] Whether the checkpoint at `height` must be retained as a durable
+/// anchor, delegated to upstream's [`AnchorRetention::retains`].
+///
+/// The grid used to be mirrored here as a local `ANCHOR_RETENTION_INTERVAL`
+/// constant, because upstream declared its own `pub(crate)`. That mirror was a
+/// standing correctness hazard and did in fact drift — it sat at 288 while
+/// upstream was 144, so this engine retained only every OTHER upstream anchor,
+/// and a transfer pre-signed against an odd multiple of 144 would have lost
+/// the checkpoint it proves against. Upstream now publishes the grid as a type
+/// that owns the arithmetic, so there is one implementation and nothing left to
+/// drift.
 ///
 /// Every exemption in the sparse mirror (checkpoint downgrade, deep-history
 /// dooming, shardtree's retention-aware prune via `ensure_retained`) keys on
@@ -148,9 +154,8 @@ const ANCHOR_RETENTION_INTERVAL: u32 = 288;
 /// `remove_retained_checkpoint` release API: we re-derive from the predicate
 /// at seed time and never release, which retains a SUPERSET — the safe
 /// direction (a few extra checkpoint rows; never a destroyed anchor).
-fn should_retain_anchor(anchor_retention_floor: Option<BlockHeight>, height: BlockHeight) -> bool {
-    anchor_retention_floor.is_some_and(|floor| height >= floor)
-        && u32::from(height) % ANCHOR_RETENTION_INTERVAL == 0
+fn should_retain_anchor(anchor_retention: Option<&AnchorRetention>, height: BlockHeight) -> bool {
+    anchor_retention.is_some_and(|retention| retention.retains(height))
 }
 
 /// v0.6 P4c/P4d (subsumes T6.9b): the persist lane's dedicated rayon pool —
@@ -203,7 +208,7 @@ fn persist_pool() -> Option<&'static rayon::ThreadPool> {
 }
 
 /// Open-time self-heal for wallets damaged by the pre-fix sandblasting-era
-/// checkpoint flood (see [`DEEP_HISTORY_CHECKPOINT_MARGIN`]): builds that ran
+/// checkpoint flood (see `DEEP_HISTORY_CHECKPOINT_MARGIN`): builds that ran
 /// v0.4/v0.5 before the fix persisted THOUSANDS of deep-history checkpoint
 /// rows (a poisoned specimen: 3,174 orchard rows spanning the whole spam era
 /// vs the healthy 100-row tip window). Every later pass — even a 10-block tip
@@ -211,47 +216,92 @@ fn persist_pool() -> Option<&'static rayon::ThreadPool> {
 /// dies in shardtree's "Tree state inconsistent with checkpoints" panic arm,
 /// wedging the wallet in the revival loop.
 ///
-/// The heal deletes checkpoint rows (and their marks-removed satellites)
-/// deeper than the margin below each pool's own max checkpoint id. For
-/// healthy wallets this is a no-op (upstream-equivalent pruning never leaves
-/// deep rows); for flooded wallets it restores exactly the state upstream's
-/// own `prune_excess_checkpoints` would have converged to. The flooded rows'
-/// retention flags were never materialized in the tree (their commitments
-/// were buffered), so store-row deletion needs no tree-side flag cleanup;
-/// stale flags from any legitimately-built deep checkpoints merely keep a
-/// node alive (bloat, not breakage).
+/// The heal removes checkpoints (their marks-removed satellites cascade in
+/// the store) deeper than the margin below each pool's own max checkpoint id.
+/// For healthy wallets this is a no-op (upstream-equivalent pruning never
+/// leaves deep rows); for flooded wallets it restores exactly the state
+/// upstream's own `prune_excess_checkpoints` would have converged to. The
+/// flooded rows' retention flags were never materialized in the tree (their
+/// commitments were buffered), so store-row deletion needs no tree-side flag
+/// cleanup; stale flags from any legitimately-built deep checkpoints merely
+/// keep a node alive (bloat, not breakage).
 ///
-/// Returns rows deleted across both pools.
-pub fn heal_flooded_checkpoints(conn: &rusqlite::Connection) -> Result<u64, rusqlite::Error> {
-    let mut deleted = 0u64;
-    // [IW-2c]/[B6] third pool included; heights on the ANCHOR_RETENTION_INTERVAL
-    // grid are spared UNCONDITIONALLY — the heal has no retention-floor context
-    // at open time, and over-exempting 1/288 of flood rows (~0.35%) is nothing
-    // next to destroying a durable anchor a migration pre-signed against.
-    for pool in ["sapling", "orchard", "ironwood"] {
-        let max_id: Option<i64> = conn.query_row(
-            &format!("SELECT MAX(checkpoint_id) FROM {pool}_tree_checkpoints"),
-            [],
-            |r| r.get(0),
-        )?;
-        let Some(max_id) = max_id else { continue };
-        let cutoff = max_id - i64::from(DEEP_HISTORY_CHECKPOINT_MARGIN);
-        deleted += conn.execute(
-            &format!(
-                "DELETE FROM {pool}_tree_checkpoint_marks_removed
-                 WHERE checkpoint_id < :cutoff AND checkpoint_id % :interval != 0"
-            ),
-            rusqlite::named_params! { ":cutoff": cutoff, ":interval": i64::from(ANCHOR_RETENTION_INTERVAL) },
-        )? as u64;
-        deleted += conn.execute(
-            &format!(
-                "DELETE FROM {pool}_tree_checkpoints
-                 WHERE checkpoint_id < :cutoff AND checkpoint_id % :interval != 0"
-            ),
-            rusqlite::named_params! { ":cutoff": cutoff, ":interval": i64::from(ANCHOR_RETENTION_INTERVAL) },
-        )? as u64;
+/// Issue #4: runs through `WalletCommitmentTrees` + the pool stores' own
+/// checkpoint API — the engine holds no direct SQL against upstream tables.
+///
+/// Returns checkpoints removed across all pools.
+// The heal_pool_checkpoints closures below look redundant, but a bare fn item
+// is "not general enough" for the for<'a> callback lifetime these methods need.
+#[allow(clippy::redundant_closure)]
+pub fn heal_flooded_checkpoints(db: &mut Db) -> Result<u64, crate::error::SlipstreamError> {
+    let heal_err = |pool: &str, e: &dyn std::fmt::Display| {
+        crate::error::SlipstreamError::Wallet(format!("checkpoint heal ({pool}): {e}"))
+    };
+    // [IW-2c]/[B6] third pool included (absent stores heal zero); durable
+    // anchors are spared by consulting each store's RETAINED checkpoint set.
+    let mut removed = 0u64;
+    removed += db
+        .with_sapling_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
+        .map_err(|e| heal_err("sapling", &e))?;
+    removed += db
+        .with_orchard_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
+        .map_err(|e| heal_err("orchard", &e))?;
+    removed += db
+        .with_ironwood_tree_mut::<_, _, ShardTreeError<_>>(|t| heal_pool_checkpoints(t))
+        .map_err(|e| heal_err("ironwood", &e))?
+        .unwrap_or(0);
+    Ok(removed)
+}
+
+/// One pool's flood heal: drop every checkpoint deeper than
+/// `DEEP_HISTORY_CHECKPOINT_MARGIN` below the pool's max checkpoint id, except
+/// those the store records as RETAINED durable anchors.
+///
+/// The retained set is read from the store rather than re-derived from the
+/// anchor grid. The heal has no retention-floor context at open time, so it
+/// used to spare every height on a hard-coded grid — which stops being possible
+/// once the grid is configurable, and was in any case a guess. `ensure_retained`
+/// has already recorded exactly which checkpoints are durable anchors, so
+/// reading that set spares precisely the right ones at whatever interval they
+/// were established under, including an interval a previous run was configured
+/// with. The flooded rows were never retained (their commitments were
+/// buffered), so they are unaffected by the exemption and still swept.
+fn heal_pool_checkpoints<S, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<S, DEPTH, SHARD_HEIGHT>,
+) -> Result<u64, ShardTreeError<S::Error>>
+where
+    S: ShardStore<CheckpointId = BlockHeight>,
+    S::H: incrementalmerkletree::Hashable + Clone + PartialEq,
+{
+    let store = tree.store_mut();
+    let Some((max_id, _)) = store
+        .get_checkpoint_at_depth(0)
+        .map_err(ShardTreeError::Storage)?
+    else {
+        return Ok(0);
+    };
+    let cutoff = u32::from(max_id).saturating_sub(DEEP_HISTORY_CHECKPOINT_MARGIN);
+    let retained = store
+        .retained_checkpoints()
+        .map_err(ShardTreeError::Storage)?;
+    // The store binds `limit` as an SQL parameter (i64), so `usize::MAX` is
+    // NOT a valid "no limit" sentinel — pass the actual row count.
+    let count = store.checkpoint_count().map_err(ShardTreeError::Storage)?;
+    let mut doomed = vec![];
+    store
+        .for_each_checkpoint(count, |id, _| {
+            if u32::from(*id) < cutoff && !retained.contains(id) {
+                doomed.push(*id);
+            }
+            Ok(())
+        })
+        .map_err(ShardTreeError::Storage)?;
+    for id in &doomed {
+        store
+            .remove_checkpoint(id)
+            .map_err(ShardTreeError::Storage)?;
     }
-    Ok(deleted)
+    Ok(doomed.len() as u64)
 }
 
 // ── In-memory shard store ──────────────────────────────────────────────────────
@@ -280,7 +330,7 @@ pub struct SparseShardStore<H> {
     checkpoints: BTreeMap<BlockHeight, Checkpoint>,
     /// Mirror of the checkpoint rows in SQLite (for flush diffing).
     db_checkpoints: BTreeMap<BlockHeight, Checkpoint>,
-    /// [B6] Checkpoint ids pinned against automatic pruning (the migration
+    /// \[B6\] Checkpoint ids pinned against automatic pruning (the migration
     /// crate's 288-block durable anchors). In-memory only: re-derived at seed
     /// time from the retention predicate — see `should_retain_anchor`.
     retained: BTreeSet<BlockHeight>,
@@ -527,12 +577,13 @@ type IronwoodSparseTree = OrchardSparseTree;
 pub struct SparseTreeState {
     sapling: Option<SaplingSparseTree>,
     orchard: Option<OrchardSparseTree>,
-    /// [B6] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
-    /// when `Some(h)`, checkpoints at heights ≥ h on the 288-block grid are durable
-    /// anchors — exempt from the T6.3b downgrade, the deep-history dooming, and
-    /// (via `ensure_retained`) shardtree's excess-checkpoint pruning. `None` (the
-    /// default) = today's behavior byte-for-byte.
-    pub(crate) anchor_retention_height: Option<BlockHeight>,
+    /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
+    /// when `Some`, checkpoints the policy retains — those at or above its floor
+    /// that fall on its grid — are durable anchors, exempt from the T6.3b
+    /// downgrade, the deep-history dooming, and (via `ensure_retained`)
+    /// shardtree's excess-checkpoint pruning. `None` (the default) = today's
+    /// behavior byte-for-byte.
+    pub(crate) anchor_retention: Option<AnchorRetention>,
     /// [IW-2c] Third pool. No graft/census/GPU lane: the ironwood tree starts
     /// at activation (tiny for years), stock lightwalletd serves no ironwood
     /// subtree roots to graft from, and the build cost is microseconds.
@@ -564,11 +615,11 @@ pub struct SparseTreeState {
 }
 
 impl SparseTreeState {
-    /// [B6] Set the anchor-retention floor (see the field docs). Public for
+    /// \[B6\] Set the anchor-retention policy (see the field docs). Public for
     /// integration tests and direct hosts; production plumbs it from
-    /// `EngineConfig::anchor_retention_height`.
-    pub fn set_anchor_retention_height(&mut self, floor: Option<BlockHeight>) {
-        self.anchor_retention_height = floor;
+    /// `EngineConfig::anchor_retention`.
+    pub fn set_anchor_retention(&mut self, anchor_retention: Option<AnchorRetention>) {
+        self.anchor_retention = anchor_retention;
     }
 
     /// v0.4 census read-out (spec §3.2) — (sapling, orchard). Production reads
@@ -615,12 +666,16 @@ impl GraftCtx {
     }
 }
 
+/// One contiguous build segment: its start position and per-row payload
+/// (`None` = a passthrough gap; `Some((hash, retention))` = a row to build).
+type BuildSegment<H> = (Position, Vec<Option<(H, Retention<BlockHeight>)>>);
+
 /// One pool's build plan for one put_blocks call: contiguous row segments to
 /// build inside the main txn (passthrough spans, eager note flushes, and — in
 /// Task 7, where the verdict is still always-build — closed clean shards), plus
 /// the shards whose buffer rows die once the txn commits.
 struct PoolPlan<H> {
-    segments: Vec<(Position, Vec<Option<(H, Retention<BlockHeight>)>>)>,
+    segments: Vec<BuildSegment<H>>,
     /// Task 8: clean shards with a server root — installed as root-only shards
     /// (upstream's own put_shard_roots shape), ZERO combines.
     grafts: Vec<(u64, H)>,
@@ -639,9 +694,7 @@ struct PoolPlan<H> {
 /// MUST carry them. Stale (below-window) ones are handled by the SAME
 /// doomed-cutoff downgrade every build already applies (the first fixture run
 /// stripped them instead and lost 97 of 100 checkpoint rows vs the OFF path).
-fn rows_to_segment<H>(
-    rows: Vec<crate::graft_accumulator::AccRow<H>>,
-) -> Option<(Position, Vec<Option<(H, Retention<BlockHeight>)>>)> {
+fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<BuildSegment<H>> {
     let first = rows.first()?.0;
     let seg = rows.into_iter().map(|(_, h, r)| Some((h, r))).collect();
     Some((Position::from(first), seg))
@@ -662,7 +715,8 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
     stream: Vec<(H, Retention<BlockHeight>)>,
     note_positions: &[u64],
     store_has_shard: impl Fn(u64) -> bool,
-    anchor_retention_floor: Option<BlockHeight>,
+    mut server_root: impl FnMut(u64) -> Result<Option<H>, SqliteClientError>,
+    anchor_retention: Option<&AnchorRetention>,
 ) -> Result<PoolPlan<H>, SqliteClientError> {
     use crate::graft_accumulator::{FeedAction, ShardAccumulator};
 
@@ -710,14 +764,14 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
                 // back to the built path (retentions travel, anchors exempted).
                 let contains_anchor = rows.iter().any(|(_, _, r)| {
                     matches!(r, Retention::Checkpoint { id, .. }
-                        if should_retain_anchor(anchor_retention_floor, *id))
+                        if should_retain_anchor(anchor_retention, *id))
                 });
                 if contains_anchor {
                     plan.fallbacks += 1;
                     plan.segments.extend(rows_to_segment(rows));
                     continue;
                 }
-                match crate::graft::server_root::<H>(conn, pool, shard_index)? {
+                match server_root(shard_index)? {
                     Some(root) => {
                         // Task 10: deterministic 1-in-N audit — build it anyway
                         // and compare roots after insertion (reproducible; the
@@ -739,7 +793,6 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
             }
             FeedAction::Buffer(rows) => {
                 if let Some(first) = rows.first() {
-                    crate::graft::ensure_buffer_table(conn)?;
                     crate::graft::append_rows(conn, pool, first.0 >> 16, &rows)?;
                 }
             }
@@ -751,7 +804,7 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
 fn seed_sapling(
     db: &mut Db,
     _from_state: &ChainState,
-    anchor_floor: Option<BlockHeight>,
+    anchor_floor: Option<&AnchorRetention>,
 ) -> Result<SaplingSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
     db.with_sapling_tree_mut::<_, _, SqliteClientError>(|tree| {
@@ -795,7 +848,7 @@ fn seed_sapling(
 fn seed_orchard(
     db: &mut Db,
     _from_state: &ChainState,
-    anchor_floor: Option<BlockHeight>,
+    anchor_floor: Option<&AnchorRetention>,
 ) -> Result<OrchardSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
     db.with_orchard_tree_mut::<_, _, SqliteClientError>(|tree| {
@@ -839,7 +892,7 @@ fn seed_orchard(
 fn seed_ironwood(
     db: &mut Db,
     _from_state: &ChainState,
-    anchor_floor: Option<BlockHeight>,
+    anchor_floor: Option<&AnchorRetention>,
 ) -> Result<IronwoodSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
     db.with_ironwood_tree_mut::<_, _, SqliteClientError>(|tree| {
@@ -902,6 +955,31 @@ where
     }
     let cap = tree.store().cap_dirty.then(|| tree.store().cap.clone());
     wdb.put_sapling_shards(&shards, cap.as_ref(), &remove, &add)?;
+    // [B6, flush half] Persist the retained-anchor marks alongside the checkpoint rows they
+    // protect, inside the same transaction. The in-memory `retained` set (predicate-derived
+    // at seed time and during the batch) shields boundary checkpoints from the IN-MEMORY
+    // excess-checkpoint prune, but until now it died with the buffer: the sqlite store never
+    // learned the marks, so the open-time deep-history heal — which spares exactly the ids
+    // the SQLITE store's retained set names — would doom every boundary anchor older than
+    // its margin, leaving pre-signed migration transfers permanently unprovable
+    // (AnchorNotFound on every prove, forever). Add-delta only: a height flushed earlier got
+    // its mark in its own flush, and a removed checkpoint was never retained (retained ids
+    // are exempt from the prune, and a state-changed re-add reappears in `add`), so there is
+    // nothing to unmark. Wallets whose checkpoints predate this fix are backfilled by the
+    // consumer's open-time reconcile.
+    let marks: Vec<BlockHeight> = add
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| tree.store().retained.contains(h))
+        .collect();
+    if !marks.is_empty() {
+        wdb.with_sapling_tree_mut::<_, _, SqliteClientError>(|db_tree| {
+            for h in &marks {
+                db_tree.ensure_retained(*h)?;
+            }
+            Ok(())
+        })?;
+    }
     let store = tree.store_mut();
     store.db_checkpoints = store.checkpoints.clone();
     // NOTE: do NOT insert dirty shard indices into db_shard_indices here.
@@ -939,6 +1017,21 @@ where
     }
     let cap = tree.store().cap_dirty.then(|| tree.store().cap.clone());
     wdb.put_orchard_shards(&shards, cap.as_ref(), &remove, &add)?;
+    // [B6, flush half] Persist retained-anchor marks for the added checkpoints — see the
+    // flush_sapling comment for the full reasoning; same transaction, add-delta only.
+    let marks: Vec<BlockHeight> = add
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| tree.store().retained.contains(h))
+        .collect();
+    if !marks.is_empty() {
+        wdb.with_orchard_tree_mut::<_, _, SqliteClientError>(|db_tree| {
+            for h in &marks {
+                db_tree.ensure_retained(*h)?;
+            }
+            Ok(())
+        })?;
+    }
     let store = tree.store_mut();
     store.db_checkpoints = store.checkpoints.clone();
     // NOTE: do NOT insert dirty shard indices into db_shard_indices here.
@@ -969,6 +1062,21 @@ where
     }
     let cap = tree.store().cap_dirty.then(|| tree.store().cap.clone());
     wdb.put_ironwood_shards(&shards, cap.as_ref(), &remove, &add)?;
+    // [B6, flush half] Persist retained-anchor marks for the added checkpoints — see the
+    // flush_sapling comment for the full reasoning; same transaction, add-delta only.
+    let marks: Vec<BlockHeight> = add
+        .iter()
+        .map(|(h, _)| *h)
+        .filter(|h| tree.store().retained.contains(h))
+        .collect();
+    if !marks.is_empty() {
+        wdb.with_ironwood_tree_mut::<_, _, SqliteClientError>(|db_tree| {
+            for h in &marks {
+                db_tree.ensure_retained(*h)?;
+            }
+            Ok(())
+        })?;
+    }
     let store = tree.store_mut();
     store.db_checkpoints = store.checkpoints.clone();
     // NOTE: do NOT insert dirty shard indices into db_shard_indices here.
@@ -1026,28 +1134,28 @@ pub fn sparse_put_blocks(
         sparse.sapling = Some(seed_sapling(
             inner,
             from_state,
-            sparse.anchor_retention_height,
+            sparse.anchor_retention.as_ref(),
         )?);
     }
     if sparse.orchard.is_none() {
         sparse.orchard = Some(seed_orchard(
             inner,
             from_state,
-            sparse.anchor_retention_height,
+            sparse.anchor_retention.as_ref(),
         )?);
     }
     if sparse.ironwood.is_none() {
         sparse.ironwood = Some(seed_ironwood(
             inner,
             from_state,
-            sparse.anchor_retention_height,
+            sparse.anchor_retention.as_ref(),
         )?);
     }
     let gpu_on = sparse.gpu_subtree;
     let batch_on = sparse.batch_combine;
     // [B6] Copy the retention floor out before the split-borrow: every downgrade
     // site and the per-lane ensure_retained calls key on it.
-    let anchor_floor = sparse.anchor_retention_height;
+    let anchor_floor = sparse.anchor_retention.as_ref();
     let SparseTreeState {
         sapling: Some(sap_tree),
         orchard: Some(orch_tree),
@@ -1101,6 +1209,11 @@ pub fn sparse_put_blocks(
             sap_stream,
             &sap_notes,
             |s| sap_tree.store().shard_has_interior(s),
+            |s| {
+                inner
+                    .get_sapling_subtree_root(s)
+                    .map_err(SqliteClientError::CommitmentTree)
+            },
             anchor_floor,
         )?;
         let op = plan_pool(
@@ -1112,6 +1225,11 @@ pub fn sparse_put_blocks(
             orch_stream,
             &orch_notes,
             |s| orch_tree.store().shard_has_interior(s),
+            |s| {
+                inner
+                    .get_orchard_subtree_root(s)
+                    .map_err(SqliteClientError::CommitmentTree)
+            },
             anchor_floor,
         )?;
         let cleanup = (sp.cleanup_shards.clone(), op.cleanup_shards.clone());
@@ -1226,18 +1344,41 @@ pub fn sparse_put_blocks(
             // only ids ≥ cutoff can reach the checkpoint tables.
             // [IW-2c] ll/wallet.rs:496-517 — three-way: each pool ensures at the
             // OTHER TWO pools' checkpoint heights so anchors align across trees.
+            //
+            // [B6-fix, field-caught 2026-08-01] This set is TWO obligations, and
+            // this lane long carried only the first. The second — every height
+            // `anchor_retention` retains in this batch's range — is what makes a
+            // ZIP 318 boundary exist at all: scanning checkpoints a block at its
+            // LAST note commitment, so a grid boundary landing on a block with no
+            // shielded output in any pool is not supplied by the cross-pool union
+            // either, and `ensure_retained` (which this lane does call, six times
+            // over) only PROMISES to preserve a checkpoint — it never creates one.
+            // The engine therefore marked boundary heights that never materialized,
+            // and every committed migration transfer anchored to one was permanently
+            // unprovable: `prove_transfer` -> AnchorNotFound -> transient defer ->
+            // retried forever. Invisible to the dual-path byte-equality seals, too,
+            // since a missing checkpoint at a commitment-free height changes no shard
+            // bytes. `batch_ensure_heights` is upstream's composition of both, so
+            // this lane can no longer half-implement the rule.
+            let [ensure_sapling, ensure_orchard, ensure_ironwood] = batch_ensure_heights(
+                &sapling_cp_pos.keys().copied().collect(),
+                &orchard_cp_pos.keys().copied().collect(),
+                &ironwood_cp_pos.keys().copied().collect(),
+                anchor_floor,
+                from_state.block_height() + 1..=last_scanned_height,
+            );
             let missing_sapling = ensure_checkpoints(
-                orchard_cp_pos.keys().chain(ironwood_cp_pos.keys()),
+                ensure_sapling.iter(),
                 &sapling_cp_pos,
                 from_state.final_sapling_tree(),
             );
             let missing_orchard = ensure_checkpoints(
-                sapling_cp_pos.keys().chain(ironwood_cp_pos.keys()),
+                ensure_orchard.iter(),
                 &orchard_cp_pos,
                 from_state.final_orchard_tree(),
             );
             let missing_ironwood = ensure_checkpoints(
-                sapling_cp_pos.keys().chain(orchard_cp_pos.keys()),
+                ensure_ironwood.iter(),
                 &ironwood_cp_pos,
                 from_state.final_ironwood_tree(),
             );
@@ -1726,9 +1867,17 @@ pub fn sparse_put_blocks(
         orch_tree_ms,
         flush_ms,
         downgraded,
-        // [B6] retention observability: the active floor + how many anchors the
-        // orchard store currently pins (0/None = retention off).
-        anchor_floor = anchor_floor.map(u32::from),
+        // [B6] retention observability: the active floor and grid, plus how many
+        // anchors the orchard store currently pins (None = retention off).
+        anchor_floor = anchor_floor.map(|r| u32::from(r.from_height())),
+        anchor_grid = anchor_floor
+            .map(|r| {
+                r.intervals()
+                    .iter()
+                    .map(|i| i.block_count().get())
+                    .collect::<Vec<_>>()
+            })
+            .map(|g| format!("{g:?}")),
         retained = orch_tree.store().retained.len(),
         "sparse put_blocks"
     );
@@ -1773,7 +1922,7 @@ pub fn sparse_put_blocks(
 /// Orchard subtree build routing. Priority: batch-affine (v0.4 Plan B, always
 /// available, ~12× the scalar combine) > GPU offload (banked B0, feature `gpu`)
 /// > scalar. Output is byte-identical on every path (lookup_build gate + the
-/// gpu equality test + the engine oracle).
+/// > gpu equality test + the engine oracle).
 fn build_orchard_subtrees(
     gpu: bool,
     batch: bool,
@@ -1970,13 +2119,13 @@ struct PoolTimers {
 fn downgrade_doomed_checkpoints<H>(
     commitments: &mut [Option<(H, Retention<BlockHeight>)>],
     cutoff: BlockHeight,
-    anchor_retention_floor: Option<BlockHeight>,
+    anchor_retention: Option<&AnchorRetention>,
 ) -> u64 {
     let mut downgraded = 0u64;
     for slot in commitments.iter_mut().flatten() {
         if let Retention::Checkpoint { id, marking } = &slot.1
             && *id < cutoff
-            && !should_retain_anchor(anchor_retention_floor, *id)
+            && !should_retain_anchor(anchor_retention, *id)
         {
             slot.1 = match marking {
                 Marking::Marked => Retention::Marked,
@@ -2061,6 +2210,9 @@ impl WalletRead for SparseFacade<'_> {
     }
     fn get_wallet_birthday(&self) -> Result<Option<BlockHeight>, Self::Error> {
         self.inner.get_wallet_birthday()
+    }
+    fn get_wallet_recover_until(&self) -> Result<Option<BlockHeight>, Self::Error> {
+        self.inner.get_wallet_recover_until()
     }
     fn get_wallet_summary(
         &self,
@@ -2179,6 +2331,31 @@ impl WalletRead for SparseFacade<'_> {
     }
 }
 
+// Output locking is a `WalletWrite` supertrait rather than part of `WalletWrite` itself;
+// the facade holds no lock state of its own, so every method delegates verbatim.
+impl OutputLockStore for SparseFacade<'_> {
+    type Error = SqliteClientError;
+    type AccountId = <Db as WalletRead>::AccountId;
+
+    fn lock_outputs(
+        &mut self,
+        outputs: &[OutputRef],
+        owner: LockOwner,
+        lock_expiry_height: BlockHeight,
+    ) -> Result<usize, LockError<Self::Error>> {
+        self.inner.lock_outputs(outputs, owner, lock_expiry_height)
+    }
+    fn unlock_output(&mut self, output: &OutputRef, owner: LockOwner) -> Result<bool, Self::Error> {
+        self.inner.unlock_output(output, owner)
+    }
+    fn clear_locked_outputs(&mut self, account: Self::AccountId) -> Result<usize, Self::Error> {
+        self.inner.clear_locked_outputs(account)
+    }
+    fn get_locked_outputs(&self, account: Self::AccountId) -> Result<Vec<OutputRef>, Self::Error> {
+        self.inner.get_locked_outputs(account)
+    }
+}
+
 impl WalletWrite for SparseFacade<'_> {
     type UtxoRef = <Db as WalletWrite>::UtxoRef;
 
@@ -2188,7 +2365,8 @@ impl WalletWrite for SparseFacade<'_> {
         seed: &SecretVec<u8>,
         birthday: &AccountBirthday,
         key_source: Option<&str>,
-    ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error> {
+    ) -> Result<(<Self as WalletRead>::AccountId, UnifiedSpendingKey), <Self as WalletRead>::Error>
+    {
         self.inner
             .create_account(account_name, seed, birthday, key_source)
     }
@@ -2199,7 +2377,7 @@ impl WalletWrite for SparseFacade<'_> {
         account_index: zip32::AccountId,
         birthday: &AccountBirthday,
         key_source: Option<&str>,
-    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error> {
+    ) -> Result<(Self::Account, UnifiedSpendingKey), <Self as WalletRead>::Error> {
         self.inner
             .import_account_hd(account_name, seed, account_index, birthday, key_source)
     }
@@ -2210,110 +2388,140 @@ impl WalletWrite for SparseFacade<'_> {
         birthday: &AccountBirthday,
         purpose: AccountPurpose,
         key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error> {
+    ) -> Result<Self::Account, <Self as WalletRead>::Error> {
         self.inner
             .import_account_ufvk(account_name, unified_key, birthday, purpose, key_source)
     }
-    fn delete_account(&mut self, account: Self::AccountId) -> Result<(), Self::Error> {
+    fn delete_account(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.delete_account(account)
     }
     fn get_next_available_address(
         &mut self,
-        account: Self::AccountId,
+        account: <Self as WalletRead>::AccountId,
         request: UnifiedAddressRequest,
-    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, Self::Error> {
+    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, <Self as WalletRead>::Error> {
         self.inner.get_next_available_address(account, request)
     }
     fn get_address_for_index(
         &mut self,
-        account: Self::AccountId,
+        account: <Self as WalletRead>::AccountId,
         diversifier_index: DiversifierIndex,
         request: UnifiedAddressRequest,
-    ) -> Result<Option<UnifiedAddress>, Self::Error> {
+    ) -> Result<Option<UnifiedAddress>, <Self as WalletRead>::Error> {
         self.inner
             .get_address_for_index(account, diversifier_index, request)
     }
-    fn update_chain_tip(&mut self, tip_height: BlockHeight) -> Result<(), Self::Error> {
+    fn update_chain_tip(
+        &mut self,
+        tip_height: BlockHeight,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         WalletWrite::update_chain_tip(self.inner, tip_height)
+    }
+
+    fn prune_scan_queue_below(
+        &mut self,
+        height: BlockHeight,
+        retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
+    ) -> Result<u64, <Self as WalletRead>::Error> {
+        WalletWrite::prune_scan_queue_below(self.inner, height, retain_with_priority)
     }
 
     // THE INTERCEPT.
     fn put_blocks(
         &mut self,
         from_state: &ChainState,
-        blocks: Vec<ScannedBlock<Self::AccountId>>,
-    ) -> Result<(), Self::Error> {
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         sparse_put_blocks(self.inner, self.sparse, from_state, blocks)
     }
 
     fn put_received_transparent_utxo(
         &mut self,
-        output: &WalletTransparentOutput<Self::AccountId>,
-    ) -> Result<Self::UtxoRef, Self::Error> {
+        output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
+    ) -> Result<Self::UtxoRef, <Self as WalletRead>::Error> {
         self.inner.put_received_transparent_utxo(output)
     }
     fn store_decrypted_tx(
         &mut self,
-        received_tx: DecryptedTransaction<Transaction, Self::AccountId>,
-    ) -> Result<(), Self::Error> {
+        received_tx: DecryptedTransaction<Transaction, <Self as WalletRead>::AccountId>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.store_decrypted_tx(received_tx)
     }
-    fn set_tx_trust(&mut self, txid: TxId, trusted: bool) -> Result<(), Self::Error> {
+    fn set_tx_trust(
+        &mut self,
+        txid: TxId,
+        trusted: bool,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.set_tx_trust(txid, trusted)
     }
     fn store_transactions_to_be_sent(
         &mut self,
-        transactions: &[SentTransaction<Self::AccountId>],
-    ) -> Result<(), Self::Error> {
+        transactions: &[SentTransaction<<Self as WalletRead>::AccountId>],
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.store_transactions_to_be_sent(transactions)
     }
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height(
+        &mut self,
+        max_height: BlockHeight,
+    ) -> Result<BlockHeight, <Self as WalletRead>::Error> {
         self.inner.truncate_to_height(max_height)
     }
-    fn truncate_to_chain_state(&mut self, chain_state: ChainState) -> Result<(), Self::Error> {
+    fn truncate_to_chain_state(
+        &mut self,
+        chain_state: ChainState,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.truncate_to_chain_state(chain_state)
     }
     fn rewind_to_chain_state(
         &mut self,
         chain_state: ChainState,
-        reset_account_birthdays: std::collections::HashSet<Self::AccountId>,
-    ) -> Result<(), zcash_client_backend::data_api::error::RewindError<Self::AccountId, Self::Error>>
-    {
+        reset_account_birthdays: std::collections::HashSet<<Self as WalletRead>::AccountId>,
+    ) -> Result<
+        (),
+        zcash_client_backend::data_api::error::RewindError<
+            <Self as WalletRead>::AccountId,
+            <Self as WalletRead>::Error,
+        >,
+    > {
         self.inner
             .rewind_to_chain_state(chain_state, reset_account_birthdays)
     }
     fn reserve_next_n_ephemeral_addresses(
         &mut self,
-        account_id: Self::AccountId,
+        account_id: <Self as WalletRead>::AccountId,
         n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, <Self as WalletRead>::Error>
+    {
         self.inner.reserve_next_n_ephemeral_addresses(account_id, n)
     }
     fn set_transaction_status(
         &mut self,
         txid: TxId,
         status: TransactionStatus,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         WalletWrite::set_transaction_status(self.inner, txid, status)
     }
     fn schedule_next_check(
         &mut self,
         address: &TransparentAddress,
         offset_seconds: u32,
-    ) -> Result<Option<SystemTime>, Self::Error> {
+    ) -> Result<Option<SystemTime>, <Self as WalletRead>::Error> {
         self.inner.schedule_next_check(address, offset_seconds)
     }
     fn mark_transparent_addresses_exposed(
         &mut self,
         exposures: &[(TransparentAddress, BlockHeight)],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.mark_transparent_addresses_exposed(exposures)
     }
     fn notify_address_checked(
         &mut self,
         request: TransactionsInvolvingAddress,
         as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.notify_address_checked(request, as_of_height)
     }
 }
@@ -2590,6 +2798,9 @@ impl WalletRead for WriteBehindFacade {
     fn get_wallet_birthday(&self) -> Result<Option<BlockHeight>, Self::Error> {
         Err(unvirtualized("get_wallet_birthday"))
     }
+    fn get_wallet_recover_until(&self) -> Result<Option<BlockHeight>, Self::Error> {
+        Err(unvirtualized("get_wallet_recover_until"))
+    }
     fn get_wallet_summary(
         &self,
         _confirmations_policy: ConfirmationsPolicy,
@@ -2676,6 +2887,36 @@ impl WalletRead for WriteBehindFacade {
     }
 }
 
+// Outside the virtualized read surface (see the module note above): the write-behind
+// facade never serves lock state, so every method fails loudly rather than silently
+// answering from the un-merged view.
+impl OutputLockStore for WriteBehindFacade {
+    type Error = SqliteClientError;
+    type AccountId = <Db as WalletRead>::AccountId;
+
+    fn lock_outputs(
+        &mut self,
+        _outputs: &[OutputRef],
+        _owner: LockOwner,
+        _lock_expiry_height: BlockHeight,
+    ) -> Result<usize, LockError<Self::Error>> {
+        Err(LockError::Storage(unvirtualized("lock_outputs")))
+    }
+    fn unlock_output(
+        &mut self,
+        _output: &OutputRef,
+        _owner: LockOwner,
+    ) -> Result<bool, Self::Error> {
+        Err(unvirtualized("unlock_output"))
+    }
+    fn clear_locked_outputs(&mut self, _account: Self::AccountId) -> Result<usize, Self::Error> {
+        Err(unvirtualized("clear_locked_outputs"))
+    }
+    fn get_locked_outputs(&self, _account: Self::AccountId) -> Result<Vec<OutputRef>, Self::Error> {
+        Err(unvirtualized("get_locked_outputs"))
+    }
+}
+
 impl WalletWrite for WriteBehindFacade {
     type UtxoRef = <Db as WalletWrite>::UtxoRef;
 
@@ -2683,8 +2924,8 @@ impl WalletWrite for WriteBehindFacade {
     fn put_blocks(
         &mut self,
         from_state: &ChainState,
-        blocks: Vec<ScannedBlock<Self::AccountId>>,
-    ) -> Result<(), Self::Error> {
+        blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         // Depth-1 invariant FIRST: an occupied stash means the scan loop failed
         // to submit the previous unit — a loop bug, never tolerated silently.
         if self.stash.is_some() {
@@ -2713,7 +2954,7 @@ impl WalletWrite for WriteBehindFacade {
                 .iter()
                 .flat_map(|tx| tx.sapling_spends().iter().map(|s| *s.nf()))
                 .collect();
-            let sap_found: Vec<(Self::AccountId, sapling::Nullifier)> = b
+            let sap_found: Vec<(<Self as WalletRead>::AccountId, sapling::Nullifier)> = b
                 .transactions()
                 .iter()
                 .flat_map(|tx| {
@@ -2729,7 +2970,7 @@ impl WalletWrite for WriteBehindFacade {
                 .iter()
                 .flat_map(|tx| tx.orchard_spends().iter().map(|s| *s.nf()))
                 .collect();
-            let orch_found: Vec<(Self::AccountId, orchard::note::Nullifier)> = b
+            let orch_found: Vec<(<Self as WalletRead>::AccountId, orchard::note::Nullifier)> = b
                 .transactions()
                 .iter()
                 .flat_map(|tx| {
@@ -2746,7 +2987,7 @@ impl WalletWrite for WriteBehindFacade {
                 .iter()
                 .flat_map(|tx| tx.ironwood_spends().iter().map(|s| *s.nf()))
                 .collect();
-            let iw_found: Vec<(Self::AccountId, orchard::note::Nullifier)> = b
+            let iw_found: Vec<(<Self as WalletRead>::AccountId, orchard::note::Nullifier)> = b
                 .transactions()
                 .iter()
                 .flat_map(|tx| {
@@ -2774,7 +3015,8 @@ impl WalletWrite for WriteBehindFacade {
         _seed: &SecretVec<u8>,
         _birthday: &AccountBirthday,
         _key_source: Option<&str>,
-    ) -> Result<(Self::AccountId, UnifiedSpendingKey), Self::Error> {
+    ) -> Result<(<Self as WalletRead>::AccountId, UnifiedSpendingKey), <Self as WalletRead>::Error>
+    {
         Err(unvirtualized("create_account"))
     }
     fn import_account_hd(
@@ -2784,7 +3026,7 @@ impl WalletWrite for WriteBehindFacade {
         _account_index: zip32::AccountId,
         _birthday: &AccountBirthday,
         _key_source: Option<&str>,
-    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error> {
+    ) -> Result<(Self::Account, UnifiedSpendingKey), <Self as WalletRead>::Error> {
         Err(unvirtualized("import_account_hd"))
     }
     fn import_account_ufvk(
@@ -2794,63 +3036,91 @@ impl WalletWrite for WriteBehindFacade {
         _birthday: &AccountBirthday,
         _purpose: AccountPurpose,
         _key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error> {
+    ) -> Result<Self::Account, <Self as WalletRead>::Error> {
         Err(unvirtualized("import_account_ufvk"))
     }
-    fn delete_account(&mut self, _account: Self::AccountId) -> Result<(), Self::Error> {
+    fn delete_account(
+        &mut self,
+        _account: <Self as WalletRead>::AccountId,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("delete_account"))
     }
     fn get_next_available_address(
         &mut self,
-        _account: Self::AccountId,
+        _account: <Self as WalletRead>::AccountId,
         _request: UnifiedAddressRequest,
-    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, Self::Error> {
+    ) -> Result<Option<(UnifiedAddress, DiversifierIndex)>, <Self as WalletRead>::Error> {
         Err(unvirtualized("get_next_available_address"))
     }
     fn get_address_for_index(
         &mut self,
-        _account: Self::AccountId,
+        _account: <Self as WalletRead>::AccountId,
         _diversifier_index: DiversifierIndex,
         _request: UnifiedAddressRequest,
-    ) -> Result<Option<UnifiedAddress>, Self::Error> {
+    ) -> Result<Option<UnifiedAddress>, <Self as WalletRead>::Error> {
         Err(unvirtualized("get_address_for_index"))
     }
-    fn update_chain_tip(&mut self, _tip_height: BlockHeight) -> Result<(), Self::Error> {
+    fn update_chain_tip(
+        &mut self,
+        _tip_height: BlockHeight,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("update_chain_tip"))
+    }
+    fn prune_scan_queue_below(
+        &mut self,
+        _height: BlockHeight,
+        _retain_with_priority: Option<zcash_client_backend::data_api::scanning::ScanPriority>,
+    ) -> Result<u64, <Self as WalletRead>::Error> {
+        Err(unvirtualized("prune_scan_queue_below"))
     }
     fn put_received_transparent_utxo(
         &mut self,
-        _output: &WalletTransparentOutput<Self::AccountId>,
-    ) -> Result<Self::UtxoRef, Self::Error> {
+        _output: &WalletTransparentOutput<<Self as WalletRead>::AccountId>,
+    ) -> Result<Self::UtxoRef, <Self as WalletRead>::Error> {
         Err(unvirtualized("put_received_transparent_utxo"))
     }
     fn store_decrypted_tx(
         &mut self,
-        _received_tx: DecryptedTransaction<Transaction, Self::AccountId>,
-    ) -> Result<(), Self::Error> {
+        _received_tx: DecryptedTransaction<Transaction, <Self as WalletRead>::AccountId>,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("store_decrypted_tx"))
     }
-    fn set_tx_trust(&mut self, _txid: TxId, _trusted: bool) -> Result<(), Self::Error> {
+    fn set_tx_trust(
+        &mut self,
+        _txid: TxId,
+        _trusted: bool,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("set_tx_trust"))
     }
     fn store_transactions_to_be_sent(
         &mut self,
-        _transactions: &[SentTransaction<Self::AccountId>],
-    ) -> Result<(), Self::Error> {
+        _transactions: &[SentTransaction<<Self as WalletRead>::AccountId>],
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("store_transactions_to_be_sent"))
     }
-    fn truncate_to_height(&mut self, _max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height(
+        &mut self,
+        _max_height: BlockHeight,
+    ) -> Result<BlockHeight, <Self as WalletRead>::Error> {
         Err(unvirtualized("truncate_to_height"))
     }
-    fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), Self::Error> {
+    fn truncate_to_chain_state(
+        &mut self,
+        _chain_state: ChainState,
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("truncate_to_chain_state"))
     }
     fn rewind_to_chain_state(
         &mut self,
         _chain_state: ChainState,
-        _reset_account_birthdays: std::collections::HashSet<Self::AccountId>,
-    ) -> Result<(), zcash_client_backend::data_api::error::RewindError<Self::AccountId, Self::Error>>
-    {
+        _reset_account_birthdays: std::collections::HashSet<<Self as WalletRead>::AccountId>,
+    ) -> Result<
+        (),
+        zcash_client_backend::data_api::error::RewindError<
+            <Self as WalletRead>::AccountId,
+            <Self as WalletRead>::Error,
+        >,
+    > {
         Err(
             zcash_client_backend::data_api::error::RewindError::DataSource(unvirtualized(
                 "rewind_to_chain_state",
@@ -2859,36 +3129,37 @@ impl WalletWrite for WriteBehindFacade {
     }
     fn reserve_next_n_ephemeral_addresses(
         &mut self,
-        _account_id: Self::AccountId,
+        _account_id: <Self as WalletRead>::AccountId,
         _n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, <Self as WalletRead>::Error>
+    {
         Err(unvirtualized("reserve_next_n_ephemeral_addresses"))
     }
     fn set_transaction_status(
         &mut self,
         _txid: TxId,
         _status: TransactionStatus,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("set_transaction_status"))
     }
     fn schedule_next_check(
         &mut self,
         _address: &TransparentAddress,
         _offset_seconds: u32,
-    ) -> Result<Option<SystemTime>, Self::Error> {
+    ) -> Result<Option<SystemTime>, <Self as WalletRead>::Error> {
         Err(unvirtualized("schedule_next_check"))
     }
     fn mark_transparent_addresses_exposed(
         &mut self,
         _exposures: &[(TransparentAddress, BlockHeight)],
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("mark_transparent_addresses_exposed"))
     }
     fn notify_address_checked(
         &mut self,
         _request: TransactionsInvolvingAddress,
         _as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("notify_address_checked"))
     }
 }
@@ -2915,7 +3186,7 @@ type PersistTaskOutput = (
 /// through the task — serialization is structural, not advisory).
 ///
 /// Thread-pool isolation: the lane's rayon work runs on the dedicated
-/// [`persist_pool`], installed at the sap∥orch join inside
+/// `persist_pool`, installed at the sap∥orch join inside
 /// `sparse_put_blocks` itself (v0.6 P4c/P4d — the policy, sizing, and full
 /// A10/A18/Mac evidence live on that fn). Write-behind and inline
 /// (write_behind=false) paths both route through it, since the install site
@@ -2973,7 +3244,7 @@ impl PersistLane {
         graft_buffering: bool,
         graft_verify_sample: u32,
         batch_combine: bool,
-        anchor_retention_height: Option<BlockHeight>,
+        anchor_retention: Option<AnchorRetention>,
     ) -> Result<Self, crate::error::SlipstreamError> {
         // [B4-16] Same wait-not-die posture as the main connection (wallet_session.rs): a
         // host write (importAccount landing mid-pass) holding the lock made the lane's
@@ -3005,7 +3276,7 @@ impl PersistLane {
             graft_buffering,
             graft,
             batch_combine,
-            anchor_retention_height,
+            anchor_retention,
             ..Default::default()
         };
         Ok(Self {
@@ -3074,7 +3345,7 @@ impl PersistLane {
             sapling,
             orchard,
             graft: Some(ctx),
-            anchor_retention_height: anchor_floor,
+            anchor_retention: anchor_floor,
             ..
         } = sparse
         else {
@@ -3129,7 +3400,7 @@ impl PersistLane {
                 if let Some(cutoff) =
                     finish_cutoff(sap_tree.store().checkpoints.keys().copied(), &rows)
                 {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, *anchor_floor);
+                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
                 }
                 for (subtree, checkpoints) in build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
                     seg_start,
@@ -3146,7 +3417,7 @@ impl PersistLane {
                 if let Some(cutoff) =
                     finish_cutoff(orch_tree.store().checkpoints.keys().copied(), &rows)
                 {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, *anchor_floor);
+                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
                 }
                 for (subtree, checkpoints) in build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
                     seg_start,
@@ -3319,6 +3590,7 @@ impl PersistLane {
 mod store_tests {
     use super::*;
     use incrementalmerkletree::{Address, Hashable as _};
+    use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
 
     type Store = SparseShardStore<sapling::Node>;
 
@@ -3500,8 +3772,9 @@ mod store_tests {
         };
 
         // Retention ON, floor below the anchors: grid ids survive, off-grid is doomed.
+        let zip318 = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
         let mut commitments = fresh(&[1152, 1300, 1440]);
-        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(h(1000)));
+        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&zip318(1000)));
         assert_eq!(n, 1, "only the off-grid checkpoint is doomed");
         assert!(matches!(
             commitments[0].as_ref().unwrap().1,
@@ -3523,22 +3796,54 @@ mod store_tests {
 
         // Grid id BELOW the floor: retention is not active there — doomed.
         let mut commitments = fresh(&[1152]);
-        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(h(1200)));
+        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&zip318(1200)));
         assert_eq!(n, 1);
+
+        // A CONFIGURED grid, not a compiled-in one: under a 12-block interval the
+        // off-ZIP-318 height 1300 is itself a boundary and survives. This is what a
+        // test network needs, and what a mirrored constant could never express.
+        let short = AnchorRetention::new(
+            h(1000),
+            AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
+        );
+        let mut commitments = fresh(&[1152, 1300, 1440]);
+        let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&short));
+        assert_eq!(n, 1, "1300 is off the 12-grid; 1152 and 1440 are on it");
+        assert!(matches!(
+            commitments[1].as_ref().unwrap().1,
+            Retention::Ephemeral
+        ));
     }
 
-    /// [B6] The predicate is upstream's `should_retain_anchor` verbatim.
+    /// [B6] The predicate delegates to upstream's `AnchorRetention::retains`, so
+    /// this engine's surviving anchor set is upstream's by construction rather
+    /// than by a mirrored constant that has to be kept in step by hand.
     #[test]
     fn should_retain_anchor_matches_upstream_predicate() {
         let h = |n: u32| BlockHeight::from(n);
-        assert!(should_retain_anchor(Some(h(1000)), h(1152)));
-        assert!(should_retain_anchor(Some(h(1152)), h(1152)), "at the floor");
-        assert!(!should_retain_anchor(Some(h(1000)), h(1300)), "off-grid");
+        let at = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
+        assert!(should_retain_anchor(Some(&at(1000)), h(1152)));
         assert!(
-            !should_retain_anchor(Some(h(1200)), h(1152)),
+            should_retain_anchor(Some(&at(1152)), h(1152)),
+            "at the floor"
+        );
+        assert!(!should_retain_anchor(Some(&at(1000)), h(1300)), "off-grid");
+        assert!(
+            !should_retain_anchor(Some(&at(1200)), h(1152)),
             "below the floor"
         );
         assert!(!should_retain_anchor(None, h(1152)), "retention off");
+
+        // The grid is whatever was configured. 1308 is a 12-block boundary but not
+        // a ZIP 318 one, so a host on a shortened test-network grid retains a
+        // height the default grid discards — which is the entire point of making
+        // the interval configurable rather than mirroring a constant.
+        let short = AnchorRetention::new(
+            h(1000),
+            AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
+        );
+        assert!(should_retain_anchor(Some(&short), h(1308)));
+        assert!(!should_retain_anchor(Some(&at(1000)), h(1308)));
     }
 
     #[test]
@@ -3947,5 +4252,147 @@ mod write_behind_tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("lane unusable"), "got: {err}");
+    }
+}
+
+/// [B6, flush half] The retained-anchor marks a flush persists — see the fix in
+/// `flush_sapling`/`flush_orchard`/`flush_ironwood`: the in-memory store's `retained` set
+/// protects boundary checkpoints from the in-memory prune, but the sqlite store must learn the
+/// marks too, or the open-time deep-history heal (which spares exactly the ids the SQLITE
+/// retained set names) dooms every boundary anchor older than its margin.
+#[cfg(test)]
+mod flush_retained_tests {
+    use super::*;
+    use zcash_client_sqlite::WalletDb;
+    use zcash_client_sqlite::util::SystemClock;
+    use zcash_client_sqlite::wallet::init::init_wallet_db;
+
+    fn fresh_db(
+        dir: &std::path::Path,
+    ) -> WalletDb<
+        rusqlite::Connection,
+        crate::network::SlipstreamNetwork,
+        SystemClock,
+        rand::rngs::OsRng,
+    > {
+        let conn = rusqlite::Connection::open(dir.join("wallet.sqlite")).expect("opens");
+        rusqlite::vtab::array::load_module(&conn).expect("array vtab");
+        let mut db = WalletDb::from_connection(
+            conn,
+            crate::network::SlipstreamNetwork::MAIN,
+            SystemClock,
+            rand::rngs::OsRng,
+        );
+        init_wallet_db(&mut db, None).expect("initializes the wallet schema");
+        db
+    }
+
+    fn table_heights(dir: &std::path::Path, table: &str) -> Vec<u32> {
+        let conn = rusqlite::Connection::open(dir.join("wallet.sqlite")).expect("re-opens");
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT checkpoint_id FROM {table} ORDER BY checkpoint_id"
+            ))
+            .expect("prepares");
+        stmt.query_map([], |r| r.get::<_, u32>(0))
+            .expect("queries")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collects")
+    }
+
+    /// The flush persists a retained mark for every ADDED checkpoint the in-memory store
+    /// retains — in the same transaction as the checkpoint rows — and no mark for an added
+    /// checkpoint that is not retained.
+    #[test]
+    fn flush_persists_retained_marks_for_added_checkpoints() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
+        store
+            .checkpoints
+            .insert(BlockHeight::from(1_000u32), Checkpoint::tree_empty());
+        store
+            .checkpoints
+            .insert(BlockHeight::from(1_002u32), Checkpoint::tree_empty());
+        store.retained.insert(BlockHeight::from(1_000u32));
+        let mut tree = ShardTree::new(store, MAX_CHECKPOINTS);
+
+        db.transactionally::<_, _, SqliteClientError>(|wdb| flush_sapling(wdb, &mut tree))
+            .expect("flushes");
+        drop(db);
+
+        assert_eq!(
+            table_heights(dir.path(), "sapling_tree_checkpoints"),
+            vec![1_000, 1_002],
+            "both added checkpoints land as rows"
+        );
+        assert_eq!(
+            table_heights(dir.path(), "sapling_tree_retained_checkpoints"),
+            vec![1_000],
+            "exactly the retained added checkpoint is marked durable in sqlite"
+        );
+    }
+
+    /// Orchard and ironwood mirror the sapling behavior into their own tables.
+    #[test]
+    fn flush_marks_mirror_in_orchard_and_ironwood() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut orch_store =
+            SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
+        orch_store
+            .checkpoints
+            .insert(BlockHeight::from(2_000u32), Checkpoint::tree_empty());
+        orch_store.retained.insert(BlockHeight::from(2_000u32));
+        let mut orch_tree: OrchardSparseTree = ShardTree::new(orch_store, MAX_CHECKPOINTS);
+
+        let mut iron_store =
+            SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
+        iron_store
+            .checkpoints
+            .insert(BlockHeight::from(3_000u32), Checkpoint::tree_empty());
+        iron_store.retained.insert(BlockHeight::from(3_000u32));
+        let mut iron_tree: IronwoodSparseTree = ShardTree::new(iron_store, MAX_CHECKPOINTS);
+
+        db.transactionally::<_, _, SqliteClientError>(|wdb| {
+            flush_orchard(wdb, &mut orch_tree)?;
+            flush_ironwood(wdb, &mut iron_tree)
+        })
+        .expect("flushes");
+        drop(db);
+
+        assert_eq!(
+            table_heights(dir.path(), "orchard_tree_retained_checkpoints"),
+            vec![2_000]
+        );
+        assert_eq!(
+            table_heights(dir.path(), "ironwood_tree_retained_checkpoints"),
+            vec![3_000]
+        );
+    }
+
+    /// A flush with nothing retained among its adds writes no marks — the fix never marks
+    /// indiscriminately.
+    #[test]
+    fn flush_without_retained_adds_writes_no_marks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+
+        let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
+        store
+            .checkpoints
+            .insert(BlockHeight::from(4_000u32), Checkpoint::tree_empty());
+        let mut tree = ShardTree::new(store, MAX_CHECKPOINTS);
+
+        db.transactionally::<_, _, SqliteClientError>(|wdb| flush_sapling(wdb, &mut tree))
+            .expect("flushes");
+        drop(db);
+
+        assert!(
+            table_heights(dir.path(), "sapling_tree_retained_checkpoints").is_empty(),
+            "no retained adds, no marks"
+        );
     }
 }

@@ -81,7 +81,11 @@ impl Gpu {
             })
             .await
             .expect("failed to open GPU device");
-        Self { device, queue, info }
+        Self {
+            device,
+            queue,
+            info,
+        }
     }
 
     /// Dispatch a Sinsemilla hash kernel: input at binding 0, output (8 u32/element) at
@@ -95,16 +99,20 @@ impl Gpu {
         gens: &[u32],
         out_u32_len: usize,
     ) -> Vec<u32> {
-        let in_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("hash-in"),
-            contents: bytemuck::cast_slice(input),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-        let gen_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("hash-gens"),
-            contents: bytemuck::cast_slice(gens),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
+        let in_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("hash-in"),
+                contents: bytemuck::cast_slice(input),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
+        let gen_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("hash-gens"),
+                contents: bytemuck::cast_slice(gens),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
         let size = (out_u32_len * std::mem::size_of::<u32>()) as wgpu::BufferAddress;
         let out_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("hash-out"),
@@ -118,10 +126,12 @@ impl Gpu {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
-        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(entry),
-            source: wgpu::ShaderSource::Wgsl(shader_src.into()),
-        });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(entry),
+                source: wgpu::ShaderSource::Wgsl(shader_src.into()),
+            });
         let pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -137,9 +147,18 @@ impl Gpu {
             label: Some("hash-bg"),
             layout: &layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: in_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: out_buf.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: gen_buf.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: in_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: gen_buf.as_entire_binding(),
+                },
             ],
         });
         let n_elems = (out_u32_len / 8) as u32;
@@ -163,7 +182,10 @@ impl Gpu {
             let _ = tx.send(r);
         });
         self.device
-            .poll(wgpu::PollType::Wait { submission_index: None, timeout: None })
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })
             .unwrap();
         rx.recv().unwrap().unwrap();
         let data = slice.get_mapped_range();
@@ -206,7 +228,9 @@ fn generators_u32() -> &'static [u32] {
                 .into();
             bytes.expect("Sinsemilla generator is non-identity (consensus constant)")
         }
-        let q = pallas::Point::hash_to_curve("z.cash:SinsemillaQ")("z.cash:Orchard-MerkleCRH".as_bytes());
+        let q = pallas::Point::hash_to_curve("z.cash:SinsemillaQ")(
+            "z.cash:Orchard-MerkleCRH".as_bytes(),
+        );
         let mut bytes: Vec<u8> = Vec::with_capacity(64 * (1 + (1 << 10)));
         bytes.extend_from_slice(&affine_xy(q));
         for m in 0..(1usize << 10) {
@@ -240,12 +264,18 @@ pub fn orchard_combine_batch(
         input.push(layers[i] as u32);
         for w in 0..8 {
             input.push(u32::from_le_bytes([
-                lefts[i][4 * w], lefts[i][4 * w + 1], lefts[i][4 * w + 2], lefts[i][4 * w + 3],
+                lefts[i][4 * w],
+                lefts[i][4 * w + 1],
+                lefts[i][4 * w + 2],
+                lefts[i][4 * w + 3],
             ]));
         }
         for w in 0..8 {
             input.push(u32::from_le_bytes([
-                rights[i][4 * w], rights[i][4 * w + 1], rights[i][4 * w + 2], rights[i][4 * w + 3],
+                rights[i][4 * w],
+                rights[i][4 * w + 1],
+                rights[i][4 * w + 2],
+                rights[i][4 * w + 3],
             ]));
         }
     }
@@ -266,11 +296,33 @@ mod tests {
     use super::*;
     use incrementalmerkletree::{Hashable, Level};
     use orchard::tree::MerkleHashOrchard;
-    use rand::{rngs::StdRng, RngCore, SeedableRng};
+    use rand::{RngCore, SeedableRng, rngs::StdRng};
+
+    /// Whether a wgpu adapter can be acquired. The GPU test skips (rather than
+    /// panicking in `Gpu::new`) where there is none — e.g. a GPU-less CI runner.
+    fn gpu_available() -> bool {
+        pollster::block_on(async {
+            wgpu::Instance::default()
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: None,
+                    force_fallback_adapter: false,
+                })
+                .await
+                .is_ok()
+        })
+    }
 
     #[test]
     fn orchard_combine_batch_matches_orchard() {
-        let mut rng = StdRng::seed_from_u64(0xB0_1);
+        if !gpu_available() {
+            eprintln!(
+                "skipping orchard_combine_batch_matches_orchard: no GPU adapter available \
+                 (e.g. a GPU-less CI runner)"
+            );
+            return;
+        }
+        let mut rng = StdRng::seed_from_u64(0x0B01);
         let n = 10_000;
         // deterministic valid nodes: fold combine from empties
         let mut pool = Vec::with_capacity(2 * n);

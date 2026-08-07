@@ -35,7 +35,7 @@ use std::{
 use crate::events::Progress;
 
 use prost::Message;
-use tokio::sync::{Semaphore, OwnedSemaphorePermit, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{debug, info, warn};
 use zcash_client_backend::proto::{
     compact_formats::CompactBlock,
@@ -44,7 +44,7 @@ use zcash_client_backend::proto::{
 
 use crate::{
     chunk::{Chunk, ChunkQueueSender},
-    config::{EngineConfig, Endpoint},
+    config::{Endpoint, EngineConfig},
     connector::connect_direct_with_retry,
     error::SlipstreamError,
     grpc::{self, LwdClient},
@@ -102,7 +102,12 @@ pub struct WireFailoverArm {
 
 impl Default for WireFailoverArm {
     fn default() -> Self {
-        Self { stall_secs: 12, collapse_fraction: 0.15, painful_mbps: 2.0, floor_mbps: 0.2 }
+        Self {
+            stall_secs: 12,
+            collapse_fraction: 0.15,
+            painful_mbps: 2.0,
+            floor_mbps: 0.2,
+        }
     }
 }
 
@@ -154,11 +159,19 @@ pub struct FetchStats {
 impl FetchStats {
     pub fn blocks_per_sec(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
-        if secs > 0.0 { self.blocks as f64 / secs } else { 0.0 }
+        if secs > 0.0 {
+            self.blocks as f64 / secs
+        } else {
+            0.0
+        }
     }
     pub fn megabytes_per_sec(&self) -> f64 {
         let secs = self.elapsed.as_secs_f64();
-        if secs > 0.0 { self.bytes as f64 / (1024.0 * 1024.0) / secs } else { 0.0 }
+        if secs > 0.0 {
+            self.bytes as f64 / (1024.0 * 1024.0) / secs
+        } else {
+            0.0
+        }
     }
 
     /// [v0.7 P0] Worst sustained wire throughput across the pass: the
@@ -192,7 +205,11 @@ impl FetchStats {
             let db = samples[j].1.saturating_sub(samples[i].1) as f64;
             worst = worst.min(db / (1024.0 * 1024.0) / dt);
         }
-        if worst.is_finite() { worst } else { self.megabytes_per_sec() }
+        if worst.is_finite() {
+            worst
+        } else {
+            self.megabytes_per_sec()
+        }
     }
 }
 
@@ -229,15 +246,18 @@ pub(crate) struct ChunkSplitter {
 
 impl ChunkSplitter {
     pub(crate) fn new(split_bytes: usize) -> Self {
-        Self { split_bytes, acc: Vec::new(), acc_bytes: 0 }
+        Self {
+            split_bytes,
+            acc: Vec::new(),
+            acc_bytes: 0,
+        }
     }
 
     /// Push the next streamed block; returns `Some((blocks, bytes))` when the
     /// budget overflows and a sub-chunk completes.
     pub(crate) fn push(&mut self, block: CompactBlock) -> Option<(Vec<CompactBlock>, usize)> {
         let block_bytes = Message::encoded_len(&block);
-        let completed = if !self.acc.is_empty() && self.acc_bytes + block_bytes > self.split_bytes
-        {
+        let completed = if !self.acc.is_empty() && self.acc_bytes + block_bytes > self.split_bytes {
             let blocks = std::mem::take(&mut self.acc);
             let bytes = std::mem::replace(&mut self.acc_bytes, 0);
             Some((blocks, bytes))
@@ -251,7 +271,11 @@ impl ChunkSplitter {
 
     /// Final flush at clean end of stream; `None` when nothing is buffered.
     pub(crate) fn finish(self) -> Option<(Vec<CompactBlock>, usize)> {
-        if self.acc.is_empty() { None } else { Some((self.acc, self.acc_bytes)) }
+        if self.acc.is_empty() {
+            None
+        } else {
+            Some((self.acc, self.acc_bytes))
+        }
     }
 }
 
@@ -287,7 +311,11 @@ struct AheadGate {
 impl AheadGate {
     fn new(cap: usize, floor: Arc<AtomicU64>) -> Self {
         let cap = cap.max(1);
-        Self { budget: Arc::new(Semaphore::new(cap.min(Semaphore::MAX_PERMITS))), cap, floor }
+        Self {
+            budget: Arc::new(Semaphore::new(cap.min(Semaphore::MAX_PERMITS))),
+            cap,
+            floor,
+        }
     }
 
     /// Returns a budget permit for one sub-chunk, or `None` when `plan_index`
@@ -418,9 +446,7 @@ where
         let Some(item) = grpc::next_with_idle_timeout(stream, &ctx).await? else {
             // Clean end of stream: flush the tail iff it completes the plan chunk.
             return match splitter.finish() {
-                Some((blocks, bytes))
-                    if blocks.last().map(|b| b.height) == Some(cursor.end) =>
-                {
+                Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(cursor.end) => {
                     if emit_sub_chunk(cursor, blocks, bytes, true, gate, out).await {
                         Ok(PumpOutcome::Completed)
                     } else {
@@ -438,8 +464,7 @@ where
                 }
             };
         };
-        let block =
-            item.map_err(|e| SlipstreamError::Transport(format!("{ctx}: {e}")))?;
+        let block = item.map_err(|e| SlipstreamError::Transport(format!("{ctx}: {e}")))?;
         if last_progress.elapsed() > progress_deadline {
             return Err(SlipstreamError::Transport(format!(
                 "{ctx}: no completed sub-chunk within {}s",
@@ -464,8 +489,14 @@ async fn open_and_pump(
     out: &mpsc::Sender<SubChunk>,
 ) -> Result<PumpOutcome, SlipstreamError> {
     let req = BlockRange {
-        start: Some(BlockId { height: cursor.resume_from, hash: vec![] }),
-        end: Some(BlockId { height: cursor.end, hash: vec![] }),
+        start: Some(BlockId {
+            height: cursor.resume_from,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: cursor.end,
+            hash: vec![],
+        }),
         ..Default::default()
     };
     // B2 (#1755): response-headers deadline. A server that accepts the request
@@ -487,7 +518,15 @@ async fn open_and_pump(
             ))
         })?
         .into_inner();
-    pump_block_stream(&mut stream, cursor, plan.split_bytes, plan.chunk_timeout, gate, out).await
+    pump_block_stream(
+        &mut stream,
+        cursor,
+        plan.split_bytes,
+        plan.chunk_timeout,
+        gate,
+        out,
+    )
+    .await
 }
 
 async fn worker(
@@ -635,7 +674,9 @@ impl WireDetector {
         self.starve_secs = 0;
         self.cum_bytes += bytes;
         self.samples.push((now_s, self.cum_bytes));
-        let Some(rate) = self.window_mbps(now_s) else { return Ok(()) };
+        let Some(rate) = self.window_mbps(now_s) else {
+            return Ok(());
+        };
         if rate > self.best_window_mbps {
             self.best_window_mbps = rate;
         }
@@ -643,12 +684,14 @@ impl WireDetector {
             return Ok(());
         }
         let relative_floor = self.arm.collapse_fraction * self.best_window_mbps;
-        let collapsed = (rate < relative_floor && rate < self.arm.painful_mbps)
-            || rate < self.arm.floor_mbps;
+        let collapsed =
+            (rate < relative_floor && rate < self.arm.painful_mbps) || rate < self.arm.floor_mbps;
         if collapsed {
             return Err(SlipstreamError::WireCollapse {
                 measured_mbps: rate,
-                floor_mbps: relative_floor.min(self.arm.painful_mbps).max(self.arm.floor_mbps),
+                floor_mbps: relative_floor
+                    .min(self.arm.painful_mbps)
+                    .max(self.arm.floor_mbps),
             });
         }
         Ok(())
@@ -724,13 +767,22 @@ async fn release_ordered(
         };
         let Some(sub) = sub else { break };
         wire_cum += sub.bytes as u64;
-        summary.wire_samples.push((started.elapsed().as_secs_f64(), wire_cum));
+        summary
+            .wire_samples
+            .push((started.elapsed().as_secs_f64(), wire_cum));
         if let Some(d) = detector.as_mut() {
             d.arrival(sub.bytes as u64, started.elapsed().as_secs_f64())?;
         }
         pending.insert((sub.plan_index, sub.sub_index), sub);
         while let Some(sub) = pending.remove(&next) {
-            let SubChunk { plan_index, is_last, bytes, blocks, permit, .. } = sub;
+            let SubChunk {
+                plan_index,
+                is_last,
+                bytes,
+                blocks,
+                permit,
+                ..
+            } = sub;
             continuity.verify_blocks(&blocks)?;
             let chunk = Chunk::from_blocks(emitted_chunks, blocks);
             let chunk_block_count = chunk.blocks.len() as u64;
@@ -793,8 +845,10 @@ pub async fn run_fetch(
 
     let next = Arc::new(AtomicU64::new(0));
     let floor = Arc::new(AtomicU64::new(0));
-    let gate =
-        AheadGate::new(plan.split_bytes.saturating_mul(AHEAD_BUDGET_FACTOR), Arc::clone(&floor));
+    let gate = AheadGate::new(
+        plan.split_bytes.saturating_mul(AHEAD_BUDGET_FACTOR),
+        Arc::clone(&floor),
+    );
     // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
     let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
 
@@ -819,8 +873,15 @@ pub async fn run_fetch(
         }
     };
 
-    let summary = match release_ordered(&mut rx, &queue, progress.as_ref(), &floor, started, plan.failover)
-        .await
+    let summary = match release_ordered(
+        &mut rx,
+        &queue,
+        progress.as_ref(),
+        &floor,
+        started,
+        plan.failover,
+    )
+    .await
     {
         Ok(s) => s,
         Err(e) => {
@@ -904,7 +965,9 @@ mod tests {
     }
 
     fn linked(from: u64, count: u64, payload: usize) -> Vec<CompactBlock> {
-        (from..from + count).map(|h| block_sized(h, payload)).collect()
+        (from..from + count)
+            .map(|h| block_sized(h, payload))
+            .collect()
     }
 
     fn test_cursor(plan_index: u64, start: u64, end: u64) -> PlanChunkCursor {
@@ -931,10 +994,15 @@ mod tests {
     }
 
     fn assert_heights_consecutive(subs: &[SubChunk], from: u64, to: u64) {
-        let heights: Vec<u64> =
-            subs.iter().flat_map(|s| s.blocks.iter().map(|b| b.height)).collect();
+        let heights: Vec<u64> = subs
+            .iter()
+            .flat_map(|s| s.blocks.iter().map(|b| b.height))
+            .collect();
         let expected: Vec<u64> = (from..=to).collect();
-        assert_eq!(heights, expected, "released heights must be exactly {from}..={to}, no dups");
+        assert_eq!(
+            heights, expected,
+            "released heights must be exactly {from}..={to}, no dups"
+        );
     }
 
     // ── ChunkSplitter ──────────────────────────────────────────────────────────
@@ -947,7 +1015,10 @@ mod tests {
         }
         let (blocks, bytes) = s.finish().expect("tail");
         assert_eq!(blocks.len(), 10);
-        assert_eq!(blocks.iter().map(|b| b.height).collect::<Vec<_>>(), (100..110).collect::<Vec<_>>());
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            (100..110).collect::<Vec<_>>()
+        );
         assert!(bytes > 0);
     }
 
@@ -965,18 +1036,33 @@ mod tests {
         if let Some((blocks, _)) = s.finish() {
             emitted.push(blocks);
         }
-        assert_eq!(emitted.len(), 4, "7 blocks at 2/sub-chunk = 3 full + 1 tail");
-        assert_eq!(emitted.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2, 2, 1]);
-        let heights: Vec<u64> =
-            emitted.iter().flatten().map(|b| b.height).collect();
-        assert_eq!(heights, (100..107).collect::<Vec<_>>(), "order preserved, nothing lost");
+        assert_eq!(
+            emitted.len(),
+            4,
+            "7 blocks at 2/sub-chunk = 3 full + 1 tail"
+        );
+        assert_eq!(
+            emitted.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![2, 2, 2, 1]
+        );
+        let heights: Vec<u64> = emitted.iter().flatten().map(|b| b.height).collect();
+        assert_eq!(
+            heights,
+            (100..107).collect::<Vec<_>>(),
+            "order preserved, nothing lost"
+        );
     }
 
     #[test]
     fn splitter_oversized_block_forms_own_subchunk() {
         let mut s = ChunkSplitter::new(1000);
-        assert!(s.push(block_sized(100, 5000)).is_none(), "first block always accumulates");
-        let (blocks, _) = s.push(block_sized(101, 5000)).expect("oversized block flushes alone");
+        assert!(
+            s.push(block_sized(100, 5000)).is_none(),
+            "first block always accumulates"
+        );
+        let (blocks, _) = s
+            .push(block_sized(101, 5000))
+            .expect("oversized block flushes alone");
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].height, 100);
         let (tail, _) = s.finish().expect("tail");
@@ -996,11 +1082,21 @@ mod tests {
         let gate = open_gate();
         let mut cursor = test_cursor(0, 100, 119);
         let mut s = stream::iter(
-            linked(100, 20, 1000).into_iter().map(Ok::<_, tonic::Status>).collect::<Vec<_>>(),
+            linked(100, 20, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
         );
-        let out = pump_block_stream(&mut s, &mut cursor, 2500, Duration::from_secs(120), &gate, &tx)
-            .await
-            .expect("pump");
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            2500,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("pump");
         assert!(matches!(out, PumpOutcome::Completed));
         drop(tx);
         let subs = drain_subs(&mut rx);
@@ -1011,10 +1107,19 @@ mod tests {
             "sub_index dense from 0"
         );
         let lasts: Vec<bool> = subs.iter().map(|s| s.is_last).collect();
-        assert!(lasts.iter().rev().skip(1).all(|l| !*l), "only the final sub-chunk is last");
-        assert!(*lasts.last().expect("nonempty"), "final sub-chunk carries is_last");
+        assert!(
+            lasts.iter().rev().skip(1).all(|l| !*l),
+            "only the final sub-chunk is last"
+        );
+        assert!(
+            *lasts.last().expect("nonempty"),
+            "final sub-chunk carries is_last"
+        );
         assert_heights_consecutive(&subs, 100, 119);
-        assert_eq!(cursor.resume_from, 120, "cursor advanced past the plan chunk");
+        assert_eq!(
+            cursor.resume_from, 120,
+            "cursor advanced past the plan chunk"
+        );
         assert_eq!(cursor.next_sub_index, subs.len() as u64);
     }
 
@@ -1026,7 +1131,10 @@ mod tests {
         let gate = open_gate();
         let mut cursor = test_cursor(3, 100, 109);
         let mut s = stream::iter(
-            linked(100, 10, 100).into_iter().map(Ok::<_, tonic::Status>).collect::<Vec<_>>(),
+            linked(100, 10, 100)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
         );
         let out = pump_block_stream(
             &mut s,
@@ -1041,7 +1149,11 @@ mod tests {
         assert!(matches!(out, PumpOutcome::Completed));
         drop(tx);
         let subs = drain_subs(&mut rx);
-        assert_eq!(subs.len(), 1, "normal-era plan chunk = exactly one sub-chunk");
+        assert_eq!(
+            subs.len(),
+            1,
+            "normal-era plan chunk = exactly one sub-chunk"
+        );
         assert!(subs[0].is_last);
         assert_eq!(subs[0].sub_index, 0);
         assert_eq!(subs[0].blocks.len(), 10);
@@ -1054,18 +1166,34 @@ mod tests {
         let mut cursor = test_cursor(0, 100, 119);
         // Clean end at 111 — 8 blocks short.
         let mut s = stream::iter(
-            linked(100, 12, 1000).into_iter().map(Ok::<_, tonic::Status>).collect::<Vec<_>>(),
+            linked(100, 12, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
         );
-        let err = pump_block_stream(&mut s, &mut cursor, 2500, Duration::from_secs(120), &gate, &tx)
-            .await
-            .expect_err("short stream must error");
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            2500,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect_err("short stream must error");
         assert!(err.to_string().contains("ended short"), "got: {err}");
         drop(tx);
         let subs = drain_subs(&mut rx);
-        assert!(subs.iter().all(|s| !s.is_last), "no is_last on a short stream");
+        assert!(
+            subs.iter().all(|s| !s.is_last),
+            "no is_last on a short stream"
+        );
         // 12 blocks at 2/sub-chunk → 5 emitted (10 blocks), 2-block tail discarded.
         let emitted_through = subs.last().and_then(|s| s.blocks.last()).map(|b| b.height);
-        assert_eq!(cursor.resume_from, emitted_through.expect("subs emitted") + 1);
+        assert_eq!(
+            cursor.resume_from,
+            emitted_through.expect("subs emitted") + 1
+        );
     }
 
     /// THE retry-resume contract (T6.8-S): a mid-plan-chunk failure after
@@ -1082,10 +1210,16 @@ mod tests {
             linked(100, 18, 1000).into_iter().map(Ok).collect();
         items.push(Err(tonic::Status::unavailable("backend dropped")));
         let mut s1 = stream::iter(items);
-        let err =
-            pump_block_stream(&mut s1, &mut cursor, 2500, Duration::from_secs(120), &gate, &tx)
-                .await
-                .expect_err("attempt 1 must surface the stream error");
+        let err = pump_block_stream(
+            &mut s1,
+            &mut cursor,
+            2500,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect_err("attempt 1 must surface the stream error");
         assert!(err.to_string().contains("backend dropped"), "got: {err}");
         assert!(cursor.emitted_this_attempt, "attempt 1 made progress");
         // 18 blocks at 2/sub-chunk → 8 sub-chunks (16 blocks) emitted; 2 discarded.
@@ -1099,12 +1233,21 @@ mod tests {
                 .map(Ok::<_, tonic::Status>)
                 .collect::<Vec<_>>(),
         );
-        let out =
-            pump_block_stream(&mut s2, &mut cursor, 2500, Duration::from_secs(120), &gate, &tx)
-                .await
-                .expect("attempt 2 completes");
+        let out = pump_block_stream(
+            &mut s2,
+            &mut cursor,
+            2500,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("attempt 2 completes");
         assert!(matches!(out, PumpOutcome::Completed));
-        assert!(cursor.next_sub_index > subs_before, "sub_index continued, not reset");
+        assert!(
+            cursor.next_sub_index > subs_before,
+            "sub_index continued, not reset"
+        );
 
         drop(tx);
         let subs = drain_subs(&mut rx);
@@ -1113,7 +1256,11 @@ mod tests {
             (0..subs.len() as u64).collect::<Vec<_>>(),
             "sub_index dense across the retry boundary"
         );
-        assert_eq!(subs.iter().filter(|s| s.is_last).count(), 1, "exactly one is_last");
+        assert_eq!(
+            subs.iter().filter(|s| s.is_last).count(),
+            1,
+            "exactly one is_last"
+        );
         assert!(subs.last().expect("nonempty").is_last);
         assert_heights_consecutive(&subs, 100, 139);
     }
@@ -1134,9 +1281,16 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some((Ok::<_, tonic::Status>(block_sized(h, 1000)), h + 1))
         }));
-        let out = pump_block_stream(&mut s, &mut cursor, 2500, Duration::from_secs(5), &gate, &tx)
-            .await
-            .expect("slow-but-progressing stream must complete");
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            2500,
+            Duration::from_secs(5),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("slow-but-progressing stream must complete");
         assert!(matches!(out, PumpOutcome::Completed));
         drop(tx);
         assert_heights_consecutive(&drain_subs(&mut rx), 100, 129);
@@ -1166,9 +1320,15 @@ mod tests {
         )
         .await
         .expect_err("no progress must time out");
-        assert!(err.to_string().contains("no completed sub-chunk"), "got: {err}");
+        assert!(
+            err.to_string().contains("no completed sub-chunk"),
+            "got: {err}"
+        );
         assert!(!cursor.emitted_this_attempt);
-        assert_eq!(cursor.resume_from, 100, "no emission → resume from plan start");
+        assert_eq!(
+            cursor.resume_from, 100,
+            "no emission → resume from plan start"
+        );
     }
 
     // ── AheadGate ──────────────────────────────────────────────────────────────
@@ -1178,9 +1338,15 @@ mod tests {
         let floor = Arc::new(AtomicU64::new(0));
         let gate = AheadGate::new(1000, Arc::clone(&floor));
         // Ahead worker (plan 1) takes the whole budget.
-        let held = gate.admit(1, 1000).await.expect("ahead worker gets a permit");
+        let held = gate
+            .admit(1, 1000)
+            .await
+            .expect("ahead worker gets a permit");
         // Floor worker (plan 0) is exempt — returns None immediately.
-        assert!(gate.admit(0, 999_999).await.is_none(), "floor must not consume budget");
+        assert!(
+            gate.admit(0, 999_999).await.is_none(),
+            "floor must not consume budget"
+        );
         drop(held);
     }
 
@@ -1193,7 +1359,10 @@ mod tests {
         let gate2 = gate.clone();
         let waiter = tokio::spawn(async move { gate2.admit(2, 500).await });
         tokio::time::sleep(Duration::from_millis(250)).await;
-        assert!(!waiter.is_finished(), "ahead worker must wait while budget is held");
+        assert!(
+            !waiter.is_finished(),
+            "ahead worker must wait while budget is held"
+        );
         // The release stage advances the floor to 2 → exemption kicks in.
         floor.store(2, Ordering::Release);
         let got = tokio::time::timeout(Duration::from_secs(2), waiter)
@@ -1250,7 +1419,9 @@ mod tests {
         for i in 0..arm.stall_secs - 1 {
             d.starve_tick(20.0 + i as f64).expect("below threshold");
         }
-        let err = d.starve_tick(20.0 + arm.stall_secs as f64).expect_err("stall fires at N");
+        let err = d
+            .starve_tick(20.0 + arm.stall_secs as f64)
+            .expect_err("stall fires at N");
         assert!(
             matches!(err, SlipstreamError::WireCollapse { measured_mbps, .. } if measured_mbps == 0.0)
         );
@@ -1301,7 +1472,14 @@ mod tests {
 
     fn sub(plan_index: u64, sub_index: u64, is_last: bool, blocks: Vec<CompactBlock>) -> SubChunk {
         let bytes = blocks.iter().map(Message::encoded_len).sum();
-        SubChunk { plan_index, sub_index, is_last, bytes, blocks, permit: None }
+        SubChunk {
+            plan_index,
+            sub_index,
+            is_last,
+            bytes,
+            blocks,
+            permit: None,
+        }
     }
 
     /// Multi-worker out-of-order completion: the consumer must receive strictly
@@ -1327,7 +1505,9 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None).await.expect("release");
+        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
+            .await
+            .expect("release");
         assert_eq!(summary.plans_released, 3);
         assert_eq!(summary.blocks, 60);
         drop(qtx);
@@ -1339,9 +1519,21 @@ mod tests {
             released_heights.extend(chunk.blocks.iter().map(|b| b.height));
             drop(permit);
         }
-        assert_eq!(released_heights, (100..160).collect::<Vec<_>>(), "strict height order");
-        assert_eq!(indices, (0..5).collect::<Vec<_>>(), "queue chunk index dense from 0");
-        assert_eq!(floor.load(Ordering::Acquire), 3, "floor advanced past the last plan chunk");
+        assert_eq!(
+            released_heights,
+            (100..160).collect::<Vec<_>>(),
+            "strict height order"
+        );
+        assert_eq!(
+            indices,
+            (0..5).collect::<Vec<_>>(),
+            "queue chunk index dense from 0"
+        );
+        assert_eq!(
+            floor.load(Ordering::Acquire),
+            3,
+            "floor advanced past the last plan chunk"
+        );
     }
 
     /// Retry-continuation shape: plan 0's tail (emitted by a resumed attempt)
@@ -1351,15 +1543,23 @@ mod tests {
     async fn release_waits_for_retry_continuation_before_advancing() {
         let all = linked(100, 30, 64);
         let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
-        tx.send(sub(0, 0, false, all[0..10].to_vec())).await.expect("send");
-        tx.send(sub(1, 0, true, all[20..30].to_vec())).await.expect("send");
+        tx.send(sub(0, 0, false, all[0..10].to_vec()))
+            .await
+            .expect("send");
+        tx.send(sub(1, 0, true, all[20..30].to_vec()))
+            .await
+            .expect("send");
         // ...worker 0 reconnects and resumes...
-        tx.send(sub(0, 1, true, all[10..20].to_vec())).await.expect("send");
+        tx.send(sub(0, 1, true, all[10..20].to_vec()))
+            .await
+            .expect("send");
         drop(tx);
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None).await.expect("release");
+        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
+            .await
+            .expect("release");
         assert_eq!(summary.plans_released, 2);
         drop(qtx);
         let mut released_heights = Vec::new();
@@ -1375,14 +1575,21 @@ mod tests {
     #[tokio::test]
     async fn release_rejects_gap_between_subchunks() {
         let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
-        tx.send(sub(0, 0, false, linked(100, 5, 64))).await.expect("send");
-        tx.send(sub(0, 1, true, linked(200, 5, 64))).await.expect("send");
+        tx.send(sub(0, 0, false, linked(100, 5, 64)))
+            .await
+            .expect("send");
+        tx.send(sub(0, 1, true, linked(200, 5, 64)))
+            .await
+            .expect("send");
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
         let err = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
             .await
             .expect_err("gap must fail");
-        assert!(matches!(err, SlipstreamError::Discontinuity { at: 200, .. }), "got: {err}");
+        assert!(
+            matches!(err, SlipstreamError::Discontinuity { at: 200, .. }),
+            "got: {err}"
+        );
     }
 }

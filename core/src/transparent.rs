@@ -32,19 +32,16 @@
 //!   map it to `()` via `.map(|_| ())` exactly as upstream sync.rs:534.
 
 use tracing::info;
+use transparent::{
+    address::Script,
+    bundle::{OutPoint, TxOut},
+};
 use zcash_client_backend::{
     data_api::{WalletRead, WalletWrite},
     wallet::WalletTransparentOutput,
 };
 use zcash_keys::encoding::AddressCodec as _;
-use zcash_protocol::{
-    consensus::BlockHeight,
-    value::Zatoshis,
-};
-use transparent::{
-    address::Script,
-    bundle::{OutPoint, TxOut},
-};
+use zcash_protocol::{consensus::BlockHeight, value::Zatoshis};
 use zcash_script::script;
 
 use crate::{
@@ -112,15 +109,17 @@ pub async fn refresh_utxos(
 
         // sync.rs:502: skip if no transparent receivers.
         if addresses.is_empty() {
-            info!(?account_id, "no transparent receivers — skipping UTXO refresh");
+            info!(
+                ?account_id,
+                "no transparent receivers — skipping UTXO refresh"
+            );
             stats.accounts += 1;
             continue;
         }
 
         // Fetch all UTXOs for these addresses from start_height.
         // sync.rs:498: start_height.into() converts BlockHeight → u64.
-        let replies =
-            grpc::get_address_utxos(client, addresses, start_height.into()).await?;
+        let replies = grpc::get_address_utxos(client, addresses, start_height.into()).await?;
 
         // sync.rs:511-537: construct WalletTransparentOutput and store each reply.
         for reply in replies {
@@ -154,16 +153,24 @@ pub async fn refresh_utxos(
             // [IW-1 SPIKE] the ironwood-era API adds optional recipient/funding
             // attribution params — `None` defers to the store's own address→account
             // resolution (the pre-existing behavior of this ingest path).
-            let output =
-                WalletTransparentOutput::from_parts(outpoint, txout, mined_height, None, None, None)
-                    .ok_or(SlipstreamError::MisbehavingServer)?;
+            let output = WalletTransparentOutput::from_parts(
+                outpoint,
+                txout,
+                mined_height,
+                None,
+                None,
+                None,
+            )
+            .ok_or(SlipstreamError::MisbehavingServer)?;
 
             // sync.rs:534-535: put and map UtxoRef → ().
             session
                 .db_mut()
                 .put_received_transparent_utxo(&output)
                 .map(|_| ())
-                .map_err(|e| SlipstreamError::Wallet(format!("put_received_transparent_utxo: {e}")))?;
+                .map_err(|e| {
+                    SlipstreamError::Wallet(format!("put_received_transparent_utxo: {e}"))
+                })?;
 
             stats.utxos += 1;
         }
@@ -171,7 +178,11 @@ pub async fn refresh_utxos(
         stats.accounts += 1;
     }
 
-    info!(accounts = stats.accounts, utxos = stats.utxos, "transparent UTXO refresh done");
+    info!(
+        accounts = stats.accounts,
+        utxos = stats.utxos,
+        "transparent UTXO refresh done"
+    );
     Ok(stats)
 }
 

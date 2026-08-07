@@ -49,7 +49,10 @@ pub(crate) enum FeedAction<H> {
     /// A shard closed note-free: ask the graft verdict for `shard_index`.
     /// `rows` is the COMPLETE row set seen for it — on a missing server root
     /// the caller builds these exact rows (no DB re-read).
-    CloseCleanShard { shard_index: u64, rows: Vec<AccRow<H>> },
+    CloseCleanShard {
+        shard_index: u64,
+        rows: Vec<AccRow<H>>,
+    },
     /// Persist these NEW rows into the buffer table this chunk (the shard is
     /// still open and note-free; earlier rows were emitted in earlier feeds).
     Buffer(Vec<AccRow<H>>),
@@ -75,7 +78,11 @@ impl<H: Clone> ShardAccumulator<H> {
     /// the shard store already holds fragment data for that shard (⇒ it was
     /// built before — stay passthrough; any stale buffer rows are the caller's
     /// to delete).
-    pub fn seed(start_position: u64, resume_rows: Vec<AccRow<H>>, store_has_internals: bool) -> Self {
+    pub fn seed(
+        start_position: u64,
+        resume_rows: Vec<AccRow<H>>,
+        store_has_internals: bool,
+    ) -> Self {
         let index = shard_of(start_position);
         debug_assert!(
             resume_rows.iter().all(|(p, ..)| shard_of(*p) == index),
@@ -84,7 +91,11 @@ impl<H: Clone> ShardAccumulator<H> {
         let passthrough = resume_rows.is_empty() && store_has_internals;
         Self {
             next_position: start_position,
-            open: Some(OpenShard { index, rows: resume_rows, passthrough }),
+            open: Some(OpenShard {
+                index,
+                rows: resume_rows,
+                passthrough,
+            }),
         }
     }
 
@@ -114,14 +125,23 @@ impl<H: Clone> ShardAccumulator<H> {
                     if let Some((index, rows, passthrough)) = closed
                         && !passthrough
                     {
-                        actions.push(FeedAction::CloseCleanShard { shard_index: index, rows });
+                        actions.push(FeedAction::CloseCleanShard {
+                            shard_index: index,
+                            rows,
+                        });
                     }
-                    self.open =
-                        Some(OpenShard { index: shard, rows: vec![], passthrough: false });
+                    self.open = Some(OpenShard {
+                        index: shard,
+                        rows: vec![],
+                        passthrough: false,
+                    });
                 }
                 None => {
-                    self.open =
-                        Some(OpenShard { index: shard, rows: vec![], passthrough: false });
+                    self.open = Some(OpenShard {
+                        index: shard,
+                        rows: vec![],
+                        passthrough: false,
+                    });
                 }
                 _ => {}
             }
@@ -134,7 +154,10 @@ impl<H: Clone> ShardAccumulator<H> {
                 .map(|(i, (h, r))| (pos + i as u64, h, r))
                 .collect();
             let has_note = note_positions.iter().any(|p| *p >= pos && *p < span_end);
-            let open = self.open.as_mut().unwrap_or_else(|| unreachable!("opened above"));
+            let open = self
+                .open
+                .as_mut()
+                .unwrap_or_else(|| unreachable!("opened above"));
             if open.passthrough {
                 actions.push(FeedAction::Build(span));
             } else if has_note {
@@ -213,7 +236,11 @@ mod tests {
         match &acts[0] {
             FeedAction::CloseCleanShard { shard_index, rows } => {
                 assert_eq!(*shard_index, 0);
-                assert_eq!(rows.len(), SHARD as usize, "complete row set for the verdict");
+                assert_eq!(
+                    rows.len(),
+                    SHARD as usize,
+                    "complete row set for the verdict"
+                );
             }
             other => panic!("expected close, got {other:?}"),
         }
@@ -236,14 +263,20 @@ mod tests {
         let acts = fresh.feed(10, items(5), &[]);
         assert!(matches!(&acts[..], [FeedAction::Buffer(_)]));
         // Resume: buffered prefix from the DB continues the same shard.
-        let prefix: Vec<AccRow<H>> = (0..10u64).map(|p| (p, p as H, Retention::Ephemeral)).collect();
+        let prefix: Vec<AccRow<H>> = (0..10u64)
+            .map(|p| (p, p as H, Retention::Ephemeral))
+            .collect();
         let mut resumed = ShardAccumulator::<H>::seed(10, prefix, false);
         let acts = resumed.feed(10, items(SHARD - 10), &[]);
         assert!(matches!(&acts[..], [FeedAction::Buffer(_)]));
         let acts = resumed.feed(SHARD, items(1), &[]);
         match &acts[0] {
             FeedAction::CloseCleanShard { rows, .. } => {
-                assert_eq!(rows.len(), SHARD as usize, "prefix + resumed rows = complete shard");
+                assert_eq!(
+                    rows.len(),
+                    SHARD as usize,
+                    "prefix + resumed rows = complete shard"
+                );
                 assert_eq!(rows.first().map(|r| r.0), Some(0));
             }
             other => panic!("expected close, got {other:?}"),
@@ -286,7 +319,11 @@ mod tests {
         let len = 10 + SHARD + 5;
         let note_in_shard1 = SHARD + 1234;
         let acts = a.feed(start, items(len), &[note_in_shard1]);
-        assert_eq!(acts.len(), 4, "buffer tail0? no — close0 comes on transition: {acts:?}");
+        assert_eq!(
+            acts.len(),
+            4,
+            "buffer tail0? no — close0 comes on transition: {acts:?}"
+        );
         // Span walk: [shard0 tail → Buffer], [transition → CloseCleanShard 0],
         // [shard1 noted → Build], [transition to 2: shard1 was passthrough → no close],
         // [shard2 head → Buffer].

@@ -33,7 +33,7 @@ pub struct MemBlockSource<'a> {
     /// call — pass 1 feeds the batch runners (walk wall = feed + task
     /// spawning), pass 2 re-walks doing the wallet-side processing (walk
     /// wall = extract recv + nullifier checks + ScannedBlock assembly) —
-    /// so after the scan call, [0] = pass 1 and [1] = pass 2. The A18 P5
+    /// so after the scan call, \[0\] = pass 1 and \[1\] = pass 2. The A18 P5
     /// readout showed the wall lives in ONE of these; this names which.
     /// RefCell: `with_blocks` takes `&self` and the producer is
     /// single-threaded.
@@ -42,7 +42,10 @@ pub struct MemBlockSource<'a> {
 
 impl<'a> MemBlockSource<'a> {
     pub fn new(chunk: &'a Chunk) -> Self {
-        Self { chunk, walk_wall: std::cell::RefCell::new(Vec::with_capacity(2)) }
+        Self {
+            chunk,
+            walk_wall: std::cell::RefCell::new(Vec::with_capacity(2)),
+        }
     }
 
     /// `(pass1, pass2)` walk walls recorded so far (zero if a walk didn't
@@ -50,7 +53,10 @@ impl<'a> MemBlockSource<'a> {
     /// the two-walk shape is upstream `scan_cached_blocks`' structure.
     pub fn walk_walls(&self) -> (std::time::Duration, std::time::Duration) {
         let w = self.walk_wall.borrow();
-        (w.first().copied().unwrap_or_default(), w.get(1).copied().unwrap_or_default())
+        (
+            w.first().copied().unwrap_or_default(),
+            w.get(1).copied().unwrap_or_default(),
+        )
     }
 }
 
@@ -96,7 +102,11 @@ mod tests {
     use crate::chunk::Chunk;
 
     fn block(height: u64) -> CompactBlock {
-        CompactBlock { height, hash: vec![height as u8; 32], ..Default::default() }
+        CompactBlock {
+            height,
+            hash: vec![height as u8; 32],
+            ..Default::default()
+        }
     }
 
     fn collect(src: &MemBlockSource<'_>, from: Option<u64>, limit: Option<usize>) -> Vec<u64> {

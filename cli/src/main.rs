@@ -18,9 +18,15 @@
 //! Subcommands land per phase: `fetch` (P1), `sync` (P2+), `report` (P5).
 
 use clap::{Parser, Subcommand};
+use slipstream_core::{BlockHeight, UnifiedFullViewingKey};
+use zcash_protocol::consensus::Parameters;
 
 #[derive(Parser, Debug)]
-#[command(name = "slipstream", version, about = "Slipstream sync engine dev harness")]
+#[command(
+    name = "slipstream",
+    version,
+    about = "Slipstream sync engine dev harness"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -57,7 +63,7 @@ enum Cmd {
     },
     /// Fetch a block range into memory and report throughput (G1 benchmark).
     Fetch {
-        /// lightwalletd URL, e.g. https://zec.rocks:443 or http://127.0.0.1:9067
+        /// lightwalletd URL, e.g. <https://zec.rocks:443> or <http://127.0.0.1:9067>
         #[arg(long)]
         server: String,
         /// Inclusive range, e.g. 2500000..2600000 (start..end)
@@ -87,7 +93,7 @@ enum Cmd {
         #[arg(long, value_enum, default_value_t = NetworkArg::Test)]
         network: NetworkArg,
     },
-    /// [B7] Send funds from a synced wallet (testnet spike tooling — the
+    /// \[B7\] Send funds from a synced wallet (testnet spike tooling — the
     /// mnemonic lands in shell history, so use it for TESTNET seeds only).
     /// Defaults to a SELF-send (the account's own unified address).
     Send {
@@ -127,7 +133,7 @@ enum Cmd {
         /// `--network main --custom-heights genesis,nu6_2=5000`.
         #[arg(long)]
         custom_heights: Option<String>,
-        /// lightwalletd URL, e.g. https://zec.rocks:443 or http://127.0.0.1:9067
+        /// lightwalletd URL, e.g. <https://zec.rocks:443> or <http://127.0.0.1:9067>
         #[arg(long)]
         server: String,
         /// Wallet directory (data.db lives inside).
@@ -149,12 +155,18 @@ enum Cmd {
         /// Pass `--sparse false` to disable (kill switch — reverts to upstream path).
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
         sparse: bool,
-        /// [B6] Anchor-retention floor: checkpoints at heights >= this on the
-        /// 288-block grid become durable anchors (exempt from checkpoint
+        /// \[B6\] Anchor-retention floor: checkpoints at heights >= this on the
+        /// anchor-bucket grid become durable anchors (exempt from checkpoint
         /// downgrade/pruning) — the migration crate's pre-signed-transfer
         /// anchors. Off when omitted.
         #[arg(long)]
         anchor_retention: Option<u32>,
+        /// \[B6\] Anchor-bucket grid, in blocks (default 144, the ZIP 318 value).
+        /// MUST match the interval the wallet itself retains on, or a migration
+        /// transfer anchored to a boundary this engine did not retain becomes
+        /// unprovable. Only meaningful with `--anchor-retention`.
+        #[arg(long, default_value_t = 144)]
+        anchor_retention_interval: u32,
         /// Byte budget per fetch sub-chunk (T6.8-S adaptive split; makes dense
         /// "sandblasting" eras traversable). Must be >= 1 MiB.
         #[arg(long, default_value_t = slipstream_core::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES)]
@@ -194,7 +206,7 @@ enum Cmd {
         /// Network the wallet database belongs to.
         #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
         network: NetworkArg,
-        /// lightwalletd URL, e.g. https://zec.rocks:443
+        /// lightwalletd URL, e.g. <https://zec.rocks:443>
         #[arg(long)]
         server: String,
         /// [v0.7 P1] Alternate lightwalletd URLs (repeatable). With any
@@ -223,12 +235,6 @@ enum Cmd {
         /// DEFAULT ON since v0.4.0 — pass `--batch-combine false` for a baseline run.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
         batch_combine: bool,
-        /// Batched same-scalar trial-decrypt DH (forked orchard lockstep
-        /// kernel). Since v0.6 P8 this selects the GLV-lockstep kernel
-        /// (prebuilt shared windows + half-length ladder). Default OFF
-        /// pending its own device A/B.
-        #[arg(long, default_value_t = false, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-        batch_decrypt: bool,
         /// v0.5 scan-pacer lever: derive chunk-boundary treestates locally
         /// (one seed fetch per range instead of one GetTreeState round-trip
         /// per boundary — P1 measured those at 62% of the Mac scan wall).
@@ -240,11 +246,6 @@ enum Cmd {
         /// and compares (0 = off, 1 = audit EVERY boundary). Default 1.
         #[arg(long, default_value_t = 1)]
         treestate_verify_sample: u32,
-        /// v0.5 C2 lever: GLV endomorphism per-item DH (half-length Straus
-        /// ladder, byte-identical). Default ON (fleet-gated 2026-07-06);
-        /// `--endo-mul false` is the baseline A/B form.
-        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
-        endo_mul: bool,
         /// Write-behind queue depth (see `sync --persist-depth`). Default 1.
         #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=64))]
         persist_depth: usize,
@@ -262,7 +263,7 @@ enum Cmd {
     },
     /// [API v2 Phase C acceptance] Live wallet console rendered ONLY from the v2 contract:
     /// the derived engine snapshot (state/permille/recovering/stalled), the engine-owned SQL
-    /// views (`slipstream_v_recovery_balance`, `slipstream_v_tx_reconciled`), and the two
+    /// views (`ext_slipstream_v_recovery_balance`, `ext_slipstream_v_tx_reconciled`), and the two
     /// DOCUMENTED one-line host rules (balance = recovering ? view : upstream summary;
     /// visible = reconciled OR NOT recovering). ZERO wallet math lives in this command — if
     /// it ever needs any, the engine API is wrong and must grow instead (ENGINE_API_V2.md §8).
@@ -270,7 +271,7 @@ enum Cmd {
         /// Network the wallet database belongs to.
         #[arg(long, value_enum, default_value_t = NetworkArg::Main)]
         network: NetworkArg,
-        /// lightwalletd URL, e.g. https://zec.rocks:443
+        /// lightwalletd URL, e.g. <https://zec.rocks:443>
         #[arg(long)]
         server: String,
         /// Wallet directory (data.db lives inside).
@@ -456,7 +457,9 @@ fn parse_range(s: &str) -> Result<(u64, u64), String> {
     if s.contains("..=") {
         return Err(format!("range must be start..end (not ..=): {s}"));
     }
-    let (a, b) = s.split_once("..").ok_or_else(|| format!("range must be start..end: {s}"))?;
+    let (a, b) = s
+        .split_once("..")
+        .ok_or_else(|| format!("range must be start..end: {s}"))?;
     let start: u64 = a.trim().parse().map_err(|e| format!("bad start: {e}"))?;
     let end: u64 = b.trim().parse().map_err(|e| format!("bad end: {e}"))?;
     if end < start {
@@ -514,13 +517,18 @@ fn cmd_throttle_proxy(
             "weather machine up: http://{} -> {} (cap {})",
             proxy.local_addr(),
             target_addr,
-            if cap_kbps == 0 { "uncapped".to_string() } else { format!("{cap_kbps} KB/s") },
+            if cap_kbps == 0 {
+                "uncapped".to_string()
+            } else {
+                format!("{cap_kbps} KB/s")
+            },
         );
-        println!("point the engine at it, e.g.: --server http://{}", proxy.local_addr());
+        println!(
+            "point the engine at it, e.g.: --server http://{}",
+            proxy.local_addr()
+        );
         if collapse_after_s > 0 {
-            println!(
-                "scripted collapse: to {collapse_to_kbps} KB/s after {collapse_after_s} s"
-            );
+            println!("scripted collapse: to {collapse_to_kbps} KB/s after {collapse_after_s} s");
             tokio::time::sleep(std::time::Duration::from_secs(collapse_after_s)).await;
             proxy.set_cap(collapse_to_kbps * 1024);
             println!("collapse fired: cap now {collapse_to_kbps} KB/s");
@@ -530,8 +538,14 @@ fn cmd_throttle_proxy(
 }
 
 fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline: bool) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
-    let (start, end) = parse_range(&range).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
+    let (start, end) = parse_range(&range).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         let mut base_stats = None;
@@ -541,12 +555,18 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
                 Ok(s) => {
                     println!(
                         "  K=1: {} blocks, {:.1} MB, {:.1}s, {:.0} blk/s, {:.2} MB/s",
-                        s.blocks, s.bytes as f64 / 1048576.0, s.elapsed.as_secs_f64(),
-                        s.blocks_per_sec(), s.megabytes_per_sec()
+                        s.blocks,
+                        s.bytes as f64 / 1048576.0,
+                        s.elapsed.as_secs_f64(),
+                        s.blocks_per_sec(),
+                        s.megabytes_per_sec()
                     );
                     base_stats = Some(s);
                 }
-                Err(e) => { eprintln!("baseline failed: {e}"); std::process::exit(1) }
+                Err(e) => {
+                    eprintln!("baseline failed: {e}");
+                    std::process::exit(1)
+                }
             }
         }
         println!("measured run (streams={streams})...");
@@ -554,24 +574,27 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
             Ok(s) => {
                 println!(
                     "  K={streams}: {} blocks, {:.1} MB, {:.1}s, {:.0} blk/s, {:.2} MB/s",
-                    s.blocks, s.bytes as f64 / 1048576.0, s.elapsed.as_secs_f64(),
-                    s.blocks_per_sec(), s.megabytes_per_sec()
+                    s.blocks,
+                    s.bytes as f64 / 1048576.0,
+                    s.elapsed.as_secs_f64(),
+                    s.blocks_per_sec(),
+                    s.megabytes_per_sec()
                 );
                 if let Some(b) = base_stats {
-                    println!("  speedup vs K=1: {:.2}x", s.megabytes_per_sec() / b.megabytes_per_sec());
+                    println!(
+                        "  speedup vs K=1: {:.2}x",
+                        s.megabytes_per_sec() / b.megabytes_per_sec()
+                    );
                 }
             }
-            Err(e) => { eprintln!("fetch failed: {e}"); std::process::exit(1) }
+            Err(e) => {
+                eprintln!("fetch failed: {e}");
+                std::process::exit(1)
+            }
         }
     });
 }
 
-/// Validate sync argument combinations. Extracted as a pure function to stay testable
-/// without any I/O or network — specifically validates that a UFVK is not supplied
-/// without a birthday height.
-///
-/// Returns `Ok(Some((ufvk_str, birthday)))` if both are present, `Ok(None)` if neither,
-/// and `Err(String)` if the combination is invalid.
 // ── `watch` (API v2 Phase C acceptance) ────────────────────────────────────────────────────
 
 fn event_tag_name(tag: u8) -> &'static str {
@@ -610,7 +633,7 @@ fn cmd_watch(
         eprintln!("{e}");
         std::process::exit(2)
     });
-    let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday).unwrap_or_else(|e| {
+    let accounts = validate_sync_args(&network, ufvk.as_deref(), birthday).unwrap_or_else(|e| {
         eprintln!("error: {e}");
         std::process::exit(2)
     });
@@ -631,16 +654,14 @@ fn cmd_watch(
         // that no host needs pre-first-suggest compensation. Failure = cold snapshot.
         if let Ok(session) =
             slipstream_core::wallet_session::WalletSession::open(network, &db_path)
-        {
-            if let Err(e) =
+            && let Err(e) =
                 slipstream_core::scheduler::seed_progress_from_wallet(&reporter.progress, &session)
             {
                 eprintln!("warn: E-3 open-time snapshot seed failed ({e}) — starting cold");
             }
-        }
         let scfg = slipstream_core::SessionConfig {
             engine: cfg,
-            account: ufvk_arg.map(|(s, h)| (s.to_string(), h)),
+            accounts,
             tor: None,
         };
         let session = tokio::spawn(slipstream_core::session::run_session(
@@ -670,20 +691,16 @@ fn cmd_watch(
             }
 
             // v2 channel 2 — the DOCUMENTED host rules, verbatim:
-            //   balance = is_recovering ? SELECT slipstream_v_recovery_balance : upstream summary
+            //   balance = is_recovering ? SELECT ext_slipstream_v_recovery_balance : upstream summary
             let balances: Vec<(String, i64, &'static str)> = if snap.is_recovering == 1 {
+                // [issue #4] The view read lives in slipstream-core (`reconcile`);
+                // the CLI holds only the short read connection.
                 let mut out = Vec::new();
                 if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-                    if let Ok(mut stmt) = conn
-                        .prepare("SELECT account_uuid, balance_zat FROM slipstream_v_recovery_balance")
-                    {
-                        if let Ok(rows) = stmt.query_map([], |r| {
-                            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
-                        }) {
-                            for row in rows.flatten() {
-                                out.push((uuid_prefix(&row.0), row.1, "Σ reconciled (recovering)"));
-                            }
+                    if let Ok(rows) = slipstream_core::reconcile::recovery_balances(&conn) {
+                        for (uuid, zat) in rows {
+                            out.push((uuid_prefix(&uuid), zat, "Σ reconciled (recovering)"));
                         }
                     }
                 }
@@ -717,20 +734,19 @@ fn cmd_watch(
             };
 
             //   visible = reconciled OR NOT is_recovering (mined txs only)
+            // [issue #4] Served entirely by the slipstream-owned view via
+            // slipstream-core (`reconcile`) — no hand-rolled SQL here.
             let visible: i64 = rusqlite::Connection::open(&db_path)
                 .ok()
                 .and_then(|conn| {
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-                    let sql = if snap.is_recovering == 1 {
-                        "SELECT COUNT(*) FROM transactions t WHERE t.mined_height IS NOT NULL \
-                         AND NOT EXISTS (SELECT 1 FROM slipstream_v_tx_reconciled r \
-                                         WHERE r.txid = t.txid AND r.reconciled = 0)"
-                    } else {
-                        "SELECT COUNT(*) FROM transactions t WHERE t.mined_height IS NOT NULL"
-                    };
-                    conn.query_row(sql, [], |r| r.get(0)).ok()
+                    slipstream_core::reconcile::visible_mined_tx_count(
+                        &conn,
+                        snap.is_recovering == 1,
+                    )
+                    .ok()
                 })
-                .unwrap_or(-1);
+                .map_or(-1, |n| i64::try_from(n).unwrap_or(i64::MAX));
 
             let state_name = match snap.state {
                 0 => "idle",
@@ -768,19 +784,36 @@ fn cmd_watch(
     });
 }
 
-fn validate_sync_args(
+/// Decode a `--ufvk` string + `--birthday` height into the engine's typed account tuple.
+/// Decoding lives at the CLI boundary so the engine only ever handles parsed keys.
+fn parse_account<P: Parameters>(
+    network: &P,
+    ufvk: &str,
+    birthday: u64,
+) -> Result<(UnifiedFullViewingKey, BlockHeight), String> {
+    let ufvk =
+        UnifiedFullViewingKey::decode(network, ufvk).map_err(|e| format!("invalid --ufvk: {e}"))?;
+    let birthday = u32::try_from(birthday)
+        .map_err(|_| format!("--birthday {birthday} exceeds the u32 block-height range"))?;
+    Ok((ufvk, BlockHeight::from_u32(birthday)))
+}
+
+/// Resolve the `--ufvk`/`--birthday` pair into the account list `sync_once` bootstraps.
+/// Returns an empty list when no key is supplied (a keyless pass over an existing wallet).
+fn validate_sync_args<P: Parameters>(
+    network: &P,
     ufvk: Option<&str>,
     birthday: Option<u64>,
-) -> Result<Option<(&str, u64)>, String> {
+) -> Result<Vec<(UnifiedFullViewingKey, BlockHeight)>, String> {
     match (ufvk, birthday) {
-        (Some(u), Some(b)) => Ok(Some((u, b))),
-        (None, None) => Ok(None),
+        (Some(u), Some(b)) => Ok(vec![parse_account(network, u, b)?]),
+        (None, None) => Ok(Vec::new()),
         (Some(_), None) => {
             Err("--ufvk requires --birthday: provide the wallet birthday height".into())
         }
         (None, Some(_)) => {
             // birthday without ufvk is silently ignored (may be used with an existing wallet)
-            Ok(None)
+            Ok(Vec::new())
         }
     }
 }
@@ -812,16 +845,17 @@ fn cmd_bench(
     graft: bool,
     gpu_subtree: bool,
     batch_combine: bool,
-    batch_decrypt: bool,
     local_treestate: bool,
     treestate_verify_sample: u32,
-    endo_mul: bool,
     persist_depth: usize,
     graft_verify_sample: u32,
     json: Option<std::path::PathBuf>,
     keep: bool,
 ) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     require_gpu_feature_if(gpu_subtree, "--gpu-subtree");
 
     // Wallet dir: user-supplied (must be fresh) or a temp dir (deleted unless --keep).
@@ -835,13 +869,17 @@ fn cmd_bench(
                 );
                 std::process::exit(2);
             }
-            std::fs::create_dir_all(&d)
-                .unwrap_or_else(|e| { eprintln!("error: create {}: {e}", d.display()); std::process::exit(2) });
+            std::fs::create_dir_all(&d).unwrap_or_else(|e| {
+                eprintln!("error: create {}: {e}", d.display());
+                std::process::exit(2)
+            });
             (d, None)
         }
         None => {
-            let td = tempfile::tempdir()
-                .unwrap_or_else(|e| { eprintln!("error: tempdir: {e}"); std::process::exit(2) });
+            let td = tempfile::tempdir().unwrap_or_else(|e| {
+                eprintln!("error: tempdir: {e}");
+                std::process::exit(2)
+            });
             (td.path().to_path_buf(), Some(td))
         }
     };
@@ -851,18 +889,26 @@ fn cmd_bench(
     cfg.gpu_subtree = gpu_subtree;
     // v0.4 Plan A lever (Task 8+): live A/B switch — the whole point of bench.
     cfg.graft_subtree = graft;
-    cfg.batch_decrypt = batch_decrypt;
     cfg.local_treestate = local_treestate;
     cfg.treestate_verify_sample = treestate_verify_sample;
-    cfg.endo_mul = endo_mul;
     cfg.persist_depth = persist_depth;
     cfg.graft_verify_sample = graft_verify_sample;
     cfg.batch_combine = batch_combine;
     cfg.alternate_endpoints = alternate_server
         .iter()
-        .map(|a| parse_server(a).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) }))
+        .map(|a| {
+            parse_server(a).unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(2)
+            })
+        })
         .collect();
-    cfg.bench_json_path = Some(json_path.clone());
+    let accounts = vec![
+        parse_account(&network, &ufvk, birthday).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2)
+        }),
+    ];
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let outcome = rt.block_on(async {
@@ -882,20 +928,21 @@ fn cmd_bench(
                 );
             }
         });
-        let result = slipstream_core::engine::sync_once(
-            &cfg,
-            Some((ufvk.as_str(), birthday)),
-            Some(progress),
-            None,
-        )
-        .await;
+        let result =
+            slipstream_core::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
         ticker.abort();
         result
     });
 
-    let outcome = outcome.unwrap_or_else(|e| { eprintln!("bench failed: {e}"); std::process::exit(1) });
+    let outcome = outcome.unwrap_or_else(|e| {
+        eprintln!("bench failed: {e}");
+        std::process::exit(1)
+    });
 
-    // Human table — same numbers the engine wrote to the JSON artifact.
+    // The engine no longer presents the pass itself — emit its tracing summary here.
+    slipstream_core::report::log_pass_summary(&outcome, &cfg);
+
+    // Human table — same numbers as the JSON artifact written below.
     let r = &outcome.report;
     let wait_s = r.persist_wait_elapsed.as_secs_f64();
     let busy_s = r.persist_busy_elapsed.as_secs_f64();
@@ -909,7 +956,10 @@ fn cmd_bench(
         wait_s,
         (busy_s - wait_s).max(0.0),
     );
-    for (label, c) in [("sapling", &r.census_sapling), ("orchard", &r.census_orchard)] {
+    for (label, c) in [
+        ("sapling", &r.census_sapling),
+        ("orchard", &r.census_orchard),
+    ] {
         println!(
             "census {label}: shards {} | noted {} | graftable {:.0}%",
             c.shards(),
@@ -921,10 +971,12 @@ fn cmd_bench(
         "Plan A ceiling (orchard, the dominant combine cost): skip ~{:.0}% of shard builds on this wallet",
         r.census_orchard.graftable_fraction() * 100.0
     );
-    if json_path.exists() {
-        println!("json: {}", json_path.display());
-    } else {
-        eprintln!("warning: engine did not write the bench JSON at {}", json_path.display());
+    match slipstream_core::report::bench_summary(&outcome).write_json(&json_path) {
+        Ok(()) => println!("json: {}", json_path.display()),
+        Err(e) => eprintln!(
+            "warning: bench JSON write failed at {}: {e}",
+            json_path.display()
+        ),
     }
     match (tempdir_guard, keep) {
         (Some(td), true) => {
@@ -954,24 +1006,43 @@ fn cmd_sync(
     persist_depth: usize,
     follow: bool,
     anchor_retention: Option<u32>,
+    anchor_retention_interval: u32,
 ) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
 
     if ufvk.is_none() && birthday.is_some() {
         eprintln!("note: --birthday without --ufvk is ignored (no import will occur)");
     }
 
-    let ufvk_arg = validate_sync_args(ufvk.as_deref(), birthday)
-        .unwrap_or_else(|e| { eprintln!("error: {e}"); std::process::exit(2) });
+    let accounts = validate_sync_args(&network, ufvk.as_deref(), birthday).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2)
+    });
 
-    let mut cfg =
-        slipstream_core::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
+    let mut cfg = slipstream_core::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
     cfg.fetch_streams = streams;
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
     cfg.chunk_split_bytes = chunk_split_bytes;
     cfg.memory_budget_bytes = memory_budget_bytes;
-    cfg.anchor_retention_height = anchor_retention; // [B6]
+    // [B6] The floor and the grid together are the retention policy; an interval
+    // of zero is not a grid, so it is rejected rather than silently defaulted.
+    cfg.anchor_retention = match anchor_retention {
+        Some(floor) => {
+            let Some(blocks) = std::num::NonZeroU32::new(anchor_retention_interval) else {
+                eprintln!("error: --anchor-retention-interval must be greater than zero");
+                std::process::exit(2)
+            };
+            Some(slipstream_core::AnchorRetention::new(
+                zcash_protocol::consensus::BlockHeight::from(floor),
+                slipstream_core::AnchorRetentionInterval::custom(blocks),
+            ))
+        }
+        None => None,
+    };
     require_gpu_feature_if(gpu_subtree, "--gpu-subtree");
     // `--sparse false` (the sparse kill switch) implies write-behind off: the
     // deferred commit runs the sparse put_blocks path, so it cannot outlive it.
@@ -1016,7 +1087,7 @@ fn cmd_sync(
         if follow {
             let scfg = slipstream_core::SessionConfig {
                 engine: cfg.clone(),
-                account: ufvk_arg.map(|(s, h)| (s.to_string(), h)),
+                accounts: accounts.clone(),
                 tor: None,
             };
             let reporter = slipstream_core::SessionReporter {
@@ -1038,13 +1109,17 @@ fn cmd_sync(
             std::process::exit(1);
         }
 
-        let result = slipstream_core::engine::sync_once(&cfg, ufvk_arg, Some(progress), None).await;
+        let result =
+            slipstream_core::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
 
         // Abort the ticker (JoinHandle::abort is fine per spec — no cleanup needed).
         ticker.abort();
 
         match result {
             Ok(outcome) => {
+                // Engine returns a bare result; emit its tracing summary here
+                // (the --follow path gets this via session::run_pass_with_retry).
+                slipstream_core::report::log_pass_summary(&outcome, &cfg);
                 let mb = outcome.report.fetch.bytes as f64 / 1_048_576.0;
                 println!(
                     "synced to tip {} in {:.1}s",
@@ -1060,8 +1135,7 @@ fn cmd_sync(
                 );
                 println!(
                     "notes found: sapling {} orchard {}",
-                    outcome.report.scan.sapling_received,
-                    outcome.report.scan.orchard_received,
+                    outcome.report.scan.sapling_received, outcome.report.scan.orchard_received,
                 );
                 println!(
                     "enhanced: {} txs, {} statuses ({} skipped)",
@@ -1071,8 +1145,7 @@ fn cmd_sync(
                 );
                 println!(
                     "utxos: {} across {} accounts",
-                    outcome.transparent.utxos,
-                    outcome.transparent.accounts,
+                    outcome.transparent.utxos, outcome.transparent.accounts,
                 );
                 // Per-stage timing + bound (Decision-Log requirement for honest G5 reporting).
                 println!(
@@ -1097,7 +1170,6 @@ fn cmd_sync(
                 if outcome.report.reorgs_recovered > 0 {
                     println!("reorgs: {} recovered", outcome.report.reorgs_recovered);
                 }
-
             }
             Err(e) => {
                 eprintln!("sync failed: {e}");
@@ -1122,7 +1194,10 @@ fn cmd_oracle(
     streams: usize,
     chunk: u32,
 ) {
-    let endpoint = parse_server(&server).unwrap_or_else(|e| { eprintln!("{e}"); std::process::exit(2) });
+    let endpoint = parse_server(&server).unwrap_or_else(|e| {
+        eprintln!("{e}");
+        std::process::exit(2)
+    });
     if write_behind_b && !sparse_b {
         eprintln!("error: --write-behind-b requires --sparse-b");
         std::process::exit(2);
@@ -1134,11 +1209,18 @@ fn cmd_oracle(
     require_gpu_feature_if(gpu_subtree_b, "--gpu-subtree-b");
     for d in [&wallet_a, &wallet_b] {
         if d.join("data.db").exists() {
-            eprintln!("error: {} already contains data.db — oracle needs fresh wallets", d.display());
+            eprintln!(
+                "error: {} already contains data.db — oracle needs fresh wallets",
+                d.display()
+            );
             std::process::exit(2);
         }
     }
-    let mk_cfg = |dir: &std::path::Path, sparse: bool, write_behind: bool, gpu_subtree: bool, persist_depth: usize| {
+    let mk_cfg = |dir: &std::path::Path,
+                  sparse: bool,
+                  write_behind: bool,
+                  gpu_subtree: bool,
+                  persist_depth: usize| {
         let mut cfg =
             slipstream_core::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
         cfg.fetch_streams = streams;
@@ -1149,13 +1231,20 @@ fn cmd_oracle(
         cfg.persist_depth = persist_depth;
         cfg
     };
+    let accounts = vec![
+        parse_account(&network, &ufvk, birthday).unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2)
+        }),
+    ];
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let verdict = rt.block_on(async {
         println!("oracle: run A (upstream persistence) …");
-        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), Some((ufvk.as_str(), birthday)), None, None).await?;
+        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), &accounts, None, None).await?;
         println!("oracle: run A done — tip {} in {:.1?}", a.chain_tip, a.elapsed);
         println!("oracle: run B (sparse_b={sparse_b} write_behind_b={write_behind_b} gpu_subtree_b={gpu_subtree_b} persist_depth_b={persist_depth_b}) …");
-        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), Some((ufvk.as_str(), birthday)), None, None).await?;
+        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), &accounts, None, None).await?;
         println!("oracle: run B done — tip {} in {:.1?}", b.chain_tip, b.elapsed);
         if a.chain_tip != b.chain_tip {
             eprintln!("oracle: TIP SKEW (A={} B={}) — rerun when the chain is quiet", a.chain_tip, b.chain_tip);
@@ -1173,11 +1262,14 @@ fn cmd_oracle(
                 std::process::exit(1);
             }
         }
-        Err(e) => { eprintln!("oracle failed: {e}"); std::process::exit(1); }
+        Err(e) => {
+            eprintln!("oracle failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
-/// [B7] Propose, prove, and broadcast a spend from a synced wallet. The
+/// \[B7\] Propose, prove, and broadcast a spend from a synced wallet. The
 /// proposal runs upstream's production shapes (greedy selector, ZIP-317
 /// multi-output change, `SpendPolicy::default()` = every shielded pool the
 /// chain has activated, Ironwood included), the transaction is proved with
@@ -1201,12 +1293,12 @@ fn cmd_send(
         ConfirmationsPolicy, SpendingKeys, create_proposed_transactions,
         input_selection::GreedyInputSelector, propose_transfer,
     };
-    use zcash_client_backend::wallet::OvkPolicy;
     use zcash_client_backend::fees::{
         DustOutputPolicy, SplitPolicy, StandardFeeRule, zip317::MultiOutputChangeStrategy,
     };
-    use zcash_protocol::{ShieldedPool, value::Zatoshis};
+    use zcash_client_backend::wallet::OvkPolicy;
     use zcash_client_backend::zip321::{Payment, TransactionRequest};
+    use zcash_protocol::{ShieldedPool, value::Zatoshis};
 
     let endpoint = match parse_server(&server) {
         Ok(e) => e,
@@ -1227,14 +1319,16 @@ fn cmd_send(
         .expect("usk derivation");
     let ufvk = usk.to_unified_full_viewing_key();
 
-    let mut session = slipstream_core::wallet_session::WalletSession::open(
-        network,
-        &wallet_dir.join("data.db"),
-    )
-    .expect("open wallet db");
+    let mut session =
+        slipstream_core::wallet_session::WalletSession::open(network, &wallet_dir.join("data.db"))
+            .expect("open wallet db");
     let db = session.db_mut();
     let accounts = db.get_account_ids().expect("account ids");
-    assert_eq!(accounts.len(), 1, "send tooling expects a single-account wallet");
+    assert_eq!(
+        accounts.len(),
+        1,
+        "send tooling expects a single-account wallet"
+    );
     let wallet_account = accounts[0];
 
     // The derived key must be THE wallet's key (guards against wrong mnemonic/account).
@@ -1265,8 +1359,15 @@ fn cmd_send(
     println!("amount: {zats} zats");
 
     let request = TransactionRequest::new(vec![
-        Payment::new(addr, Some(Zatoshis::const_from_u64(zats)), None, None, None, vec![])
-            .expect("payment"),
+        Payment::new(
+            addr,
+            Some(Zatoshis::const_from_u64(zats)),
+            None,
+            None,
+            None,
+            vec![],
+        )
+        .expect("payment"),
     ])
     .expect("transaction request");
 
@@ -1294,6 +1395,7 @@ fn cmd_send(
         request,
         ConfirmationsPolicy::new_symmetrical(NonZeroU32::MIN, true),
         &zcash_client_backend::data_api::wallet::input_selection::SpendPolicy::default(),
+        None,
         None,
     )
     .expect("propose_transfer");
@@ -1353,7 +1455,14 @@ fn cmd_send(
     }
 
     println!("proving + creating transaction (orchard circuit, pool-agnostic)...");
-    let txids = create_proposed_transactions::<_, _, std::convert::Infallible, _, std::convert::Infallible, _>(
+    let txids = create_proposed_transactions::<
+        _,
+        _,
+        std::convert::Infallible,
+        _,
+        std::convert::Infallible,
+        _,
+    >(
         db,
         &network,
         &NoSapling,
@@ -1361,6 +1470,7 @@ fn cmd_send(
         &SpendingKeys::from_unified_spending_key(usk),
         OvkPolicy::Sender,
         &proposal,
+        None,
     )
     .expect("create_proposed_transactions");
     assert_eq!(txids.len(), 1, "exactly one transaction expected");
@@ -1409,32 +1519,174 @@ fn main() {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Version => {
-            println!("{} {}", slipstream_core::CRATE_NAME, env!("CARGO_PKG_VERSION"));
+            println!(
+                "{} {}",
+                slipstream_core::CRATE_NAME,
+                env!("CARGO_PKG_VERSION")
+            );
         }
-        Cmd::ThrottleProxy { target, listen, cap_kbps, collapse_after_s, collapse_to_kbps } => {
+        Cmd::ThrottleProxy {
+            target,
+            listen,
+            cap_kbps,
+            collapse_after_s,
+            collapse_to_kbps,
+        } => {
             cmd_throttle_proxy(target, listen, cap_kbps, collapse_after_s, collapse_to_kbps);
         }
-        Cmd::Fetch { server, range, streams, chunk, baseline } => {
+        Cmd::Fetch {
+            server,
+            range,
+            streams,
+            chunk,
+            baseline,
+        } => {
             cmd_fetch(server, range, streams, chunk, baseline);
         }
-        Cmd::DeriveUfvk { mnemonic, account, network } => {
+        Cmd::DeriveUfvk {
+            mnemonic,
+            account,
+            network,
+        } => {
             cmd_derive_ufvk(&mnemonic, account, network.to_network());
         }
-        Cmd::Send { network, server, wallet_dir, mnemonic, account, to, zats } => {
-            cmd_send(network.to_network(), server, wallet_dir, mnemonic, account, to, zats);
+        Cmd::Send {
+            network,
+            server,
+            wallet_dir,
+            mnemonic,
+            account,
+            to,
+            zats,
+        } => {
+            cmd_send(
+                network.to_network(),
+                server,
+                wallet_dir,
+                mnemonic,
+                account,
+                to,
+                zats,
+            );
         }
-        Cmd::Sync { network, custom_heights, server, wallet_dir, ufvk, birthday, streams, chunk, sparse,
-            anchor_retention, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow } => {
-            cmd_sync(resolve_network(network, custom_heights.as_deref()), server, wallet_dir, ufvk, birthday, streams, chunk, sparse, chunk_split_bytes, memory_budget_bytes, write_behind, gpu_subtree, persist_depth, follow, anchor_retention);
+        Cmd::Sync {
+            network,
+            custom_heights,
+            server,
+            wallet_dir,
+            ufvk,
+            birthday,
+            streams,
+            chunk,
+            sparse,
+            anchor_retention,
+            anchor_retention_interval,
+            chunk_split_bytes,
+            memory_budget_bytes,
+            write_behind,
+            gpu_subtree,
+            persist_depth,
+            follow,
+        } => {
+            cmd_sync(
+                resolve_network(network, custom_heights.as_deref()),
+                server,
+                wallet_dir,
+                ufvk,
+                birthday,
+                streams,
+                chunk,
+                sparse,
+                chunk_split_bytes,
+                memory_budget_bytes,
+                write_behind,
+                gpu_subtree,
+                persist_depth,
+                follow,
+                anchor_retention,
+                anchor_retention_interval,
+            );
         }
-        Cmd::Bench { network, server, alternate_server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep } => {
-            cmd_bench(network.to_network(), server, alternate_server, ufvk, birthday, wallet_dir, graft, gpu_subtree, batch_combine, batch_decrypt, local_treestate, treestate_verify_sample, endo_mul, persist_depth, graft_verify_sample, json, keep);
+        Cmd::Bench {
+            network,
+            server,
+            alternate_server,
+            ufvk,
+            birthday,
+            wallet_dir,
+            graft,
+            gpu_subtree,
+            batch_combine,
+            local_treestate,
+            treestate_verify_sample,
+            persist_depth,
+            graft_verify_sample,
+            json,
+            keep,
+        } => {
+            cmd_bench(
+                network.to_network(),
+                server,
+                alternate_server,
+                ufvk,
+                birthday,
+                wallet_dir,
+                graft,
+                gpu_subtree,
+                batch_combine,
+                local_treestate,
+                treestate_verify_sample,
+                persist_depth,
+                graft_verify_sample,
+                json,
+                keep,
+            );
         }
-        Cmd::Watch { network, server, wallet_dir, ufvk, birthday, interval_ms } => {
-            cmd_watch(network.to_network(), server, wallet_dir, ufvk, birthday, interval_ms);
+        Cmd::Watch {
+            network,
+            server,
+            wallet_dir,
+            ufvk,
+            birthday,
+            interval_ms,
+        } => {
+            cmd_watch(
+                network.to_network(),
+                server,
+                wallet_dir,
+                ufvk,
+                birthday,
+                interval_ms,
+            );
         }
-        Cmd::Oracle { network, server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk } => {
-            cmd_oracle(network.to_network(), server, wallet_a, wallet_b, ufvk, birthday, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b, streams, chunk);
+        Cmd::Oracle {
+            network,
+            server,
+            wallet_a,
+            wallet_b,
+            ufvk,
+            birthday,
+            sparse_b,
+            write_behind_b,
+            gpu_subtree_b,
+            persist_depth_b,
+            streams,
+            chunk,
+        } => {
+            cmd_oracle(
+                network.to_network(),
+                server,
+                wallet_a,
+                wallet_b,
+                ufvk,
+                birthday,
+                sparse_b,
+                write_behind_b,
+                gpu_subtree_b,
+                persist_depth_b,
+                streams,
+                chunk,
+            );
         }
     }
 }
@@ -1471,22 +1723,41 @@ mod tests {
     #[test]
     fn parses_network_flag_and_defaults_to_main() {
         let cli = Cli::try_parse_from([
-            "slipstream", "sync",
-            "--network", "test",
-            "--server", "https://lwd.example:443",
-            "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--network",
+            "test",
+            "--server",
+            "https://lwd.example:443",
+            "--wallet-dir",
+            "/tmp/w",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { network: NetworkArg::Test, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                network: NetworkArg::Test,
+                ..
+            }
+        ));
 
         let cli = Cli::try_parse_from([
-            "slipstream", "sync",
-            "--server", "https://lwd.example:443",
-            "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--server",
+            "https://lwd.example:443",
+            "--wallet-dir",
+            "/tmp/w",
         ])
         .expect("parses");
         assert!(
-            matches!(cli.cmd, Cmd::Sync { network: NetworkArg::Main, .. }),
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    network: NetworkArg::Main,
+                    ..
+                }
+            ),
             "network must default to mainnet"
         );
     }
@@ -1495,7 +1766,9 @@ mod tests {
     fn derive_ufvk_produces_a_testnet_ufvk() {
         // The standard BIP-39 test mnemonic; testnet fixture derivation only.
         let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
-        let seed = bip39::Mnemonic::parse(phrase).expect("valid mnemonic").to_seed("");
+        let seed = bip39::Mnemonic::parse(phrase)
+            .expect("valid mnemonic")
+            .to_seed("");
         let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
             &slipstream_core::Network::TestNetwork,
             &seed,
@@ -1514,40 +1787,67 @@ mod tests {
     #[test]
     fn parses_bench_minimal() {
         let cli = Cli::try_parse_from([
-            "slipstream", "bench",
-            "--server", "https://zec.rocks:443",
-            "--ufvk", "uview1abc",
-            "--birthday", "2500000",
+            "slipstream",
+            "bench",
+            "--server",
+            "https://zec.rocks:443",
+            "--ufvk",
+            "uview1abc",
+            "--birthday",
+            "2500000",
         ])
         .expect("parses");
-        // v0.4.0: graft + batch_combine default ON; v0.5: endo_mul default ON —
-        // bench mirrors production; `--graft false --batch-combine false
-        // --endo-mul false` is the baseline A/B form.
+        // v0.4.0: graft + batch_combine default ON; bench mirrors production —
+        // `--graft false --batch-combine false` is the baseline A/B form.
         assert!(matches!(
             cli.cmd,
-            Cmd::Bench { graft: true, batch_combine: true, endo_mul: true, gpu_subtree: false, keep: false, .. }
+            Cmd::Bench {
+                graft: true,
+                batch_combine: true,
+                gpu_subtree: false,
+                keep: false,
+                ..
+            }
         ));
     }
 
     #[test]
     fn parses_bench_full_flags() {
         let cli = Cli::try_parse_from([
-            "slipstream", "bench",
-            "--server", "https://zec.rocks:443",
-            "--ufvk", "uview1abc",
-            "--birthday", "2500000",
-            "--wallet-dir", "/tmp/benchw",
-            "--graft", "true",
-            "--gpu-subtree", "true",
-            "--json", "/tmp/out.json",
+            "slipstream",
+            "bench",
+            "--server",
+            "https://zec.rocks:443",
+            "--ufvk",
+            "uview1abc",
+            "--birthday",
+            "2500000",
+            "--wallet-dir",
+            "/tmp/benchw",
+            "--graft",
+            "true",
+            "--gpu-subtree",
+            "true",
+            "--json",
+            "/tmp/out.json",
             "--keep",
         ])
         .expect("parses");
         match cli.cmd {
-            Cmd::Bench { graft, gpu_subtree, keep, json, wallet_dir, .. } => {
+            Cmd::Bench {
+                graft,
+                gpu_subtree,
+                keep,
+                json,
+                wallet_dir,
+                ..
+            } => {
                 assert!(graft && gpu_subtree && keep);
                 assert_eq!(json.as_deref(), Some(std::path::Path::new("/tmp/out.json")));
-                assert_eq!(wallet_dir.as_deref(), Some(std::path::Path::new("/tmp/benchw")));
+                assert_eq!(
+                    wallet_dir.as_deref(),
+                    Some(std::path::Path::new("/tmp/benchw"))
+                );
             }
             other => panic!("wrong cmd: {other:?}"),
         }
@@ -1559,9 +1859,12 @@ mod tests {
         assert!(Cli::try_parse_from(["slipstream", "bench", "--server", "http://x:1"]).is_err());
         assert!(
             Cli::try_parse_from([
-                "slipstream", "bench",
-                "--server", "http://x:1",
-                "--ufvk", "uview1abc",
+                "slipstream",
+                "bench",
+                "--server",
+                "http://x:1",
+                "--ufvk",
+                "uview1abc",
             ])
             .is_err()
         );
@@ -1643,7 +1946,10 @@ mod tests {
             "/tmp/test-wallet",
         ])
         .expect("parses default");
-        assert!(matches!(cli.cmd, Cmd::Sync { sparse: true, .. }), "default must be true");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { sparse: true, .. }),
+            "default must be true"
+        );
     }
 
     #[test]
@@ -1703,7 +2009,13 @@ mod tests {
         ])
         .expect("parses --chunk-split-bytes");
         assert!(
-            matches!(cli.cmd, Cmd::Sync { chunk_split_bytes: 2_097_152, .. }),
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    chunk_split_bytes: 2_097_152,
+                    ..
+                }
+            ),
             "--chunk-split-bytes must override the default"
         );
     }
@@ -1745,7 +2057,13 @@ mod tests {
         ])
         .expect("parses --memory-budget-bytes");
         assert!(
-            matches!(cli.cmd, Cmd::Sync { memory_budget_bytes: 67_108_864, .. }),
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    memory_budget_bytes: 67_108_864,
+                    ..
+                }
+            ),
             "--memory-budget-bytes must override the default"
         );
     }
@@ -1758,32 +2076,64 @@ mod tests {
         assert!(result.is_err(), "should fail without --server");
     }
 
+    // A real mainnet UFVK (the repo's canonical darkside test key, copied here because
+    // `wallet_session::TEST_UFVK` is `#[cfg(any(test, feature = "darkside"))]` and so not
+    // reachable from this crate's tests). `validate_sync_args` now decodes, so the success
+    // path needs a genuinely decodable key.
+    const VALID_MAINNET_UFVK: &str = concat!(
+        "uview17fme6ux853km45g9ep07djpfzeydxxgm22xpmr7arzxyutlusalgpqlx7suga4ahzywfuwz4jclm00u7g8u65qvvdt45kttnfunvschssg3h3g06txs9ja32vx3xa8dej3unnat",
+        "gzjvd0vumk37t8es3ludldrtse3q6226ws7eq4q0ywz78nudwpepgdn7jmxz8yvp7k6gxkeynkam0f8aqf9qpeaej55zhkw39x7epayhndul0j4xjttdxxlnwcd09nr8svyx8j0zng0w6",
+        "scx3m5unpkaqxcm3hslhlfg4caz7r8d4xy9wm7klkg79w7j0uyzec5s3yje20eg946r6rmkf532nfydu26s8q9ua7mwxw2j2ag7hfcuu652gw6uta03vlm05zju3a9rwc4h367kqzfqrc",
+        "z35pdwdk2a7yqnk850un3ujxcvve45ueajgvtr6dj4ufszgqwdy0aedgmkalx2p7qed2suarwkr35dl0c8dnqp3"
+    );
+
     #[test]
     fn sync_requires_birthday_with_ufvk() {
-        // validate_sync_args is a pure function we can call directly.
-        let result = validate_sync_args(Some("uview1someufvk"), None);
+        // The (ufvk, no birthday) arm errors before any decode, so a placeholder key is fine.
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, Some("uview1someufvk"), None);
         assert!(result.is_err(), "ufvk without birthday must error");
         let msg = result.unwrap_err();
-        assert!(msg.contains("birthday"), "error message should mention birthday: {msg}");
+        assert!(
+            msg.contains("birthday"),
+            "error message should mention birthday: {msg}"
+        );
     }
 
     #[test]
     fn sync_allows_no_ufvk_no_birthday() {
-        let result = validate_sync_args(None, None);
-        assert!(matches!(result, Ok(None)));
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, None, None).expect("no args is valid");
+        assert!(result.is_empty(), "no ufvk = no accounts to import");
     }
 
     #[test]
     fn sync_allows_ufvk_with_birthday() {
-        let result = validate_sync_args(Some("uview1someufvk"), Some(800_000));
-        assert!(matches!(result, Ok(Some(("uview1someufvk", 800_000)))));
+        let net = slipstream_core::Network::MainNetwork;
+        let accounts = validate_sync_args(&net, Some(VALID_MAINNET_UFVK), Some(800_000))
+            .expect("valid ufvk + birthday");
+        assert_eq!(accounts.len(), 1, "one account to bootstrap");
+        assert_eq!(
+            u32::from(accounts[0].1),
+            800_000,
+            "birthday preserved as a BlockHeight"
+        );
     }
 
     #[test]
-    fn sync_allows_birthday_without_ufvk_returns_none() {
-        // birthday with no ufvk: silently ignored (validate_sync_args returns Ok(None))
-        let result = validate_sync_args(None, Some(800_000));
-        assert!(matches!(result, Ok(None)), "expected Ok(None), got {result:?}");
+    fn sync_rejects_undecodable_ufvk() {
+        // Decoding now happens at the CLI boundary: a malformed --ufvk is a clean error.
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, Some("uview1someufvk"), Some(800_000));
+        assert!(result.is_err(), "an undecodable ufvk must error");
+    }
+
+    #[test]
+    fn sync_allows_birthday_without_ufvk_returns_empty() {
+        // birthday with no ufvk: silently ignored (no account to import).
+        let net = slipstream_core::Network::MainNetwork;
+        let result = validate_sync_args(&net, None, Some(800_000)).expect("birthday-only is valid");
+        assert!(result.is_empty(), "expected no accounts, got {result:?}");
     }
 
     #[test]
@@ -1803,11 +2153,16 @@ mod tests {
             "1500000",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Oracle { write_behind_b: false, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Oracle {
+                write_behind_b: false,
+                ..
+            }
+        ));
     }
 
     // ── T6.9 write-behind flags ────────────────────────────────────────────────
-
 
     #[test]
     fn sync_write_behind_defaults_on() {
@@ -1821,7 +2176,13 @@ mod tests {
             "/tmp/test-wallet",
         ])
         .expect("parses without the flag");
-        assert!(matches!(cli.cmd, Cmd::Sync { write_behind: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                write_behind: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1836,7 +2197,13 @@ mod tests {
             "--write-behind",
         ])
         .expect("parses bare --write-behind");
-        assert!(matches!(cli.cmd, Cmd::Sync { write_behind: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                write_behind: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1852,7 +2219,13 @@ mod tests {
             "false",
         ])
         .expect("parses --write-behind false");
-        assert!(matches!(cli.cmd, Cmd::Sync { write_behind: false, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                write_behind: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1876,7 +2249,11 @@ mod tests {
         .expect("parses");
         assert!(matches!(
             cli.cmd,
-            Cmd::Oracle { sparse_b: true, write_behind_b: true, .. }
+            Cmd::Oracle {
+                sparse_b: true,
+                write_behind_b: true,
+                ..
+            }
         ));
     }
 
@@ -1884,53 +2261,119 @@ mod tests {
     fn gpu_subtree_flags_parse() {
         // oracle --gpu-subtree-b (B0.4 acceptance-gate flag)
         let cli = Cli::try_parse_from([
-            "slipstream", "oracle",
-            "--server", "http://127.0.0.1:9067",
-            "--wallet-a", "/tmp/oa", "--wallet-b", "/tmp/ob",
-            "--ufvk", "uview1someufvk", "--birthday", "1500000",
-            "--sparse-b", "--gpu-subtree-b",
+            "slipstream",
+            "oracle",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-a",
+            "/tmp/oa",
+            "--wallet-b",
+            "/tmp/ob",
+            "--ufvk",
+            "uview1someufvk",
+            "--birthday",
+            "1500000",
+            "--sparse-b",
+            "--gpu-subtree-b",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Oracle { gpu_subtree_b: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Oracle {
+                gpu_subtree_b: true,
+                ..
+            }
+        ));
 
         // sync --gpu-subtree
         let cli = Cli::try_parse_from([
-            "slipstream", "sync",
-            "--server", "http://127.0.0.1:9067",
-            "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/w",
             "--gpu-subtree",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { gpu_subtree: true, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                gpu_subtree: true,
+                ..
+            }
+        ));
     }
 
     #[test]
     fn persist_depth_flags_parse() {
         // oracle --persist-depth-b
         let cli = Cli::try_parse_from([
-            "slipstream", "oracle",
-            "--server", "http://127.0.0.1:9067",
-            "--wallet-a", "/tmp/oa", "--wallet-b", "/tmp/ob",
-            "--ufvk", "uview1someufvk", "--birthday", "1500000",
-            "--sparse-b", "--persist-depth-b", "4",
+            "slipstream",
+            "oracle",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-a",
+            "/tmp/oa",
+            "--wallet-b",
+            "/tmp/ob",
+            "--ufvk",
+            "uview1someufvk",
+            "--birthday",
+            "1500000",
+            "--sparse-b",
+            "--persist-depth-b",
+            "4",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Oracle { persist_depth_b: 4, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Oracle {
+                persist_depth_b: 4,
+                ..
+            }
+        ));
 
         // sync --persist-depth
         let cli = Cli::try_parse_from([
-            "slipstream", "sync", "--server", "http://127.0.0.1:9067",
-            "--wallet-dir", "/tmp/w", "--persist-depth", "3",
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/w",
+            "--persist-depth",
+            "3",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { persist_depth: 3, .. }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Sync {
+                persist_depth: 3,
+                ..
+            }
+        ));
 
         // default depth = 1
         let cli = Cli::try_parse_from([
-            "slipstream", "sync", "--server", "http://127.0.0.1:9067", "--wallet-dir", "/tmp/w",
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/w",
         ])
         .expect("parses");
-        assert!(matches!(cli.cmd, Cmd::Sync { persist_depth: 1, .. }), "default depth must be 1");
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    persist_depth: 1,
+                    ..
+                }
+            ),
+            "default depth must be 1"
+        );
     }
 
     #[test]
@@ -1962,7 +2405,10 @@ mod tests {
             "/tmp/test-wallet",
         ])
         .expect("parses without --follow");
-        assert!(matches!(cli.cmd, Cmd::Sync { follow: false, .. }), "default must be false");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { follow: false, .. }),
+            "default must be false"
+        );
 
         // --follow enables following.
         let cli = Cli::try_parse_from([
@@ -1975,6 +2421,9 @@ mod tests {
             "--follow",
         ])
         .expect("parses --follow");
-        assert!(matches!(cli.cmd, Cmd::Sync { follow: true, .. }), "--follow must enable following");
+        assert!(
+            matches!(cli.cmd, Cmd::Sync { follow: true, .. }),
+            "--follow must enable following"
+        );
     }
 }

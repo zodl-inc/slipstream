@@ -55,7 +55,10 @@ pub const ANCHOR_MAX_REORG_BLOCKS: u64 = 100;
 pub enum AnchorIntent {
     /// Restoring from seed (or importing a UFVK) with `birthday`; `fallback_checkpoint`
     /// is the host's latest BUNDLED checkpoint height — the offline recover_until input.
-    Restore { birthday: u64, fallback_checkpoint: u64 },
+    Restore {
+        birthday: u64,
+        fallback_checkpoint: u64,
+    },
     /// Creating a brand-new wallet (no history).
     New,
 }
@@ -83,7 +86,10 @@ pub async fn restore_anchor(
         AnchorIntent::Restore { .. } => match tip_via(endpoint, tor).await {
             Some(tip) => {
                 info!(tip, "restore anchor: recover_until = live tip");
-                Anchor { height: tip, treestate: None }
+                Anchor {
+                    height: tip,
+                    treestate: None,
+                }
             }
             None => offline_anchor(intent),
         },
@@ -95,16 +101,26 @@ pub async fn restore_anchor(
             let fetched = async {
                 let mut client = client_via(endpoint, tor).await?;
                 let tip = grpc::get_latest_block_height(&mut client).await.ok()?;
-                let anchor_height = tip.saturating_sub(ANCHOR_MAX_REORG_BLOCKS).max(sapling_activation);
-                let ts = grpc::get_tree_state(&mut client, anchor_height).await.ok()?;
+                let anchor_height = tip
+                    .saturating_sub(ANCHOR_MAX_REORG_BLOCKS)
+                    .max(sapling_activation);
+                let ts = grpc::get_tree_state(&mut client, anchor_height)
+                    .await
+                    .ok()?;
                 // Trust the SERVER's height for consistency (it equals anchor_height in
                 // practice; on any discrepancy the treestate's own height wins).
-                Some(Anchor { height: ts.height, treestate: Some(ts) })
+                Some(Anchor {
+                    height: ts.height,
+                    treestate: Some(ts),
+                })
             }
             .await;
             match fetched {
                 Some(anchor) => {
-                    info!(height = anchor.height, "new-wallet anchor: reorg-safe server tree state");
+                    info!(
+                        height = anchor.height,
+                        "new-wallet anchor: reorg-safe server tree state"
+                    );
                     anchor
                 }
                 None => offline_anchor(intent),
@@ -118,7 +134,10 @@ pub async fn restore_anchor(
 /// (never a silent de-anonymising direct retry).
 pub fn offline_anchor(intent: AnchorIntent) -> Anchor {
     match intent {
-        AnchorIntent::Restore { birthday, fallback_checkpoint } => {
+        AnchorIntent::Restore {
+            birthday,
+            fallback_checkpoint,
+        } => {
             // The syncLogsMac9 rule, verbatim: the best offline estimate of "now";
             // max(.., birthday+1) guarantees a non-empty recovery segment even when the
             // wallet's birthday is newer than the bundled checkpoints.
@@ -129,11 +148,17 @@ pub fn offline_anchor(intent: AnchorIntent) -> Anchor {
                 birthday,
                 "restore anchor: server unreachable — offline recover_until fallback"
             );
-            Anchor { height, treestate: None }
+            Anchor {
+                height,
+                treestate: None,
+            }
         }
         AnchorIntent::New => {
             warn!("new-wallet anchor: server unreachable — host keeps its bundled checkpoint");
-            Anchor { height: 0, treestate: None }
+            Anchor {
+                height: 0,
+                treestate: None,
+            }
         }
     }
 }
@@ -150,7 +175,9 @@ async fn tip_via(endpoint: &Endpoint, tor: Option<&TorConn>) -> Option<u64> {
 /// the multi-attempt backoff window the sync pass uses would be pure added latency).
 async fn client_via(endpoint: &Endpoint, tor: Option<&TorConn>) -> Option<crate::grpc::LwdClient> {
     match tor {
-        Some(_) => connect_via(endpoint, tor, ConnPurpose::MetadataUnique).await.ok(),
+        Some(_) => connect_via(endpoint, tor, ConnPurpose::MetadataUnique)
+            .await
+            .ok(),
         None => grpc::connect(endpoint).await.ok(),
     }
 }
@@ -166,11 +193,18 @@ mod tests {
         // Unroutable endpoint (TEST-NET-1 address, port closed) — connect fails fast enough
         // for the direct retry budget only on refused connections; use an invalid host to
         // fail at URI/DNS level instead.
-        let endpoint = Endpoint { host: "invalid.host.invalid".into(), port: 1, tls: false };
+        let endpoint = Endpoint {
+            host: "invalid.host.invalid".into(),
+            port: 1,
+            tls: false,
+        };
         let anchor = restore_anchor(
             &endpoint,
             crate::network::SlipstreamNetwork::MAIN,
-            AnchorIntent::Restore { birthday: 2_000_000, fallback_checkpoint: 1_500_000 },
+            AnchorIntent::Restore {
+                birthday: 2_000_000,
+                fallback_checkpoint: 1_500_000,
+            },
             None,
         )
         .await;
@@ -178,24 +212,43 @@ mod tests {
             anchor.height, 2_000_001,
             "birthday newer than the bundled checkpoints ⇒ birthday+1 floor"
         );
-        assert!(anchor.treestate.is_none(), "restore intent never carries a treestate");
+        assert!(
+            anchor.treestate.is_none(),
+            "restore intent never carries a treestate"
+        );
 
         let anchor = restore_anchor(
             &endpoint,
             crate::network::SlipstreamNetwork::MAIN,
-            AnchorIntent::Restore { birthday: 1_000_000, fallback_checkpoint: 1_500_000 },
+            AnchorIntent::Restore {
+                birthday: 1_000_000,
+                fallback_checkpoint: 1_500_000,
+            },
             None,
         )
         .await;
-        assert_eq!(anchor.height, 1_500_000, "old birthday ⇒ the checkpoint estimate of now");
+        assert_eq!(
+            anchor.height, 1_500_000,
+            "old birthday ⇒ the checkpoint estimate of now"
+        );
     }
 
     /// Offline new-wallet: no anchor — the host keeps its bundled checkpoint (height 0
     /// + no treestate is the documented "keep your defaults" signal).
     #[tokio::test]
     async fn offline_new_wallet_yields_no_anchor() {
-        let endpoint = Endpoint { host: "invalid.host.invalid".into(), port: 1, tls: false };
-        let anchor = restore_anchor(&endpoint, crate::network::SlipstreamNetwork::MAIN, AnchorIntent::New, None).await;
+        let endpoint = Endpoint {
+            host: "invalid.host.invalid".into(),
+            port: 1,
+            tls: false,
+        };
+        let anchor = restore_anchor(
+            &endpoint,
+            crate::network::SlipstreamNetwork::MAIN,
+            AnchorIntent::New,
+            None,
+        )
+        .await;
         assert_eq!(anchor.height, 0);
         assert!(anchor.treestate.is_none());
     }

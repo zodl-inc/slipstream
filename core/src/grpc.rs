@@ -100,9 +100,12 @@ pub(crate) async fn retry_get_tree_state(
         // For the first attempt, connect fresh; for retries, also fresh (reconnect
         // semantics — avoids reusing a wedged channel). Tor-aware: treestate is
         // `.uniqueTor` (isolated circuit) when Tor is on, direct otherwise.
-        let mut client =
-            crate::connector::connect_via(endpoint, tor, crate::connector::ConnPurpose::MetadataUnique)
-                .await?;
+        let mut client = crate::connector::connect_via(
+            endpoint,
+            tor,
+            crate::connector::ConnPurpose::MetadataUnique,
+        )
+        .await?;
         match get_tree_state(&mut client, height).await {
             Ok(ts) => return Ok(ts),
             Err(err) if err.is_transient() && attempt < TREESTATE_RETRY_MAX => {
@@ -147,12 +150,14 @@ pub(crate) async fn next_with_idle_timeout<T, S>(
 where
     S: futures_util::Stream<Item = Result<T, tonic::Status>> + Unpin,
 {
-    tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()).await.map_err(|_| {
-        SlipstreamError::Transport(format!(
-            "{context}: stream idle timeout ({}s without a message)",
-            STREAM_IDLE_TIMEOUT.as_secs()
-        ))
-    })
+    tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+        .await
+        .map_err(|_| {
+            SlipstreamError::Transport(format!(
+                "{context}: stream idle timeout ({}s without a message)",
+                STREAM_IDLE_TIMEOUT.as_secs()
+            ))
+        })
 }
 
 /// Open a channel to lightwalletd. TLS uses webpki roots (same trust source
@@ -177,26 +182,40 @@ pub async fn get_lightd_info(client: &mut LwdClient) -> Result<LightdInfo, Slips
     with_unary_timeout("get_lightd_info", client.get_lightd_info(Empty {})).await
 }
 
-/// Broadcast a raw transaction ([B7] send tooling). Returns the server's
+/// Broadcast a raw transaction (\[B7\] send tooling). Returns the server's
 /// `(error_code, error_message)`; code 0 = accepted into the mempool.
 pub async fn send_transaction(
     client: &mut LwdClient,
     tx_bytes: Vec<u8>,
 ) -> Result<(i32, String), SlipstreamError> {
-    let req = zcash_client_backend::proto::service::RawTransaction { data: tx_bytes, height: 0 };
+    let req = zcash_client_backend::proto::service::RawTransaction {
+        data: tx_bytes,
+        height: 0,
+    };
     let resp = with_unary_timeout("send_transaction", client.send_transaction(req)).await?;
     Ok((resp.error_code as i32, resp.error_message))
 }
 
 pub async fn get_latest_block_height(client: &mut LwdClient) -> Result<u64, SlipstreamError> {
-    Ok(with_unary_timeout("get_latest_block", client.get_latest_block(ChainSpec {}))
-        .await?
-        .height)
+    Ok(
+        with_unary_timeout("get_latest_block", client.get_latest_block(ChainSpec {}))
+            .await?
+            .height,
+    )
 }
 
-pub async fn get_tree_state(client: &mut LwdClient, height: u64) -> Result<TreeState, SlipstreamError> {
-    with_unary_timeout("get_tree_state", client.get_tree_state(BlockId { height, hash: vec![] }))
-        .await
+pub async fn get_tree_state(
+    client: &mut LwdClient,
+    height: u64,
+) -> Result<TreeState, SlipstreamError> {
+    with_unary_timeout(
+        "get_tree_state",
+        client.get_tree_state(BlockId {
+            height,
+            hash: vec![],
+        }),
+    )
+    .await
 }
 
 /// Collected subtree roots for both pools (Sapling first, Orchard second).
@@ -217,7 +236,8 @@ async fn collect_subtree_roots<H: HashSer>(
     let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
     let mut roots = Vec::new();
     while let Some(item) = next_with_idle_timeout(&mut stream, &context).await? {
-        let r = item.map_err(|e| SlipstreamError::Transport(format!("subtree root stream: {e}")))?;
+        let r =
+            item.map_err(|e| SlipstreamError::Transport(format!("subtree root stream: {e}")))?;
         let node = H::read(&r.root_hash[..])
             .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
         roots.push(CommitmentTreeRoot::from_parts(
@@ -238,7 +258,10 @@ pub async fn get_subtree_roots(client: &mut LwdClient) -> Result<SubtreeRoots, S
         "orchard",
     )
     .await?;
-    Ok(SubtreeRoots { sapling: sapling_roots, orchard: orchard_roots })
+    Ok(SubtreeRoots {
+        sapling: sapling_roots,
+        orchard: orchard_roots,
+    })
 }
 
 /// Fetch a full transaction by txid.
@@ -261,7 +284,10 @@ pub async fn get_transaction(
     // call cannot reuse with_unary_timeout's uniform error mapping.
     let outcome = tokio::time::timeout(
         UNARY_TIMEOUT,
-        client.get_transaction(TxFilter { hash: txid.to_vec(), ..Default::default() }),
+        client.get_transaction(TxFilter {
+            hash: txid.to_vec(),
+            ..Default::default()
+        }),
     )
     .await
     .map_err(|_| {
@@ -312,7 +338,7 @@ pub async fn get_taddress_txids(
 /// (lightwalletd contract, `service.proto:188-192`). Unlike the other stream
 /// helpers this returns the RAW stream — the caller reacts per-message.
 ///
-/// Deliberately NOT wrapped in [`with_unary_timeout`]: `GetMempoolStream` is
+/// Deliberately NOT wrapped in `with_unary_timeout`: `GetMempoolStream` is
 /// server-streaming and lightwalletd sends its response HEADERS lazily — only
 /// with the first mempool tx, or when it closes the stream on a new block. On a
 /// quiet mempool the `.await` here legitimately blocks well past the 30 s unary
@@ -358,7 +384,11 @@ mod tests {
 
     #[tokio::test]
     async fn connect_to_unroutable_host_fails_with_transport_error() {
-        let ep = Endpoint { host: "127.0.0.1".into(), port: 1, tls: false };
+        let ep = Endpoint {
+            host: "127.0.0.1".into(),
+            port: 1,
+            tls: false,
+        };
         match connect(&ep).await {
             Err(SlipstreamError::Transport(msg)) => assert!(msg.contains("connect")),
             other => panic!("expected Transport error, got {other:?}"),
@@ -372,8 +402,7 @@ mod tests {
     /// surface as a Transport timeout, never hang.
     #[tokio::test(start_paused = true)]
     async fn unary_timeout_fires_on_stalled_call() {
-        let fut =
-            futures_util::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
+        let fut = futures_util::future::pending::<Result<tonic::Response<()>, tonic::Status>>();
         match with_unary_timeout("stalled_unary", fut).await {
             Err(SlipstreamError::Transport(msg)) => {
                 assert!(msg.contains("stalled_unary"), "context missing: {msg}");
@@ -391,7 +420,10 @@ mod tests {
         match next_with_idle_timeout(&mut stream, "stalled_stream").await {
             Err(SlipstreamError::Transport(msg)) => {
                 assert!(msg.contains("stalled_stream"), "context missing: {msg}");
-                assert!(msg.contains("stream idle timeout"), "idle marker missing: {msg}");
+                assert!(
+                    msg.contains("stream idle timeout"),
+                    "idle marker missing: {msg}"
+                );
             }
             other => panic!("expected Transport idle timeout, got {other:?}"),
         }
@@ -400,13 +432,18 @@ mod tests {
     /// Healthy streams pass through unchanged: messages then a clean end.
     #[tokio::test]
     async fn stream_idle_timeout_passes_messages_and_end() {
-        let mut stream =
-            futures_util::stream::iter(vec![Ok::<u32, tonic::Status>(7), Ok(8)]);
-        let first = next_with_idle_timeout(&mut stream, "healthy").await.expect("no timeout");
+        let mut stream = futures_util::stream::iter(vec![Ok::<u32, tonic::Status>(7), Ok(8)]);
+        let first = next_with_idle_timeout(&mut stream, "healthy")
+            .await
+            .expect("no timeout");
         assert_eq!(first.expect("a message").expect("ok item"), 7);
-        let second = next_with_idle_timeout(&mut stream, "healthy").await.expect("no timeout");
+        let second = next_with_idle_timeout(&mut stream, "healthy")
+            .await
+            .expect("no timeout");
         assert_eq!(second.expect("a message").expect("ok item"), 8);
-        let end = next_with_idle_timeout(&mut stream, "healthy").await.expect("no timeout");
+        let end = next_with_idle_timeout(&mut stream, "healthy")
+            .await
+            .expect("no timeout");
         assert!(end.is_none(), "clean end of stream must be Ok(None)");
     }
 
@@ -414,7 +451,11 @@ mod tests {
     #[tokio::test]
     #[ignore = "network"]
     async fn live_lightd_info_smoke() {
-        let ep = Endpoint { host: "zec.rocks".into(), port: 443, tls: true };
+        let ep = Endpoint {
+            host: "zec.rocks".into(),
+            port: 443,
+            tls: true,
+        };
         let mut c = connect(&ep).await.expect("connect");
         let info = get_lightd_info(&mut c).await.expect("info");
         assert_eq!(info.chain_name, "main");
@@ -431,7 +472,11 @@ mod tests {
         // Uses an unroutable endpoint so connect() always fails (Transport error).
         // Confirm the first attempt sees a transport error. We can't mock the actual
         // get_tree_state, so we verify the retry helper propagates errors from connect.
-        let ep = Endpoint { host: "127.0.0.1".into(), port: 1, tls: false };
+        let ep = Endpoint {
+            host: "127.0.0.1".into(),
+            port: 1,
+            tls: false,
+        };
         // Should fail (connect refused — transient), retry up to 3 times.
         // PASS_RETRY_MAX=2 means 3 total attempts; all will fail with Transport.
         // The test just confirms that: (a) it returns a Transport error (not panic),
@@ -448,12 +493,24 @@ mod tests {
     #[test]
     fn retry_constants_are_sane() {
         // 2 additional attempts (3 total, matching TREESTATE_RETRY_MAX).
-        assert_eq!(TREESTATE_RETRY_MAX, 2, "must allow exactly 2 retries (3 total)");
+        assert_eq!(
+            TREESTATE_RETRY_MAX, 2,
+            "must allow exactly 2 retries (3 total)"
+        );
         // Backoff schedule: attempt 1 = 1s, attempt 2 = 3s.
-        assert_eq!(treestate_retry_backoff(1), std::time::Duration::from_secs(1));
-        assert_eq!(treestate_retry_backoff(2), std::time::Duration::from_secs(3));
+        assert_eq!(
+            treestate_retry_backoff(1),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            treestate_retry_backoff(2),
+            std::time::Duration::from_secs(3)
+        );
         // Attempt 3+ uses the default arm (3s cap).
-        assert_eq!(treestate_retry_backoff(3), std::time::Duration::from_secs(3));
+        assert_eq!(
+            treestate_retry_backoff(3),
+            std::time::Duration::from_secs(3)
+        );
     }
 
     /// Verify that Transport errors are classified as transient (the condition the

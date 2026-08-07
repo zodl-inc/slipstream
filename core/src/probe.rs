@@ -35,6 +35,10 @@ use crate::{
     grpc::{self, LwdClient},
 };
 
+/// Default shared wall-clock budget for one [`probe_endpoints`] race (tip
+/// query + timed sample across all candidates).
+pub const DEFAULT_PROBE_BUDGET: Duration = Duration::from_millis(1200);
+
 /// Blocks in the timed throughput sample (ending at the endpoint's tip —
 /// tip-region blocks are small, but ranking is RELATIVE so only fairness
 /// across endpoints matters, not absolute MB/s).
@@ -65,7 +69,7 @@ pub struct ProbeOutcome {
     pub elapsed: Duration,
 }
 
-/// Pure ranking, TDD'd: endpoints with a tip within [`TIP_FRESHNESS_SLACK`]
+/// Pure ranking, TDD'd: endpoints with a tip within `TIP_FRESHNESS_SLACK`
 /// of the best observed tip qualify; among qualified, the highest sampled
 /// rate wins (a missing sample ranks below any measured one); ties keep
 /// configured order (index 0 = the host's preferred endpoint). Nothing
@@ -128,7 +132,11 @@ pub async fn probe_endpoints(endpoints: &[Endpoint], budget: Duration) -> ProbeO
             "wire probe"
         );
     }
-    ProbeOutcome { results, chosen, elapsed: started.elapsed() }
+    ProbeOutcome {
+        results,
+        chosen,
+        elapsed: started.elapsed(),
+    }
 }
 
 fn remaining(deadline: Instant) -> Duration {
@@ -136,13 +144,20 @@ fn remaining(deadline: Instant) -> Duration {
 }
 
 async fn probe_one(endpoint: Endpoint, deadline: Instant) -> ProbeResult {
-    let mut result = ProbeResult { endpoint: endpoint.clone(), tip: None, sample_mbps: None };
+    let mut result = ProbeResult {
+        endpoint: endpoint.clone(),
+        tip: None,
+        sample_mbps: None,
+    };
 
     let Ok(Ok(mut client)) = timeout(remaining(deadline), grpc::connect(&endpoint)).await else {
         return result;
     };
-    let Ok(Ok(tip)) =
-        timeout(remaining(deadline), grpc::get_latest_block_height(&mut client)).await
+    let Ok(Ok(tip)) = timeout(
+        remaining(deadline),
+        grpc::get_latest_block_height(&mut client),
+    )
+    .await
     else {
         return result;
     };
@@ -162,10 +177,21 @@ async fn probe_one(endpoint: Endpoint, deadline: Instant) -> ProbeResult {
 
 /// Stream `start..=end`, returning bytes received by stream end OR the
 /// deadline, whichever first (errors just cut the sample short).
-async fn sample_range_bytes(client: &mut LwdClient, start: u64, end: u64, deadline: Instant) -> u64 {
+async fn sample_range_bytes(
+    client: &mut LwdClient,
+    start: u64,
+    end: u64,
+    deadline: Instant,
+) -> u64 {
     let req = BlockRange {
-        start: Some(BlockId { height: start, hash: vec![] }),
-        end: Some(BlockId { height: end, hash: vec![] }),
+        start: Some(BlockId {
+            height: start,
+            hash: vec![],
+        }),
+        end: Some(BlockId {
+            height: end,
+            hash: vec![],
+        }),
         ..Default::default()
     };
     let Ok(Ok(resp)) = timeout(remaining(deadline), client.get_block_range(req)).await else {
@@ -188,11 +214,19 @@ mod tests {
     use super::*;
 
     fn ep(host: &str) -> Endpoint {
-        Endpoint { host: host.into(), port: 443, tls: true }
+        Endpoint {
+            host: host.into(),
+            port: 443,
+            tls: true,
+        }
     }
 
     fn r(host: &str, tip: Option<u64>, mbps: Option<f64>) -> ProbeResult {
-        ProbeResult { endpoint: ep(host), tip, sample_mbps: mbps }
+        ProbeResult {
+            endpoint: ep(host),
+            tip,
+            sample_mbps: mbps,
+        }
     }
 
     #[test]
@@ -209,7 +243,11 @@ mod tests {
     fn stale_tip_disqualifies_even_the_fastest() {
         let results = [
             r("preferred", Some(1000), Some(2.0)),
-            r("alt-stale", Some(1000 - TIP_FRESHNESS_SLACK - 1), Some(50.0)),
+            r(
+                "alt-stale",
+                Some(1000 - TIP_FRESHNESS_SLACK - 1),
+                Some(50.0),
+            ),
         ];
         assert_eq!(rank(&results), 0);
     }

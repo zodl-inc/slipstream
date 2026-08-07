@@ -38,7 +38,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::{debug, info, warn};
-use zcash_client_backend::data_api::chain::{ChainState, error::Error as ChainError, scan_cached_blocks};
+use zcash_client_backend::data_api::chain::{
+    ChainState, error::Error as ChainError, scan_cached_blocks,
+};
 use zcash_client_backend::proto::service::TreeState;
 use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
@@ -72,17 +74,26 @@ struct AuditEntry {
 /// revived pass runs the server path); audit-fetch transport failures only
 /// warn — the audit is defense in depth, not a correctness dependency (see
 /// treestate.rs for the other two nets).
-async fn drain_audits(audits: &mut Vec<AuditEntry>, force_all: bool) -> Result<(), SlipstreamError> {
+async fn drain_audits(
+    audits: &mut Vec<AuditEntry>,
+    force_all: bool,
+) -> Result<(), SlipstreamError> {
     let mut remaining = Vec::with_capacity(audits.len());
     for entry in audits.drain(..) {
         if !force_all && !entry.fetch.is_finished() {
             remaining.push(entry);
             continue;
         }
-        let AuditEntry { height, fetch, expected } = entry;
+        let AuditEntry {
+            height,
+            fetch,
+            expected,
+        } = entry;
         match fetch.await {
             Err(join_err) => warn!(height, %join_err, "treestate audit task failed — skipped"),
-            Ok(Err(fetch_err)) => warn!(height, %fetch_err, "treestate audit fetch failed — skipped"),
+            Ok(Err(fetch_err)) => {
+                warn!(height, %fetch_err, "treestate audit fetch failed — skipped")
+            }
             Ok(Ok(server)) => match server.to_chain_state() {
                 Err(e) => warn!(height, %e, "treestate audit parse failed — skipped"),
                 Ok(server_state) => {
@@ -101,7 +112,6 @@ async fn drain_audits(audits: &mut Vec<AuditEntry>, force_all: bool) -> Result<(
 }
 
 // ── Adaptive controller constants ──────────────────────────────────────────────
-
 
 /// Minimum number of blocks in a single scan_cached_blocks call.  Prevents the
 /// controller from issuing tiny batches under extreme slowness.
@@ -301,7 +311,15 @@ pub async fn scan_chunks(
     let mut wb: Option<WriteBehind> = if config.write_behind {
         let facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
             .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
-        let mut lane = crate::persist::PersistLane::open(&config.wallet_db_path, config.network, config.persist_depth, graft_buffering, config.graft_verify_sample, config.batch_combine, config.anchor_retention_height.map(BlockHeight::from))?;
+        let mut lane = crate::persist::PersistLane::open(
+            &config.wallet_db_path,
+            config.network,
+            config.persist_depth,
+            graft_buffering,
+            config.graft_verify_sample,
+            config.batch_combine,
+            config.anchor_retention.clone(),
+        )?;
         // [B4-16 drain] Every deferred commit holds the writer gate so the FFI
         // stop()/start() drain can wait out an orphan commit abort() can't cancel.
         if let Some(p) = &progress {
@@ -312,9 +330,19 @@ pub async fn scan_chunks(
         None
     };
 
-    let result =
-        scan_chunks_inner(session, client, range_start, rx, progress, config, skipped_keys, &mut wb, tor, graft_buffering)
-            .await;
+    let result = scan_chunks_inner(
+        session,
+        client,
+        range_start,
+        rx,
+        progress,
+        config,
+        skipped_keys,
+        &mut wb,
+        tor,
+        graft_buffering,
+    )
+    .await;
 
     // ── T6.9 full barrier (range end AND every error exit) ───────────────────
     // Drain the in-flight deferred commit before anything else may touch the
@@ -385,7 +413,7 @@ async fn scan_chunks_inner(
     sparse_state.gpu_subtree = config.gpu_subtree; // B0: route Orchard build to GPU when set
     sparse_state.graft_buffering = graft_buffering; // v0.4: only used on the inline path (wb's lane carries its own)
     sparse_state.batch_combine = config.batch_combine; // v0.4 Plan B (inline path)
-    sparse_state.anchor_retention_height = config.anchor_retention_height.map(BlockHeight::from); // [B6]
+    sparse_state.anchor_retention = config.anchor_retention.clone(); // [B6]
     // Read config fields once.
     let batch_target_ms = config.scan_batch_target_ms;
     let network = config.network;
@@ -427,7 +455,9 @@ async fn scan_chunks_inner(
     loop {
         // v0.5 pacer: time the chunk wait — fetch/split starvation shows here.
         let recv_started = Instant::now();
-        let Some((chunk, permit, mut chunk_boundary)) = rx.recv().await else { break };
+        let Some((chunk, permit, mut chunk_boundary)) = rx.recv().await else {
+            break;
+        };
         stats.recv_wait += recv_started.elapsed();
         // Binding note 1: no expect() in non-test code — use structured error extraction.
         let (chunk_start, chunk_end) = match (chunk.start_height(), chunk.end_height()) {
@@ -493,14 +523,24 @@ async fn scan_chunks_inner(
                 && config.treestate_verify_sample > 0
                 && boundary_index.is_multiple_of(u64::from(config.treestate_verify_sample));
             boundary_index += 1;
-            let carried = if sub_end == chunk_end { chunk_boundary.take() } else { None };
+            let carried = if sub_end == chunk_end {
+                chunk_boundary.take()
+            } else {
+                None
+            };
             let prefetch = if !local_mode || audit_this {
                 carried.or_else(|| {
                     Some(tokio::spawn({
                         let ep = endpoint.clone();
                         let tor_owned = tor.cloned();
                         async move {
-                            grpc::retry_get_tree_state(&ep, sub_end, "chunk-boundary prefetch", tor_owned.as_ref()).await
+                            grpc::retry_get_tree_state(
+                                &ep,
+                                sub_end,
+                                "chunk-boundary prefetch",
+                                tor_owned.as_ref(),
+                            )
+                            .await
                         }
                     }))
                 })
@@ -661,8 +701,9 @@ async fn scan_chunks_inner(
                             block.hash.len()
                         )));
                     }
-                    ts.absorb_block(block)
-                        .map_err(|e| SlipstreamError::Wallet(format!("local treestate absorb: {e}")))?;
+                    ts.absorb_block(block).map_err(|e| {
+                        SlipstreamError::Wallet(format!("local treestate absorb: {e}"))
+                    })?;
                 }
                 let last = &chunk.blocks[(sub_end - chunk_start) as usize];
                 local_boundary = Some((sub_end, last.hash()));
@@ -676,8 +717,9 @@ async fn scan_chunks_inner(
             if let Some(handle) = prefetch {
                 if local_mode {
                     if let (Some(ts), Some((bh, bhash))) = (&local_ts, &local_boundary) {
-                        let h = u32::try_from(*bh)
-                            .map_err(|_| SlipstreamError::Wallet(format!("height {bh} exceeds u32")))?;
+                        let h = u32::try_from(*bh).map_err(|_| {
+                            SlipstreamError::Wallet(format!("height {bh} exceeds u32"))
+                        })?;
                         audits.push(AuditEntry {
                             height: *bh,
                             fetch: handle,
@@ -776,7 +818,15 @@ async fn scan_chunks_inner(
             }
             let started = Instant::now();
             let mut enhance_client = client.clone();
-            match run_enhancement(session, &mut enhance_client, network, progress.clone(), skipped_keys).await {
+            match run_enhancement(
+                session,
+                &mut enhance_client,
+                network,
+                progress.clone(),
+                skipped_keys,
+            )
+            .await
+            {
                 Ok(es) => {
                     stats.interleaved_enhance.requests += es.requests;
                     stats.interleaved_enhance.txs_stored += es.txs_stored;
@@ -907,19 +957,37 @@ pub async fn scan_chunks_from_treestate(
     let mut wb: Option<WriteBehind> = if write_behind {
         let facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
             .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
-        let lane = crate::persist::PersistLane::open(session.db_path(), session.network, 1, graft, 1, false, None)?;
+        let lane = crate::persist::PersistLane::open(
+            session.db_path(),
+            session.network,
+            1,
+            graft,
+            1,
+            false,
+            None,
+        )?;
         Some(WriteBehind { facade, lane })
     } else {
         None
     };
 
-    let result =
-        scan_chunks_from_treestate_inner(session, initial_state, rx, sparse, gpu_subtree, graft, &mut wb).await;
+    let result = scan_chunks_from_treestate_inner(
+        session,
+        initial_state,
+        rx,
+        sparse,
+        gpu_subtree,
+        graft,
+        &mut wb,
+    )
+    .await;
 
     // T6.9 full barrier — mirror of scan_chunks (persist error precedence).
     if let Some(mut wb) = wb {
         if wb.facade.take_stash().is_some() {
-            warn!("write-behind (treestate driver): dropping an unsubmitted pending unit on error exit");
+            warn!(
+                "write-behind (treestate driver): dropping an unsubmitted pending unit on error exit"
+            );
         }
         let drain_result = wb.lane.drain().await;
         return match (result, drain_result) {
@@ -993,8 +1061,9 @@ async fn scan_chunks_from_treestate_inner(
         let scan_start_t = Instant::now();
         let summary = {
             let source = MemBlockSource::new(&chunk);
-            let from_height = u32::try_from(chunk_start)
-                .map_err(|_| SlipstreamError::Wallet(format!("height {chunk_start} exceeds u32")))?;
+            let from_height = u32::try_from(chunk_start).map_err(|_| {
+                SlipstreamError::Wallet(format!("height {chunk_start} exceeds u32"))
+            })?;
             tokio::task::block_in_place(|| {
                 if let Some(wb) = wb.as_mut() {
                     // T6.9 write-behind: virtualized reads + stash.
@@ -1048,7 +1117,14 @@ async fn scan_chunks_from_treestate_inner(
         stats.chunks += 1;
         stats.sapling_received += summary.received_sapling_note_count() as u64;
         stats.orchard_received += summary.received_orchard_note_count() as u64;
-        info!(chunk_start, chunk_end, len, outputs = chunk.outputs, chunk_elapsed_ms = elapsed_ms, "chunk scanned");
+        info!(
+            chunk_start,
+            chunk_end,
+            len,
+            outputs = chunk.outputs,
+            chunk_elapsed_ms = elapsed_ms,
+            "chunk scanned"
+        );
 
         drop(permit);
         next_state = synthesized_next;
@@ -1057,7 +1133,13 @@ async fn scan_chunks_from_treestate_inner(
     // wrapper overwrites from the lane after its drain barrier).
     stats.census_sapling = std::mem::take(&mut sparse_state.census_sapling);
     stats.census_orchard = std::mem::take(&mut sparse_state.census_orchard);
-    info!(blocks = stats.blocks, chunks = stats.chunks, sapling = stats.sapling_received, orchard = stats.orchard_received, "scan_from_treestate done");
+    info!(
+        blocks = stats.blocks,
+        chunks = stats.chunks,
+        sapling = stats.sapling_received,
+        orchard = stats.orchard_received,
+        "scan_from_treestate done"
+    );
     Ok(stats)
 }
 
@@ -1157,11 +1239,15 @@ mod tests {
         let chunk_start: u64 = 1_000_000;
         let chunk_end: u64 = chunk_start + chunk_len as u64 - 1;
         let sub_start = chunk_start;
-        let current_batch_len = (batch_len as usize).min((chunk_end + 1).saturating_sub(sub_start) as usize);
+        let current_batch_len =
+            (batch_len as usize).min((chunk_end + 1).saturating_sub(sub_start) as usize);
         let sub_end = sub_start + current_batch_len as u64 - 1;
         let next_sub_start = sub_end + 1;
         let remaining_after = (chunk_end + 1).saturating_sub(next_sub_start) as usize;
-        assert_eq!(remaining_after, 0, "None: loop must exit after one iteration");
+        assert_eq!(
+            remaining_after, 0,
+            "None: loop must exit after one iteration"
+        );
 
         // Also verify: with Some target, batch_len is NOT reset to chunk_len on
         // subsequent chunks (carried value persists if > 0).
@@ -1170,6 +1256,9 @@ mod tests {
         if batch_target_ms_some.is_none() || batch_len_carried == 0 {
             batch_len_carried = chunk_len;
         }
-        assert_eq!(batch_len_carried, 5_000, "Some: carried batch_len must not be overwritten");
+        assert_eq!(
+            batch_len_carried, 5_000,
+            "Some: carried batch_len must not be overwritten"
+        );
     }
 }

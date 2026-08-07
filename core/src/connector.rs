@@ -105,7 +105,11 @@ impl TorConn {
         Ok(Self { client })
     }
 
-    async fn connect(&self, mode: TorMode, endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    async fn connect(
+        &self,
+        mode: TorMode,
+        endpoint: &Endpoint,
+    ) -> Result<LwdClient, SlipstreamError> {
         let uri: Uri = endpoint
             .uri()
             .parse()
@@ -125,7 +129,7 @@ impl TorConn {
             };
             match tokio::time::timeout(
                 TOR_CONNECT_TIMEOUT,
-                client.connect_to_lightwalletd(uri.clone()),
+                client.connect_to_lightwalletd(uri.clone(), false),
             )
             .await
             {
@@ -164,7 +168,10 @@ pub struct Connector {
 impl Connector {
     /// Tor-off: every purpose dials directly.
     pub fn direct(endpoint: Endpoint) -> Self {
-        Self { endpoint, tor: None }
+        Self {
+            endpoint,
+            tor: None,
+        }
     }
 
     /// Tor-on: metadata over Tor, bulk still direct.
@@ -243,11 +250,16 @@ where
 }
 
 /// Direct (non-Tor) lightwalletd connect with bounded transient-failure retry (see
-/// [`DIRECT_CONNECT_ATTEMPTS`]). Drop-in for `grpc::connect` at the sites that must survive a brief
+/// `DIRECT_CONNECT_ATTEMPTS`). Drop-in for `grpc::connect` at the sites that must survive a brief
 /// server outage without restarting the sync pass: the bulk-fetch workers and the direct branch of
 /// [`connect_via`].
 pub async fn connect_direct_with_retry(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
-    retry_transient(|| grpc::connect(endpoint), DIRECT_CONNECT_ATTEMPTS, direct_connect_backoff).await
+    retry_transient(
+        || grpc::connect(endpoint),
+        DIRECT_CONNECT_ATTEMPTS,
+        direct_connect_backoff,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -262,18 +274,26 @@ mod tests {
 
     #[test]
     fn metadata_maps_to_isolated_and_default_circuits() {
-        assert_eq!(tor_mode(ConnPurpose::MetadataUnique), Some(TorMode::Isolated)); // .uniqueTor
-        assert_eq!(tor_mode(ConnPurpose::MetadataDefault), Some(TorMode::Default)); // .defaultTor
+        assert_eq!(
+            tor_mode(ConnPurpose::MetadataUnique),
+            Some(TorMode::Isolated)
+        ); // .uniqueTor
+        assert_eq!(
+            tor_mode(ConnPurpose::MetadataDefault),
+            Some(TorMode::Default)
+        ); // .defaultTor
     }
 
     /// Locks the bounded-retry design intent: at least one fresh-circuit retry, and a per-attempt
     /// timeout that gives a healthy circuit room (>=5s) while cutting a stuck one promptly (<=30s).
     #[test]
     fn tor_connect_retry_constants_are_sane() {
-        assert!(
-            TOR_CONNECT_ATTEMPTS >= 2,
-            "need at least one retry on a fresh circuit"
-        );
+        const {
+            assert!(
+                TOR_CONNECT_ATTEMPTS >= 2,
+                "need at least one retry on a fresh circuit"
+            )
+        };
         let secs = TOR_CONNECT_TIMEOUT.as_secs();
         assert!(
             (5..=30).contains(&secs),
@@ -302,7 +322,11 @@ mod tests {
         )
         .await;
         assert_eq!(out.expect("recovers in place — no pass restart"), 3);
-        assert_eq!(calls.get(), 3, "stops retrying the moment the connect succeeds");
+        assert_eq!(
+            calls.get(),
+            3,
+            "stops retrying the moment the connect succeeds"
+        );
     }
 
     #[tokio::test]
@@ -318,7 +342,10 @@ mod tests {
             |_| std::time::Duration::ZERO,
         )
         .await;
-        assert!(out.is_err(), "a genuinely-down endpoint still surfaces (pass then falls back to a restart)");
+        assert!(
+            out.is_err(),
+            "a genuinely-down endpoint still surfaces (pass then falls back to a restart)"
+        );
         assert_eq!(calls.get(), 4, "exactly `attempts` tries");
     }
 
@@ -336,7 +363,11 @@ mod tests {
         )
         .await;
         assert!(out.is_err());
-        assert_eq!(calls.get(), 1, "a non-transient (config) error surfaces immediately, never retried");
+        assert_eq!(
+            calls.get(),
+            1,
+            "a non-transient (config) error surfaces immediately, never retried"
+        );
     }
 
     #[test]
@@ -344,7 +375,16 @@ mod tests {
         assert_eq!(direct_connect_backoff(1).as_secs(), 1);
         assert_eq!(direct_connect_backoff(2).as_secs(), 2);
         assert_eq!(direct_connect_backoff(5).as_secs(), 16);
-        assert_eq!(direct_connect_backoff(99).as_secs(), 16, "held at the 16s cap, never overflows");
-        assert!(DIRECT_CONNECT_ATTEMPTS >= 2, "need at least one retry to absorb a blip");
+        assert_eq!(
+            direct_connect_backoff(99).as_secs(),
+            16,
+            "held at the 16s cap, never overflows"
+        );
+        const {
+            assert!(
+                DIRECT_CONNECT_ATTEMPTS >= 2,
+                "need at least one retry to absorb a blip"
+            )
+        };
     }
 }

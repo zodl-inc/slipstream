@@ -84,8 +84,14 @@ mod tests {
 
     #[test]
     fn discontinuity_displays_height_and_detail() {
-        let e = SlipstreamError::Discontinuity { at: 1_650_000, detail: "prev-hash mismatch".into() };
-        assert_eq!(e.to_string(), "chain discontinuity at height 1650000: prev-hash mismatch");
+        let e = SlipstreamError::Discontinuity {
+            at: 1_650_000,
+            detail: "prev-hash mismatch".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "chain discontinuity at height 1650000: prev-hash mismatch"
+        );
     }
 
     #[test]
@@ -100,7 +106,10 @@ mod tests {
     fn transport_is_transient() {
         assert!(SlipstreamError::Transport("timeout".into()).is_transient());
         assert!(SlipstreamError::Transport("connect refused".into()).is_transient());
-        assert!(SlipstreamError::Transport("stream idle timeout (30s without a message)".into()).is_transient());
+        assert!(
+            SlipstreamError::Transport("stream idle timeout (30s without a message)".into())
+                .is_transient()
+        );
     }
 
     #[test]
@@ -120,7 +129,13 @@ mod tests {
 
     #[test]
     fn discontinuity_is_not_transient() {
-        assert!(!SlipstreamError::Discontinuity { at: 1_000_000, detail: "prev-hash mismatch".into() }.is_transient());
+        assert!(
+            !SlipstreamError::Discontinuity {
+                at: 1_000_000,
+                detail: "prev-hash mismatch".into()
+            }
+            .is_transient()
+        );
     }
 
     #[test]

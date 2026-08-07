@@ -82,7 +82,9 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
             index: 0,
             txid: h32(0x77, height),
             fee: 0,
-            spends: vec![CompactSaplingSpend { nf: h32(0x4F, height) }],
+            spends: vec![CompactSaplingSpend {
+                nf: h32(0x4F, height),
+            }],
             outputs,
             actions: vec![],
             ..Default::default()
@@ -90,7 +92,11 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
         blocks.push(CompactBlock {
             height,
             hash: h32(0xBB, height),
-            prev_hash: if i == 0 { vec![0u8; 32] } else { h32(0xBB, height - 1) },
+            prev_hash: if i == 0 {
+                vec![0u8; 32]
+            } else {
+                h32(0xBB, height - 1)
+            },
             time: height as u32,
             header: vec![],
             vtx: vec![tx],
@@ -119,23 +125,34 @@ async fn scan_and_census(dir: std::path::PathBuf) -> Result<(u64, u64, u64), Str
         time: 1,
         ..Default::default()
     };
+    let ufvk = slipstream_core::UnifiedFullViewingKey::decode(
+        &slipstream_core::Network::MainNetwork,
+        TEST_UFVK,
+    )
+    .map_err(|e| format!("ufvk decode: {e}"))?;
     session
-        .ensure_account(TEST_UFVK, birthday_ts.clone())
-        .map_err(|e| format!("ensure_account: {e}"))?;
+        .import_account(&ufvk, birthday_ts.clone())
+        .map_err(|e| format!("import_account: {e}"))?;
     let tip = blocks.last().map(|b| b.height).unwrap_or(SYNTH_START);
-    session.update_chain_tip(tip).map_err(|e| format!("update_chain_tip: {e}"))?;
+    session
+        .update_chain_tip(tip)
+        .map_err(|e| format!("update_chain_tip: {e}"))?;
 
     let mut sparse_state = SparseTreeState::default();
-    let from_state = birthday_ts.to_chain_state().map_err(|e| format!("chain state: {e}"))?;
-    let from_height =
-        u32::try_from(SYNTH_START).map_err(|_| "height exceeds u32".to_string())?;
+    let from_state = birthday_ts
+        .to_chain_state()
+        .map_err(|e| format!("chain state: {e}"))?;
+    let from_height = u32::try_from(SYNTH_START).map_err(|_| "height exceeds u32".to_string())?;
     let len = blocks.len();
     let chunk = Chunk::from_blocks(0, blocks);
     let network = session.network;
 
     tokio::task::block_in_place(|| {
         let source = MemBlockSource::new(&chunk);
-        let mut facade = SparseFacade { inner: session.db_mut(), sparse: &mut sparse_state };
+        let mut facade = SparseFacade {
+            inner: session.db_mut(),
+            sparse: &mut sparse_state,
+        };
         scan_cached_blocks(
             &network,
             &source,
@@ -148,7 +165,11 @@ async fn scan_and_census(dir: std::path::PathBuf) -> Result<(u64, u64, u64), Str
     .map_err(|e| format!("scan_cached_blocks (sparse): {e}"))?;
 
     let (sapling, _orchard) = sparse_state.census();
-    Ok((sapling.shards(), sapling.noted_shards(), sapling.commitments))
+    Ok((
+        sapling.shards(),
+        sapling.noted_shards(),
+        sapling.commitments,
+    ))
 }
 
 /// A fresh wallet scanning a foreign chain: every commitment counted, one shard
@@ -170,5 +191,8 @@ fn census_populated_by_sparse_scan() {
         .expect("scan");
     assert_eq!(commitments, BLOCKS * u64::from(OUTS_PER_BLOCK));
     assert_eq!(shards, 1, "12 positions all land in shard 0");
-    assert_eq!(noted, 0, "fixture wallet owns no notes in the synthetic chain");
+    assert_eq!(
+        noted, 0,
+        "fixture wallet owns no notes in the synthetic chain"
+    );
 }

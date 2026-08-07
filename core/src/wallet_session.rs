@@ -108,84 +108,138 @@ impl WalletSession {
             zcash_client_sqlite::util::SystemClock,
             rand::rngs::OsRng,
         );
-        zcash_client_sqlite::wallet::init::init_wallet_db(&mut db, None)
+        // Issue #4: the engine's own `ext_slipstream_*` schema (graft buffer,
+        // reconciliation views — see `migrations.rs`) rides the wallet's
+        // migrator as external schemerz migrations, so it is created and
+        // versioned exactly like the upstream schema (seedless — keyless engine).
+        zcash_client_sqlite::wallet::init::WalletMigrator::new()
+            .with_external_migrations(crate::migrations::external_migrations())
+            .init_or_migrate(&mut db)
             .map_err(|e| wallet_err("init/migrations", e))?;
-        // [#1755] Install the slipstream-owned, read-side reconciliation view
-        // (additive; see `reconcile.rs`). It is a VIEW — adds no rows to data.db,
-        // never runs on the scan hot path, and is invisible to the golden oracle
-        // (which diffs `type='table'` only). Idempotent, so every host inherits it
-        // with no FFI change. WAL (set above) permits this short side connection.
-        {
-            let conn = Connection::open(db_path).map_err(|e| wallet_err("reconcile view open", e))?;
-            // [audit ENG-1] same per-connection timeout as the pre-open connection above.
-            conn.busy_timeout(std::time::Duration::from_secs(5))
-                .map_err(|e| wallet_err("set busy_timeout (reconcile)", e))?;
-            crate::reconcile::create_reconcile_view(&conn)?;
-            // [B4-16] Queue hygiene: drop Historic ranges no remaining account justifies.
-            // An account deleted mid-restore leaves its deep ranges queued (upstream
-            // `delete_account` never touches scan_queue) — without this, the engine grinds
-            // a full deep restore for keys that no longer exist. Runs at every open (= every
-            // pass start too), so wedged wallets heal at launch and an in-app delete →
-            // restart heals immediately. Warn-and-continue: a failed prune must not block
-            // opening — sync still runs correctly without it, just wastefully.
-            match crate::scan_queue::prune_orphaned_historic_ranges(&conn) {
-                Ok(0) => {}
-                Ok(n) => info!(
-                    pruned = n,
-                    "scan queue: dropped orphaned historic ranges (below every account birthday)"
-                ),
-                Err(e) => tracing::warn!(%e, "scan queue prune failed (non-fatal) — continuing"),
-            }
-            // Sandblasting-era flood heal (2026-07-06): wallets that scanned the
-            // spam era on a pre-fix build carry thousands of deep-history
-            // checkpoint rows that panic every subsequent pass — delete them at
-            // open so damaged wallets self-repair without a reset. No-op on
-            // healthy wallets. Warn-and-continue, same policy as the prune above.
-            match crate::persist::heal_flooded_checkpoints(&conn) {
-                Ok(0) => {}
-                Ok(n) => info!(
-                    healed = n,
-                    "checkpoint store: deleted flooded deep-history checkpoint rows (pre-fix sandblasting damage)"
-                ),
-                Err(e) => {
-                    tracing::warn!(%e, "checkpoint flood heal failed (non-fatal) — continuing")
-                }
+        // [B4-16] Queue hygiene: drop Historic ranges no remaining account justifies.
+        // An account deleted mid-restore leaves its deep ranges queued (upstream
+        // `delete_account` never touches scan_queue) — without this, the engine grinds
+        // a full deep restore for keys that no longer exist. Runs at every open (= every
+        // pass start too), so wedged wallets heal at launch and an in-app delete →
+        // restart heals immediately. Warn-and-continue: a failed prune must not block
+        // opening — sync still runs correctly without it, just wastefully.
+        match crate::scan_queue::prune_orphaned_historic_ranges(&mut db) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                pruned = n,
+                "scan queue: dropped orphaned historic ranges (below every account birthday)"
+            ),
+            Err(e) => tracing::warn!(%e, "scan queue prune failed (non-fatal) — continuing"),
+        }
+        // Sandblasting-era flood heal (2026-07-06): wallets that scanned the
+        // spam era on a pre-fix build carry thousands of deep-history
+        // checkpoint rows that panic every subsequent pass — remove them at
+        // open (via the pools' own checkpoint stores) so damaged wallets
+        // self-repair without a reset. No-op on healthy wallets.
+        // Warn-and-continue, same policy as the prune above.
+        match crate::persist::heal_flooded_checkpoints(&mut db) {
+            Ok(0) => {}
+            Ok(n) => info!(
+                healed = n,
+                "checkpoint store: removed flooded deep-history checkpoints (pre-fix sandblasting damage)"
+            ),
+            Err(e) => {
+                tracing::warn!(%e, "checkpoint flood heal failed (non-fatal) — continuing")
             }
         }
-        Ok(Self { network, db, db_path: db_path.to_path_buf() })
+        Ok(Self {
+            network,
+            db,
+            db_path: db_path.to_path_buf(),
+        })
     }
 
-    /// [API v2 §4.4] The wallet's recovery ceiling: MAX(`accounts.recover_until_height`), or
-    /// `None` when no account has one (new wallets / fully non-restore imports). The scheduler
-    /// compares suggested ranges against this once per suggest round to drive the snapshot's
-    /// `is_recovering`. Read through a short side connection (same pattern as the reconcile view;
-    /// WAL permits it) so it needs no upstream API surface.
+    /// [API v2 §4.4] The wallet's recovery ceiling, or `None` when no account has one
+    /// (new wallets / fully non-restore imports). The scheduler compares suggested ranges
+    /// against this once per suggest round to drive the snapshot's `is_recovering`.
+    /// Issue #4: reads via [`WalletRead::get_wallet_recover_until`] — no direct SQL.
     pub fn max_recover_until(&self) -> Result<Option<u64>, SlipstreamError> {
-        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("recover_until open", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| wallet_err("recover_until busy_timeout", e))?;
-        let max: Option<i64> = conn
-            .query_row("SELECT MAX(recover_until_height) FROM accounts", [], |row| row.get(0))
-            .map_err(|e| wallet_err("recover_until query", e))?;
-        Ok(max.and_then(|v| u64::try_from(v).ok()))
+        Ok(self
+            .db
+            .get_wallet_recover_until()
+            .map_err(|e| wallet_err("wallet recover_until", e))?
+            .map(|h| u64::from(u32::from(h))))
     }
 
-    /// [API v2 §4.4 / Phase E] The wallet's oldest account birthday: MIN(`accounts.birthday_height`),
-    /// or `None` when no accounts exist. With the chain tip and the remaining scan queue it seeds the
-    /// global permille floor once per suggest round (`scheduler::global_floor_permille`). Same
-    /// short-side-connection pattern as `max_recover_until`.
+    /// [API v2 §4.4 / Phase E] The wallet's oldest account birthday, or `None` when no
+    /// accounts exist. With the chain tip and the remaining scan queue it seeds the
+    /// global permille floor once per suggest round (`scheduler::global_floor_permille`).
+    /// Issue #4: reads via [`WalletRead::get_wallet_birthday`] (whose contract is exactly
+    /// the minimum account birthday) — no direct SQL.
     pub fn min_birthday(&self) -> Result<Option<u64>, SlipstreamError> {
-        let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("birthday open", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| wallet_err("birthday busy_timeout", e))?;
-        let min: Option<i64> = conn
-            .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| row.get(0))
-            .map_err(|e| wallet_err("birthday query", e))?;
-        Ok(min.and_then(|v| u64::try_from(v).ok()))
+        Ok(self
+            .db
+            .get_wallet_birthday()
+            .map_err(|e| wallet_err("wallet birthday", e))?
+            .map(|h| u64::from(u32::from(h))))
     }
 
-    /// Keyless import: UFVK string + birthday treestate (server-provided at
-    /// birthday-1). No-op if any account already exists.
+    /// Whether the wallet already tracks an account for `ufvk`.
+    ///
+    /// The engine's per-account import guard: `sync_once` imports each provided key only
+    /// when this returns `false`, so a re-run — or a wallet a host already provisioned —
+    /// neither re-imports the key nor spends a `GetTreeState` RPC on it.
+    pub fn has_account_for_ufvk(
+        &self,
+        ufvk: &UnifiedFullViewingKey,
+    ) -> Result<bool, SlipstreamError> {
+        Ok(self
+            .db
+            .get_account_for_ufvk(ufvk)
+            .map_err(|e| wallet_err("get_account_for_ufvk", e))?
+            .is_some())
+    }
+
+    /// Imports `ufvk` as a view-only account with the given birthday treestate
+    /// (server-provided at birthday-1).
+    ///
+    /// The import is UNCONDITIONAL: the caller must first confirm the account is absent
+    /// (see [`has_account_for_ufvk`](Self::has_account_for_ufvk)). The engine keeps the
+    /// treestate fetch and the presence check together so a key already present costs
+    /// neither an RPC nor a redundant import.
+    pub fn import_account(
+        &mut self,
+        ufvk: &UnifiedFullViewingKey,
+        birthday_treestate: TreeState,
+    ) -> Result<(), SlipstreamError> {
+        let birthday = AccountBirthday::from_treestate(birthday_treestate, None).map_err(|e| {
+            use zcash_client_backend::data_api::BirthdayError;
+            let detail = match e {
+                BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
+                BirthdayError::Decode(io) => format!("decode: {io}"),
+                // `BirthdayError` is `#[non_exhaustive]` and implements neither `Debug` nor
+                // `Display`, so a variant added upstream can only be reported generically.
+                _ => "unrecognized birthday error".to_string(),
+            };
+            SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
+        })?;
+        self.db
+            .import_account_ufvk(
+                "slipstream",
+                ufvk,
+                &birthday,
+                AccountPurpose::ViewOnly,
+                None,
+            )
+            .map_err(|e| wallet_err("import_account_ufvk", e))?;
+        info!("account imported (view-only)");
+        Ok(())
+    }
+
+    /// Test/darkside bootstrap convenience: import `ufvk_str` (decoded here) as the
+    /// wallet's single view-only account, but NO-OP if the wallet already has ANY account.
+    ///
+    /// The whole-wallet guard exists because fixtures may pre-seed a *spending* account and
+    /// then expect this to defer (see the oracle synthetic-window harness). Production goes
+    /// through [`import_account`](Self::import_account) with an already-decoded key and a
+    /// per-account presence check; this string-decoding, single-account shape is only for
+    /// tests that pass the `TEST_UFVK` constant directly.
+    #[cfg(any(test, feature = "darkside"))]
     pub fn ensure_account(
         &mut self,
         ufvk_str: &str,
@@ -200,20 +254,7 @@ impl WalletSession {
         }
         let ufvk = UnifiedFullViewingKey::decode(&self.network, ufvk_str)
             .map_err(|e| wallet_err("ufvk decode", e))?;
-        let birthday = AccountBirthday::from_treestate(birthday_treestate, None)
-            .map_err(|e| {
-                use zcash_client_backend::data_api::BirthdayError;
-                let detail = match e {
-                    BirthdayError::HeightInvalid(ie) => format!("height invalid: {ie}"),
-                    BirthdayError::Decode(io) => format!("decode: {io}"),
-                };
-                SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
-            })?;
-        self.db
-            .import_account_ufvk("slipstream", &ufvk, &birthday, AccountPurpose::ViewOnly, None)
-            .map_err(|e| wallet_err("import_account_ufvk", e))?;
-        info!("account imported (view-only)");
-        Ok(())
+        self.import_account(&ufvk, birthday_treestate)
     }
 
     pub fn put_subtree_roots(&mut self, roots: &SubtreeRoots) -> Result<(), SlipstreamError> {
@@ -253,27 +294,30 @@ impl WalletSession {
     }
 
     /// [API v2.1 E-4] Cheap signature of the wallet's transaction set:
-    /// `(COUNT(transactions), COUNT(unreconciled per slipstream_v_tx_reconciled))`.
+    /// `(COUNT(tx rows), COUNT(unreconciled))`, both read from the slipstream-owned
+    /// `ext_slipstream_v_tx_reconciled` view (one row per wallet tx by construction).
     /// The scheduler compares it across range boundaries and bumps `tx_set_version` when it
     /// moved — catching set changes that arrive WITHOUT an enhancement write (the classic
     /// case: scanning a historic block stores the received note that LINKS an
     /// already-stored dangling spend, flipping it reconciled). Same short-side-connection
-    /// pattern as `max_recover_until`; both counts are over wallet-sized tables (cheap).
+    /// pattern as `max_recover_until`; the counts are over wallet-sized tables (cheap).
     pub fn tx_set_signature(&self) -> Result<(u64, u64), SlipstreamError> {
         let conn = Connection::open(&self.db_path).map_err(|e| wallet_err("tx sig open", e))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| wallet_err("tx sig busy_timeout", e))?;
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transactions", [], |row| row.get(0))
-            .map_err(|e| wallet_err("tx sig count", e))?;
-        let unreconciled: i64 = conn
+        let (total, unreconciled): (i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*) FROM slipstream_v_tx_reconciled WHERE reconciled = 0",
+                "SELECT COUNT(*),
+                        COALESCE(SUM(CASE WHEN reconciled = 0 THEN 1 ELSE 0 END), 0)
+                 FROM ext_slipstream_v_tx_reconciled",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
-            .map_err(|e| wallet_err("tx sig unreconciled", e))?;
-        Ok((u64::try_from(total).unwrap_or(0), u64::try_from(unreconciled).unwrap_or(0)))
+            .map_err(|e| wallet_err("tx sig counts", e))?;
+        Ok((
+            u64::try_from(total).unwrap_or(0),
+            u64::try_from(unreconciled).unwrap_or(0),
+        ))
     }
 
     /// Exclusive access for the scan driver (scan_cached_blocks needs &mut).
@@ -392,10 +436,12 @@ mod tests {
                 .prepare("INSERT INTO orchard_tree_checkpoints (checkpoint_id, position) VALUES (?1, ?2)")
                 .expect("prepare");
             for id in (1_687_103..1_990_103).step_by(100) {
-                stmt.execute(rusqlite::params![id, 1_000]).expect("insert flood");
+                stmt.execute(rusqlite::params![id, 1_000])
+                    .expect("insert flood");
             }
             for id in 3_402_885..3_402_985 {
-                stmt.execute(rusqlite::params![id, 2_000_000]).expect("insert window");
+                stmt.execute(rusqlite::params![id, 2_000_000])
+                    .expect("insert window");
             }
         }
         // Second open runs the heal.
@@ -409,7 +455,10 @@ mod tests {
             )
             .expect("count");
         assert_eq!(n, 100, "only the tip window survives the heal");
-        assert!(min_id >= 3_402_985 - 10_000, "flood rows below the margin are gone");
+        assert!(
+            min_id >= 3_402_985 - 10_000,
+            "flood rows below the margin are gone"
+        );
     }
 
     #[test]
@@ -422,7 +471,8 @@ mod tests {
 
         let conn = Connection::open(&path).expect("side conn");
         // Same as reconcile.rs's fixture: raw fixture rows without full FK graphs.
-        conn.pragma_update(None, "foreign_keys", false).expect("fk off");
+        conn.pragma_update(None, "foreign_keys", false)
+            .expect("fk off");
         // A pure receive (no observed spends) is reconciled immediately: count moves, not unreconciled.
         conn.execute(
             "INSERT INTO transactions (id_tx, txid, mined_height, tx_index, min_observed_height)
@@ -430,7 +480,11 @@ mod tests {
             params![vec![0x01u8; 32]],
         )
         .expect("insert pure receive");
-        assert_eq!(s.tx_set_signature().expect("sig"), (1, 0), "insert moves the count");
+        assert_eq!(
+            s.tx_set_signature().expect("sig"),
+            (1, 0),
+            "insert moves the count"
+        );
 
         // A dangling shielded spend (nullifier observed, note not yet received) flips unreconciled.
         let txid2 = vec![0x02u8; 32];
@@ -451,7 +505,11 @@ mod tests {
             params![nf],
         )
         .expect("insert nullifier");
-        assert_eq!(s.tx_set_signature().expect("sig"), (2, 1), "dangling spend flips unreconciled");
+        assert_eq!(
+            s.tx_set_signature().expect("sig"),
+            (2, 1),
+            "dangling spend flips unreconciled"
+        );
 
         // Scanning the origin block receives the note -> the spend LINKS with NO new tx row:
         // exactly the change class only the signature (not the enhance counter) can see.
@@ -462,7 +520,11 @@ mod tests {
             params![nf],
         )
         .expect("link note");
-        assert_eq!(s.tx_set_signature().expect("sig"), (2, 0), "linkage moves the signature");
+        assert_eq!(
+            s.tx_set_signature().expect("sig"),
+            (2, 0),
+            "linkage moves the signature"
+        );
     }
 
     #[test]
@@ -481,10 +543,39 @@ mod tests {
             time: 1,
             ..Default::default()
         };
-        s.ensure_account(TEST_UFVK, ts.clone()).expect("first import");
+        s.ensure_account(TEST_UFVK, ts.clone())
+            .expect("first import");
         s.ensure_account(TEST_UFVK, ts).expect("idempotent");
         // Note 4: assert on account count (simpler than range-suggestion check on fresh wallet)
         let ids = s.db.get_account_ids().expect("get_account_ids");
         assert_eq!(ids.len(), 1);
+    }
+
+    #[test]
+    fn import_account_is_guarded_by_per_ufvk_presence_check() {
+        // The typed production path: `has_account_for_ufvk` flips false→true across an
+        // `import_account`, which is how the engine imports each key at most once.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let mut s = WalletSession::open(Network::MainNetwork, &path).expect("open");
+        let net = SlipstreamNetwork::from(Network::MainNetwork);
+        let ufvk = UnifiedFullViewingKey::decode(&net, TEST_UFVK).expect("decode TEST_UFVK");
+        let ts = TreeState {
+            network: "main".into(),
+            height: 663_149,
+            hash: "0".repeat(64),
+            time: 1,
+            ..Default::default()
+        };
+        assert!(
+            !s.has_account_for_ufvk(&ufvk).expect("presence"),
+            "absent before import"
+        );
+        s.import_account(&ufvk, ts).expect("import");
+        assert!(
+            s.has_account_for_ufvk(&ufvk).expect("presence"),
+            "present after import"
+        );
+        assert_eq!(s.db.get_account_ids().expect("get_account_ids").len(), 1);
     }
 }

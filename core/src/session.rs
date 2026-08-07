@@ -30,25 +30,49 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_protocol::consensus::BlockHeight;
+
 use crate::config::EngineConfig;
 use crate::connector::TorConn;
 use crate::engine::{SyncOutcome, probe_tip, should_resync, sync_once, wall_clock_utc};
 use crate::error::SlipstreamError;
 use crate::events::Progress;
-use crate::ffi_handle::{FfiSlipstreamEvent, SyncState};
 #[cfg(test)]
 use crate::ffi_handle::EVENT_RING_CAP;
+use crate::ffi_handle::{FfiSlipstreamEvent, SyncState};
 
-/// Per-session configuration: the per-pass engine config + optional account import + optional Tor.
-#[derive(Clone, Debug)]
+/// Per-session configuration: the per-pass engine config + accounts to bootstrap + optional Tor.
+#[derive(Clone)]
 pub struct SessionConfig {
     /// Per-pass engine config (network, db, endpoint, budgets, sparse, write-behind, gpu).
     pub engine: EngineConfig,
-    /// `Some((ufvk, birthday))` imports the account on the initial pass if the wallet has none;
-    /// `None` = already imported. Follow passes are always keyless regardless.
-    pub account: Option<(String, u64)>,
+    /// Accounts to bootstrap on the initial pass — each `(ufvk, birthday)` is imported if the
+    /// wallet does not already track it. Empty = nothing to import (a wallet a host already
+    /// provisioned). Follow passes are always keyless regardless.
+    pub accounts: Vec<(UnifiedFullViewingKey, BlockHeight)>,
     /// `Some` routes metadata over isolated Tor circuits (bulk stays direct); `None` = all direct.
     pub tor: Option<TorSessionConfig>,
+}
+
+// `UnifiedFullViewingKey` is deliberately not `Debug` (key material must not land in logs),
+// so `SessionConfig` cannot derive it. Redact the keys, surfacing only the account count and
+// birthdays — the operationally useful part without leaking a viewing key.
+impl std::fmt::Debug for SessionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let birthdays: Vec<u32> = self.accounts.iter().map(|(_, h)| u32::from(*h)).collect();
+        f.debug_struct("SessionConfig")
+            .field("engine", &self.engine)
+            .field(
+                "accounts",
+                &format_args!(
+                    "<{} ufvk(s) redacted; birthdays {birthdays:?}>",
+                    self.accounts.len()
+                ),
+            )
+            .field("tor", &self.tor)
+            .finish()
+    }
 }
 
 /// Tor session policy. The HOST decides `dangerously_trust_everyone` (true on sandboxed app dirs:
@@ -163,15 +187,21 @@ pub(crate) fn should_retry(err: &SlipstreamError, attempt: u32) -> Option<Durati
 /// caller's responsibility (emitted once per session).
 pub(crate) async fn run_pass_with_retry(
     cfg: &EngineConfig,
-    ufvk_ref: Option<(&str, u64)>,
+    accounts: &[(UnifiedFullViewingKey, BlockHeight)],
     progress: &Arc<Progress>,
     tor: Option<&TorConn>,
 ) -> Result<SyncOutcome, SlipstreamError> {
     let mut attempt: u32 = 0;
     loop {
-        let result = sync_once(cfg, ufvk_ref, Some(progress.clone()), tor).await;
+        let result = sync_once(cfg, accounts, Some(progress.clone()), tor).await;
         match result {
-            Ok(outcome) => return Ok(outcome),
+            Ok(outcome) => {
+                // The engine returns a bare result; the orchestration layer owns
+                // presentation — emit the per-pass tracing summary here (covers the
+                // production/FFI initial pass and every follow-loop catch-up pass).
+                crate::report::log_pass_summary(&outcome, cfg);
+                return Ok(outcome);
+            }
             Err(err) => {
                 attempt += 1;
                 match should_retry(&err, attempt) {
@@ -290,10 +320,6 @@ pub async fn run_session(
         }
     };
 
-    // Initial-pass account import (if any). `Option<(&str, u64)>` is Copy, so it is reused per
-    // retry iteration without re-borrowing.
-    let account_ref = config.account.as_ref().map(|(s, h)| (s.as_str(), *h));
-
     // ── Initial pass: RESILIENT retry loop (T8.7) ────────────────────────────
     // A foreground wallet must NEVER surface a hard sync error for a recoverable
     // (transient/transport) failure. On a transient error we retry with a capped backoff,
@@ -306,7 +332,7 @@ pub async fn run_session(
         reporter.set_state(SyncState::Syncing);
         match run_pass_with_retry(
             &config.engine,
-            account_ref,
+            &config.accounts,
             &reporter.progress,
             tor_conn.as_ref(),
         )
@@ -384,8 +410,7 @@ async fn follow_loop(
     // mempool on every reconnect (Deviation D6).
     let mut mempool_enabled = true;
     let mut mempool_failures: u32 = 0;
-    let mut seen_txids: std::collections::HashSet<[u8; 32]> =
-        std::collections::HashSet::new();
+    let mut seen_txids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     loop {
         // Between passes: hold a mempool session (surfaces 0-conf incoming) or jitter-sleep
         // if mempool is disabled. A live session blocks until the server closes the stream
@@ -483,13 +508,17 @@ async fn follow_loop(
             continue;
         }
 
-        tracing::info!(last_tip, observed, "follow: tip advanced, running catch-up pass");
+        tracing::info!(
+            last_tip,
+            observed,
+            "follow: tip advanced, running catch-up pass"
+        );
 
         // New block(s): Syncing for the pass duration, then Done. Follow passes are ALWAYS
-        // keyless (ufvk=None) — the account is already imported; passing Some would waste a
-        // GetTreeState RPC on every catch-up pass.
+        // keyless (empty accounts) — the accounts are already imported; passing any would
+        // waste a GetTreeState RPC on every catch-up pass.
         reporter.set_state(SyncState::Syncing);
-        match run_pass_with_retry(&config.engine, None, &reporter.progress, tor_conn).await {
+        match run_pass_with_retry(&config.engine, &[], &reporter.progress, tor_conn).await {
             Ok(o) => {
                 last_tip = o.chain_tip;
                 consecutive_failures = 0;
@@ -555,7 +584,10 @@ mod tests {
 
     #[test]
     fn pass_retry_max_is_two() {
-        assert_eq!(PASS_RETRY_MAX, 2, "PASS_RETRY_MAX must be 2 (3 total attempts)");
+        assert_eq!(
+            PASS_RETRY_MAX, 2,
+            "PASS_RETRY_MAX must be 2 (3 total attempts)"
+        );
         assert_eq!(pass_retry_sleep(1), Duration::from_secs(5));
         assert_eq!(pass_retry_sleep(2), Duration::from_secs(15));
         assert_eq!(pass_retry_sleep(3), Duration::from_secs(15)); // default arm
@@ -565,7 +597,10 @@ mod tests {
 
     #[test]
     fn follow_poll_jitter_min_sample_yields_min_secs() {
-        assert_eq!(follow_poll_jitter(0.0), Duration::from_secs(FOLLOW_POLL_MIN_SECS));
+        assert_eq!(
+            follow_poll_jitter(0.0),
+            Duration::from_secs(FOLLOW_POLL_MIN_SECS)
+        );
     }
 
     #[test]
@@ -623,23 +658,44 @@ mod tests {
 
     #[test]
     fn follow_poll_is_in_old_sdk_band() {
-        assert!(FOLLOW_POLL_MIN_SECS >= 10, "min must be >= 10 (old-SDK floor)");
-        assert!(FOLLOW_POLL_MAX_SECS <= 30, "max must be <= 30 (old-SDK ceiling)");
-        assert!(FOLLOW_POLL_MIN_SECS <= FOLLOW_POLL_MAX_SECS, "min must be <= max");
+        const {
+            assert!(
+                FOLLOW_POLL_MIN_SECS >= 10,
+                "min must be >= 10 (old-SDK floor)"
+            );
+            assert!(
+                FOLLOW_POLL_MAX_SECS <= 30,
+                "max must be <= 30 (old-SDK ceiling)"
+            );
+            assert!(
+                FOLLOW_POLL_MIN_SECS <= FOLLOW_POLL_MAX_SECS,
+                "min must be <= max"
+            );
+        }
     }
 
     #[test]
     fn follow_failure_cap_is_sane() {
-        assert!(FOLLOW_FAILURE_CAP >= 3, "must tolerate transient server weather");
+        const {
+            assert!(
+                FOLLOW_FAILURE_CAP >= 3,
+                "must tolerate transient server weather"
+            )
+        };
     }
 
     #[test]
     fn mempool_failure_cap_is_sane() {
-        assert!(MEMPOOL_FAILURE_CAP >= 1, "one failure must not disable mempool");
-        assert!(
-            MEMPOOL_FAILURE_CAP < FOLLOW_FAILURE_CAP,
-            "mempool (non-essential) must give up before the essential tip poll"
-        );
+        const {
+            assert!(
+                MEMPOOL_FAILURE_CAP >= 1,
+                "one failure must not disable mempool"
+            );
+            assert!(
+                MEMPOOL_FAILURE_CAP < FOLLOW_FAILURE_CAP,
+                "mempool (non-essential) must give up before the essential tip poll"
+            );
+        }
     }
 
     // ── SessionReporter ──────────────────────────────────────────────────────

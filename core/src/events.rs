@@ -208,7 +208,9 @@ impl Progress {
     /// have not yet been updated; calls store (not add) to avoid accumulated-per-range
     /// semantics that caused the % snap-back bug.
     #[inline]
-    #[deprecated(note = "use set_pass_total (store semantics); add_pass_total (accumulate) caused % snap-back")]
+    #[deprecated(
+        note = "use set_pass_total (store semantics); add_pass_total (accumulate) caused % snap-back"
+    )]
     pub fn add_pass_total(&self, n: u64) {
         // Preserve behaviour for callers that haven't migrated: treat as set.
         self.pass_total_blocks.store(n, Ordering::Relaxed);
@@ -251,7 +253,8 @@ impl Progress {
     /// window — i.e. suggested ranges remain below the wallet's recover-until height.
     #[inline]
     pub fn set_recovering(&self, recovering: bool) {
-        self.recovering.store(u64::from(recovering), Ordering::Relaxed);
+        self.recovering
+            .store(u64::from(recovering), Ordering::Relaxed);
     }
 
     /// Read the live recovering flag (terminal-state forcing happens in the snapshot).
@@ -271,7 +274,8 @@ impl Progress {
     #[inline]
     pub fn permille_floor(&self, raw: u64) -> u64 {
         let clamped = raw.min(1000);
-        self.progress_permille_floor.fetch_max(clamped, Ordering::Relaxed);
+        self.progress_permille_floor
+            .fetch_max(clamped, Ordering::Relaxed);
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
@@ -287,7 +291,8 @@ impl Progress {
     pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64) -> bool {
         let current = self.progress_permille_floor.load(Ordering::Relaxed);
         if seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current {
-            self.progress_permille_floor.store(seed.min(1000), Ordering::Relaxed);
+            self.progress_permille_floor
+                .store(seed.min(1000), Ordering::Relaxed);
             return true;
         }
         false
@@ -528,15 +533,27 @@ mod tests {
         assert_eq!(p.pass_total(), 15_000);
         // Re-suggest after first range (scanned_so_far=10_000 + remaining 5_000) → still 15_000.
         p.set_pass_total(15_000);
-        assert_eq!(p.pass_total(), 15_000, "re-suggest with same total stays stable");
+        assert_eq!(
+            p.pass_total(),
+            15_000,
+            "re-suggest with same total stays stable"
+        );
         // Re-suggest exposes more ranges: new total = 20_000 → store overwrites.
         p.set_pass_total(20_000);
-        assert_eq!(p.pass_total(), 20_000, "set_pass_total must overwrite, not add");
+        assert_eq!(
+            p.pass_total(),
+            20_000,
+            "set_pass_total must overwrite, not add"
+        );
 
         // spendable latches to 1 and stays there.
         assert_eq!(p.spendable(), 0, "not yet spendable before set_spendable()");
         p.set_spendable();
-        assert_eq!(p.spendable(), 1, "spendable must be 1 after set_spendable()");
+        assert_eq!(
+            p.spendable(),
+            1,
+            "spendable must be 1 after set_spendable()"
+        );
         p.set_spendable(); // idempotent
         assert_eq!(p.spendable(), 1, "set_spendable is idempotent");
     }
@@ -553,23 +570,37 @@ mod tests {
 
         // First suggest: 0 scanned + 100 (ChainTip) + 200 (Historic) = 300.
         p.set_pass_total(300);
-        assert_eq!(p.pass_total(), 300, "whole-pass denominator set on first suggest");
+        assert_eq!(
+            p.pass_total(),
+            300,
+            "whole-pass denominator set on first suggest"
+        );
 
         // Scan ChainTip range.
         p.add_scanned(100);
 
         // Re-suggest: 100 scanned + 200 remaining = 300 → same value; store is idempotent.
         p.set_pass_total(300);
-        assert_eq!(p.pass_total(), 300, "denominator stays 300 after re-suggest");
+        assert_eq!(
+            p.pass_total(),
+            300,
+            "denominator stays 300 after re-suggest"
+        );
 
         // At this point, progress = 100/300 ≈ 33.3% — no 100→60% snap-back.
         let ratio = p.scanned() as f64 / p.pass_total() as f64;
-        assert!((ratio - 1.0 / 3.0).abs() < 1e-9, "progress must be ~33.3% mid-pass");
+        assert!(
+            (ratio - 1.0 / 3.0).abs() < 1e-9,
+            "progress must be ~33.3% mid-pass"
+        );
 
         // Scan Historic range.
         p.add_scanned(200);
         let final_ratio = p.scanned() as f64 / p.pass_total() as f64;
-        assert!((final_ratio - 1.0).abs() < 1e-9, "progress must be 100% when all ranges done");
+        assert!(
+            (final_ratio - 1.0).abs() < 1e-9,
+            "progress must be 100% when all ranges done"
+        );
     }
 
     #[test]
@@ -604,7 +635,11 @@ mod tests {
         for _ in 0..10 {
             p.add_ranges_completed();
         }
-        assert_eq!(p.ranges_completed(), 12, "must accumulate across all ranges");
+        assert_eq!(
+            p.ranges_completed(),
+            12,
+            "must accumulate across all ranges"
+        );
     }
 
     #[test]
@@ -659,12 +694,28 @@ mod tests {
 
         // Monotonic delta counters preserved (Swift compares strict-greater).
         assert_eq!(p.enhanced(), 20, "enhanced_txs is monotonic per handle");
-        assert_eq!(p.ranges_completed(), 1, "ranges_completed is monotonic per handle");
+        assert_eq!(
+            p.ranges_completed(),
+            1,
+            "ranges_completed is monotonic per handle"
+        );
         assert_eq!(p.reorgs(), 1, "reorgs_recovered is cumulative diagnostics");
-        assert_eq!(p.chain_tip(), 3_374_188, "chain_tip is overwritten by the new pass anyway");
+        assert_eq!(
+            p.chain_tip(),
+            3_374_188,
+            "chain_tip is overwritten by the new pass anyway"
+        );
         // [E-2/E-4] The freshness and tx-set counters are per-handle facts, not pass ratios.
-        assert_eq!(p.tip_refreshes(), 1, "tip_refreshes is monotonic per handle");
-        assert_eq!(p.tx_set_version(), 2, "tx_set_version is monotonic per handle");
+        assert_eq!(
+            p.tip_refreshes(),
+            1,
+            "tip_refreshes is monotonic per handle"
+        );
+        assert_eq!(
+            p.tx_set_version(),
+            2,
+            "tx_set_version is monotonic per handle"
+        );
     }
 
     /// [API v2.1 E-5] The floor re-baselines when the scope EXPANDS (seed materially below
@@ -674,15 +725,25 @@ mod tests {
         let p = Progress::default();
         assert_eq!(p.permille_floor(990), 990);
         // Within-scope drift up to the epsilon never re-baselines (tip drift is <1‰).
-        assert!(!p.rebaseline_floor_if_scope_expanded(989), "1‰ dip is noise");
+        assert!(
+            !p.rebaseline_floor_if_scope_expanded(989),
+            "1‰ dip is noise"
+        );
         assert!(
             !p.rebaseline_floor_if_scope_expanded(990 - FLOOR_REBASELINE_EPSILON_PERMILLE),
             "exactly-epsilon dip is still within scope"
         );
         assert_eq!(p.permille_floor(0), 990, "floor held through noise");
         // Import with an older birthday: the seed plummets → re-baseline to the truth.
-        assert!(p.rebaseline_floor_if_scope_expanded(120), "material drop = scope expansion");
-        assert_eq!(p.permille_floor(0), 120, "floor re-baselined to the expanded-scope seed");
+        assert!(
+            p.rebaseline_floor_if_scope_expanded(120),
+            "material drop = scope expansion"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            120,
+            "floor re-baselined to the expanded-scope seed"
+        );
         // …and climbs monotonically again within the new scope.
         assert_eq!(p.permille_floor(300), 300);
     }

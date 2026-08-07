@@ -1,0 +1,116 @@
+name: CI
+
+# Adapted from the librustzcash CI breakdown, pared down to what applies to this
+# workspace. Slipstream is a std, tokio/sqlite/gRPC sync engine consuming git-patched
+# librustzcash crates, so the librustzcash-specific jobs are intentionally omitted:
+#   - cross-target builds (wasm32 / thumbv7 no_std)      — not a target here
+#   - the pool/consensus feature matrix (Orchard/NU7/…)  — not features here
+#   - uuid / readme-graph / protobuf-regen consistency   — librustzcash-specific
+#   - macOS/Windows test legs, benches (bitrot), mutants — deferred
+# The two slipstream features (`darkside`, `gpu`) are compile-only in CI: the darkside
+# integration tests need a live lightwalletd and the gpu tests need a GPU, so they are
+# built (to catch API drift) but not run — see `check-all-features`.
+
+permissions: {}
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+# Cancel superseded runs on the same ref (a new push aborts the previous run).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (default features)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run tests
+        run: cargo test --workspace --verbose
+      - name: Verify working directory is clean
+        run: git diff --exit-code
+
+  check-all-features:
+    name: Check (all features — darkside + gpu)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Compile-only: `darkside` tests need a live lightwalletd and `gpu` tests need a
+      # GPU, so neither RUNS in CI. Building every target under all features is what
+      # catches the cross-feature API drift a default-features build would miss.
+      - name: cargo check --all-targets --all-features
+        run: cargo check --workspace --all-targets --all-features
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: Run clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  doc-links:
+    name: Intra-doc links
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      # Denies rustdoc warnings (broken intra-doc links included) across public and
+      # private items — the same doc hygiene librustzcash gates on.
+      - name: Check intra-doc links
+        run: cargo doc --no-deps --workspace --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  required-checks:
+    name: Required status checks have passed
+    needs:
+      - test
+      - check-all-features
+      - fmt
+      - clippy
+      - doc-links
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Determine whether all required jobs succeeded
+        run: echo "${NEEDS}" | jq -e '[ .[] | .result == "success" ] | all'
+        env:
+          NEEDS: ${{ toJSON(needs) }}

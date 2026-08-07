@@ -8,13 +8,6 @@ members = [
     "cli",
     "gpuhash",
     "protogen",
-    # v0.5 vendored forks — un-membered since the workspace rides orchard 0.15
-    # (the forks are 0.14-based; see vendor/*/Cargo.toml — each carries its own
-    # bolted-on [workspace] so its in-crate KATs still run standalone with
-    # `cargo test` from inside the vendor directory). Re-vendor onto the 0.15
-    # line or retire via the upstream seam PRs to restore the DH-path perf work.
-    # "vendor/zcash_note_encryption",
-    # "vendor/orchard",
 ]
 resolver = "3"
 
@@ -29,32 +22,37 @@ tonic-prost = "0.14"
 futures-util = "0.3"
 thiserror = "2"
 tracing = "0.1"
-zcash_protocol = "=0.10.0"
-zcash_client_backend = { version = "=0.24.0-rc.1", features = [
+zcash_protocol = "0.10.2"
+zcash_client_backend = { version = "0.24.0-rc.7", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
-    "pczt",
     "tor",
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
-zcash_keys = { version = "=0.15.0", features = ["orchard"] }
+zcash_client_sqlite = { version = "0.22.0-rc.8", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_keys = { version = "0.16.1", features = ["orchard"] }
 rusqlite = "0.37"
+# Issue #4: slipstream's own `ext_slipstream_*` schema rides the wallet DB's
+# schemerz migrator (WalletMigrator::with_external_migrations) — versions match
+# the ones zcash_client_sqlite itself resolves.
+schemerz = "0.2"
+schemerz-rusqlite = "0.370"
+uuid = "1"
 secrecy = "0.8"
 rand = "0.8"
 sapling = { package = "sapling-crypto", version = "0.7", default-features = false }
-orchard = { version = "0.15.0", features = ["unstable-voting-circuits"] }
-zcash_primitives = "=0.29.0"
-transparent = { package = "zcash_transparent", version = "=0.9.0", default-features = false }
+orchard = "0.15"
+zcash_primitives = "0.30.0"
+transparent = { package = "zcash_transparent", version = "0.10.0", default-features = false }
 zcash_script = "0.4"
 tempfile = "3"          # dev-only usage; listed here for version unity
 incrementalmerkletree = { version = "0.8", default-features = false }
 shardtree = "0.7"
 rayon = "1.7"
 zip32 = "0.2"
-zcash_note_encryption = "0.4.1"
-zcash_address = "=0.13.0"
+zcash_note_encryption = "0.4.2"
+zcash_address = "0.13.0"
 # T10b spend-proof stub prover signatures only (already in the graph via sapling).
 jubjub = "0.10"
 bls12_381 = "0.8"
@@ -71,23 +69,21 @@ group = "0.13"
 pasta_curves = "0.5"
 ff = "0.13"
 
-# The Ironwood-era librustzcash family is not fully released to crates.io yet, so
-# the whole family rides [patch.crates-io] against the canonical repo — never
-# direct git+branch deps. `=x.y.z` pins on the patched crates (above) stop a
-# future crates.io patch release from out-resolving the [patch] block. The rev
-# is current zcash/librustzcash main — the same rev upstream zcash_voting rides,
-# so SDK-side consumers resolve one family instance; bump deliberately, with the
-# engine gates re-run. The whole block dies at the 0.24-era crates.io release.
+# The unreleased librustzcash generation this engine builds against: the anchor-checkpoint
+# ensure/retention seam (`batch_ensure_heights`) is not in any crates.io release yet, so a
+# standalone `cargo test -p slipstream-core` cannot resolve without these. Every family crate
+# is patched to the SAME rev so the graph stays a single family instance. Consumers embedding
+# slipstream-core in their own workspace (the iOS SDK) carry an equivalent patch set at the
+# workspace root — root patches govern there, and this section is ignored. Re-pin to
+# crates.io at the first release that carries the seam.
 [patch.crates-io]
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "30bbc8990c3f7987868ea56fb483a7c11c56bad2" }
+# pczt = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }
+# zip321 = { git = "https://github.com/zcash/librustzcash", rev = "REPLACE_ME" }

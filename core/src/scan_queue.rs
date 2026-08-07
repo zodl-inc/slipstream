@@ -16,102 +16,83 @@
 
 //! Slipstream-owned scan-queue hygiene (additive; the upstream data model is untouched).
 //!
-//! [B4-16] Upstream `WalletWrite::delete_account` (zcash_client_sqlite 0.21,
-//! `wallet.rs::delete_account`) removes the account row and the transaction data solely
-//! linked to it — but it NEVER touches `scan_queue`. The historic ranges a deep-birthday
-//! import queued survive the deletion, so the engine would grind a full deep restore for
-//! viewing keys that no longer exist: hours of wasted scan on a wallet whose remaining
-//! accounts cannot have notes down there (an account has no notes below its birthday).
+//! [B4-16] Upstream `WalletWrite::delete_account` removes the account row and the
+//! transaction data solely linked to it — but it NEVER touches `scan_queue`. The historic
+//! ranges a deep-birthday import queued survive the deletion, so the engine would grind a
+//! full deep restore for viewing keys that no longer exist: hours of wasted scan on a
+//! wallet whose remaining accounts cannot have notes down there (an account has no notes
+//! below its birthday).
 //!
 //! [`prune_orphaned_historic_ranges`] restores the queue to the shape it would have if the
-//! deleted account had never been imported: it drops `Historic`-priority rows lying
-//! ENTIRELY below every remaining account's birthday and trims straddlers to start at that
-//! floor. Only `Historic` is touched, deliberately:
+//! deleted account had never been imported: work queued ENTIRELY below every remaining
+//! account's birthday is cancelled and straddlers are trimmed to start at that floor,
+//! RETAINING `OpenAdjacent` and greater. Per the trait's contiguity contract, cancelled
+//! ranges are demoted in place to `Ignored` (merging adjacent demotions) wherever a
+//! retained row lies beneath them; only coverage below the lowest retained row is deleted
+//! outright, since that merely raises the queue's floor:
 //!
-//! - `Historic` work below `MIN(accounts.birthday_height)` can only have been justified by
-//!   a now-deleted account — upstream never queues Historic ranges below the wallet
-//!   birthday, and its own "wallet birthday" notion IS `MIN(birthday_height)` (db.rs).
-//! - `FoundNote`/`ChainTip`/`Verify`/`OpenAdjacent` rows are kept even below the floor: a
+//! - `Historic` work below the wallet birthday can only have been justified by a
+//!   now-deleted account — upstream never queues Historic ranges below the wallet
+//!   birthday, and [`WalletRead::get_wallet_birthday`] is exactly that floor.
+//! - `OpenAdjacent`/`FoundNote`/`ChainTip`/`Verify` rows are kept even below the floor: a
 //!   REMAINING account's shard-completion range (needed for witnesses) may legitimately
 //!   start below its birthday — a found note's subtree spans earlier blocks. A stale one
 //!   left by the deleted account is bounded by shard size: seconds of scan, not hours.
-//! - `Scanned`/`Ignored` rows are bookkeeping, not work — untouched.
+//! - `Scanned`/`Ignored` rows are bookkeeping, not work — upstream itself maintains them
+//!   (e.g. the canonical `Ignored` range spanning activation → wallet birthday), so
+//!   `prune_scan_queue_below` retains them unconditionally in its `Some(_)` form; pruning
+//!   them would make the queue shape diverge from upstream's (the golden oracle's
+//!   restart-equivalence test catches exactly that).
+//!
+//! Issue #4: the whole operation is expressed through the upstream storage traits
+//! ([`WalletRead::get_wallet_birthday`] for the floor,
+//! [`WalletWrite::prune_scan_queue_below`] for the demote/trim — whose no-op fast path
+//! stays read-only, taking no write lock).
 //!
 //! Called from [`crate::wallet_session::WalletSession::open`] — i.e. at host open AND at
 //! every pass start (`engine::sync_once` opens a fresh session) — so a wallet wedged by an
 //! earlier delete heals at the next launch, and an in-app delete → restart heals
-//! immediately, with no FFI surface. No accounts ⇒ no floor ⇒ no-op. Idempotent, and the
-//! hot path (nothing to prune) is a read-only probe that takes no write lock.
+//! immediately, with no FFI surface. No accounts ⇒ no floor ⇒ no-op. Idempotent.
+//!
+//! [`WalletRead::get_wallet_birthday`]: zcash_client_backend::data_api::WalletRead::get_wallet_birthday
+//! [`WalletWrite::prune_scan_queue_below`]: zcash_client_backend::data_api::WalletWrite::prune_scan_queue_below
 
-use rusqlite::Connection;
+use zcash_client_backend::data_api::{WalletRead, WalletWrite, scanning::ScanPriority};
 
 use crate::error::SlipstreamError;
+use crate::wallet_session::Db;
 
-/// Upstream's persisted priority code for `ScanPriority::Historic`
-/// (zcash_client_sqlite-0.21 `wallet/scanning.rs::priority_code`). Priority codes are a
-/// persisted format — changing one upstream would require a DB migration — so pinning the
-/// value is stable across the crate versions we track.
-const PRIORITY_HISTORIC: i64 = 20;
-
-fn err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
-    SlipstreamError::Wallet(format!("scan-queue prune {context}: {e}"))
-}
-
-/// Drop/trim `Historic` scan-queue rows that lie below EVERY remaining account's birthday.
-/// Returns the number of rows changed (deleted + trimmed); `Ok(0)` when there are no
-/// accounts or nothing qualifies (the common case — a read-only probe, no write lock).
-pub fn prune_orphaned_historic_ranges(conn: &Connection) -> Result<u64, SlipstreamError> {
-    let floor: Option<i64> = conn
-        .query_row("SELECT MIN(birthday_height) FROM accounts", [], |row| row.get(0))
-        .map_err(|e| err("min birthday", e))?;
-    let Some(floor) = floor else { return Ok(0) };
-
-    // Fast path: `block_range_start < floor` captures exactly the rows the two statements
-    // below would touch (fully-below rows AND straddlers). Zero matches — the steady state
-    // on every healthy open — means no write transaction is ever taken.
-    let orphans: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM scan_queue WHERE priority = ?1 AND block_range_start < ?2",
-            rusqlite::params![PRIORITY_HISTORIC, floor],
-            |row| row.get(0),
-        )
-        .map_err(|e| err("probe", e))?;
-    if orphans == 0 {
+/// Cancel scan work queued below EVERY remaining account's birthday (demoting to
+/// `Ignored`, or deleting where the trait's contiguity contract permits), retaining the
+/// witness-relevant priorities (`OpenAdjacent` and greater). Returns the number of rows
+/// changed (deleted, demoted, or trimmed); `Ok(0)` when there are no accounts or nothing
+/// qualifies (the common case — a read-only probe, no write lock).
+pub fn prune_orphaned_historic_ranges(db: &mut Db) -> Result<u64, SlipstreamError> {
+    let err = |context: &str, e: &dyn std::fmt::Display| {
+        SlipstreamError::Wallet(format!("scan-queue prune {context}: {e}"))
+    };
+    let Some(floor) = db
+        .get_wallet_birthday()
+        .map_err(|e| err("wallet birthday", &e))?
+    else {
         return Ok(0);
-    }
-
-    // One transaction: delete + trim land together. (A crash between them would only leave
-    // a straddler the next open trims — idempotent — but atomicity is free here.)
-    let tx = conn.unchecked_transaction().map_err(|e| err("begin", e))?;
-    let deleted = tx
-        .execute(
-            "DELETE FROM scan_queue WHERE priority = ?1 AND block_range_end <= ?2",
-            rusqlite::params![PRIORITY_HISTORIC, floor],
-        )
-        .map_err(|e| err("delete", e))?;
-    // Non-overlap invariant makes the trimmed start unique: no other row can already
-    // start at `floor`, because it would overlap the straddler being trimmed.
-    let trimmed = tx
-        .execute(
-            "UPDATE scan_queue SET block_range_start = ?2 \
-             WHERE priority = ?1 AND block_range_start < ?2 AND block_range_end > ?2",
-            rusqlite::params![PRIORITY_HISTORIC, floor],
-        )
-        .map_err(|e| err("trim", e))?;
-    tx.commit().map_err(|e| err("commit", e))?;
-    Ok((deleted + trimmed) as u64)
+    };
+    db.prune_scan_queue_below(floor, Some(ScanPriority::OpenAdjacent))
+        .map_err(|e| err("prune", &e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::wallet_session::{TEST_UFVK, WalletSession};
-    use rusqlite::params;
+    use rusqlite::{Connection, params};
     use zcash_protocol::consensus::Network;
 
     /// Migrated wallet with ONE account (birthday 663_150 — the treestate is at 663_149),
-    /// then the scan queue cleared so tests insert controlled rows only.
-    fn fixture_with_account() -> (tempfile::TempDir, Connection) {
+    /// then the scan queue cleared so tests insert controlled rows only. The session stays
+    /// open (the prune runs through its WalletDb); the side connection serves the test's
+    /// own fixture inserts and assertions (WAL permits both).
+    fn fixture_with_account() -> (tempfile::TempDir, WalletSession, Connection) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("data.db");
         let mut s = WalletSession::open(Network::MainNetwork, &path).expect("open");
@@ -123,10 +104,10 @@ mod tests {
             ..Default::default()
         };
         s.ensure_account(TEST_UFVK, ts).expect("import account");
-        drop(s);
         let conn = Connection::open(&path).expect("conn");
-        conn.execute("DELETE FROM scan_queue", []).expect("clear queue");
-        (dir, conn)
+        conn.execute("DELETE FROM scan_queue", [])
+            .expect("clear queue");
+        (dir, s, conn)
     }
 
     fn insert_range(conn: &Connection, start: i64, end: i64, priority: i64) {
@@ -152,26 +133,30 @@ mod tests {
     }
 
     /// The core B4-16 shape: a deleted deep-birthday account left Historic ranges below
-    /// the remaining account's birthday (663_150). Fully-below rows are dropped, a
-    /// straddler is trimmed to the floor, and Historic-above plus non-Historic-below
-    /// (the shard-completion class) are kept. Rows are non-overlapping (queue invariant).
+    /// the remaining account's birthday (663_150). Fully-below rows sit above the
+    /// retained FoundNote row, so contiguity demotes them (merged with the straddler's
+    /// vacated span) to a single `Ignored` row rather than deleting them; the straddler
+    /// is trimmed to the floor, and Historic-above plus the witness-class FoundNote and
+    /// bookkeeping Scanned rows below the floor are kept. Rows are non-overlapping
+    /// (queue invariant).
     #[test]
     fn prune_drops_orphaned_historic_keeps_justified_rows() {
-        let (_dir, conn) = fixture_with_account();
+        let (_dir, mut s, conn) = fixture_with_account();
         insert_range(&conn, 500_000, 550_000, 20); // Historic, fully below → deleted
         insert_range(&conn, 550_000, 600_000, 20); // Historic, fully below → deleted
         insert_range(&conn, 600_000, 700_000, 20); // Historic straddler → trimmed
         insert_range(&conn, 700_000, 710_000, 20); // Historic above floor → kept
         insert_range(&conn, 450_000, 460_000, 40); // FoundNote below floor → kept
-        insert_range(&conn, 460_000, 470_000, 10); // Scanned below floor → kept
+        insert_range(&conn, 460_000, 470_000, 10); // Scanned below floor → kept (bookkeeping)
 
-        let changed = prune_orphaned_historic_ranges(&conn).expect("prune");
-        assert_eq!(changed, 3, "2 deleted + 1 trimmed");
+        let changed = prune_orphaned_historic_ranges(s.db_mut()).expect("prune");
+        assert_eq!(changed, 3, "2 demoted + 1 trimmed");
         assert_eq!(
             ranges(&conn),
             vec![
                 (450_000, 460_000, 40),
                 (460_000, 470_000, 10),
+                (500_000, 663_150, 0),
                 (663_150, 700_000, 20),
                 (700_000, 710_000, 20),
             ]
@@ -183,9 +168,12 @@ mod tests {
     /// empty range, which the schema's `start < end` CHECK would reject).
     #[test]
     fn prune_treats_end_at_floor_as_fully_below() {
-        let (_dir, conn) = fixture_with_account();
+        let (_dir, mut s, conn) = fixture_with_account();
         insert_range(&conn, 600_000, 663_150, 20);
-        assert_eq!(prune_orphaned_historic_ranges(&conn).expect("prune"), 1);
+        assert_eq!(
+            prune_orphaned_historic_ranges(s.db_mut()).expect("prune"),
+            1
+        );
         assert!(ranges(&conn).is_empty());
     }
 
@@ -194,30 +182,40 @@ mod tests {
     fn prune_without_accounts_is_noop() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("data.db");
-        let _s = WalletSession::open(Network::MainNetwork, &path).expect("open");
+        let mut s = WalletSession::open(Network::MainNetwork, &path).expect("open");
         let conn = Connection::open(&path).expect("conn");
         insert_range(&conn, 100_000, 200_000, 20);
 
-        assert_eq!(prune_orphaned_historic_ranges(&conn).expect("prune"), 0);
+        assert_eq!(
+            prune_orphaned_historic_ranges(s.db_mut()).expect("prune"),
+            0
+        );
         assert_eq!(ranges(&conn), vec![(100_000, 200_000, 20)]);
     }
 
     /// A second run finds nothing (and, per the fast path, takes no write transaction).
     #[test]
     fn prune_is_idempotent() {
-        let (_dir, conn) = fixture_with_account();
+        let (_dir, mut s, conn) = fixture_with_account();
         insert_range(&conn, 500_000, 600_000, 20);
-        assert_eq!(prune_orphaned_historic_ranges(&conn).expect("first"), 1);
-        assert_eq!(prune_orphaned_historic_ranges(&conn).expect("second"), 0);
+        assert_eq!(
+            prune_orphaned_historic_ranges(s.db_mut()).expect("first"),
+            1
+        );
+        assert_eq!(
+            prune_orphaned_historic_ranges(s.db_mut()).expect("second"),
+            0
+        );
     }
 
     /// End-to-end proof of the hook: `WalletSession::open` itself heals a wedged wallet —
     /// the exact field path (app relaunch after a mid-restore account delete).
     #[test]
     fn open_prunes_orphaned_ranges() {
-        let (dir, conn) = fixture_with_account();
+        let (dir, s, conn) = fixture_with_account();
         insert_range(&conn, 500_000, 600_000, 20);
         drop(conn);
+        drop(s);
 
         let path = dir.path().join("data.db");
         let _s = WalletSession::open(Network::MainNetwork, &path).expect("re-open");

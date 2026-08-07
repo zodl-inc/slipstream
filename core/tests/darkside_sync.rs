@@ -62,13 +62,13 @@ use futures_util::StreamExt;
 use rusqlite::Connection;
 use slipstream_core::{
     chunk::chunk_queue,
-    config::{EngineConfig, Endpoint},
+    config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
     enhance::run_enhancement,
     fetch::{FetchPlan, run_fetch},
     grpc,
     scan::scan_chunks_from_treestate,
-    wallet_session::{WalletSession, TEST_UFVK},
+    wallet_session::{TEST_UFVK, WalletSession},
 };
 use zcash_client_backend::data_api::{WalletRead, wallet::ConfirmationsPolicy};
 use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
@@ -81,7 +81,11 @@ use zcash_protocol::value::Zatoshis;
 
 /// The canonical darkside endpoint (plaintext, port 9067).
 fn darkside_endpoint() -> Endpoint {
-    Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false }
+    Endpoint {
+        host: "127.0.0.1".into(),
+        port: 9067,
+        tls: false,
+    }
 }
 
 /// Birthday for the test wallet (sapling activation height).
@@ -90,20 +94,17 @@ const BIRTHDAY_HEIGHT: u64 = 663_150;
 
 /// `FakeChainBuilder.txMainnetBlockUrl` — the single real mainnet compact block at 663150.
 /// Source: Tests/TestUtils/FakeChainBuilder.swift:17
-const TX_MAINNET_BLOCK_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/663150.txt";
+const TX_MAINNET_BLOCK_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/663150.txt";
 
 /// Transaction received by the test wallet at height 663174.
 /// txid: 8f064d23c66dc36e32445e5f3b50e0f32ac3ddb78cff21fb521eb6c19c07c99a
 /// Source: Tests/TestUtils/FakeChainBuilder.swift:210 (`txUrls[663174]`)
-const TX_663174_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/8f064d23c66dc36e32445e5f3b50e0f32ac3ddb78cff21fb521eb6c19c07c99a.txt";
+const TX_663174_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/8f064d23c66dc36e32445e5f3b50e0f32ac3ddb78cff21fb521eb6c19c07c99a.txt";
 
 /// Transaction received by the test wallet at height 663188.
 /// txid: 15a677b6770c5505fb47439361d3d3a7c21238ee1a6874fdedad18ae96850590
 /// Source: Tests/TestUtils/FakeChainBuilder.swift:211 (`txUrls[663188]`)
-const TX_663188_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/15a677b6770c5505fb47439361d3d3a7c21238ee1a6874fdedad18ae96850590.txt";
+const TX_663188_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/transactions/recv/15a677b6770c5505fb47439361d3d3a7c21238ee1a6874fdedad18ae96850590.txt";
 
 /// Height at which staged blocks are applied (defaultLatestHeight in BalanceTests.swift:15).
 /// Source: Tests/DarksideTests/BalanceTests.swift:15
@@ -141,34 +142,47 @@ const EXPECTED_BALANCE_ZATOSHI: i64 = 200_000;
 /// Verified: CommitmentTree::size() with this structure = 128607.
 const SAPLING_TREE_128607: &str = concat!(
     // left = Some(0x00 * 32):  0x01 flag + 32 zero bytes
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     // right = None:  0x00 flag
     "00",
     // parents: CompactSize(16) = 0x10, then 16 entries
     "10",
     // parents[0..3] = Some (bits 1..4 of 128606 are 1):
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     // parents[4] = None (bit 5 of 128606 = 0):
     "00",
     // parents[5] = Some (bit 6 = 1):
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     // parents[6..7] = None (bits 7..8 = 0):
     "00",
     "00",
     // parents[8..9] = Some (bits 9..10 = 1):
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     // parents[10] = None (bit 11 = 0):
     "00",
     // parents[11..15] = Some (bits 12..16 = 1):
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
 );
 
 // ---------------------------------------------------------------------------
@@ -216,11 +230,15 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
 
     // Stage the real mainnet block at height 663150.
     // (FakeChainBuilder.swift:35: darksideWallet.useDataset(from: txMainnetBlockUrl))
-    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL).await.expect("stage 663150 block");
+    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL)
+        .await
+        .expect("stage 663150 block");
 
     // Stage empty blocks 663151..663250 (100 blocks).
     // (FakeChainBuilder.swift:37: stageBlocksCreate(from: 663151, count: 100))
-    ctl.stage_blocks_create(663_151, 100).await.expect("stage empty blocks");
+    ctl.stage_blocks_create(663_151, 100)
+        .await
+        .expect("stage empty blocks");
 
     // Stage real receive transactions at the heights the test wallet owns them.
     // (FakeChainBuilder.swift:97: stageTransaction(from: txUrls[663174]!, at: 663174))
@@ -279,8 +297,7 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
     cfg.chunk_blocks = 100; // small chunks for this test chain (~39 blocks)
     cfg.fetch_streams = 2;
 
-    let mut session =
-        WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
+    let mut session = WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
 
     // Import account: birthday treestate at 663149 (= birthday_height - 1 = 663150 - 1).
     // Use SAPLING_TREE_128607 so birthday_sapling_tree_size is stored as 128607 in the
@@ -342,8 +359,14 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
     // its `prev_hash` field — that is the real mainnet block 663149 hash.
     let block_663149_hash: Vec<u8> = {
         let req = BlockRange {
-            start: Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
-            end:   Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
+            start: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
             ..Default::default()
         };
         let mut stream = client
@@ -351,14 +374,20 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
             .await
             .expect("get_block_range for birthday")
             .into_inner();
-        let first_block = stream.next().await
+        let first_block = stream
+            .next()
+            .await
             .expect("stream should yield birthday block")
             .expect("block 663150 ok");
         first_block.prev_hash
     };
     assert_eq!(block_663149_hash.len(), 32, "prev_hash should be 32 bytes");
     session
-        .seed_block_metadata(BIRTHDAY_HEIGHT - 1, START_SAPLING_TREE_SIZE, &block_663149_hash)
+        .seed_block_metadata(
+            BIRTHDAY_HEIGHT - 1,
+            START_SAPLING_TREE_SIZE,
+            &block_663149_hash,
+        )
         .expect("seed_block_metadata");
 
     // --- Fetch ∥ Scan pipeline ---
@@ -386,15 +415,28 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
     };
 
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
-    let plan = FetchPlan::new(scan_range_start, scan_range_end, cfg.chunk_blocks, cfg.fetch_streams);
+    let plan = FetchPlan::new(
+        scan_range_start,
+        scan_range_end,
+        cfg.chunk_blocks,
+        cfg.fetch_streams,
+    );
     let fetch_ep = ep.clone();
 
     let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
 
-    let scan_stats =
-        scan_chunks_from_treestate(&mut session, scan_range_start, initial_scan_state, rx, sparse, write_behind, false, false)
-            .await
-            .expect("scan_chunks_from_treestate");
+    let scan_stats = scan_chunks_from_treestate(
+        &mut session,
+        scan_range_start,
+        initial_scan_state,
+        rx,
+        sparse,
+        write_behind,
+        false,
+        false,
+    )
+    .await
+    .expect("scan_chunks_from_treestate");
 
     let fetch_stats = fetch_task
         .await
@@ -403,8 +445,7 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
 
     // --- Assertion 1: chain tip ---
     assert_eq!(
-        chain_tip,
-        APPLY_HEIGHT as u64,
+        chain_tip, APPLY_HEIGHT as u64,
         "chain_tip must equal APPLY_HEIGHT ({APPLY_HEIGHT})"
     );
 
@@ -416,7 +457,10 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
         "expected scan.blocks >= {expected_min_blocks} (APPLY_HEIGHT - BIRTHDAY + 1), got {}",
         scan_stats.blocks
     );
-    assert!(fetch_stats.blocks >= expected_min_blocks, "fetch blocks mismatch");
+    assert!(
+        fetch_stats.blocks >= expected_min_blocks,
+        "fetch blocks mismatch"
+    );
 
     // --- Assertions 3 + 4: wallet truth via rusqlite ---
     // Re-open the DB read-only to inspect wallet state.
@@ -510,8 +554,12 @@ async fn sync_enhancement_stores_raw_fields() {
     ctl.reset_with_tree_sizes(START_SAPLING_TREE_SIZE, 0)
         .await
         .expect("reset");
-    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL).await.expect("stage 663150 block");
-    ctl.stage_blocks_create(663_151, 100).await.expect("stage empty blocks");
+    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL)
+        .await
+        .expect("stage 663150 block");
+    ctl.stage_blocks_create(663_151, 100)
+        .await
+        .expect("stage empty blocks");
     ctl.stage_transactions_url(TX_663174_URL, 663_174)
         .await
         .expect("stage tx at 663174");
@@ -534,8 +582,7 @@ async fn sync_enhancement_stores_raw_fields() {
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
 
-    let mut session =
-        WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
+    let mut session = WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
 
     let birthday_ts = TreeState {
         network: "main".into(),
@@ -560,8 +607,14 @@ async fn sync_enhancement_stores_raw_fields() {
     // Seed block 663149 metadata (v0.4.9 workaround — same as sync_finds_fixture_transactions).
     let block_663149_hash: Vec<u8> = {
         let req = BlockRange {
-            start: Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
-            end:   Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
+            start: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
             ..Default::default()
         };
         let mut stream = client
@@ -569,14 +622,20 @@ async fn sync_enhancement_stores_raw_fields() {
             .await
             .expect("get_block_range for birthday")
             .into_inner();
-        let first_block = stream.next().await
+        let first_block = stream
+            .next()
+            .await
             .expect("stream should yield birthday block")
             .expect("block 663150 ok");
         first_block.prev_hash
     };
     assert_eq!(block_663149_hash.len(), 32, "prev_hash should be 32 bytes");
     session
-        .seed_block_metadata(BIRTHDAY_HEIGHT - 1, START_SAPLING_TREE_SIZE, &block_663149_hash)
+        .seed_block_metadata(
+            BIRTHDAY_HEIGHT - 1,
+            START_SAPLING_TREE_SIZE,
+            &block_663149_hash,
+        )
         .expect("seed_block_metadata");
 
     // --- Scan the chain ---
@@ -590,14 +649,28 @@ async fn sync_enhancement_stores_raw_fields() {
     };
 
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
-    let plan = FetchPlan::new(BIRTHDAY_HEIGHT, chain_tip, cfg.chunk_blocks, cfg.fetch_streams);
+    let plan = FetchPlan::new(
+        BIRTHDAY_HEIGHT,
+        chain_tip,
+        cfg.chunk_blocks,
+        cfg.fetch_streams,
+    );
     let fetch_ep = ep.clone();
 
     let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
 
-    let _scan_stats = scan_chunks_from_treestate(&mut session, BIRTHDAY_HEIGHT, initial_scan_state, rx, false, false, false, false)
-        .await
-        .expect("scan_chunks_from_treestate");
+    let _scan_stats = scan_chunks_from_treestate(
+        &mut session,
+        BIRTHDAY_HEIGHT,
+        initial_scan_state,
+        rx,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await
+    .expect("scan_chunks_from_treestate");
 
     let _fetch_stats = fetch_task
         .await
@@ -619,7 +692,11 @@ async fn sync_enhancement_stores_raw_fields() {
             "scan must detect {EXPECTED_TX_COUNT} txs before enhancement (got {pre_tx_count})"
         );
         let pre_raw_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM transactions WHERE raw IS NOT NULL", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM transactions WHERE raw IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
             .expect("pre-enhancement raw count");
         // After scan only (no enhancement), raw SHOULD be NULL — scan stores only metadata.
         // (If this assertion fails, the scan backend is already storing raw data, which is
@@ -643,9 +720,15 @@ async fn sync_enhancement_stores_raw_fields() {
     //   until they appear in a mined block. After ApplyStaged(663188), both txs are in
     //   the active blockchain and GetTransaction returns them. This is verified by
     //   the strict `stats.txs_stored == 2` assertion below.
-    let enhance_stats = run_enhancement(&mut session, &mut client, Network::MainNetwork, None, &mut std::collections::HashSet::new())
-        .await
-        .expect("run_enhancement");
+    let enhance_stats = run_enhancement(
+        &mut session,
+        &mut client,
+        Network::MainNetwork.into(),
+        None,
+        &mut std::collections::HashSet::new(),
+    )
+    .await
+    .expect("run_enhancement");
 
     // --- G3 Assertion A: EnhanceStats parity ---
     //
@@ -847,8 +930,12 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
     ctl.reset_with_tree_sizes(START_SAPLING_TREE_SIZE, 0)
         .await
         .expect("reset");
-    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL).await.expect("stage 663150 block");
-    ctl.stage_blocks_create(663_151, 100).await.expect("stage empty blocks");
+    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL)
+        .await
+        .expect("stage 663150 block");
+    ctl.stage_blocks_create(663_151, 100)
+        .await
+        .expect("stage empty blocks");
     ctl.stage_transactions_url(TX_663174_URL, 663_174)
         .await
         .expect("stage tx at 663174");
@@ -857,7 +944,9 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
         .expect("stage tx at 663188");
 
     // Apply ALL staged blocks (663250) — deep confirmation for both fixture txs.
-    ctl.apply_staged(SPENDABILITY_APPLY_HEIGHT).await.expect("apply staged");
+    ctl.apply_staged(SPENDABILITY_APPLY_HEIGHT)
+        .await
+        .expect("apply staged");
 
     // Darkside propagates staged state asynchronously — sleep 2s (Swift pattern).
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -877,8 +966,7 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
     cfg.chunk_blocks = 200;
     cfg.fetch_streams = 2;
 
-    let mut session =
-        WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
+    let mut session = WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
 
     let birthday_ts = TreeState {
         network: "main".into(),
@@ -906,8 +994,14 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
 
     let block_663149_hash: Vec<u8> = {
         let req = BlockRange {
-            start: Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
-            end:   Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
+            start: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
             ..Default::default()
         };
         let mut stream = client
@@ -915,14 +1009,20 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
             .await
             .expect("get_block_range for birthday")
             .into_inner();
-        let first_block = stream.next().await
+        let first_block = stream
+            .next()
+            .await
             .expect("stream should yield birthday block")
             .expect("block 663150 ok");
         first_block.prev_hash
     };
     assert_eq!(block_663149_hash.len(), 32, "prev_hash should be 32 bytes");
     session
-        .seed_block_metadata(BIRTHDAY_HEIGHT - 1, START_SAPLING_TREE_SIZE, &block_663149_hash)
+        .seed_block_metadata(
+            BIRTHDAY_HEIGHT - 1,
+            START_SAPLING_TREE_SIZE,
+            &block_663149_hash,
+        )
         .expect("seed_block_metadata");
 
     // --- Fetch ∥ scan: full pipeline, PRODUCTION persistence path (sparse = true) ---
@@ -936,15 +1036,28 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
     };
 
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
-    let plan = FetchPlan::new(BIRTHDAY_HEIGHT, chain_tip, cfg.chunk_blocks, cfg.fetch_streams);
+    let plan = FetchPlan::new(
+        BIRTHDAY_HEIGHT,
+        chain_tip,
+        cfg.chunk_blocks,
+        cfg.fetch_streams,
+    );
     let fetch_ep = ep.clone();
 
     let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
 
-    let scan_stats =
-        scan_chunks_from_treestate(&mut session, BIRTHDAY_HEIGHT, initial_scan_state, rx, sparse, write_behind, false, false)
-            .await
-            .expect("scan_chunks_from_treestate");
+    let scan_stats = scan_chunks_from_treestate(
+        &mut session,
+        BIRTHDAY_HEIGHT,
+        initial_scan_state,
+        rx,
+        sparse,
+        write_behind,
+        false,
+        false,
+    )
+    .await
+    .expect("scan_chunks_from_treestate");
 
     fetch_task
         .await
@@ -1027,7 +1140,8 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
 
         // 2. THE GATE: everything is spendable (deep confirmations + complete scan).
         assert_eq!(
-            spendable, total,
+            spendable,
+            total,
             "SPENDABILITY GATE FAILED for account {account:?}: \
              spendable={spendable:?} != total={total:?}. \
              Buckets: change_pending_confirmation={change_pending:?}, \

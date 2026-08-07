@@ -18,6 +18,10 @@
 //! docs/SLIPSTREAM_DESIGN.md §4; modes adjust them later (P8).
 
 use std::path::PathBuf;
+use std::time::Duration;
+
+use tracing::info;
+use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 
 use crate::error::SlipstreamError;
 use crate::network::SlipstreamNetwork;
@@ -50,7 +54,9 @@ impl Endpoint {
         } else if let Some(r) = s.strip_prefix("http://") {
             (false, r)
         } else {
-            return Err(format!("endpoint URI must start with http:// or https://: {s:?}"));
+            return Err(format!(
+                "endpoint URI must start with http:// or https://: {s:?}"
+            ));
         };
         let rest = rest.strip_suffix('/').unwrap_or(rest);
         let (host, port) = rest
@@ -59,9 +65,14 @@ impl Endpoint {
         if host.is_empty() {
             return Err(format!("endpoint URI has empty host: {s:?}"));
         }
-        let port: u16 =
-            port.parse().map_err(|e| format!("endpoint URI port ({e}): {s:?}"))?;
-        Ok(Endpoint { host: host.to_string(), port, tls })
+        let port: u16 = port
+            .parse()
+            .map_err(|e| format!("endpoint URI port ({e}): {s:?}"))?;
+        Ok(Endpoint {
+            host: host.to_string(),
+            port,
+            tls,
+        })
     }
 }
 
@@ -139,11 +150,6 @@ pub struct EngineConfig {
     /// is byte-for-byte identical when off (kill switch: `--gpu-subtree false`).
     pub gpu_subtree: bool,
 
-    /// v0.4 P0 bench (spec §3.1): when set, the engine writes a machine-readable
-    /// end-of-pass `BenchSummary` JSON (stage split + shard census) to this path —
-    /// consumed by `slipstream-cli bench` and bench-ios. `None` (default) = off.
-    pub bench_json_path: Option<PathBuf>,
-
     /// v0.4 Plan A (spec §4): graft server-provided subtree roots for note-free
     /// shards instead of computing them locally. Requires `sparse_persistence`.
     /// **Default ON since 2026-07-05** — P3 device gates passed 100% (4-device
@@ -157,12 +163,21 @@ pub struct EngineConfig {
     /// 1 = verify every graft (the full-audit mode used for validation runs).
     /// Deterministic by shard index (reproducible; no RNG in the hot path).
     pub graft_verify_sample: u32,
-    /// [B6] Anchor-retention floor (upstream put_blocks' `anchor_retention_height`):
-    /// when `Some(h)`, checkpoints at heights ≥ h on the 288-block grid are durable
-    /// anchors, exempt from checkpoint downgrade/dooming and excess-checkpoint
-    /// pruning — the migration crate (MOB-1455) pre-signs transfers against them.
+    /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
+    /// when `Some`, the checkpoints it retains — those at or above its floor that
+    /// fall on its grid — are durable anchors, exempt from checkpoint
+    /// downgrade/dooming and excess-checkpoint pruning. The migration crate
+    /// (MOB-1455) pre-signs transfers against them.
+    ///
+    /// The grid MUST match the one the wallet's own retention uses, or a transfer
+    /// anchored to a boundary this engine did not retain becomes unprovable. Build
+    /// it from the wallet's `AnchorRetentionInterval` rather than choosing a value
+    /// here: on mainnet that is `AnchorRetentionInterval::ZIP_318`, and a host
+    /// running a shortened test-network grid must pass the same one it configured
+    /// on the wallet.
+    ///
     /// `None` (default) = retention off, byte-identical to pre-B6 behavior.
-    pub anchor_retention_height: Option<u32>,
+    pub anchor_retention: Option<AnchorRetention>,
 
     /// v0.4 Plan B (spec §5): batch-affine Orchard combine — all of a fragment's
     /// combines computed level-synchronously with shared Montgomery inversions
@@ -172,18 +187,6 @@ pub struct EngineConfig {
     /// +15.7% on note-bearing wallets). Kill switch: `ZCASH_BATCH_COMBINE=0`.
     pub batch_combine: bool,
 
-    /// Batched same-scalar trial-decrypt DH — the forked orchard's
-    /// lockstep-affine kernel (one shared inversion per ladder step across
-    /// the whole batch; byte-identical, KAT-gated in the fork). [v0.6 P8]
-    /// the toggle now selects the GLV-lockstep kernel for window-prepared
-    /// epks (prebuilt P7 tables + half-length digit schedule + per-call
-    /// scratch — the rebuild of v0.5 C1 on the instrument-named fixes; C1's
-    /// full-width kernel remains behind it for Wnaf-prepared epks). Default
-    /// OFF pending its own device A/B (C1's lesson: microbench wins don't
-    /// automatically survive scan concurrency). Kill/dev switch:
-    /// `ZCASH_BATCH_DECRYPT`. Process-global toggle set at pass start.
-    pub batch_decrypt: bool,
-
     /// v0.5 scan-pacer lever (2026-07-06 plan): derive chunk-boundary
     /// treestates LOCALLY (seed once per range, absorb scanned commitments
     /// into running frontiers) instead of one `GetTreeState` round-trip per
@@ -191,15 +194,6 @@ pub struct EngineConfig {
     /// scan wall (71 × ~455 ms). Default OFF until the A/B + audit gates.
     /// Kill/dev switch: `ZCASH_LOCAL_TREESTATE`.
     pub local_treestate: bool,
-
-    /// v0.5 C2: GLV endomorphism multiplication for trial-decrypt DH (the
-    /// per-item path — half-length Straus ladder, ~1.7x fewer group ops,
-    /// byte-identical, KAT-gated in the orchard fork). Default ON since
-    /// 2026-07-06, fleet-gated: A18 production +16% wall, M4 dh −25% with
-    /// zero concurrency penalty, A14/A10 100% coverage + zero errors +
-    /// clean per-lane scaling. Kill switch: `ZCASH_ENDO_MUL=0`.
-    /// Process-global toggle.
-    pub endo_mul: bool,
 
     /// Boundary-audit cadence for local treestates: every Nth locally served
     /// boundary ALSO fetches the server treestate (spawned, OFF the critical
@@ -250,15 +244,12 @@ impl EngineConfig {
             sparse_persistence: true,
             write_behind: true,
             gpu_subtree: false,
-            bench_json_path: None,
             graft_subtree: true,
             graft_verify_sample: 16,
-            anchor_retention_height: None,
+            anchor_retention: None,
             batch_combine: true,
-            batch_decrypt: false,
             local_treestate: false,
             treestate_verify_sample: 1,
-            endo_mul: true,
             persist_depth: 1,
         }
     }
@@ -271,13 +262,19 @@ impl EngineConfig {
             return Err(SlipstreamError::Config("fetch_streams must be >= 1".into()));
         }
         if self.chunk_blocks < 100 {
-            return Err(SlipstreamError::Config("chunk_blocks must be >= 100".into()));
+            return Err(SlipstreamError::Config(
+                "chunk_blocks must be >= 100".into(),
+            ));
         }
         if self.memory_budget_bytes < 16 * 1024 * 1024 {
-            return Err(SlipstreamError::Config("memory_budget_bytes must be >= 16 MiB".into()));
+            return Err(SlipstreamError::Config(
+                "memory_budget_bytes must be >= 16 MiB".into(),
+            ));
         }
         if self.chunk_split_bytes < 1024 * 1024 {
-            return Err(SlipstreamError::Config("chunk_split_bytes must be >= 1 MiB".into()));
+            return Err(SlipstreamError::Config(
+                "chunk_split_bytes must be >= 1 MiB".into(),
+            ));
         }
         if let Some(ms) = self.scan_batch_target_ms
             && ms < 500
@@ -343,6 +340,41 @@ impl EngineConfig {
         }
         self
     }
+
+    /// [v0.7 P1] Probe-then-commit: race the preferred + alternate endpoints
+    /// ([`crate::probe::probe_endpoints`], ~1 s shared budget: tip + timed
+    /// ~100-block sample) and return this config with the winner committed as
+    /// its `endpoint`, plus the wall-clock cost of the probe. Every consumer
+    /// of the returned config (metadata client, scheduler fetch, treestate
+    /// prefetch, enhance) transparently follows the winner.
+    ///
+    /// With no alternates there is nothing to choose, and with `via_tor` set
+    /// the probe is SKIPPED entirely — it dials direct, which would bypass
+    /// the Tor circuit (a privacy leak, not a ranking). Both cases return
+    /// the config unchanged at zero cost, the pre-v0.7 single-server
+    /// behavior.
+    pub async fn with_selected_endpoint(self, via_tor: bool) -> (Self, Duration) {
+        if self.alternate_endpoints.is_empty() || via_tor {
+            return (self, Duration::ZERO);
+        }
+        let mut endpoints = Vec::with_capacity(1 + self.alternate_endpoints.len());
+        endpoints.push(self.endpoint.clone());
+        endpoints.extend(self.alternate_endpoints.iter().cloned());
+        let outcome =
+            crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
+        info!(
+            chosen = outcome.chosen,
+            host = endpoints[outcome.chosen].host.as_str(),
+            port = endpoints[outcome.chosen].port,
+            probe_ms = outcome.elapsed.as_millis() as u64,
+            "wire probe committed"
+        );
+        let committed = Self {
+            endpoint: endpoints.swap_remove(outcome.chosen),
+            ..self
+        };
+        (committed, outcome.elapsed)
+    }
 }
 
 #[cfg(test)]
@@ -350,11 +382,47 @@ mod tests {
     use super::*;
 
     fn endpoint() -> Endpoint {
-        Endpoint { host: "zec.rocks".into(), port: 443, tls: true }
+        Endpoint {
+            host: "zec.rocks".into(),
+            port: 443,
+            tls: true,
+        }
     }
 
     fn config() -> EngineConfig {
-        EngineConfig::new(crate::Network::MainNetwork, PathBuf::from("/tmp/data.db"), endpoint())
+        EngineConfig::new(
+            crate::Network::MainNetwork,
+            PathBuf::from("/tmp/data.db"),
+            endpoint(),
+        )
+    }
+
+    fn alt(host: &str) -> Endpoint {
+        Endpoint {
+            host: host.into(),
+            port: 443,
+            tls: true,
+        }
+    }
+
+    // ── EngineConfig::with_selected_endpoint (probe-then-commit) ──
+    // Only the skip paths are unit-testable — the probing path dials real
+    // endpoints and is exercised by live syncs. Both skips return without any
+    // I/O, so these tests are hermetic.
+
+    #[test]
+    fn endpoint_selection_skipped_without_alternates_and_under_tor() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
+        // No alternates: nothing to choose, no probe.
+        let (committed, elapsed) = rt.block_on(config().with_selected_endpoint(false));
+        assert_eq!(committed.endpoint, endpoint());
+        assert_eq!(elapsed, Duration::ZERO);
+        // Tor: the probe dials direct and must be skipped even with alternates.
+        let mut cfg = config();
+        cfg.alternate_endpoints = vec![alt("alt-1")];
+        let (committed, elapsed) = rt.block_on(cfg.with_selected_endpoint(true));
+        assert_eq!(committed.endpoint, endpoint());
+        assert_eq!(elapsed, Duration::ZERO);
     }
 
     // ── v0.7 P1b: Endpoint::parse_uri (the FFI alternate-server wire format) ──
@@ -362,8 +430,16 @@ mod tests {
     #[test]
     fn parse_uri_round_trips_uri() {
         for ep in [
-            Endpoint { host: "zec.rocks".into(), port: 443, tls: true },
-            Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false },
+            Endpoint {
+                host: "zec.rocks".into(),
+                port: 443,
+                tls: true,
+            },
+            Endpoint {
+                host: "127.0.0.1".into(),
+                port: 9067,
+                tls: false,
+            },
         ] {
             assert_eq!(Endpoint::parse_uri(&ep.uri()).unwrap(), ep);
         }
@@ -382,7 +458,14 @@ mod tests {
     #[test]
     fn parse_uri_tolerates_trailing_slash() {
         let ep = Endpoint::parse_uri("https://zec.rocks:443/").unwrap();
-        assert_eq!(ep, Endpoint { host: "zec.rocks".into(), port: 443, tls: true });
+        assert_eq!(
+            ep,
+            Endpoint {
+                host: "zec.rocks".into(),
+                port: 443,
+                tls: true
+            }
+        );
     }
 
     #[test]
@@ -517,13 +600,32 @@ mod tests {
     fn device_memory_scaling_derates_small_devices() {
         let c = config();
         // Unknown (0) and big devices keep defaults.
-        assert_eq!(c.clone().scaled_for_device_memory(0).memory_budget_bytes, EngineConfig::DEFAULT_MEMORY_BUDGET);
-        assert_eq!(c.clone().scaled_for_device_memory(8 << 30).chunk_split_bytes, EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES);
-        assert_eq!(c.clone().scaled_for_device_memory(3 << 30).memory_budget_bytes, EngineConfig::DEFAULT_MEMORY_BUDGET);
+        assert_eq!(
+            c.clone().scaled_for_device_memory(0).memory_budget_bytes,
+            EngineConfig::DEFAULT_MEMORY_BUDGET
+        );
+        assert_eq!(
+            c.clone()
+                .scaled_for_device_memory(8 << 30)
+                .chunk_split_bytes,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES
+        );
+        assert_eq!(
+            c.clone()
+                .scaled_for_device_memory(3 << 30)
+                .memory_budget_bytes,
+            EngineConfig::DEFAULT_MEMORY_BUDGET
+        );
         // Sub-3 GiB devices (A10 iPad = 2 GiB) derate to the Blockers sizing.
         let small = c.clone().scaled_for_device_memory((3 << 30) - 1);
-        assert_eq!(small.memory_budget_bytes, EngineConfig::SMALL_DEVICE_MEMORY_BUDGET);
-        assert_eq!(small.chunk_split_bytes, EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES);
+        assert_eq!(
+            small.memory_budget_bytes,
+            EngineConfig::SMALL_DEVICE_MEMORY_BUDGET
+        );
+        assert_eq!(
+            small.chunk_split_bytes,
+            EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES
+        );
         small.validate().expect("derated config must validate");
     }
 }

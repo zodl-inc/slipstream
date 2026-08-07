@@ -127,33 +127,10 @@ pub struct BenchSummary {
     pub persist_wait_s: f64,
     pub persist_overlap_s: f64,
     pub blocks: u64,
-    /// v0.5 C1 did-it-fire stats: `batch_ka_agree_dec` entries, total lanes
-    /// through the seam, and lanes the lockstep kernel actually multiplied
-    /// (0 with the lever off). `calls > 0, kernel = 0` = seam reached but
-    /// kernel disengaged; `calls = 0` = the scanner never hit the seam.
-    pub batch_dh_calls: u64,
-    pub batch_dh_lanes: u64,
-    pub batch_dh_kernel_lanes: u64,
-    /// CPU-side seconds accumulated inside `batch_ka_agree_dec` summed across
-    /// all scan threads and both paths — the true production DH cost. An
-    /// ON/OFF pair of these measures the kernel's real ratio; against
-    /// `scan_s × cores` it bounds DH's share of the scan.
-    pub batch_dh_s: f64,
-    /// v0.6 P5: union-of-intervals wall for the (orchard-domain) DH seam —
-    /// time ≥1 `batch_ka_agree_dec` in flight on any thread.
-    /// `batch_dh_s / batch_dh_wall_s` = average busy threads DURING DH;
-    /// `scan_call_s − batch_dh_wall_s` = the scan's serial non-DH share
-    /// (decode, AEAD trial decrypt, sapling-pool DH, batch assembly).
-    /// Discriminates the two scan-floor levers: under-parallelized bursts
-    /// vs serial gaps.
-    pub batch_dh_wall_s: f64,
     /// v0.6 P6: CPU inside `batch_epk` (epk point decompression + per-epk
-    /// table build) — batch-task work the DH bracket was blind to; joins
-    /// the same union wall. True bracketed-task busy =
-    /// `(batch_dh_s + batch_epk_s) / batch_dh_wall_s`. P6 sized the waste
-    /// here (13.3 CPU-s of unread wNAF tables on A18); since P7 the build
-    /// is the shared φ-endo window both scope ivks reuse, so this should
-    /// read ~decompression + a small batched build.
+    /// table build). Retained in the bench JSON schema; always 0 on the
+    /// current graph (the batched trial-decryption instrumentation it
+    /// paired with now lives upstream).
     pub batch_epk_s: f64,
     /// v0.5 pacer split (2026-07-06 plan §3): the scan lane's wall decomposed.
     /// `scan_s ≈ recv_wait + call + prefetch_wait + interleave_drain +
@@ -195,8 +172,6 @@ pub struct BenchSummary {
     pub persist_insert_s: f64,
     pub persist_ensure_s: f64,
     pub persist_downgraded: u64,
-    /// v0.5 C2: multiplications served by the GLV endo path (0 = lever off).
-    pub endo_calls: u64,
     /// Enhancement wall split: awaiting gRPC tx fetches vs serial DB applies
     /// vs the address-window phase (explains the device enhance_s swings).
     pub enhance_fetch_s: f64,
@@ -215,7 +190,7 @@ impl BenchSummary {
             )
         }
         format!(
-            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"wire_mbps_avg\":{},\"wire_worst_5s_mbps\":{},\"wire_probe_ms\":{},\"wire_switches\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_dh_calls\":{},\"batch_dh_lanes\":{},\"batch_dh_kernel_lanes\":{},\"batch_dh_s\":{},\"batch_dh_wall_s\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_frontier_s\":{},\"persist_insert_s\":{},\"persist_ensure_s\":{},\"persist_downgraded\":{},\"endo_calls\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
+            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"wire_mbps_avg\":{},\"wire_worst_5s_mbps\":{},\"wire_probe_ms\":{},\"wire_switches\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_frontier_s\":{},\"persist_insert_s\":{},\"persist_ensure_s\":{},\"persist_downgraded\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
             self.engine_build,
             self.total_s,
             self.fetch_s,
@@ -228,11 +203,6 @@ impl BenchSummary {
             self.persist_wait_s,
             self.persist_overlap_s,
             self.blocks,
-            self.batch_dh_calls,
-            self.batch_dh_lanes,
-            self.batch_dh_kernel_lanes,
-            self.batch_dh_s,
-            self.batch_dh_wall_s,
             self.batch_epk_s,
             self.scan_recv_wait_s,
             self.scan_call_s,
@@ -257,7 +227,6 @@ impl BenchSummary {
             self.persist_insert_s,
             self.persist_ensure_s,
             self.persist_downgraded,
-            self.endo_calls,
             self.enhance_fetch_s,
             self.enhance_store_s,
             self.enhance_address_s,
@@ -335,11 +304,6 @@ mod tests {
             persist_wait_s: 0.0,
             persist_overlap_s: 0.5,
             blocks: 100,
-            batch_dh_calls: 7,
-            batch_dh_lanes: 700,
-            batch_dh_kernel_lanes: 690,
-            batch_dh_s: 0.75,
-            batch_dh_wall_s: 0.35,
             batch_epk_s: 0.05,
             scan_recv_wait_s: 0.1,
             scan_call_s: 0.8,
@@ -364,7 +328,6 @@ mod tests {
             persist_insert_s: 0.1,
             persist_ensure_s: 0.05,
             persist_downgraded: 59000,
-            endo_calls: 42,
             enhance_fetch_s: 0.06,
             enhance_store_s: 0.04,
             enhance_address_s: 0.01,
@@ -382,8 +345,6 @@ mod tests {
             "\"wire_probe_ms\":850",
             "\"wire_switches\":1",
             "\"blocks\":100",
-            "\"batch_dh_kernel_lanes\":690",
-            "\"batch_dh_wall_s\":0.35",
             "\"batch_epk_s\":0.05",
             "\"scan_call_s\":0.8",
             "\"scan_pass1_s\":0.15",

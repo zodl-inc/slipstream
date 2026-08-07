@@ -44,13 +44,13 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use slipstream_core::{
     chunk::chunk_queue,
-    config::{EngineConfig, Endpoint},
+    config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
     engine::{probe_tip, should_resync},
     fetch::{FetchPlan, run_fetch},
     grpc, mempool,
     scan::scan_chunks_from_treestate,
-    wallet_session::{WalletSession, TEST_UFVK},
+    wallet_session::{TEST_UFVK, WalletSession},
 };
 use zcash_client_backend::data_api::WalletRead;
 use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
@@ -61,12 +61,15 @@ use zcash_protocol::consensus::Network;
 // ---------------------------------------------------------------------------
 
 fn darkside_endpoint() -> Endpoint {
-    Endpoint { host: "127.0.0.1".into(), port: 9067, tls: false }
+    Endpoint {
+        host: "127.0.0.1".into(),
+        port: 9067,
+        tls: false,
+    }
 }
 
 const BIRTHDAY_HEIGHT: u64 = 663_150;
-const TX_MAINNET_BLOCK_URL: &str =
-    "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/663150.txt";
+const TX_MAINNET_BLOCK_URL: &str = "https://raw.githubusercontent.com/zcash-hackworks/darksidewalletd-test-data/master/basic-reorg/663150.txt";
 
 /// Height at which the initial chain is applied.
 const APPLY_HEIGHT: i32 = 663_188;
@@ -74,25 +77,38 @@ const APPLY_HEIGHT: i32 = 663_188;
 const START_SAPLING_TREE_SIZE: u32 = 128_607;
 
 const SAPLING_TREE_128607: &str = concat!(
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
     "10",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
     "00",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
-    "01", "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
+    "01",
+    "0000000000000000000000000000000000000000000000000000000000000000",
 );
 
 // ---------------------------------------------------------------------------
@@ -120,11 +136,17 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         .expect("reset");
 
     // Stage the real mainnet block at 663150 + empty blocks 663151..663250.
-    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL).await.expect("stage 663150 block");
-    ctl.stage_blocks_create(663_151, 100).await.expect("stage empty blocks 663151..663250");
+    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL)
+        .await
+        .expect("stage 663150 block");
+    ctl.stage_blocks_create(663_151, 100)
+        .await
+        .expect("stage empty blocks 663151..663250");
 
     // Apply at APPLY_HEIGHT (663188).
-    ctl.apply_staged(APPLY_HEIGHT).await.expect("apply initial chain");
+    ctl.apply_staged(APPLY_HEIGHT)
+        .await
+        .expect("apply initial chain");
 
     // Darkside propagates asynchronously — sleep matches Swift DarksideTests sleep(2).
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -149,22 +171,35 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         sapling_tree: SAPLING_TREE_128607.into(),
         ..Default::default()
     };
-    session.ensure_account(TEST_UFVK, birthday_ts.clone()).expect("ensure_account");
+    session
+        .ensure_account(TEST_UFVK, birthday_ts.clone())
+        .expect("ensure_account");
 
     // Update chain tip via GetLatestBlock (supported by v0.4.9).
     let mut client = grpc::connect(&ep).await.expect("grpc connect");
     let initial_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
-    assert_eq!(initial_tip, APPLY_HEIGHT as u64, "initial tip must be APPLY_HEIGHT");
+    assert_eq!(
+        initial_tip, APPLY_HEIGHT as u64,
+        "initial tip must be APPLY_HEIGHT"
+    );
 
-    session.update_chain_tip(initial_tip).expect("update_chain_tip");
+    session
+        .update_chain_tip(initial_tip)
+        .expect("update_chain_tip");
 
     // Pre-seed block 663149 metadata (v0.4.9 compatibility — same as darkside_sync.rs).
     let block_663149_hash: Vec<u8> = {
         let req = BlockRange {
-            start: Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
-            end:   Some(BlockId { height: BIRTHDAY_HEIGHT, hash: vec![] }),
+            start: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: BIRTHDAY_HEIGHT,
+                hash: vec![],
+            }),
             ..Default::default()
         };
         let mut stream = client
@@ -172,14 +207,20 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
             .await
             .expect("get_block_range for birthday")
             .into_inner();
-        let first_block = stream.next().await
+        let first_block = stream
+            .next()
+            .await
             .expect("stream should yield birthday block")
             .expect("block 663150 ok");
         first_block.prev_hash
     };
     assert_eq!(block_663149_hash.len(), 32, "prev_hash should be 32 bytes");
     session
-        .seed_block_metadata(BIRTHDAY_HEIGHT - 1, START_SAPLING_TREE_SIZE, &block_663149_hash)
+        .seed_block_metadata(
+            BIRTHDAY_HEIGHT - 1,
+            START_SAPLING_TREE_SIZE,
+            &block_663149_hash,
+        )
         .expect("seed_block_metadata");
 
     // Fetch + scan the initial range.
@@ -193,18 +234,37 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
     };
 
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
-    let plan = FetchPlan::new(BIRTHDAY_HEIGHT, initial_tip, cfg.chunk_blocks, cfg.fetch_streams);
+    let plan = FetchPlan::new(
+        BIRTHDAY_HEIGHT,
+        initial_tip,
+        cfg.chunk_blocks,
+        cfg.fetch_streams,
+    );
     let fetch_ep = ep.clone();
     let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
 
-    scan_chunks_from_treestate(&mut session, BIRTHDAY_HEIGHT, initial_scan_state, rx, false, false, false, false)
-        .await
-        .expect("initial scan_chunks_from_treestate");
+    scan_chunks_from_treestate(
+        &mut session,
+        BIRTHDAY_HEIGHT,
+        initial_scan_state,
+        rx,
+        false,
+        false,
+        false,
+        false,
+    )
+    .await
+    .expect("initial scan_chunks_from_treestate");
 
-    let _ = fetch_task.await.expect("fetch task join").expect("fetch stats");
+    let _ = fetch_task
+        .await
+        .expect("fetch task join")
+        .expect("fetch stats");
 
     // Verify the initial sync landed at APPLY_HEIGHT.
-    let chain_height_after_initial = session.db_mut().chain_height()
+    let chain_height_after_initial = session
+        .db_mut()
+        .chain_height()
         .expect("chain_height query")
         .expect("chain_height must be Some after sync");
     assert_eq!(
@@ -215,8 +275,13 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
 
     // ── Phase 3: probe_tip at the current tip — should_resync must be false ──
 
-    let probe_before = probe_tip(&cfg, None).await.expect("probe_tip at initial tip");
-    assert_eq!(probe_before, APPLY_HEIGHT as u64, "probe must return APPLY_HEIGHT");
+    let probe_before = probe_tip(&cfg, None)
+        .await
+        .expect("probe_tip at initial tip");
+    assert_eq!(
+        probe_before, APPLY_HEIGHT as u64,
+        "probe must return APPLY_HEIGHT"
+    );
     assert!(
         !should_resync(initial_tip, probe_before),
         "should_resync must be false when tip unchanged"
@@ -226,7 +291,9 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
 
     // Stage empty blocks 663189 and 663190.
     let new_apply = APPLY_HEIGHT + 2; // 663190
-    ctl.stage_blocks_create(APPLY_HEIGHT + 1, 2).await.expect("stage 2 new blocks");
+    ctl.stage_blocks_create(APPLY_HEIGHT + 1, 2)
+        .await
+        .expect("stage 2 new blocks");
     ctl.apply_staged(new_apply).await.expect("apply new blocks");
 
     // Wait for darkside to propagate.
@@ -234,10 +301,11 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
 
     // ── Phase 5: probe_tip must return the new tip; should_resync must be true ──
 
-    let probe_after = probe_tip(&cfg, None).await.expect("probe_tip after new blocks");
+    let probe_after = probe_tip(&cfg, None)
+        .await
+        .expect("probe_tip after new blocks");
     assert_eq!(
-        probe_after,
-        new_apply as u64,
+        probe_after, new_apply as u64,
         "probe_tip must return the new applied height ({new_apply})"
     );
     assert!(
@@ -264,13 +332,20 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
 
     // Get current treestate for the continuation (from DB after initial scan).
     // We re-use the session that already has the initial scan results.
-    session.update_chain_tip(probe_after).expect("update chain tip to new probe");
+    session
+        .update_chain_tip(probe_after)
+        .expect("update chain tip to new probe");
 
     let followup_start = initial_tip + 1;
     let followup_end = probe_after;
 
     let (tx2, rx2) = chunk_queue(cfg.memory_budget_bytes);
-    let plan2 = FetchPlan::new(followup_start, followup_end, cfg.chunk_blocks, cfg.fetch_streams);
+    let plan2 = FetchPlan::new(
+        followup_start,
+        followup_end,
+        cfg.chunk_blocks,
+        cfg.fetch_streams,
+    );
     let fetch_ep2 = ep.clone();
     let fetch_task2 = tokio::spawn(async move { run_fetch(&fetch_ep2, plan2, tx2, None).await });
 
@@ -278,7 +353,7 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
     // Use a zero hash (accepted for continuation — the chain continuity check uses DB state).
     let continuation_state = TreeState {
         network: "main".into(),
-        height: initial_tip,       // 663188
+        height: initial_tip, // 663188
         hash: "0".repeat(64),
         time: 1,
         sapling_tree: SAPLING_TREE_128607.into(), // tree size stays same (no new outputs)
@@ -298,7 +373,10 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
     .await
     .expect("follow scan_chunks_from_treestate");
 
-    let _ = fetch_task2.await.expect("follow fetch task join").expect("follow fetch stats");
+    let _ = fetch_task2
+        .await
+        .expect("follow fetch task join")
+        .expect("follow fetch stats");
 
     // Assert: at least the 2 new blocks were scanned.
     assert!(
@@ -308,7 +386,9 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
     );
 
     // Assert: wallet chain_height advanced to new_apply.
-    let chain_height_after_follow = session.db_mut().chain_height()
+    let chain_height_after_follow = session
+        .db_mut()
+        .chain_height()
         .expect("chain_height query after follow")
         .expect("chain_height must be Some after follow sync");
     assert_eq!(
@@ -350,9 +430,15 @@ async fn mempool_session_handles_quiet_mempool() {
 
     // A minimal applied chain so the server has a tip. The mempool stays empty:
     // we never SendTransaction nor stage a loose tx.
-    ctl.reset_with_tree_sizes(START_SAPLING_TREE_SIZE, 0).await.expect("reset");
-    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL).await.expect("stage 663150 block");
-    ctl.stage_blocks_create(663_151, 40).await.expect("stage empty blocks");
+    ctl.reset_with_tree_sizes(START_SAPLING_TREE_SIZE, 0)
+        .await
+        .expect("reset");
+    ctl.stage_blocks_url(TX_MAINNET_BLOCK_URL)
+        .await
+        .expect("stage 663150 block");
+    ctl.stage_blocks_create(663_151, 40)
+        .await
+        .expect("stage empty blocks");
     ctl.apply_staged(APPLY_HEIGHT).await.expect("apply chain");
     tokio::time::sleep(Duration::from_secs(2)).await;
 
@@ -368,12 +454,21 @@ async fn mempool_session_handles_quiet_mempool() {
         .expect("run_session must NOT error on a quiet mempool (lazy-header open is idle-bounded)");
 
     eprintln!("quiet mempool session: end={end:?}, stats={stats:?}");
-    assert_eq!(stats.stored_hits, 0, "a quiet mempool must yield no wallet hits");
-    assert_eq!(stats.received, 0, "no mempool txs were submitted — none should be received");
+    assert_eq!(
+        stats.stored_hits, 0,
+        "a quiet mempool must yield no wallet hits"
+    );
+    assert_eq!(
+        stats.received, 0,
+        "no mempool txs were submitted — none should be received"
+    );
     // Lazy headers + quiet mempool ⇒ the open idles out ⇒ benign IdleReconnect
     // (BlockBoundary is also acceptable if the server happened to close first).
     assert!(
-        matches!(end, mempool::SessionEnd::IdleReconnect | mempool::SessionEnd::BlockBoundary),
+        matches!(
+            end,
+            mempool::SessionEnd::IdleReconnect | mempool::SessionEnd::BlockBoundary
+        ),
         "quiet session must end benignly, got {end:?}"
     );
 }

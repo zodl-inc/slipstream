@@ -36,7 +36,6 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `graft_accumulator.rs` | v0.4: pure per-pool state machine — buffer note-free shards, eager-flush on the first owned note, close-clean at shard boundaries; range-end shards always build. |
 | `batch_sinsemilla.rs` | v0.4: batch-affine Sinsemilla combine (lockstep half-steps, one Montgomery batch inversion each) — byte-identical, KAT-gated. |
 | `lookup_build.rs` | v0.4: the shared lookup-build machinery (precompute map → verbatim `from_iter` → convert) parameterized by a batch-combine fn; routes batch > gpu > scalar. |
-| `batch_ecdh.rs` | v0.5: C0 measurement probe (DH = 92.4% of compact decrypt) + the shared wired A/B harness (`wired_decrypt_ab`) proving batch/endo levers byte-identical through the real `ka_agree_dec` seam + `endo_bench`. |
 | `treestate.rs` | v0.5 (parked, default OFF): local running-frontier treestate derivation + off-path server audit + process fuse — built, audited byte-identical, measured out (naive per-leaf absorb costs more than the RTT it saves); revival path = batch-affine bulk absorb. |
 | `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut; v0.7 P2: clock-free wire-collapse detector (STALL/COLLAPSE triggers) + bounded (≤ 2) mid-pass failover. |
 | `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**). |

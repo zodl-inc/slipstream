@@ -17,12 +17,11 @@
 //! Engine v0: one full sync pass (preflight → chain state → scheduler → enhancement).
 //! P3 adds enhancement/transparent/events; P4 wraps this behind FFI.
 
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Instant};
 
 use tracing::{info, warn};
+use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     config::{Endpoint, EngineConfig},
@@ -42,7 +41,23 @@ use crate::{
 /// tag in the log doesn't match HEAD's value, the device is running a stale
 /// XCFramework (the three-layer gotcha, consuming side). Probe a built slice with:
 /// `strings <slice>/libzcashlc.framework/libzcashlc | grep <tag>`.
-pub const ENGINE_BUILD: &str = "2026-07-08.v07-wire-p2";
+///
+/// IT WENT STALE, and cost real diagnostic time (2026-08-02). A device log reading
+/// `engine_build="2026-07-08.v07-wire-p2"` was taken as evidence that the phone was
+/// running a month-old engine — the single most likely explanation for a migration
+/// that would not prove — when in fact the binary was current and only this constant
+/// was a month behind. Two minutes were spent chasing a stale-slice hypothesis that
+/// the binary itself refuted (`strings` showed BOTH this tag and the current
+/// `zcashlc_build`, which is how the mistake was caught).
+///
+/// A freshness marker that can silently go stale is worse than no marker: it does not
+/// merely fail to inform, it actively misinforms, and it does so precisely when
+/// someone is under pressure and reaching for it. Every ironwood/migration change
+/// since 07-08 shipped without touching this line. If the discipline of bumping it by
+/// hand cannot be relied on — and this is the evidence that it cannot — it should be
+/// derived from something that moves on its own (git describe at build time) rather
+/// than maintained.
+pub const ENGINE_BUILD: &str = "2026-08-02.v0.8-ironwood-migration";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick
@@ -92,6 +107,13 @@ pub struct SyncOutcome {
     pub enhance_elapsed: std::time::Duration,
     pub elapsed: std::time::Duration,
     pub chain_tip: u64,
+    /// Wire-probe cost (ms) for this pass; 0 when no alternates were probed.
+    /// Reporting input (see `crate::report`), not consumed by the sync itself.
+    pub wire_probe_ms: f64,
+    /// Mid-pass wire failovers that occurred this pass. Reporting input.
+    pub wire_switches: u32,
+    /// This pass's persist-lane telemetry (delta over the pass). Reporting input.
+    pub persist_lane: crate::persist::lane_stats::Totals,
 }
 
 impl SyncOutcome {
@@ -143,9 +165,10 @@ pub async fn probe_tip(
     grpc::get_latest_block_height(&mut client).await
 }
 
-/// One sync pass. If `ufvk` is Some and the wallet has no accounts, imports it
-/// with a birthday at `birthday_height` (treestate fetched from the server at
-/// `birthday_height - 1`).
+/// One sync pass. `accounts` bootstraps the wallet: each `(ufvk, birthday)` is imported
+/// as a view-only account when the wallet does not already track that key (its treestate
+/// is fetched from the server at `birthday - 1`). Pass an empty slice for a keyless pass —
+/// every follow pass, and any host that provisions its own accounts into the wallet DB.
 ///
 /// `progress` — optional shared progress state for poll-based consumers (decision D8).
 /// Pass `Some(Arc::new(Progress::default()))` to receive live counter updates;
@@ -153,25 +176,33 @@ pub async fn probe_tip(
 /// The `chain_tip` and `current_range_end` fields are set by the engine;
 /// `fetched_blocks` / `scanned_blocks` / `enhanced_txs` are bumped during the pipeline.
 ///
-/// # Deviation from plan draft
-/// The plan does not guard against `birthday_height == 0`. Since `birthday_height`
-/// is u64, `birthday_height - 1` would underflow for 0. We guard here and return
-/// a Config error; a birthday of 0 is never valid for a mainnet/testnet wallet.
+/// Every birthday must be `>= 1`: the birthday-1 treestate fetch would underflow at
+/// height 0, which is never a valid mainnet/testnet wallet birthday. All birthdays are
+/// validated up front — a clean Config error — before any network or wallet I/O.
+///
+/// Endpoint selection is a property of the config: with `alternate_endpoints`
+/// configured (and Tor off), the pass opens by racing them and committing the
+/// winner ([`EngineConfig::with_selected_endpoint`]); with none, `config.endpoint`
+/// is used as-is at zero cost.
 pub async fn sync_once(
     config: &EngineConfig,
-    ufvk: Option<(&str, u64)>,
+    accounts: &[(UnifiedFullViewingKey, BlockHeight)],
     progress: Option<Arc<Progress>>,
     tor: Option<&TorConn>,
 ) -> Result<SyncOutcome, SlipstreamError> {
     config.validate()?;
 
-    // Early guard: birthday_height == 0 would underflow (birthday_height - 1) below.
-    // A birthday of 0 is never valid for mainnet/testnet. Check here, before any I/O,
-    // so the error is a clean Config failure regardless of network availability.
-    // (u64 subtraction wraps in release builds without overflow checks — guard is required.)
-    if let Some((_, 0)) = ufvk {
+    // Early guard: a birthday of 0 would underflow the `birthday - 1` treestate fetch
+    // below, and is never valid for mainnet/testnet. Validate EVERY provided account here,
+    // before any I/O, so a bad birthday is a clean Config failure regardless of network
+    // availability. (u32 subtraction wraps in release builds without overflow checks —
+    // the guard is required.)
+    if accounts
+        .iter()
+        .any(|(_, birthday)| u32::from(*birthday) == 0)
+    {
         return Err(SlipstreamError::Config(
-            "birthday_height must be >= 1 (height 0 is not a valid wallet birthday)".into(),
+            "birthday must be >= 1 (height 0 is not a valid wallet birthday)".into(),
         ));
     }
 
@@ -195,57 +226,38 @@ pub async fn sync_once(
         gpu_subtree = config.gpu_subtree,
         graft_subtree = config.graft_subtree,
         batch_combine = config.batch_combine,
-        batch_decrypt = config.batch_decrypt,
-        endo_mul = config.endo_mul,
         local_treestate = config.local_treestate,
         started_at_utc = %wall_clock_utc(),
         "engine pass starting"
     );
-    // v0.5 C1: the forked orchard's batched-DH kernel is a process-global
-    // toggle (the swap point is a trait impl with no config channel).
-    crate::vendor_shim::set_batch_dh_enabled(config.batch_decrypt);
-    // v0.5 C2: GLV endomorphism per-item multiplication (same toggle pattern).
-    crate::vendor_shim::set_endo_enabled(config.endo_mul);
     // v0.6 P2: persist-lane totals are process-cumulative atomics — snapshot
     // here so the pass-end log reports THIS pass's delta.
     let persist_lane_start = crate::persist::lane_stats::totals();
 
-    // [v0.7 P1] Probe-then-commit: with alternates configured, race every
-    // endpoint (~1 s shared budget: tip + timed ~100-block sample) and
-    // commit the winner for THIS pass. The rest of the engine reads the
-    // chosen endpoint through a config clone, so every downstream consumer
-    // (metadata client, scheduler fetch, treestate prefetch, enhance)
-    // transparently follows. No alternates = the pre-v0.7 single-server
-    // path, zero cost. Tor passes SKIP the probe: `probe_endpoints` dials
-    // direct, which would bypass the Tor circuit — a privacy leak, not a
-    // ranking.
-    let probed_config;
-    let (config, wire_probe_ms) = if config.alternate_endpoints.is_empty() || tor.is_some() {
-        (config, 0.0)
-    } else {
-        let mut endpoints = Vec::with_capacity(1 + config.alternate_endpoints.len());
-        endpoints.push(config.endpoint.clone());
-        endpoints.extend(config.alternate_endpoints.iter().cloned());
-        let outcome = crate::probe::probe_endpoints(&endpoints, Duration::from_millis(1200)).await;
-        info!(
-            chosen = outcome.chosen,
-            host = endpoints[outcome.chosen].host.as_str(),
-            port = endpoints[outcome.chosen].port,
-            probe_ms = outcome.elapsed.as_millis() as u64,
-            "wire probe committed"
-        );
-        let mut c = config.clone();
-        c.endpoint = endpoints[outcome.chosen].clone();
-        probed_config = c;
-        (&probed_config, outcome.elapsed.as_secs_f64() * 1e3)
-    };
+    // [v0.7 P1] Probe-then-commit (`EngineConfig::with_selected_endpoint`):
+    // with alternates configured, race every endpoint and commit the winner
+    // for THIS pass; the rest of the pass reads the winner through the
+    // returned config. Skipped — config unchanged, zero cost — with no
+    // alternates, and on Tor passes (the probe dials direct, which would
+    // bypass the circuit).
+    let (config, probe_elapsed) = config.clone().with_selected_endpoint(tor.is_some()).await;
+    let wire_probe_ms = probe_elapsed.as_secs_f64() * 1e3;
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
     let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
 
-    if let Some((ufvk_str, birthday_height)) = ufvk {
-        let birthday_ts = grpc::get_tree_state(&mut client, birthday_height - 1).await?;
-        session.ensure_account(ufvk_str, birthday_ts)?;
+    // Per-account bootstrap (for hosts without their own account manager — the CLI and
+    // tests; production hosts import directly into the wallet DB). Each key is imported
+    // only if the wallet does not already track it, so a re-run neither re-imports nor
+    // spends a GetTreeState RPC on an account already present. An empty slice (every
+    // follow pass) skips this loop entirely.
+    for (ufvk, birthday) in accounts {
+        if session.has_account_for_ufvk(ufvk)? {
+            continue;
+        }
+        let birthday_ts =
+            grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1).await?;
+        session.import_account(ufvk, birthday_ts)?;
     }
 
     let roots = grpc::get_subtree_roots(&mut client).await?;
@@ -326,9 +338,11 @@ pub async fn sync_once(
                 let next = if candidates.len() == 1 {
                     candidates.remove(0)
                 } else {
-                    let outcome =
-                        crate::probe::probe_endpoints(&candidates, Duration::from_millis(1200))
-                            .await;
+                    let outcome = crate::probe::probe_endpoints(
+                        &candidates,
+                        crate::probe::DEFAULT_PROBE_BUDGET,
+                    )
+                    .await;
                     candidates.swap_remove(outcome.chosen)
                 };
                 info!(
@@ -381,6 +395,10 @@ pub async fn sync_once(
     let enhance = report.enhance.clone();
     let enhance_elapsed = total_enhance_elapsed;
 
+    // v0.6 P2: this pass's persist-lane delta over the pass-start snapshot
+    // (process-cumulative atomics; see the snapshot at pass start).
+    let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
+
     let outcome = SyncOutcome {
         report,
         enhance,
@@ -388,210 +406,10 @@ pub async fn sync_once(
         enhance_elapsed,
         elapsed: started.elapsed(),
         chain_tip: tip,
+        wire_probe_ms,
+        wire_switches,
+        persist_lane,
     };
-
-    // Log the stage split: total time + per-stage breakdown + bound.
-    // F3: enhance_s is now the SUM of all per-range runs + the final post-loop run.
-    // T6.6: sparse field added so log clearly shows which persistence path ran.
-    // T6.9 (write-behind semantics): scan_s stays the HONEST scan-loop wall time —
-    // with write_behind=true it still INCLUDES persist_wait_s (time the loop
-    // blocked on a previous deferred commit). The two added fields keep the split
-    // interpretable: persist_wait_s ≈ 0 means perfect overlap; persist_overlap_s
-    // = persist_busy − persist_wait (clamped ≥0) is the commit work that ran
-    // HIDDEN under decryption instead of serialized after it. Both are 0 with
-    // the flag off. The per-chunk rows/tree/flush attribution stays inside the
-    // deferred commit's own "sparse put_blocks" line (persist.rs), unchanged.
-    let persist_wait_s = outcome.report.persist_wait_elapsed.as_secs_f64();
-    let persist_busy_s = outcome.report.persist_busy_elapsed.as_secs_f64();
-    info!(
-        total_s = outcome.elapsed.as_secs_f64(),
-        fetch_s = outcome.report.fetch_elapsed.as_secs_f64(),
-        scan_s = outcome.report.scan_elapsed.as_secs_f64(),
-        enhance_s = outcome.enhance_elapsed.as_secs_f64(),
-        persist_wait_s,
-        persist_overlap_s = (persist_busy_s - persist_wait_s).max(0.0),
-        blocks = outcome.report.scan.blocks,
-        bound = outcome.bound(),
-        engine_build = ENGINE_BUILD,
-        finished_at_utc = %wall_clock_utc(),
-        sparse = config.sparse_persistence,
-        write_behind = config.write_behind,
-        "sync stage split"
-    );
-
-    // [v0.7 P0] Wire health: the server's side of the ledger. avg = pass
-    // bytes over fetch wall; worst_5s = the deepest sustained trough across
-    // ranges (the collapse-detection signal P2 will act on). The 2026-07-08
-    // ship-day evidence this instruments: a 10× same-morning provider swing
-    // (1.5 → 14.7 MB/s) with the engine's own variance at ±3%.
-    let wire_fetch_s = outcome.report.fetch_elapsed.as_secs_f64();
-    let wire_mbps_avg = if wire_fetch_s > 0.0 {
-        outcome.report.wire_bytes as f64 / (1024.0 * 1024.0) / wire_fetch_s
-    } else {
-        0.0
-    };
-    info!(
-        wire_mbps_avg = format!("{wire_mbps_avg:.2}").as_str(),
-        wire_worst_5s_mbps = format!("{:.2}", outcome.report.wire_worst_window_mbps).as_str(),
-        wire_mb = outcome.report.wire_bytes / (1024 * 1024),
-        "wire health"
-    );
-
-    // v0.4 P0 (spec §3): shard census on the pass record — `graftable` PREDICTS
-    // Plan A's ceiling for this wallet before the graft exists.
-    info!(
-        sapling_shards = outcome.report.census_sapling.shards(),
-        sapling_noted = outcome.report.census_sapling.noted_shards(),
-        sapling_graftable = outcome.report.census_sapling.graftable_fraction(),
-        orchard_shards = outcome.report.census_orchard.shards(),
-        orchard_noted = outcome.report.census_orchard.noted_shards(),
-        orchard_graftable = outcome.report.census_orchard.graftable_fraction(),
-        "shard census"
-    );
-
-    // v0.5 pacer split (plan §3): the scan lane's wall decomposed. The residue
-    // (scan_s minus everything measured) is bookkeeping between the timed spans
-    // — a large residue is itself a finding.
-    let scan_split = &outcome.report;
-    let scan_split_sum = scan_split.scan_recv_wait
-        + scan_split.scan_call
-        + scan_split.scan_prefetch_wait
-        + scan_split.scan_interleave_drain
-        + scan_split.scan_final_drain
-        + scan_split.scan_absorb
-        + scan_split.scan_state_prep
-        + scan_split.scan_prefetch_spawn
-        + scan_split.scan_submit_wait
-        + scan_split.scan_submit_extra
-        + scan_split.scan_reseed;
-    info!(
-        recv_wait_s = scan_split.scan_recv_wait.as_secs_f64(),
-        scan_call_s = scan_split.scan_call.as_secs_f64(),
-        prefetch_wait_s = scan_split.scan_prefetch_wait.as_secs_f64(),
-        interleave_drain_s = scan_split.scan_interleave_drain.as_secs_f64(),
-        final_drain_s = scan_split.scan_final_drain.as_secs_f64(),
-        absorb_s = scan_split.scan_absorb.as_secs_f64(),
-        // v0.6 P1: the residue named — state prep, spawn, in-loop submit
-        // wait/extra, post-enhance reseed. residue_s is what remains unnamed.
-        state_prep_s = scan_split.scan_state_prep.as_secs_f64(),
-        prefetch_spawn_s = scan_split.scan_prefetch_spawn.as_secs_f64(),
-        submit_wait_s = scan_split.scan_submit_wait.as_secs_f64(),
-        submit_extra_s = scan_split.scan_submit_extra.as_secs_f64(),
-        reseed_s = scan_split.scan_reseed.as_secs_f64(),
-        // v0.6 P6: scan_call's two-pass interior (pass1 = feed runners,
-        // pass2 = wallet-side processing; pass1 + pass2 ≈ scan_call).
-        pass1_s = scan_split.scan_pass1.as_secs_f64(),
-        pass2_s = scan_split.scan_pass2.as_secs_f64(),
-        residue_s =
-            (outcome.report.scan_elapsed.as_secs_f64() - scan_split_sum.as_secs_f64()).max(0.0),
-        "scan lane split"
-    );
-    // v0.6 P2: the persist lane's pass delta — PERF_LEDGER #1's decomposition.
-    let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
-    info!(
-        calls = persist_lane.calls,
-        rows_s = persist_lane.rows_ms as f64 / 1e3,
-        tree_join_s = persist_lane.tree_join_ms as f64 / 1e3,
-        flush_s = persist_lane.flush_ms as f64 / 1e3,
-        downgrade_s = persist_lane.downgrade_ms as f64 / 1e3,
-        build_s = persist_lane.build_ms as f64 / 1e3,
-        frontier_s = persist_lane.frontier_ms as f64 / 1e3,
-        insert_s = persist_lane.insert_ms as f64 / 1e3,
-        ensure_s = persist_lane.ensure_ms as f64 / 1e3,
-        downgraded = persist_lane.downgraded,
-        "persist lane split"
-    );
-    info!(
-        fetch_wait_s = outcome.enhance.fetch_wait.as_secs_f64(),
-        store_s = outcome.enhance.store.as_secs_f64(),
-        address_s = outcome.enhance.address.as_secs_f64(),
-        requests = outcome.enhance.requests,
-        "enhance split"
-    );
-
-    // v0.5 C1 did-it-fire stats (the graft lever's lesson): calls proves the
-    // batched seam is reached, kernel_lanes proves the kernel engaged, dh_s
-    // is the true cross-thread production DH cost (ON/OFF pairs = real ratio).
-    let (
-        batch_dh_calls,
-        batch_dh_lanes,
-        batch_dh_kernel_lanes,
-        batch_dh_nanos,
-        batch_dh_wall_nanos,
-        batch_epk_nanos,
-    ) = crate::vendor_shim::batch_dh_stats();
-    let batch_dh_s = batch_dh_nanos as f64 / 1e9;
-    // v0.6 P5/P6: union wall over the DH + batch_epk brackets —
-    // (dh_s + epk_s)/wall = avg busy threads inside the bracketed task core.
-    let batch_dh_wall_s = batch_dh_wall_nanos as f64 / 1e9;
-    let batch_epk_s = batch_epk_nanos as f64 / 1e9;
-    info!(
-        calls = batch_dh_calls,
-        lanes = batch_dh_lanes,
-        kernel_lanes = batch_dh_kernel_lanes,
-        dh_s = batch_dh_s,
-        dh_wall_s = batch_dh_wall_s,
-        epk_s = batch_epk_s,
-        endo_calls = crate::vendor_shim::endo_calls(),
-        enabled = config.batch_decrypt,
-        "batch_dh fire stats"
-    );
-
-    // v0.4 P0 (spec §3.1): the machine-readable bench artifact, host-opted via config.
-    if let Some(path) = &config.bench_json_path {
-        let bench = crate::census::BenchSummary {
-            engine_build: ENGINE_BUILD,
-            total_s: outcome.elapsed.as_secs_f64(),
-            fetch_s: outcome.report.fetch_elapsed.as_secs_f64(),
-            wire_mbps_avg,
-            wire_worst_5s_mbps: outcome.report.wire_worst_window_mbps,
-            wire_probe_ms,
-            wire_switches: u64::from(wire_switches),
-            scan_s: outcome.report.scan_elapsed.as_secs_f64(),
-            enhance_s: outcome.enhance_elapsed.as_secs_f64(),
-            persist_wait_s,
-            persist_overlap_s: (persist_busy_s - persist_wait_s).max(0.0),
-            blocks: outcome.report.scan.blocks,
-            batch_dh_calls,
-            batch_dh_lanes,
-            batch_dh_kernel_lanes,
-            batch_dh_s,
-            batch_dh_wall_s,
-            batch_epk_s,
-            scan_recv_wait_s: outcome.report.scan_recv_wait.as_secs_f64(),
-            scan_call_s: outcome.report.scan_call.as_secs_f64(),
-            scan_prefetch_wait_s: outcome.report.scan_prefetch_wait.as_secs_f64(),
-            scan_interleave_drain_s: outcome.report.scan_interleave_drain.as_secs_f64(),
-            scan_final_drain_s: outcome.report.scan_final_drain.as_secs_f64(),
-            scan_absorb_s: outcome.report.scan_absorb.as_secs_f64(),
-            scan_state_prep_s: outcome.report.scan_state_prep.as_secs_f64(),
-            scan_prefetch_spawn_s: outcome.report.scan_prefetch_spawn.as_secs_f64(),
-            scan_submit_wait_s: outcome.report.scan_submit_wait.as_secs_f64(),
-            scan_submit_extra_s: outcome.report.scan_submit_extra.as_secs_f64(),
-            scan_reseed_s: outcome.report.scan_reseed.as_secs_f64(),
-            scan_pass1_s: outcome.report.scan_pass1.as_secs_f64(),
-            scan_pass2_s: outcome.report.scan_pass2.as_secs_f64(),
-            persist_calls: persist_lane.calls,
-            persist_rows_s: persist_lane.rows_ms as f64 / 1e3,
-            persist_tree_join_s: persist_lane.tree_join_ms as f64 / 1e3,
-            persist_flush_s: persist_lane.flush_ms as f64 / 1e3,
-            persist_downgrade_s: persist_lane.downgrade_ms as f64 / 1e3,
-            persist_build_s: persist_lane.build_ms as f64 / 1e3,
-            persist_frontier_s: persist_lane.frontier_ms as f64 / 1e3,
-            persist_insert_s: persist_lane.insert_ms as f64 / 1e3,
-            persist_ensure_s: persist_lane.ensure_ms as f64 / 1e3,
-            persist_downgraded: persist_lane.downgraded,
-            endo_calls: crate::vendor_shim::endo_calls(),
-            enhance_fetch_s: outcome.enhance.fetch_wait.as_secs_f64(),
-            enhance_store_s: outcome.enhance.store.as_secs_f64(),
-            enhance_address_s: outcome.enhance.address.as_secs_f64(),
-            sapling: (&outcome.report.census_sapling).into(),
-            orchard: (&outcome.report.census_orchard).into(),
-        };
-        if let Err(e) = bench.write_json(path) {
-            tracing::warn!(path = %path.display(), %e, "bench JSON write failed");
-        }
-    }
 
     Ok(outcome)
 }
@@ -635,6 +453,9 @@ mod tests {
             enhance_elapsed: Duration::from_secs_f64(enhance_s),
             elapsed: Duration::from_secs_f64(fetch_s + scan_s + enhance_s),
             chain_tip: 0,
+            wire_probe_ms: 0.0,
+            wire_switches: 0,
+            persist_lane: crate::persist::lane_stats::Totals::default(),
         }
     }
 
@@ -670,11 +491,9 @@ mod tests {
 
     #[test]
     fn birthday_height_zero_is_rejected() {
-        // This test is hermetic: we just call validate_ufvk_birthday_guard, which
-        // does not require a real network or wallet. We test the guard's logic
-        // directly by checking that birthday=0 with a ufvk is a Config error.
-        // The guard is inline in sync_once; exercise it via the public function
-        // signature in a tokio runtime.
+        // Hermetic: the birthday guard runs before any network or wallet I/O. The engine
+        // now receives an already-decoded key, so the guard inspects the BlockHeight
+        // directly (decoding is the caller's concern). A birthday of 0 is a Config error.
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime for test");
         let cfg = EngineConfig::new(
             zcash_protocol::consensus::Network::MainNetwork,
@@ -685,9 +504,15 @@ mod tests {
                 tls: false,
             },
         );
+        let ufvk = UnifiedFullViewingKey::decode(
+            &zcash_protocol::consensus::Network::MainNetwork,
+            crate::wallet_session::TEST_UFVK,
+        )
+        .expect("decode TEST_UFVK");
         // birthday=0 must fail before any network call.
-        let result =
-            rt.block_on(async { sync_once(&cfg, Some(("dummy_ufvk", 0)), None, None).await });
+        let result = rt.block_on(async {
+            sync_once(&cfg, &[(ufvk, BlockHeight::from_u32(0))], None, None).await
+        });
         assert!(
             matches!(result, Err(SlipstreamError::Config(_))),
             "expected Config error for birthday=0, got: {result:?}"
