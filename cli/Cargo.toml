@@ -1,0 +1,46 @@
+[package]
+name = "slipstream-cli"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+categories.workspace = true
+publish = false
+
+[[bin]]
+name = "slipstream"
+path = "src/main.rs"
+
+[features]
+# Passthrough so `cargo run -p slipstream-cli --features gpu` enables the GPU Orchard
+# subtree build in zodl-slipstream. Without it, --gpu-subtree / --gpu-subtree-b would
+# silently fall back to the CPU path (a false IDENTICAL); main.rs guards against that.
+gpu = ["zodl-slipstream/gpu"]
+
+[dependencies]
+zodl-slipstream = { path = "../core", features = ["zcash_client_sqlite"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { workspace = true }
+rand = { workspace = true }
+# `bench` (v0.4 P0): temp wallet dirs for fresh-restore benchmarks.
+tempfile = { workspace = true }
+# `watch` (Phase C acceptance): the second-host proof consumes the v2 contract —
+# rusqlite for the engine-owned views, zcash_client_sqlite/backend for the upstream
+# summary when NOT recovering (the documented host rule, verbatim).
+rusqlite = { workspace = true }
+zcash_client_sqlite = { workspace = true }
+zcash_client_backend = { workspace = true }
+zcash_protocol = { workspace = true }
+# `derive-ufvk` (Ironwood testnet fixture tooling): mnemonic → seed → UFVK, so
+# claimed faucet wallets are usable with `sync --network test` in one step.
+bip39 = "2"
+zcash_keys = { workspace = true }
+sapling = { workspace = true }
+jubjub = { workspace = true }
+bls12_381 = { workspace = true }
+zcash_address = { workspace = true }
+zip32 = { workspace = true }

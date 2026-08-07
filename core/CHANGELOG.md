@@ -1,0 +1,24 @@
+# Changelog
+All notable changes to this library will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this library adheres to Rust's notion of
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Future releases are
+indicated by the `PLANNED` status in order to make it possible to correctly
+represent the transitive `semver` implications of changes within the enclosing
+workspace.
+
+## [Unreleased]
+
+## [0.1.1] - 2026-08-07
+
+Initial public release of the `zodl-slipstream` crate. This crate provides an
+optimized syncing engine for Zcash wallets. It is licensed under the GNU Affero
+General Public License, version 3 only (AGPL-3.0-only). Commercial licensing is
+available from Znewco, Inc. - see COMMERCIAL-LICENSE.md for details.
+
+## [0.1.0] - 2026-08-07 [YANKED]
+
+Published without the `LICENSE`, `COMMERCIAL-LICENSE.md`, and
+`LICENSE-EXCEPTIONS.md` files that this crate's source headers reference.
+Superseded by 0.1.1.

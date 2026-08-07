@@ -1,0 +1,123 @@
+[package]
+name = "zodl-slipstream"
+description = "A high-performance zcash light wallet sync engine"
+version = "0.1.1"
+authors = [
+    "Lukas Korba <lukas.korba@seznam.cz>",
+    "Kris Nuttycombe <kris@electriccoin.co>"
+]
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+categories.workspace = true
+
+[dependencies]
+slipstream-gpuhash = { workspace = true, optional = true }
+
+zcash_protocol = { workspace = true }
+zcash_client_backend = { workspace = true }
+zcash_client_sqlite = { workspace = true, optional = true }
+zcash_keys = { workspace = true }
+zcash_primitives = { workspace = true }
+zip32 = { workspace = true }
+zcash_note_encryption = { workspace = true }
+zcash_address = { workspace = true }
+incrementalmerkletree = { workspace = true }
+shardtree = { workspace = true }
+
+sapling = { workspace = true }
+orchard = { workspace = true }
+transparent = { workspace = true }
+zcash_script = { workspace = true }
+
+rusqlite = { workspace = true, optional = true }
+schemerz = { workspace = true, optional = true }
+schemerz-rusqlite = { workspace = true, optional = true }
+
+uuid = { workspace = true, optional = true }
+secrecy = { workspace = true }
+rand = { workspace = true }
+sinsemilla = { workspace = true }
+pasta_curves = { workspace = true }
+group = { workspace = true }
+ff = { workspace = true }
+
+rayon = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tonic-prost = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# T10b spend-proof: the sapling stub prover's trait signatures name these types
+# (never invoked — orchard-only transactions); versions pinned by sapling 0.7.
+jubjub = { workspace = true }
+bls12_381 = { workspace = true }
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the B2 transport
+# deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
+# Test-only feature of an existing workspace dep (never enabled in the FFI build).
+tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["zcash_client_sqlite"]
+# The zcash_client_sqlite wallet-storage backend. Gates the storage-consuming
+# half of the crate — WalletSession, the sparse persistence lanes, the
+# ext_slipstream_* schema/migrations, and the engine loop that is (today)
+# hard-wired to them. Without it the crate compiles the storage-independent
+# transport/planning layer only; a future non-sqlite backend slots in beside
+# this gate.
+zcash_client_sqlite = [
+    "dep:zcash_client_sqlite",
+    "dep:rusqlite",
+    "dep:schemerz",
+    "dep:schemerz-rusqlite",
+    "dep:uuid",
+]
+
+# Hermetic integration tests against a local darkside lightwalletd (see CONVENTIONS).
+# The darkside harness drives WalletSession, so it requires the sqlite backend.
+darkside = ["zcash_client_sqlite"]
+
+# GPU-accelerated Orchard subtree-build (B0). Pulls slipstream-gpuhash + wgpu.
+# OFF by default → the default libzcashlc build never compiles wgpu. The GPU
+# lane exists solely for the sqlite persistence path, so it requires that
+# backend.
+gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
+
+# Integration-test binaries that require the sqlite backend are declared with
+# `required-features`, so `cargo test --no-default-features` SKIPS them instead
+# of failing to build — a non-sqlite backend must keep a runnable test suite
+# (issue #4). The darkside binaries additionally self-gate on `#![cfg]`.
+[[test]]
+name = "census_scan"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
+name = "stress_sparse_join"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
+name = "darkside_follow"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_oracle"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_reorg"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_sync"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_transport"
+required-features = ["darkside"]

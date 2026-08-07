@@ -1,0 +1,772 @@
+// Copyright © 2026 Znewco, Inc. (d/b/a Zcash Open Development Lab)
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// This file is part of ZODL Slipstream.
+//
+// ZODL Slipstream is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License,
+// version 3 only, as published by the Free Software Foundation.
+//
+// ZODL Slipstream is distributed in the hope that it will be useful, but
+// WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+// Affero General Public License for more details.
+//
+// Commercial licensing: see COMMERCIAL-LICENSE.md.
+
+//! Opaque FFI handle for the Slipstream engine.
+//!
+//! Lifecycle:
+//!   open  → allocates SlipstreamHandle (tokio runtime + snapshot atomics + event ring)
+//!   start → spawns sync task on the runtime; previous task cancelled first
+//!   stop  → cancels the sync task; handle stays live for snapshot/drain_events
+//!   free  → drops the handle (drops runtime → all tasks cancel)
+//!
+//! All fields are Send + Sync; the handle is always behind a raw pointer (Box::into_raw),
+//! accessed from Swift/Obj-C single-threaded callers serialised by the actor.
+//!
+//! BINDING: SlipstreamHandle is NOT exposed in the C header (opaque pointer). Its fields
+//! are internal. The C header only sees `typedef struct SlipstreamHandle SlipstreamHandle;`.
+
+use std::sync::{Arc, Mutex};
+use tokio::{runtime::Runtime, task::AbortHandle};
+
+use crate::{config::Endpoint, events::Progress};
+
+/// C-compatible snapshot struct. All fields are C-safe integers.
+/// Maps to `FfiSlipstreamSnapshot` in `zcashlc.h` (cbindgen generates this).
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FfiSlipstreamSnapshot {
+    /// Current chain tip height (0 = not yet fetched).
+    pub chain_tip: u64,
+    /// Number of blocks fetched in the current/last sync pass.
+    pub fetched_blocks: u64,
+    /// Number of blocks scanned in the current/last sync pass.
+    pub scanned_blocks: u64,
+    /// Number of transactions enhanced in the current/last sync pass.
+    pub enhanced_txs: u64,
+    /// End height of the block range currently being processed.
+    pub current_range_end: u64,
+    /// Sync state: 0=idle, 1=syncing, 2=error, 3=done.
+    pub state: u8,
+    // ── T5.5 counter-based progress fields (appended at END for padding stability) ──
+    /// Total blocks in the current pass. Set (not accumulated) by the scheduler each time
+    /// suggest_scan_ranges returns: value = scanned_so_far + sum(all returned ranges).
+    /// Denominator for counter-based progress: scanned_blocks / pass_total_blocks.
+    pub pass_total_blocks: u64,
+    /// Spendable hint: 0 = not yet spendable; 1 = a ChainTip-priority range has completed
+    /// scanning (≈ SBS funds-spendable semantics). Latches to 1; never resets within a pass.
+    pub spendable_hint: u8,
+    // ── T5.6 range-boundary signals (appended at END for padding stability) ──
+    /// Number of suggested ranges whose scan+enhancement has completed in the current pass.
+    /// Swift observes this counter and triggers ONE balance-summary fetch per boundary.
+    pub ranges_completed: u64,
+    // ── API v2 fields (ENGINE_API_V2.md §4.4; appended at END for padding stability) ──
+    /// 1 while the wallet is inside its recovery (restore backfill) window. Engine-computed
+    /// from suggested ranges vs `accounts.recover_until_height`, with the fail-safe latch
+    /// built in: terminal states (Done / Error) force 0, so a dead pass can never wedge a
+    /// host's "Restoring" UI.
+    pub is_recovering: u8,
+    /// Blessed progress value, 0..=1000, session-monotonic (never regresses while the
+    /// handle lives). Done forces 1000. Replaces host-side % math.
+    pub progress_permille: u16,
+    /// Seconds since the last forward progress while state == Syncing; 0 otherwise.
+    /// The host keeps the policy (log vs restart); the engine supplies the fact.
+    pub stalled_seconds: u32,
+    // ── API v2.1 E-4 (appended at END for padding stability) ──
+    /// Monotonic version of the wallet's stored transaction set (see
+    /// `Progress::tx_set_version`). Host rule: version moved since last poll →
+    /// re-fetch transactions + publish. Never reset while the handle lives.
+    pub tx_set_version: u64,
+}
+
+/// C-compatible event record.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct FfiSlipstreamEvent {
+    /// Event tag: 1=SyncStarted, 2=SyncProgress, 3=SyncDone, 4=SyncError, 5=FoundTransactions.
+    pub tag: u8,
+    /// For SyncDone: count of transactions stored; for SyncError: error code; others: 0.
+    pub value: u64,
+}
+
+/// State of the sync task.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SyncState {
+    Idle,
+    Syncing,
+    Error(u8), // error code (u8 for C compat)
+    Done,
+}
+
+/// Maximum events to keep in the ring before dropping oldest.
+pub const EVENT_RING_CAP: usize = 64;
+
+/// Push onto the bounded event ring with the v2 CRITICALITY policy ([audit ENG-4] / API v2 §4.5):
+/// on overflow, evict the oldest DROPPABLE event first — tag 1 (SyncStarted) / tag 2 (SyncProgress)
+/// are pure UI pacing and safe to lose; tags 3 (SyncDone), 4 (SyncError), 5 (FoundTransactions) are
+/// edge signals a host may act on exactly once, so they survive as long as anything droppable
+/// remains. Only a ring FULL of critical events (pathological — the host stopped draining) evicts a
+/// critical, and every eviction logs a warning so field logs show event loss instead of silence.
+pub fn push_event_bounded(ring: &mut Vec<FfiSlipstreamEvent>, e: FfiSlipstreamEvent) {
+    if ring.len() >= EVENT_RING_CAP {
+        let droppable = ring.iter().position(|ev| ev.tag == 1 || ev.tag == 2);
+        let evicted = ring.remove(droppable.unwrap_or(0));
+        tracing::warn!(
+            evicted_tag = evicted.tag,
+            incoming_tag = e.tag,
+            critical_evicted = droppable.is_none(),
+            "slipstream event ring overflow — oldest {} event dropped",
+            if droppable.is_some() {
+                "droppable"
+            } else {
+                "CRITICAL"
+            }
+        );
+    }
+    ring.push(e);
+}
+
+pub struct SlipstreamHandle {
+    /// Single multi-thread tokio runtime owned by this handle (dropped with the handle).
+    /// D7 deviation: runtime is created at `open` and dropped at `free` (not per-start/stop).
+    pub runtime: Runtime,
+    /// Shared progress atomics — read by snapshot; written by the sync task.
+    pub progress: Arc<Progress>,
+    /// Current sync state — written by sync task, read by snapshot.
+    pub state: Arc<Mutex<SyncState>>,
+    /// Event ring — sync task pushes; Swift drains.
+    pub events: Arc<Mutex<Vec<FfiSlipstreamEvent>>>,
+    /// Abort handle for the currently-running sync task (None = not started or stopped).
+    ///
+    /// B1 (#1755 failure-path hardening): the sync task's `JoinHandle` is OWNED by a
+    /// supervisor task (spawned alongside it in `zcashlc_slipstream_start`) that awaits
+    /// it and converts a panic (`JoinError::is_panic`) into `SyncState::Error` + a
+    /// tag=4 event — a panicking pass can no longer die silently leaving the state
+    /// stuck at "Syncing" forever (field failure 2, 2026-06-12). `stop()` / `free()` /
+    /// restart only need to CANCEL the task, so they hold this `AbortHandle` instead
+    /// of the `JoinHandle` (the abort is observed by the supervisor as a cancellation
+    /// and deliberately ignored — `stop()` already set the state to Idle).
+    pub task: Option<AbortHandle>,
+    /// Serializes overlapping sync passes on this handle. `session::run_session` holds this for
+    /// the WHOLE pass (acquired as its outermost local). On a `start()`-while-running restart the
+    /// host aborts the previous task (`zcashlc_slipstream_start`), but tokio's `abort()` is
+    /// ASYNCHRONOUS — the old pass keeps running until its next await. This lock makes the new
+    /// pass wait until the aborted old pass has unwound and dropped the guard; because guards drop
+    /// in reverse acquisition order, the old pass's `WalletSession` (and its `data.db` connection)
+    /// is already closed by then, so two passes never touch `data.db` concurrently. Without it the
+    /// `importAccount` restart raced two passes on one DB → panic → `SyncState::Error(2)` (Keystone
+    /// restore field failure, 2026-06-30). The host always abort()s the old task before spawning the
+    /// new one, so the old holder is guaranteed to release — no deadlock.
+    pub pass_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Server endpoint — set at open; used for start.
+    pub endpoint: Endpoint,
+    /// Wallet db path — set at open.
+    pub wallet_db_path: std::path::PathBuf,
+    /// Network (MainNetwork or TestNetwork).
+    pub network: zcash_protocol::consensus::Network,
+    /// Host physical memory in bytes, passed by Swift at open (`ProcessInfo`
+    /// `.physicalMemory`); 0 = unknown. Drives `EngineConfig::scaled_for_device_memory`
+    /// at start so <3 GiB devices get derated fetch/split budgets (T8.4).
+    pub total_memory_bytes: u64,
+}
+
+/// Spawns `fut` on `runtime` together with a SUPERVISOR task that owns the
+/// spawned task's `JoinHandle`, and returns the `AbortHandle` for the spawned task.
+///
+/// B1 (#1755 failure-path hardening): tokio swallows panics inside spawned tasks —
+/// they surface only through the `JoinHandle`, which nothing previously inspected,
+/// so a panicking sync pass died silently and the state stayed "Syncing" forever
+/// (field failure 2, 2026-06-12). The supervisor converts a PANIC `JoinError` into
+/// `SyncState::Error(2)` + a tag=4/value=2 event + a `tracing::error!` carrying the
+/// panic payload. A CANCELLED `JoinError` (the returned `AbortHandle` was used by
+/// stop()/free()/restart) is deliberately ignored — the canceller already set the
+/// state. Normal completion needs nothing (the task body sets Done/Error itself).
+///
+/// Known benign race (pre-existing class): a start()-while-running restart aborts the
+/// old task, but if that task panicked just before the abort landed, its supervisor
+/// writes Error(2) concurrently with the new pass — the same unguarded window in
+/// which the OLD task body could always write Done/Error around a restart. The Swift
+/// layer never restarts without stop() (which aborts first → supervisor sees
+/// cancellation), and switchTo() re-opens a fresh handle with fresh state Arcs.
+pub fn spawn_supervised<F>(
+    runtime: &Runtime,
+    fut: F,
+    state: Arc<Mutex<SyncState>>,
+    events: Arc<Mutex<Vec<FfiSlipstreamEvent>>>,
+) -> AbortHandle
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let task = runtime.spawn(fut);
+    let abort_handle = task.abort_handle();
+    runtime.spawn(async move {
+        match task.await {
+            Ok(()) => {}
+            Err(join_err) if join_err.is_cancelled() => {}
+            Err(join_err) => {
+                let panic_msg = match join_err.try_into_panic() {
+                    Ok(payload) => payload
+                        .downcast_ref::<&str>()
+                        .map(|s| (*s).to_string())
+                        .or_else(|| payload.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "non-string panic payload".to_string()),
+                    Err(join_err) => join_err.to_string(),
+                };
+                tracing::error!(
+                    panic = %panic_msg,
+                    "slipstream sync task PANICKED — converting to error state"
+                );
+                *state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Error(2);
+                let mut ring = events.lock().unwrap_or_else(|p| p.into_inner());
+                // SyncError (tag=4): value = error code 2 (task panicked). v2 bounded push —
+                // the error event evicts a droppable (started/progress) entry, never a critical.
+                push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 4, value: 2 });
+            }
+        }
+    });
+    abort_handle
+}
+
+impl SlipstreamHandle {
+    /// Push one event onto the ring (v2 bounded policy: overflow evicts the oldest
+    /// started/progress event first; done/error/found-transactions survive; loss is logged).
+    pub fn push_event(&self, event: FfiSlipstreamEvent) {
+        let mut ring = self.events.lock().unwrap_or_else(|p| p.into_inner());
+        push_event_bounded(&mut ring, event);
+    }
+
+    /// Read a point-in-time snapshot of progress counters and sync state.
+    pub fn snapshot(&self) -> FfiSlipstreamSnapshot {
+        let state = *self.state.lock().unwrap_or_else(|p| p.into_inner());
+        derive_snapshot(&self.progress, state)
+    }
+}
+
+/// Derive the v2 snapshot from live progress + state. Shared by the FFI handle and Rust
+/// hosts (e.g. `slipstream-cli watch`) so the v2 semantics — the recovery fail-safe latch,
+/// the session-monotonic permille floor, the stall clock — have exactly ONE implementation.
+pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlipstreamSnapshot {
+    {
+        let state_u8 = match state {
+            SyncState::Idle => 0,
+            SyncState::Syncing => 1,
+            SyncState::Error(_) => 2,
+            SyncState::Done => 3,
+        };
+        // ── API v2 derived fields (ENGINE_API_V2.md §4.4) ──
+        // Blessed progress: raw pass ratio folded into the session-monotonic floor (reported
+        // progress never regresses while the handle lives). Done folds 1000 into the floor so
+        // a later catch-up pass can't display below a completed pass's 100%.
+        let raw_permille = p
+            .scanned()
+            .saturating_mul(1000)
+            .checked_div(p.pass_total())
+            .unwrap_or(0);
+        let progress_permille = match state {
+            SyncState::Done => p.permille_floor(1000) as u16,
+            _ => p.permille_floor(raw_permille) as u16,
+        };
+        // Fail-safe latch: terminal states force NOT-recovering regardless of the live flag —
+        // a dead pass can never wedge a host's "Restoring" UI (previously Swift-side hardening).
+        let is_recovering_u8 = match state {
+            SyncState::Done | SyncState::Error(_) => 0u8,
+            _ => u8::from(p.recovering()),
+        };
+        // Stall clock: only meaningful while actively syncing; 0 when idle/terminal or before
+        // the first progress stamp.
+        let stalled_seconds = match state {
+            SyncState::Syncing => {
+                let last = p.last_progress_unix_secs();
+                if last == 0 {
+                    0
+                } else {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    u32::try_from(now.saturating_sub(last)).unwrap_or(u32::MAX)
+                }
+            }
+            _ => 0u32,
+        };
+        FfiSlipstreamSnapshot {
+            chain_tip: p.chain_tip(),
+            fetched_blocks: p.fetched(),
+            scanned_blocks: p.scanned(),
+            enhanced_txs: p.enhanced(),
+            current_range_end: p.range_end(),
+            state: state_u8,
+            pass_total_blocks: p.pass_total(),
+            spendable_hint: p.spendable() as u8,
+            ranges_completed: p.ranges_completed(),
+            is_recovering: is_recovering_u8,
+            progress_permille,
+            stalled_seconds,
+            tx_set_version: p.tx_set_version(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [API v2 §4.5] Overflow evicts the oldest DROPPABLE (started/progress) event, so a critical
+    /// event pushed into a full ring never displaces another critical while pacing events remain.
+    #[test]
+    fn ring_overflow_evicts_droppable_before_critical() {
+        let mut ring: Vec<FfiSlipstreamEvent> = Vec::new();
+        // 3 criticals first (found-transactions), then fill the rest with progress.
+        for i in 0..3 {
+            push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 5, value: i });
+        }
+        for i in 0..(EVENT_RING_CAP - 3) {
+            push_event_bounded(
+                &mut ring,
+                FfiSlipstreamEvent {
+                    tag: 2,
+                    value: i as u64,
+                },
+            );
+        }
+        assert_eq!(ring.len(), EVENT_RING_CAP);
+        // Push a critical into the full ring: the oldest PROGRESS event (value 0) must go,
+        // all 3 early criticals must survive, and the new critical must be at the tail.
+        push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 4, value: 9 });
+        assert_eq!(ring.len(), EVENT_RING_CAP);
+        assert_eq!(
+            ring.iter().filter(|e| e.tag == 5).count(),
+            3,
+            "early criticals survive"
+        );
+        assert!(
+            !ring.iter().any(|e| e.tag == 2 && e.value == 0),
+            "oldest droppable evicted, not position 0"
+        );
+        let last = ring.last().unwrap();
+        assert_eq!((last.tag, last.value), (4, 9));
+    }
+
+    /// Pathological fallback: a ring FULL of criticals still accepts (evicts oldest overall).
+    #[test]
+    fn ring_overflow_all_critical_falls_back_to_oldest() {
+        let mut ring: Vec<FfiSlipstreamEvent> = Vec::new();
+        for i in 0..EVENT_RING_CAP {
+            push_event_bounded(
+                &mut ring,
+                FfiSlipstreamEvent {
+                    tag: 5,
+                    value: i as u64,
+                },
+            );
+        }
+        push_event_bounded(&mut ring, FfiSlipstreamEvent { tag: 3, value: 7 });
+        assert_eq!(ring.len(), EVENT_RING_CAP);
+        assert!(
+            !ring.iter().any(|e| e.value == 0 && e.tag == 5),
+            "oldest critical evicted"
+        );
+        let last = ring.last().unwrap();
+        assert_eq!((last.tag, last.value), (3, 7));
+    }
+
+    #[test]
+    fn ffi_snapshot_default_is_zero() {
+        let s = FfiSlipstreamSnapshot::default();
+        assert_eq!(s.chain_tip, 0);
+        assert_eq!(s.fetched_blocks, 0);
+        assert_eq!(s.scanned_blocks, 0);
+        assert_eq!(s.enhanced_txs, 0);
+        assert_eq!(s.current_range_end, 0);
+        assert_eq!(s.state, 0);
+        assert_eq!(
+            s.pass_total_blocks, 0,
+            "pass_total_blocks default must be 0"
+        );
+        assert_eq!(s.spendable_hint, 0, "spendable_hint default must be 0");
+        assert_eq!(s.ranges_completed, 0, "ranges_completed default must be 0");
+        assert_eq!(s.is_recovering, 0, "is_recovering default must be 0");
+        assert_eq!(
+            s.progress_permille, 0,
+            "progress_permille default must be 0"
+        );
+        assert_eq!(s.stalled_seconds, 0, "stalled_seconds default must be 0");
+        assert_eq!(s.tx_set_version, 0, "tx_set_version default must be 0");
+    }
+
+    /// [API v2 §4.4] The permille floor is session-monotonic: raw regressions never lower
+    /// the reported value, and raw values clamp to 1000.
+    #[test]
+    fn permille_floor_is_monotonic_and_clamped() {
+        let p = crate::events::Progress::default();
+        assert_eq!(p.permille_floor(300), 300);
+        assert_eq!(p.permille_floor(100), 300, "regression must hold the floor");
+        assert_eq!(p.permille_floor(999), 999);
+        assert_eq!(p.permille_floor(5000), 1000, "raw clamps to 1000");
+        assert_eq!(p.permille_floor(0), 1000, "floor persists at max");
+    }
+
+    /// [API v2 §4.4] Terminal states force is_recovering = 0 (the fail-safe latch), and Done
+    /// forces progress to 1000 — a dead or finished pass can never wedge a "Restoring" UI or
+    /// show partial progress.
+    #[test]
+    fn snapshot_terminal_states_apply_v2_latches() {
+        let mk = |state: SyncState, progress: std::sync::Arc<crate::events::Progress>| {
+            SlipstreamHandle {
+                runtime: tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime"),
+                progress,
+                state: std::sync::Arc::new(Mutex::new(state)),
+                events: std::sync::Arc::new(Mutex::new(Vec::new())),
+                task: None,
+                pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+                endpoint: Endpoint {
+                    host: "localhost".into(),
+                    port: 9067,
+                    tls: false,
+                },
+                wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+                network: zcash_protocol::consensus::Network::TestNetwork,
+                total_memory_bytes: 0,
+            }
+        };
+
+        // Syncing + recovering flag set → surfaces as recovering, permille from counters.
+        let p1 = std::sync::Arc::new(crate::events::Progress::default());
+        p1.set_recovering(true);
+        p1.set_pass_total(1000);
+        p1.add_scanned(250);
+        let snap = mk(SyncState::Syncing, p1.clone()).snapshot();
+        assert_eq!(snap.is_recovering, 1);
+        assert_eq!(snap.progress_permille, 250);
+
+        // Error → latch forces NOT recovering even though the live flag is still true.
+        let snap = mk(SyncState::Error(2), p1.clone()).snapshot();
+        assert_eq!(
+            snap.is_recovering, 0,
+            "Error must release the recovery gate"
+        );
+        assert_eq!(
+            snap.stalled_seconds, 0,
+            "stall clock only ticks while Syncing"
+        );
+
+        // Done → recovery off AND progress forced to (and floored at) 1000.
+        let snap = mk(SyncState::Done, p1).snapshot();
+        assert_eq!(snap.is_recovering, 0, "Done must clear recovering");
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "Done must complete the progress"
+        );
+    }
+
+    #[test]
+    fn ffi_snapshot_counter_fields_roundtrip() {
+        // Build a fake Progress, set the new counters, and verify they surface in snapshot().
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let progress = std::sync::Arc::new(crate::events::Progress::default());
+        let handle = SlipstreamHandle {
+            runtime,
+            progress: progress.clone(),
+            state: std::sync::Arc::new(Mutex::new(SyncState::Syncing)),
+            events: std::sync::Arc::new(Mutex::new(Vec::new())),
+            task: None,
+            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            total_memory_bytes: 0,
+        };
+
+        // Simulate F1: scheduler calls set_pass_total with whole-pass total.
+        // First suggest: scanned=0 + 10_000 (ChainTip) + 5_000 (Historic) = 15_000.
+        progress.set_pass_total(15_000);
+        progress.add_scanned(7_500);
+        progress.set_spendable();
+
+        // F2: simulate completing two ranges.
+        progress.add_ranges_completed(); // range 1 done
+        progress.add_ranges_completed(); // range 2 done
+
+        let snap = handle.snapshot();
+        assert_eq!(
+            snap.pass_total_blocks, 15_000,
+            "pass_total_blocks must equal set_pass_total value (F1 store semantics)"
+        );
+        assert_eq!(
+            snap.spendable_hint, 1,
+            "spendable_hint must be 1 after set_spendable()"
+        );
+        assert_eq!(
+            snap.scanned_blocks, 7_500,
+            "scanned_blocks must equal add_scanned total"
+        );
+        assert_eq!(snap.state, 1, "state must be 1 (Syncing)");
+        assert_eq!(
+            snap.ranges_completed, 2,
+            "ranges_completed must reflect add_ranges_completed calls (F2)"
+        );
+    }
+
+    #[test]
+    fn ffi_snapshot_ranges_completed_roundtrip() {
+        // Verify ranges_completed surfaces correctly from Progress → snapshot.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let progress = std::sync::Arc::new(crate::events::Progress::default());
+        let handle = SlipstreamHandle {
+            runtime,
+            progress: progress.clone(),
+            state: std::sync::Arc::new(Mutex::new(SyncState::Idle)),
+            events: std::sync::Arc::new(Mutex::new(Vec::new())),
+            task: None,
+            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            total_memory_bytes: 0,
+        };
+
+        assert_eq!(
+            handle.snapshot().ranges_completed,
+            0,
+            "initial value must be 0"
+        );
+        progress.add_ranges_completed();
+        assert_eq!(
+            handle.snapshot().ranges_completed,
+            1,
+            "must be 1 after first range"
+        );
+        progress.add_ranges_completed();
+        progress.add_ranges_completed();
+        assert_eq!(
+            handle.snapshot().ranges_completed,
+            3,
+            "must be 3 after three ranges"
+        );
+    }
+
+    #[test]
+    fn event_ring_cap_at_64() {
+        // Build a handle with a real tokio runtime for the ring test.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = SlipstreamHandle {
+            runtime,
+            progress: Arc::new(Progress::default()),
+            state: Arc::new(Mutex::new(SyncState::Idle)),
+            events: Arc::new(Mutex::new(Vec::new())),
+            task: None,
+            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            total_memory_bytes: 0,
+        };
+
+        // Push 70 events — only the last 64 should survive.
+        for i in 0u64..70 {
+            handle.push_event(FfiSlipstreamEvent { tag: 1, value: i });
+        }
+        let ring = handle.events.lock().unwrap();
+        assert_eq!(ring.len(), EVENT_RING_CAP);
+        // The oldest 6 (values 0..5) were dropped; first kept value is 6.
+        assert_eq!(ring[0].value, 6);
+        // Last kept value is 69.
+        assert_eq!(ring[EVENT_RING_CAP - 1].value, 69);
+    }
+
+    // ── B1 (#1755) supervisor tests ────────────────────────────────────────────
+
+    /// Polls `state` until `pred` holds or ~5 s elapse. The supervisor runs on the
+    /// runtime's worker threads; the test thread observes its effects.
+    fn wait_for_state(
+        state: &Arc<Mutex<SyncState>>,
+        pred: impl Fn(&SyncState) -> bool,
+    ) -> SyncState {
+        for _ in 0..500 {
+            {
+                let s = state.lock().unwrap();
+                if pred(&s) {
+                    return *s;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        *state.lock().unwrap()
+    }
+
+    /// A panicking sync task must surface as Error(2) + a tag=4/value=2 event —
+    /// never a silent death with the state stuck at Syncing (field failure 2).
+    #[test]
+    fn supervisor_converts_panic_to_error_state() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let state = Arc::new(Mutex::new(SyncState::Syncing));
+        let events: Arc<Mutex<Vec<FfiSlipstreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let _abort = spawn_supervised(
+            &runtime,
+            async { panic!("boom: synthetic sync panic") },
+            Arc::clone(&state),
+            Arc::clone(&events),
+        );
+
+        let observed = wait_for_state(&state, |s| matches!(s, SyncState::Error(_)));
+        assert_eq!(observed, SyncState::Error(2), "panic must become Error(2)");
+        let ring = events.lock().unwrap();
+        assert!(
+            ring.iter().any(|e| e.tag == 4 && e.value == 2),
+            "panic must push a tag=4/value=2 event, got {ring:?}"
+        );
+    }
+
+    /// Cancellation via the AbortHandle (stop()/free()/restart) must NOT be
+    /// reported as an error — the canceller owns the state transition.
+    #[test]
+    fn supervisor_ignores_cancellation() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let state = Arc::new(Mutex::new(SyncState::Syncing));
+        let events: Arc<Mutex<Vec<FfiSlipstreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let abort = spawn_supervised(
+            &runtime,
+            async {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+            },
+            Arc::clone(&state),
+            Arc::clone(&events),
+        );
+        abort.abort();
+
+        // Give the supervisor time to observe the cancellation; the state and the
+        // event ring must remain untouched.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            *state.lock().unwrap(),
+            SyncState::Syncing,
+            "cancel must not write state"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "cancel must not push events"
+        );
+    }
+
+    /// Normal completion writes nothing — the task body owns Done/Error.
+    #[test]
+    fn supervisor_passes_through_normal_completion() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let state = Arc::new(Mutex::new(SyncState::Syncing));
+        let events: Arc<Mutex<Vec<FfiSlipstreamEvent>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_inner = Arc::clone(&done);
+        let _abort = spawn_supervised(
+            &runtime,
+            async move {
+                done_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+            },
+            Arc::clone(&state),
+            Arc::clone(&events),
+        );
+
+        for _ in 0..500 {
+            if done.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200)); // let the supervisor settle
+        assert_eq!(
+            *state.lock().unwrap(),
+            SyncState::Syncing,
+            "completion must not write state"
+        );
+        assert!(
+            events.lock().unwrap().is_empty(),
+            "completion must not push events"
+        );
+    }
+
+    #[test]
+    fn event_ring_drain_is_atomic() {
+        // Build a handle and verify drain removes exactly the pushed events.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = SlipstreamHandle {
+            runtime,
+            progress: Arc::new(Progress::default()),
+            state: Arc::new(Mutex::new(SyncState::Idle)),
+            events: Arc::new(Mutex::new(Vec::new())),
+            task: None,
+            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            total_memory_bytes: 0,
+        };
+
+        handle.push_event(FfiSlipstreamEvent { tag: 1, value: 10 });
+        handle.push_event(FfiSlipstreamEvent { tag: 3, value: 2 });
+
+        // Simulate drain by locking and draining.
+        let drained: Vec<FfiSlipstreamEvent> = {
+            let mut ring = handle.events.lock().unwrap();
+            ring.drain(..).collect()
+        };
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].value, 10);
+        assert_eq!(drained[1].value, 2);
+
+        // Ring must be empty after drain.
+        let ring = handle.events.lock().unwrap();
+        assert!(ring.is_empty());
+    }
+}

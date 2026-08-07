@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Keep the SHA-pinned GitHub Actions in .github/workflows/ current. Cargo deps are
+  # intentionally not managed here: the librustzcash family is pinned via a git
+  # [patch.crates-io] rev in the workspace Cargo.toml, which Dependabot cannot bump.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

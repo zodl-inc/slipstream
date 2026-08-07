@@ -29,7 +29,7 @@ ZcashLightClientKit on the same wallet.
 Deep history holds up: a real 2019 wallet — ~2.4M blocks including the entire 2022–23
 "sandblasting" spam era — restores in **51 minutes** (M4), a range effectively
 unrestorable on the reference path. On device, Slipstream also beats the Zingo and Zkool
-reference engines. Methodology and full numbers in `docs/`.
+reference engines. See `REVIEWING.md` for the module map.
 
 ## Design — "upstream brain, Slipstream body"
 
@@ -48,11 +48,10 @@ and can be embedded anywhere Rust runs.
 
 | Crate | Role |
 |---|---|
-| `core` — `slipstream-core` | the engine |
+| `core` — `zodl-slipstream` | the engine |
 | `cli` — `slipstream-cli` | benchmark / golden-oracle / A-B harness |
-| `gpuhash` — `slipstream-gpuhash` | **parked** GPU Sinsemilla kernel — off by default; a default build links zero `wgpu` |
-| `protogen` | dev-only gRPC code generator |
-| `vendor/` | the two patched forks (`orchard`, `zcash_note_encryption`), wired via `[patch.crates-io]` |
+| `gpuhash` — `zodl-slipstream-gpuhash` | **parked** GPU Sinsemilla kernel — off by default; a default build links zero `wgpu` |
+| `protogen` — `slipstream-protogen` | dev-only gRPC code generator |
 
 ## Correctness
 
@@ -64,7 +63,7 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (228 + 32 tests)
+cargo test -p zodl-slipstream -p slipstream-cli   # the always-green gate (228 + 32 tests)
 cargo build --workspace                           # full workspace incl. the parked gpuhash
 ```
 
@@ -72,9 +71,9 @@ Edition 2024, Rust 1.90+. Dependencies are published crates.io releases.
 
 ## Documentation
 
-- **`docs/book/`** — *The Slipstream Book*: 20 chapters covering architecture, data model,
-  fetch/scan/persist, reorgs, resilience, the correctness oracle, security, privacy,
-  exploitability, performance, and tests. Start at `docs/book/index.html`.
+- **`HOSTING.md`** — the crate consumer's guide: what to call, in what order, and how to
+  read the results correctly.
+- **`REVIEWING.md`** — module map for protocol engineers.
 
 ## License
 
