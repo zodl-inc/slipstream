@@ -10,6 +10,13 @@ workspace.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-19
+
+### Changed
+- Updated to `zcash_client_backend-0.24`, `zcash_client_sqlite-0.22` final releases.
+  The 0.1.x release series was published against release candidate versions of these
+  crates.
+
 ## [0.1.1] - 2026-08-07
 
 Initial public release of the `zodl-slipstream` crate. This crate provides an
