@@ -171,6 +171,14 @@ enum Cmd {
         /// "sandblasting" eras traversable). Must be >= 1 MiB.
         #[arg(long, default_value_t = zodl_slipstream::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES)]
         chunk_split_bytes: usize,
+        /// \[DEV-5\] Block-count budget per fetch sub-chunk, applied ALONGSIDE
+        /// --chunk-split-bytes (split on whichever cap is hit first). Defends
+        /// against a middle-density plan chunk that stays under the byte cap
+        /// but ships as one gRPC stream of thousands of small messages,
+        /// tripping the server's h2 per-stream frame-count protection
+        /// (`GoAway ... ENHANCE_YOUR_CALM`). Must be >= 100.
+        #[arg(long, default_value_t = zodl_slipstream::EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS)]
+        chunk_split_blocks: u32,
         /// T8.4: in-memory fetch/decode budget (bytes); must be >= 16 MiB. Lower it for
         /// memory-constrained runs — the device path derates this automatically from
         /// ProcessInfo.physicalMemory; this flag is the Mac/CLI equivalent (book ch.19).
@@ -1000,6 +1008,7 @@ fn cmd_sync(
     chunk: u32,
     sparse: bool,
     chunk_split_bytes: usize,
+    chunk_split_blocks: u32,
     memory_budget_bytes: usize,
     write_behind: bool,
     gpu_subtree: bool,
@@ -1027,6 +1036,7 @@ fn cmd_sync(
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
     cfg.chunk_split_bytes = chunk_split_bytes;
+    cfg.chunk_split_blocks = chunk_split_blocks;
     cfg.memory_budget_bytes = memory_budget_bytes;
     // [B6] The floor and the grid together are the retention policy; an interval
     // of zero is not a grid, so it is rejected rather than silently defaulted.
@@ -1582,6 +1592,7 @@ fn main() {
             anchor_retention,
             anchor_retention_interval,
             chunk_split_bytes,
+            chunk_split_blocks,
             memory_budget_bytes,
             write_behind,
             gpu_subtree,
@@ -1598,6 +1609,7 @@ fn main() {
                 chunk,
                 sparse,
                 chunk_split_bytes,
+                chunk_split_blocks,
                 memory_budget_bytes,
                 write_behind,
                 gpu_subtree,
@@ -2017,6 +2029,56 @@ mod tests {
                 }
             ),
             "--chunk-split-bytes must override the default"
+        );
+    }
+
+    // ── DEV-5: --chunk-split-blocks ────────────────────────────────────────
+
+    #[test]
+    fn sync_chunk_split_blocks_defaults_to_engine_default() {
+        let cli = Cli::try_parse_from([
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/test-wallet",
+        ])
+        .expect("parses default");
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    chunk_split_blocks: zodl_slipstream::EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS,
+                    ..
+                }
+            ),
+            "default chunk_split_blocks must equal EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS"
+        );
+    }
+
+    #[test]
+    fn sync_chunk_split_blocks_is_overridable() {
+        let cli = Cli::try_parse_from([
+            "slipstream",
+            "sync",
+            "--server",
+            "http://127.0.0.1:9067",
+            "--wallet-dir",
+            "/tmp/test-wallet",
+            "--chunk-split-blocks",
+            "2500",
+        ])
+        .expect("parses --chunk-split-blocks");
+        assert!(
+            matches!(
+                cli.cmd,
+                Cmd::Sync {
+                    chunk_split_blocks: 2_500,
+                    ..
+                }
+            ),
+            "--chunk-split-blocks must override the default"
         );
     }
 

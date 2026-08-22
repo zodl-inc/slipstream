@@ -361,6 +361,9 @@ pub async fn run_to_completion(
         let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
+        // DEV-5: block-count-budgeted sub-chunk splitting (h2 frame-count
+        // protection survival — see EngineConfig::chunk_split_blocks's doc).
+        plan.split_blocks = config.chunk_split_blocks;
         // [v0.7 P2] Arm the wire-collapse detector only when the engine has
         // somewhere to fail over TO (and the kill switch is on). Tor passes
         // never have alternates armed (the probe is skipped there too).

@@ -16,12 +16,18 @@
 
 //! Parallel block fetch: K workers claim consecutive sub-ranges ("plan chunks")
 //! of the requested range and stream them via GetBlockRange, splitting each
-//! stream into byte-budgeted SUB-chunks (T6.8-S) so spam-era plan chunks
-//! (mainnet "sandblasting" ~1.70M–2.00M: hundreds of MB per 10k blocks) stay
-//! memory-bounded and timeout-immune. A reorder stage releases sub-chunks
-//! strictly in (plan_index, sub_index) order — continuity-verified — into the
-//! byte-budgeted ChunkQueue. Splitting + resume-from-height retry landed in
-//! run T6.8-S, 2026-06-12.
+//! stream into byte- AND block-count-budgeted SUB-chunks (T6.8-S; the
+//! block-count side landed in DEV-5) so spam-era plan chunks (mainnet
+//! "sandblasting" ~1.70M–2.00M: hundreds of MB per 10k blocks) stay
+//! memory-bounded and timeout-immune, AND so a middle-density plan chunk that
+//! stays under the byte budget (~10,000 small messages on one gRPC stream)
+//! cannot trip the server's h2 per-stream frame-count protection (`GoAway
+//! b"too_many_data_frames" ENHANCE_YOUR_CALM`; field-reproduced at
+//! 3,355,000..3,364,999 — see `DEV-5-FRAMECAP-REPORT.md`). A reorder stage
+//! releases sub-chunks strictly in (plan_index, sub_index) order —
+//! continuity-verified — into the byte-budgeted ChunkQueue. Splitting +
+//! resume-from-height retry landed in run T6.8-S, 2026-06-12; the
+//! block-count cap landed in DEV-5.
 
 use std::{
     collections::BTreeMap,
@@ -74,6 +80,14 @@ pub struct FetchPlan {
     /// split into many small sub-chunks automatically. Threaded from
     /// [`EngineConfig::chunk_split_bytes`] by the scheduler.
     pub split_bytes: usize,
+    /// \[DEV-5\] Block-count budget per emitted sub-chunk, applied ALONGSIDE
+    /// `split_bytes` — the splitter completes a sub-chunk whenever EITHER cap
+    /// would be exceeded, whichever fires first. Defends against a
+    /// middle-density plan chunk (under the byte cap, but ~10,000 messages on
+    /// one gRPC stream) tripping the server's h2 per-stream frame-count
+    /// protection. Threaded from [`EngineConfig::chunk_split_blocks`] by the
+    /// scheduler; see that field's doc for the full mechanism + citations.
+    pub split_blocks: u32,
     /// [v0.7 P2] Arm the wire-collapse detector (Some ⇔ the engine has
     /// alternates to fail over to; None = pre-v0.7 behavior verbatim).
     pub failover: Option<WireFailoverArm>,
@@ -124,6 +138,7 @@ impl FetchPlan {
             retries_per_chunk: 3,
             chunk_timeout: Duration::from_secs(120),
             split_bytes: EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            split_blocks: EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS,
             failover: None,
         }
     }
@@ -233,31 +248,43 @@ struct SubChunk {
     permit: Option<OwnedSemaphorePermit>,
 }
 
-/// Byte-budgeted accumulator: collects streamed blocks and yields a completed
-/// sub-chunk whenever adding the next block would exceed `split_bytes` (the
-/// pushed block then opens the next sub-chunk). Invariants: yielded sub-chunks
-/// are never empty and preserve stream order; a single block larger than the
-/// budget forms its own sub-chunk (no infinite loop).
+/// Byte- AND block-count-budgeted accumulator (DEV-5 added the block-count
+/// side): collects streamed blocks and yields a completed sub-chunk whenever
+/// adding the next block would exceed EITHER `split_bytes` OR `split_blocks`
+/// (the pushed block then opens the next sub-chunk). Invariants: yielded
+/// sub-chunks are never empty and preserve stream order; a single block
+/// larger than the byte budget forms its own sub-chunk (no infinite loop);
+/// reaching a cap EXACTLY — without exceeding it — does not split, for
+/// either dimension (matches the pre-existing byte-cap semantic: the budget
+/// is a ceiling on what a sub-chunk may hold, not a target it must hit).
 pub(crate) struct ChunkSplitter {
     split_bytes: usize,
+    split_blocks: usize,
     acc: Vec<CompactBlock>,
     acc_bytes: usize,
 }
 
 impl ChunkSplitter {
-    pub(crate) fn new(split_bytes: usize) -> Self {
+    pub(crate) fn new(split_bytes: usize, split_blocks: usize) -> Self {
         Self {
             split_bytes,
+            split_blocks,
             acc: Vec::new(),
             acc_bytes: 0,
         }
     }
 
-    /// Push the next streamed block; returns `Some((blocks, bytes))` when the
-    /// budget overflows and a sub-chunk completes.
+    /// Push the next streamed block; returns `Some((blocks, bytes))` when
+    /// either budget overflows and a sub-chunk completes.
     pub(crate) fn push(&mut self, block: CompactBlock) -> Option<(Vec<CompactBlock>, usize)> {
         let block_bytes = Message::encoded_len(&block);
-        let completed = if !self.acc.is_empty() && self.acc_bytes + block_bytes > self.split_bytes {
+        let would_exceed_bytes = self.acc_bytes + block_bytes > self.split_bytes;
+        // Adding this block would make the count split_blocks + 1, i.e. the
+        // count already sits AT the cap — mirrors the byte check's "adding
+        // the next block would exceed" phrasing (an int-arithmetic-overflow-
+        // free rewrite of `self.acc.len() + 1 > self.split_blocks`).
+        let would_exceed_blocks = self.acc.len() >= self.split_blocks;
+        let completed = if !self.acc.is_empty() && (would_exceed_bytes || would_exceed_blocks) {
             let blocks = std::mem::take(&mut self.acc);
             let bytes = std::mem::replace(&mut self.acc_bytes, 0);
             Some((blocks, bytes))
@@ -428,6 +455,7 @@ async fn pump_block_stream<S>(
     stream: &mut S,
     cursor: &mut PlanChunkCursor,
     split_bytes: usize,
+    split_blocks: usize,
     progress_deadline: Duration,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
@@ -439,7 +467,7 @@ where
         "block stream {}..{} (plan chunk {})",
         cursor.resume_from, cursor.end, cursor.plan_index
     );
-    let mut splitter = ChunkSplitter::new(split_bytes);
+    let mut splitter = ChunkSplitter::new(split_bytes, split_blocks);
     // tokio Instant (not std) so start_paused tests drive the deadline.
     let mut last_progress = tokio::time::Instant::now();
     loop {
@@ -522,6 +550,7 @@ async fn open_and_pump(
         &mut stream,
         cursor,
         plan.split_bytes,
+        plan.split_blocks as usize,
         plan.chunk_timeout,
         gate,
         out,
@@ -801,12 +830,18 @@ async fn release_ordered(
             drop(permit);
             if is_last {
                 if plan_subs > 1 {
+                    // DEV-5: no longer necessarily a dense/sandblasting-era
+                    // split — a middle-density chunk under the byte cap can
+                    // now also split purely on block count. blocks/subs and
+                    // mb/subs below disambiguate after the fact: a sub-chunk
+                    // averaging far under chunk_split_bytes was block-count
+                    // triggered, not byte triggered.
                     info!(
                         plan_index,
                         subs = plan_subs,
                         blocks = plan_blocks,
                         mb = plan_bytes / (1024 * 1024),
-                        "plan chunk split into sub-chunks (dense era)"
+                        "plan chunk split into sub-chunks"
                     );
                 }
                 summary.plans_released += 1;
@@ -944,6 +979,14 @@ mod tests {
         FetchPlan::new(1000, 999, 100, 1);
     }
 
+    /// DEV-5: FetchPlan::new must pick up the block-count cap's engine
+    /// default, exactly like it already does for split_bytes.
+    #[test]
+    fn plan_default_split_blocks_matches_engine_default() {
+        let p = FetchPlan::new(1000, 1999, 300, 4);
+        assert_eq!(p.split_blocks, EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS);
+    }
+
     // ── T6.8-S helpers ─────────────────────────────────────────────────────────
 
     /// Block with a controllable wire size via the `header` field; prev_hash
@@ -985,6 +1028,12 @@ mod tests {
         AheadGate::new(1 << 30, Arc::new(AtomicU64::new(0)))
     }
 
+    /// DEV-5: sentinel `split_blocks` for tests that exercise ONLY the
+    /// byte-cap dimension — high enough that the block-count cap never fires
+    /// for any block count these tests use, isolating pre-existing byte-only
+    /// splitter behavior exactly as it was before DEV-5.
+    const NO_BLOCK_CAP: usize = usize::MAX;
+
     fn drain_subs(rx: &mut mpsc::Receiver<SubChunk>) -> Vec<SubChunk> {
         let mut subs = Vec::new();
         while let Ok(s) = rx.try_recv() {
@@ -1009,7 +1058,7 @@ mod tests {
 
     #[test]
     fn splitter_small_blocks_single_subchunk_fast_path() {
-        let mut s = ChunkSplitter::new(1024 * 1024);
+        let mut s = ChunkSplitter::new(1024 * 1024, NO_BLOCK_CAP);
         for b in linked(100, 10, 16) {
             assert!(s.push(b).is_none(), "small blocks must not split");
         }
@@ -1025,7 +1074,7 @@ mod tests {
     #[test]
     fn splitter_splits_at_threshold_preserving_order() {
         // ~1040-byte blocks against a 2500-byte budget → 2-block sub-chunks.
-        let mut s = ChunkSplitter::new(2500);
+        let mut s = ChunkSplitter::new(2500, NO_BLOCK_CAP);
         let mut emitted: Vec<Vec<CompactBlock>> = Vec::new();
         for b in linked(100, 7, 1000) {
             if let Some((blocks, bytes)) = s.push(b) {
@@ -1055,7 +1104,7 @@ mod tests {
 
     #[test]
     fn splitter_oversized_block_forms_own_subchunk() {
-        let mut s = ChunkSplitter::new(1000);
+        let mut s = ChunkSplitter::new(1000, NO_BLOCK_CAP);
         assert!(
             s.push(block_sized(100, 5000)).is_none(),
             "first block always accumulates"
@@ -1071,7 +1120,145 @@ mod tests {
 
     #[test]
     fn splitter_empty_finish_is_none() {
-        assert!(ChunkSplitter::new(1000).finish().is_none());
+        assert!(ChunkSplitter::new(1000, NO_BLOCK_CAP).finish().is_none());
+    }
+
+    // ── DEV-5: ChunkSplitter block-count cap ──────────────────────────────────
+
+    #[test]
+    fn splitter_splits_at_block_count_cap() {
+        // Tiny blocks (zero byte pressure — split_bytes is effectively
+        // unbounded) against a 3-block cap → 3 + 3 + 1, the block-count
+        // mirror of splitter_splits_at_threshold_preserving_order.
+        let mut s = ChunkSplitter::new(usize::MAX, 3);
+        let mut emitted: Vec<Vec<CompactBlock>> = Vec::new();
+        for b in linked(100, 7, 16) {
+            if let Some((blocks, _bytes)) = s.push(b) {
+                assert!(
+                    blocks.len() <= 3,
+                    "emitted sub-chunk must respect the block-count budget"
+                );
+                emitted.push(blocks);
+            }
+        }
+        if let Some((blocks, _)) = s.finish() {
+            emitted.push(blocks);
+        }
+        assert_eq!(
+            emitted.len(),
+            3,
+            "7 blocks at 3/sub-chunk = 2 full + 1 tail"
+        );
+        assert_eq!(
+            emitted.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 3, 1]
+        );
+        let heights: Vec<u64> = emitted.iter().flatten().map(|b| b.height).collect();
+        assert_eq!(
+            heights,
+            (100..107).collect::<Vec<_>>(),
+            "order preserved, nothing lost"
+        );
+    }
+
+    /// Boundary case explicitly required by the task: landing EXACTLY on the
+    /// block-count cap must not split — only EXCEEDING it does (matches the
+    /// pre-existing byte-cap semantic, `splitter_small_blocks_single_subchunk_fast_path`'s
+    /// sibling for the count dimension).
+    #[test]
+    fn splitter_exactly_at_block_cap_does_not_split() {
+        let mut s = ChunkSplitter::new(usize::MAX, 5);
+        for b in linked(100, 5, 16) {
+            assert!(
+                s.push(b).is_none(),
+                "exactly-at-cap must never split mid-stream"
+            );
+        }
+        let (blocks, _bytes) = s.finish().expect("tail");
+        assert_eq!(blocks.len(), 5, "all 5 blocks land in one sub-chunk");
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            (100..105).collect::<Vec<_>>()
+        );
+    }
+
+    /// Boundary case explicitly required by the task: a chunk ALREADY split
+    /// fine-grained by the byte cap (sandblasting-era shape) must see the
+    /// block-count cap stay completely inert — identical output to the
+    /// pre-DEV-5 byte-only splitter, i.e. the new cap never ADDS
+    /// fragmentation on top of an already-dense split.
+    #[test]
+    fn splitter_dense_already_split_by_bytes_block_cap_inert() {
+        // Oversized (5000-byte) blocks against a 1000-byte budget: the byte
+        // cap fires on every single block (splitter_oversized_block_forms_own_subchunk's
+        // shape, generalized to 6 blocks). The block-count cap is set to the
+        // production default (5,000) — nowhere near tripping on a 6-block run.
+        let mut s = ChunkSplitter::new(1000, EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize);
+        let mut emitted: Vec<Vec<CompactBlock>> = Vec::new();
+        for b in linked(100, 6, 5000) {
+            if let Some((blocks, _bytes)) = s.push(b) {
+                emitted.push(blocks);
+            }
+        }
+        if let Some((blocks, _)) = s.finish() {
+            emitted.push(blocks);
+        }
+        assert_eq!(
+            emitted.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![1, 1, 1, 1, 1, 1],
+            "byte cap alone governs a dense stream; block cap adds nothing"
+        );
+    }
+
+    /// THE DEV-5 reproduction, in unit-test form: the exact failing shape
+    /// reported from the field (block stream 3,355,000..3,364,999, "plan
+    /// chunk 25", h2 GoAway b\"too_many_data_frames\" ENHANCE_YOUR_CALM — see
+    /// DEV-5-FRAMECAP-REPORT.md §1). A 10,000-block plan chunk at ~500-600
+    /// B/block (~5-6 MB total) stays comfortably under the 8 MiB byte cap —
+    /// PRE-DEV-5 (byte-only splitter) this was ONE sub-chunk, i.e. one gRPC
+    /// stream of ~10,000 messages. POST-DEV-5, the shipped production
+    /// defaults (8 MiB byte cap, 5,000-block cap) must split it into exactly
+    /// 2 sub-chunks of 5,000 blocks each, halving the frames-per-stream count
+    /// with the byte cap never once entering into it.
+    #[test]
+    fn splitter_sparse_many_blocks_hits_block_cap_not_bytes() {
+        let mut s = ChunkSplitter::new(
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize,
+        );
+        let mut emitted: Vec<Vec<CompactBlock>> = Vec::new();
+        let mut total_bytes = 0usize;
+        for b in linked(3_355_000, 10_000, 550) {
+            if let Some((blocks, bytes)) = s.push(b) {
+                total_bytes += bytes;
+                emitted.push(blocks);
+            }
+        }
+        if let Some((blocks, bytes)) = s.finish() {
+            total_bytes += bytes;
+            emitted.push(blocks);
+        }
+        assert!(
+            total_bytes < EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            "the whole 10,000-block range must stay under the byte cap -- this \
+             is exactly what made the pre-DEV-5 byte-only splitter blind to it \
+             (got {total_bytes} bytes)"
+        );
+        assert_eq!(
+            emitted.len(),
+            2,
+            "10,000 blocks at a 5,000-block cap must split into exactly 2 sub-chunks"
+        );
+        assert_eq!(
+            emitted.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![5000, 5000]
+        );
+        let heights: Vec<u64> = emitted.iter().flatten().map(|b| b.height).collect();
+        assert_eq!(
+            heights,
+            (3_355_000..3_365_000).collect::<Vec<_>>(),
+            "order preserved, nothing lost, exact failing range reproduced"
+        );
     }
 
     // ── pump_block_stream ──────────────────────────────────────────────────────
@@ -1091,6 +1278,7 @@ mod tests {
             &mut s,
             &mut cursor,
             2500,
+            NO_BLOCK_CAP,
             Duration::from_secs(120),
             &gate,
             &tx,
@@ -1140,6 +1328,7 @@ mod tests {
             &mut s,
             &mut cursor,
             EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize,
             Duration::from_secs(120),
             &gate,
             &tx,
@@ -1175,6 +1364,7 @@ mod tests {
             &mut s,
             &mut cursor,
             2500,
+            NO_BLOCK_CAP,
             Duration::from_secs(120),
             &gate,
             &tx,
@@ -1214,6 +1404,7 @@ mod tests {
             &mut s1,
             &mut cursor,
             2500,
+            NO_BLOCK_CAP,
             Duration::from_secs(120),
             &gate,
             &tx,
@@ -1237,6 +1428,7 @@ mod tests {
             &mut s2,
             &mut cursor,
             2500,
+            NO_BLOCK_CAP,
             Duration::from_secs(120),
             &gate,
             &tx,
@@ -1285,6 +1477,7 @@ mod tests {
             &mut s,
             &mut cursor,
             2500,
+            NO_BLOCK_CAP,
             Duration::from_secs(5),
             &gate,
             &tx,
@@ -1309,11 +1502,12 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some((Ok::<_, tonic::Status>(block_sized(h, 1000)), h + 1))
         }));
-        // Budget is huge → nothing ever emits → the 5s progress deadline fires.
+        // Both budgets are huge → nothing ever emits → the 5s progress deadline fires.
         let err = pump_block_stream(
             &mut s,
             &mut cursor,
             usize::MAX >> 8,
+            NO_BLOCK_CAP,
             Duration::from_secs(5),
             &gate,
             &tx,
@@ -1329,6 +1523,48 @@ mod tests {
             cursor.resume_from, 100,
             "no emission → resume from plan start"
         );
+    }
+
+    /// DEV-5 end-to-end: proves the block-count cap is correctly threaded all
+    /// the way through `pump_block_stream` (not just the raw `ChunkSplitter`
+    /// unit tests above) — a huge byte budget that would never split these
+    /// tiny blocks, paired with a block-count cap of 5, must still yield 3
+    /// sub-chunks (5, 5, 2) with `is_last` only on the final one.
+    #[tokio::test]
+    async fn pump_block_count_cap_splits_even_when_bytes_are_tiny() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(7, 100, 111);
+        let mut s = stream::iter(
+            linked(100, 12, 16)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            1024 * 1024, // huge byte budget -- never trips for 12×16-byte blocks
+            5,           // the DEV-5 cap under test
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("pump");
+        assert!(matches!(out, PumpOutcome::Completed));
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        assert_eq!(
+            subs.iter().map(|s| s.blocks.len()).collect::<Vec<_>>(),
+            vec![5, 5, 2],
+            "block-count cap must govern sub-chunk sizes end-to-end through the pump path"
+        );
+        assert_eq!(
+            subs.iter().map(|s| s.is_last).collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_heights_consecutive(&subs, 100, 111);
     }
 
     // ── AheadGate ──────────────────────────────────────────────────────────────

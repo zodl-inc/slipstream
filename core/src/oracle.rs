@@ -1166,7 +1166,9 @@ mod tests {
 
         // Derive the window lengths from the production splitter.
         let mut lens: Vec<usize> = Vec::new();
-        let mut splitter = crate::fetch::ChunkSplitter::new(6 * 1024);
+        // DEV-5: usize::MAX isolates the byte-only splitter behavior this
+        // dense-chunking oracle test is specifically about.
+        let mut splitter = crate::fetch::ChunkSplitter::new(6 * 1024, usize::MAX);
         for b in blocks.clone() {
             if let Some((sub, _bytes)) = splitter.push(b) {
                 lens.push(sub.len());
@@ -1440,7 +1442,9 @@ mod tests {
         let blocks = super::testkit::synth_blocks(80, 20);
 
         let mut lens: Vec<usize> = Vec::new();
-        let mut splitter = crate::fetch::ChunkSplitter::new(6 * 1024);
+        // DEV-5: usize::MAX isolates the byte-only splitter behavior this
+        // dense-chunking oracle test is specifically about.
+        let mut splitter = crate::fetch::ChunkSplitter::new(6 * 1024, usize::MAX);
         for b in blocks.clone() {
             if let Some((sub, _bytes)) = splitter.push(b) {
                 lens.push(sub.len());
