@@ -1137,11 +1137,12 @@ fn cmd_sync(
                     outcome.elapsed.as_secs_f64()
                 );
                 println!(
-                    "ranges {} | fetched {} blocks ({:.1} MB) | scanned {} blocks",
+                    "ranges {} | fetched {} blocks ({:.1} MB) | scanned {} blocks | goaway_splits {}",
                     outcome.report.ranges_processed,
                     outcome.report.fetch.blocks,
                     mb,
                     outcome.report.scan.blocks,
+                    outcome.report.fetch.goaway_splits,
                 );
                 println!(
                     "notes found: sapling {} orchard {}",

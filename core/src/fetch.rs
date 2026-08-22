@@ -21,13 +21,34 @@
 //! "sandblasting" ~1.70M–2.00M: hundreds of MB per 10k blocks) stay
 //! memory-bounded and timeout-immune, AND so a middle-density plan chunk that
 //! stays under the byte budget (~10,000 small messages on one gRPC stream)
-//! cannot trip the server's h2 per-stream frame-count protection (`GoAway
+//! is less likely to trip h2's own per-stream small-DATA-frame guard (`GoAway
 //! b"too_many_data_frames" ENHANCE_YOUR_CALM`; field-reproduced at
 //! 3,355,000..3,364,999 — see `DEV-5-FRAMECAP-REPORT.md`). A reorder stage
 //! releases sub-chunks strictly in (plan_index, sub_index) order —
 //! continuity-verified — into the byte-budgeted ChunkQueue. Splitting +
 //! resume-from-height retry landed in run T6.8-S, 2026-06-12; the
 //! block-count cap landed in DEV-5.
+//!
+//! \[DEV-6\] DEV-5's `chunk_split_blocks` is a proactive CONSTANT — sized for
+//! the one failing range that had been field-observed when it shipped, blind
+//! to any budget it wasn't tuned against. `worker`'s retry path adds the
+//! reactive counterpart: when a request attempt fails with SPECIFICALLY the
+//! classified GoAway (`is_goaway_frame_overload`, this file) — h2's own
+//! locally-raised `too_many_data_frames`/`ENHANCE_YOUR_CALM` self-protection,
+//! see that function's doc for the primary-source citation of WHERE the
+//! error actually originates — the worker immediately halves the failing
+//! attempt's requested block span (`goaway_halved_cap`) and re-issues a
+//! smaller `GetBlockRange` call from the same recorded resume height, no
+//! sleep, outside the zero-progress retry-strike accounting entirely. This
+//! repeats, halving again on each further classified GoAway, down to a
+//! 1,000-block floor (`GOAWAY_ADAPTIVE_FLOOR_BLOCKS`); a request already at
+//! the floor that still GoAways is treated as a genuine failure and falls
+//! through to the pre-DEV-6 zero-progress sleep-ladder unchanged. The
+//! resulting extra sub-requests are just more grist for the SAME
+//! resume-from-height/sub_index machinery T6.8-S already built for
+//! error-triggered retries — `PlanChunkCursor::request_end` is the only new
+//! seam, threaded through `open_and_pump`/`pump_block_stream` alongside the
+//! plan chunk's true end (which alone still governs `is_last`).
 
 use std::{
     collections::BTreeMap,
@@ -169,6 +190,14 @@ pub struct FetchStats {
     /// raw material for windowed throughput (worst-window reporting now, the
     /// P2 collapse detector later). ~1 sample per ≤ split_bytes of wire data.
     pub wire_samples: Vec<(f64, u64)>,
+    /// \[DEV-6\] Count of adaptive halving steps the GoAway reflex engaged
+    /// across every worker during this fetch — one per classified GoAway that
+    /// got a smaller-span immediate retry (not one per plan chunk; a plan
+    /// chunk that halves 10,000→5,000→2,500 before succeeding counts 2).
+    /// Zero in the overwhelming common case; a nonzero value means h2's
+    /// `too_many_data_frames` guard fired and the reflex absorbed it without
+    /// falling back to the sleep ladder.
+    pub goaway_splits: u64,
 }
 
 impl FetchStats {
@@ -375,7 +404,9 @@ impl AheadGate {
 /// Per-plan-chunk streaming state, surviving retries (resume-from-height).
 struct PlanChunkCursor {
     plan_index: u64,
-    /// Plan-chunk end bound (inclusive).
+    /// Plan-chunk end bound (inclusive). The plan chunk's TRUE final height —
+    /// unlike `request_end()` below, never shrunk by the DEV-6 adaptive cap —
+    /// this alone decides `is_last`.
     end: u64,
     /// Next height to request: (last emitted sub-chunk's end) + 1. Retries
     /// re-open the stream HERE — already-emitted heights are never re-sent, so
@@ -386,6 +417,31 @@ struct PlanChunkCursor {
     /// Set by every emitted sub-chunk; cleared at attempt start (see worker's
     /// zero-progress retry accounting).
     emitted_this_attempt: bool,
+    /// \[DEV-6\] Active GoAway-adaptive request-span cap for the REST of this
+    /// plan chunk's attempts. `None` = unrestricted (request `resume_from..end`
+    /// as one call — pre-DEV-6 behavior, unchanged). Set on the first
+    /// classified GoAway (`goaway_halved_cap`) and halved again on every
+    /// subsequent one; STICKY once engaged — persists across a successful
+    /// capped sub-request too, for the rest of THIS plan chunk, rather than
+    /// springing back to full size and risking an immediate repeat GoAway.
+    /// Reset only by moving to a new plan chunk (a fresh `PlanChunkCursor`).
+    goaway_cap: Option<u32>,
+}
+
+impl PlanChunkCursor {
+    /// \[DEV-6\] End height to request on THIS attempt: the plan chunk's true
+    /// end, clamped by the active adaptive cap (if any) — never below
+    /// `resume_from` since `goaway_cap` is always `>= 1`.
+    fn request_end(&self) -> u64 {
+        match self.goaway_cap {
+            Some(cap) => self.end.min(
+                self.resume_from
+                    .saturating_add(u64::from(cap))
+                    .saturating_sub(1),
+            ),
+            None => self.end,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -436,6 +492,81 @@ async fn emit_sub_chunk(
     true
 }
 
+// ── DEV-6: adaptive split-on-GoAway reflex ─────────────────────────────────────
+
+/// \[DEV-6\] Floor for the GoAway-adaptive halving reflex: the smallest
+/// request span the reflex will retry immediately. A request already at (or
+/// below) this floor that still GoAways is a genuine failure, not something
+/// further halving could plausibly fix — it falls through to the pre-DEV-6
+/// zero-progress sleep-ladder unchanged (`worker`'s retry loop).
+const GOAWAY_ADAPTIVE_FLOOR_BLOCKS: u32 = 1_000;
+
+/// \[DEV-6\] Precise classifier for the GoAway-adaptive reflex: true only for
+/// h2's own locally-raised `too_many_data_frames` / `ENHANCE_YOUR_CALM`
+/// self-protection — its per-stream guard against a peer delivering an
+/// excessive run of small DATA frames (`h2-0.4.18` `proto/streams/streams.rs`:
+/// `counts.record_data_frame(payload_len)` failing raises exactly
+/// `Error::library_go_away_data(Reason::ENHANCE_YOUR_CALM,
+/// "too_many_data_frames")`). Read primary sources rather than assumed: this
+/// is `Initiator::Library` — h2's OWN client-side stack closing the
+/// connection on itself, not a frame lightwalletd sent; the earlier
+/// `h2 = "0.4.15"` pinned by this workspace's `Cargo.lock` predates this
+/// specific guard (absent from that version's source; introduced by 0.4.18),
+/// which independently bears on whether a live run this session can trip it
+/// at all — see the DEV-6 report.
+///
+/// Matching happens on the fully rendered error text rather than a typed
+/// downcast, because by the time a stream-read error reaches
+/// `SlipstreamError::Transport` (via `format!("{ctx}: {e}")`, both call sites
+/// below), it already IS just a `String` — `SlipstreamError::Transport`'s
+/// only shape. That string is not lossy for this purpose: `tonic::Status`'s
+/// own `Display` impl (tonic 0.14.6 `status.rs`) writes
+/// `code: '...', message: "...", source: {source:?}`, and `hyper::Error` /
+/// `h2::Error`'s `Debug` impls recursively chain into that `source:` slot —
+/// confirmed by reading the exact impls, not assumed — so all three markers
+/// below are present verbatim whenever the underlying cause truly is this
+/// GoAway class. Requiring all three (not `ENHANCE_YOUR_CALM` alone, which
+/// h2 also raises for unrelated self-protections like
+/// `too_many_internal_resets`) is the "match precisely" this reflex needs:
+/// non-matching transport errors — including other GoAway reasons — fall
+/// through to today's unchanged handling.
+fn is_goaway_frame_overload(err: &SlipstreamError) -> bool {
+    let SlipstreamError::Transport(msg) = err else {
+        return false;
+    };
+    msg.contains("GoAway(")
+        && msg.contains("ENHANCE_YOUR_CALM")
+        && msg.contains("too_many_data_frames")
+}
+
+/// \[DEV-6\] Pure halving step, independent of any network/async machinery.
+/// `attempted_span` is the block count actually requested by the attempt
+/// that just GoAway'd (the plan chunk's full remaining span the first time;
+/// the prior cap — or less, near a plan chunk's tail — on subsequent
+/// halvings). Returns the new, smaller cap to retry immediately with, or
+/// `None` once `attempted_span` is already at or below `floor`: "give up the
+/// adaptive path for this GoAway; fall through to the normal ladder."
+fn goaway_halved_cap(attempted_span: u32, floor: u32) -> Option<u32> {
+    if attempted_span <= floor {
+        None
+    } else {
+        Some((attempted_span / 2).max(floor))
+    }
+}
+
+/// \[DEV-6\] The reflex's full decision in one call: classify, then (if it
+/// matches) halve. `worker`'s retry loop calls this once per failed attempt;
+/// `Some(cap)` means "retry immediately at this cap, no strike, no sleep,"
+/// `None` means "not this reflex's concern — run the normal ladder" (either
+/// because the error isn't the classified GoAway at all, or because it is
+/// but `attempted_span` was already at the floor).
+fn goaway_adaptive_response(err: &SlipstreamError, attempted_span: u32, floor: u32) -> Option<u32> {
+    if !is_goaway_frame_overload(err) {
+        return None;
+    }
+    goaway_halved_cap(attempted_span, floor)
+}
+
 /// Streams one (possibly resumed) plan-chunk request into byte-budgeted
 /// sub-chunks. Generic over the message stream so hermetic tests can inject
 /// synthetic/flaky streams (production passes tonic's `Streaming`).
@@ -446,14 +577,24 @@ async fn emit_sub_chunk(
 /// stalled-but-open stream dies earlier via the per-message
 /// grpc::STREAM_IDLE_TIMEOUT inside `next_with_idle_timeout`.
 ///
-/// A clean stream end BEFORE `cursor.end` (short/empty delivery) is a
+/// A clean stream end BEFORE `request_end` (short/empty delivery) is a
 /// retryable Transport error: emitting the partial tail would either lose the
 /// missing blocks silently or feed scan an empty chunk; the worker retries
 /// from `resume_from` instead (the un-emitted tail is discarded by design —
 /// resume re-downloads at most one sub-chunk's worth).
+///
+/// `request_end` (\[DEV-6\]) is the end height THIS call actually requested —
+/// `cursor.end` (the plan chunk's true end) when no adaptive cap is active,
+/// or something smaller when the caller is retrying a GoAway-halved span.
+/// Reaching it cleanly always completes THIS call (`PumpOutcome::Completed`);
+/// only reaching it AT `cursor.end` also marks the sub-chunk `is_last` and
+/// therefore the whole plan chunk done — the caller (`worker`) tells the two
+/// apart via `cursor.resume_from > cursor.end`.
+#[allow(clippy::too_many_arguments)] // internal seam of run_fetch; bundling would obscure the borrow structure
 async fn pump_block_stream<S>(
     stream: &mut S,
     cursor: &mut PlanChunkCursor,
+    request_end: u64,
     split_bytes: usize,
     split_blocks: usize,
     progress_deadline: Duration,
@@ -465,17 +606,20 @@ where
 {
     let ctx = format!(
         "block stream {}..{} (plan chunk {})",
-        cursor.resume_from, cursor.end, cursor.plan_index
+        cursor.resume_from, request_end, cursor.plan_index
     );
     let mut splitter = ChunkSplitter::new(split_bytes, split_blocks);
     // tokio Instant (not std) so start_paused tests drive the deadline.
     let mut last_progress = tokio::time::Instant::now();
     loop {
         let Some(item) = grpc::next_with_idle_timeout(stream, &ctx).await? else {
-            // Clean end of stream: flush the tail iff it completes the plan chunk.
+            // Clean end of stream: flush the tail iff it completes THIS request.
             return match splitter.finish() {
-                Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(cursor.end) => {
-                    if emit_sub_chunk(cursor, blocks, bytes, true, gate, out).await {
+                Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(request_end) => {
+                    // [DEV-6] is_last only at the plan chunk's TRUE end, never
+                    // at a smaller adaptively-capped request_end.
+                    let is_last = request_end == cursor.end;
+                    if emit_sub_chunk(cursor, blocks, bytes, is_last, gate, out).await {
                         Ok(PumpOutcome::Completed)
                     } else {
                         Ok(PumpOutcome::ConsumerGone)
@@ -486,8 +630,7 @@ where
                         .and_then(|(blocks, _)| blocks.last().map(|b| b.height))
                         .unwrap_or_else(|| cursor.resume_from.saturating_sub(1));
                     Err(SlipstreamError::Transport(format!(
-                        "{ctx}: stream ended short at {got}, expected {}",
-                        cursor.end
+                        "{ctx}: stream ended short at {got}, expected {request_end}"
                     )))
                 }
             };
@@ -509,9 +652,14 @@ where
 }
 
 /// Opens the (resume-aware) GetBlockRange stream and pumps it into sub-chunks.
+///
+/// `request_end` (\[DEV-6\]) — see `pump_block_stream`'s doc — bounds THIS
+/// call's request; pass `cursor.request_end()` (the plan chunk's true end,
+/// clamped by any active GoAway-adaptive cap).
 async fn open_and_pump(
     client: &mut LwdClient,
     cursor: &mut PlanChunkCursor,
+    request_end: u64,
     plan: &FetchPlan,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
@@ -522,7 +670,7 @@ async fn open_and_pump(
             hash: vec![],
         }),
         end: Some(BlockId {
-            height: cursor.end,
+            height: request_end,
             hash: vec![],
         }),
         ..Default::default()
@@ -535,20 +683,21 @@ async fn open_and_pump(
             SlipstreamError::Transport(format!(
                 "get_block_range {}..{}: timed out after {}s",
                 cursor.resume_from,
-                cursor.end,
+                request_end,
                 grpc::UNARY_TIMEOUT.as_secs()
             ))
         })?
         .map_err(|e| {
             SlipstreamError::Transport(format!(
                 "get_block_range {}..{}: {e}",
-                cursor.resume_from, cursor.end
+                cursor.resume_from, request_end
             ))
         })?
         .into_inner();
     pump_block_stream(
         &mut stream,
         cursor,
+        request_end,
         plan.split_bytes,
         plan.split_blocks as usize,
         plan.chunk_timeout,
@@ -565,6 +714,7 @@ async fn worker(
     next: Arc<AtomicU64>,
     gate: AheadGate,
     out: mpsc::Sender<SubChunk>,
+    goaway_splits: Arc<AtomicU64>,
 ) -> Result<(), SlipstreamError> {
     let mut client = connect_direct_with_retry(&endpoint).await?;
     loop {
@@ -580,19 +730,59 @@ async fn worker(
             resume_from: s,
             next_sub_index: 0,
             emitted_this_attempt: false,
+            goaway_cap: None,
         };
         // Counts consecutive ZERO-PROGRESS attempts; an attempt that emitted a
         // sub-chunk resets the budget (resume makes such retries cheap and the
-        // total attempt count stays bounded by sub-chunks × retries).
+        // total attempt count stays bounded by sub-chunks × retries). [DEV-6]
+        // The adaptive GoAway reflex below never touches this counter at all —
+        // it is a separate, self-bounded (halving-to-floor) budget.
         let mut attempt: u32 = 0;
         loop {
-            attempt += 1;
+            let request_end = cursor.request_end();
             cursor.emitted_this_attempt = false;
-            match open_and_pump(&mut client, &mut cursor, &plan, &gate, &out).await {
-                Ok(PumpOutcome::Completed) => break,
+            match open_and_pump(&mut client, &mut cursor, request_end, &plan, &gate, &out).await {
+                Ok(PumpOutcome::Completed) => {
+                    if cursor.resume_from > cursor.end {
+                        break; // whole plan chunk released
+                    }
+                    // [DEV-6] Adaptively-capped partial success: more of this
+                    // plan chunk remains. Continue immediately with the next
+                    // (still-capped) slice — expected multi-request progress,
+                    // not a retry, so `attempt` stays untouched.
+                    continue;
+                }
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
                 Err(err) => {
-                    let failed_attempt = attempt;
+                    // [DEV-6] The adaptive reflex: a precisely classified GoAway
+                    // halves the request span and retries immediately, entirely
+                    // outside the zero-progress strike ladder — UNLESS the span
+                    // that just failed was already at (or below) the floor, in
+                    // which case this falls through to the unchanged handling.
+                    let attempted_span =
+                        u32::try_from(request_end - cursor.resume_from + 1).unwrap_or(u32::MAX);
+                    if let Some(new_cap) =
+                        goaway_adaptive_response(&err, attempted_span, GOAWAY_ADAPTIVE_FLOOR_BLOCKS)
+                    {
+                        cursor.goaway_cap = Some(new_cap);
+                        goaway_splits.fetch_add(1, Ordering::Relaxed);
+                        info!(
+                            worker_id,
+                            index,
+                            attempted_span,
+                            new_cap,
+                            resume_from = cursor.resume_from,
+                            "GoAway (too_many_data_frames): halving request span, retrying immediately"
+                        );
+                        // The connection is going away (h2 GOAWAY tears down the
+                        // whole connection, not just this stream) — same
+                        // poisoned-channel assumption as the normal path below,
+                        // just without the sleep.
+                        client = connect_direct_with_retry(&endpoint).await?;
+                        continue;
+                    }
+                    let failed_attempt = attempt + 1;
+                    attempt = failed_attempt;
                     if cursor.emitted_this_attempt {
                         attempt = 0; // progress was made — fresh retry budget
                     }
@@ -886,6 +1076,8 @@ pub async fn run_fetch(
     );
     // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
     let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
+    // [DEV-6] Shared across every worker; read back after they all join.
+    let goaway_splits = Arc::new(AtomicU64::new(0));
 
     let mut handles = Vec::with_capacity(plan.streams);
     for worker_id in 0..plan.streams.max(1) {
@@ -896,6 +1088,7 @@ pub async fn run_fetch(
             Arc::clone(&next),
             gate.clone(),
             tx.clone(),
+            Arc::clone(&goaway_splits),
         )));
     }
     drop(tx); // release loop ends when all workers finish
@@ -940,6 +1133,7 @@ pub async fn run_fetch(
         bytes: summary.bytes,
         elapsed: started.elapsed(),
         wire_samples: summary.wire_samples,
+        goaway_splits: goaway_splits.load(Ordering::Relaxed),
     };
     info!(
         blocks = stats.blocks,
@@ -947,6 +1141,7 @@ pub async fn run_fetch(
         elapsed_s = stats.elapsed.as_secs(),
         wire_mbps = format!("{:.1}", stats.megabytes_per_sec()).as_str(),
         wire_worst_5s_mbps = format!("{:.1}", stats.worst_window_mbps(5.0)).as_str(),
+        goaway_splits = stats.goaway_splits,
         "fetch done"
     );
     Ok(stats)
@@ -1020,6 +1215,7 @@ mod tests {
             resume_from: start,
             next_sub_index: 0,
             emitted_this_attempt: false,
+            goaway_cap: None,
         }
     }
 
@@ -1261,6 +1457,168 @@ mod tests {
         );
     }
 
+    // ── DEV-6: is_goaway_frame_overload (the error-classifier) ────────────────
+
+    /// The exact shape cited in `DEV-5-FRAMECAP-REPORT.md` §1.4 (itself cited
+    /// from `F2-ADAPTER-PARITY-REPORT.md`), reproduced here as a fabricated
+    /// `SlipstreamError::Transport` — this is precisely what
+    /// `format!("{ctx}: {e}")` produces from a live `tonic::Status` whose
+    /// source chain is this GoAway (verified against tonic 0.14.6's own
+    /// `Status::fmt`/`hyper::Error`'s/`h2::Error`'s `Debug` impls; see the
+    /// classifier's doc comment).
+    fn fabricated_goaway_chain() -> SlipstreamError {
+        SlipstreamError::Transport(
+            "block stream 3355000..3364999 (plan chunk 25): code: 'Some resource has been \
+             exhausted', message: \"h2 protocol error: error reading a body from connection\", \
+             source: hyper::Error(Body, Error { kind: GoAway(b\"too_many_data_frames\", \
+             ENHANCE_YOUR_CALM, Library) })"
+                .to_string(),
+        )
+    }
+
+    #[test]
+    fn goaway_classifier_matches_fabricated_chain() {
+        assert!(is_goaway_frame_overload(&fabricated_goaway_chain()));
+    }
+
+    #[test]
+    fn goaway_classifier_rejects_plain_connection_reset() {
+        let err = SlipstreamError::Transport(
+            "get_block_range 100..200: transport error: connection reset by peer".into(),
+        );
+        assert!(!is_goaway_frame_overload(&err));
+    }
+
+    /// "Do NOT broaden to all transport errors": h2 raises `ENHANCE_YOUR_CALM`
+    /// for OTHER self-protections too (e.g. `too_many_internal_resets`,
+    /// `h2-0.4.15` `proto/streams/streams.rs`) — the reason code alone is not
+    /// precise enough; the debug-data string must ALSO match.
+    #[test]
+    fn goaway_classifier_rejects_other_enhance_your_calm_reasons() {
+        let err = SlipstreamError::Transport(
+            "block stream 100..200 (plan chunk 1): code: 'Some resource has been exhausted', \
+             message: \"h2 protocol error\", source: hyper::Error(Body, Error { kind: \
+             GoAway(b\"too_many_internal_resets\", ENHANCE_YOUR_CALM, Library) })"
+                .into(),
+        );
+        assert!(
+            !is_goaway_frame_overload(&err),
+            "ENHANCE_YOUR_CALM alone (a different h2 self-protection) must not match"
+        );
+    }
+
+    /// The classifier gates on the `SlipstreamError` variant, not merely on
+    /// substring content anywhere in the program — a non-`Transport` error
+    /// can never be this reflex's concern regardless of what text it carries.
+    #[test]
+    fn goaway_classifier_rejects_non_transport_variant() {
+        let err = SlipstreamError::Wallet("too_many_data_frames ENHANCE_YOUR_CALM GoAway(".into());
+        assert!(!is_goaway_frame_overload(&err));
+    }
+
+    // ── DEV-6: goaway_halved_cap (the halving math) ────────────────────────────
+
+    #[test]
+    fn goaway_halving_sequence_from_full_chunk_to_floor() {
+        // The DEV-5-default shape: a 10,000-block plan chunk with no adaptive
+        // cap yet active halves 10000 -> 5000 -> 2500 -> 1250 -> 1000(floor),
+        // then gives up (constraint: the floor is where the reflex stops).
+        let floor = 1_000;
+        let mut span = 10_000u32;
+        let mut caps = Vec::new();
+        while let Some(cap) = goaway_halved_cap(span, floor) {
+            caps.push(cap);
+            span = cap;
+        }
+        assert_eq!(caps, vec![5_000, 2_500, 1_250, 1_000]);
+    }
+
+    #[test]
+    fn goaway_halving_stops_once_at_or_below_floor() {
+        assert_eq!(goaway_halved_cap(1_000, 1_000), None, "exactly at floor");
+        assert_eq!(goaway_halved_cap(999, 1_000), None, "already below floor");
+    }
+
+    #[test]
+    fn goaway_halving_never_undershoots_the_floor() {
+        // Raw halving of 1250 is 625, which is BELOW the 1000 floor -- the
+        // result must clamp to the floor, not fall under it.
+        assert_eq!(goaway_halved_cap(1_250, 1_000), Some(1_000));
+    }
+
+    #[test]
+    fn goaway_halving_small_remaining_span_gives_up_immediately() {
+        // A plan-chunk TAIL already smaller than the floor (e.g. the last
+        // 800 blocks of a plan chunk) never gets a "free" adaptive retry --
+        // nothing left to halve meaningfully, straight to the normal ladder.
+        assert_eq!(goaway_halved_cap(800, 1_000), None);
+    }
+
+    // ── DEV-6: goaway_adaptive_response (classify + halve, worker's call) ─────
+
+    #[test]
+    fn adaptive_response_engages_on_matching_goaway_above_floor() {
+        assert_eq!(
+            goaway_adaptive_response(&fabricated_goaway_chain(), 10_000, 1_000),
+            Some(5_000)
+        );
+    }
+
+    #[test]
+    fn adaptive_response_none_on_matching_goaway_at_floor() {
+        assert_eq!(
+            goaway_adaptive_response(&fabricated_goaway_chain(), 1_000, 1_000),
+            None,
+            "at the floor and STILL GoAway-ing falls through to the normal ladder"
+        );
+    }
+
+    #[test]
+    fn adaptive_response_none_on_non_goaway_error_regardless_of_span() {
+        let err = SlipstreamError::Transport("stream idle timeout (30s)".into());
+        assert_eq!(goaway_adaptive_response(&err, 10_000, 1_000), None);
+    }
+
+    // ── DEV-6: PlanChunkCursor::request_end (resume-height interaction) ───────
+
+    #[test]
+    fn request_end_unrestricted_without_a_cap() {
+        let cursor = test_cursor(0, 3_355_000, 3_364_999);
+        assert_eq!(cursor.request_end(), 3_364_999);
+    }
+
+    #[test]
+    fn request_end_clamped_by_an_active_cap() {
+        let mut cursor = test_cursor(25, 3_355_000, 3_364_999);
+        cursor.goaway_cap = Some(5_000);
+        assert_eq!(cursor.request_end(), 3_359_999, "resume_from + cap - 1");
+    }
+
+    #[test]
+    fn request_end_cap_interacts_with_an_advanced_resume_from() {
+        // After some sub-chunks already emitted, the cap re-anchors on the
+        // NEW resume_from -- proving the "resume-height interaction" the
+        // task asked to cover explicitly.
+        let mut cursor = test_cursor(25, 3_355_000, 3_364_999);
+        cursor.resume_from = 3_360_000; // 5,000 blocks already emitted
+        cursor.goaway_cap = Some(2_500);
+        assert_eq!(cursor.request_end(), 3_362_499);
+    }
+
+    #[test]
+    fn request_end_cap_never_exceeds_the_plan_chunk_true_end() {
+        // Near a plan chunk's tail, a cap larger than what's left must not
+        // reach past cursor.end (would ask for blocks outside this plan
+        // chunk entirely).
+        let mut cursor = test_cursor(25, 3_364_500, 3_364_999); // 500 blocks left
+        cursor.goaway_cap = Some(1_000); // cap bigger than the remaining span
+        assert_eq!(
+            cursor.request_end(),
+            3_364_999,
+            "clamped to cursor.end, not resume_from + cap - 1"
+        );
+    }
+
     // ── pump_block_stream ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1277,6 +1635,7 @@ mod tests {
         let out = pump_block_stream(
             &mut s,
             &mut cursor,
+            119,
             2500,
             NO_BLOCK_CAP,
             Duration::from_secs(120),
@@ -1327,6 +1686,7 @@ mod tests {
         let out = pump_block_stream(
             &mut s,
             &mut cursor,
+            109,
             EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
             EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize,
             Duration::from_secs(120),
@@ -1363,6 +1723,7 @@ mod tests {
         let err = pump_block_stream(
             &mut s,
             &mut cursor,
+            119,
             2500,
             NO_BLOCK_CAP,
             Duration::from_secs(120),
@@ -1403,6 +1764,7 @@ mod tests {
         let err = pump_block_stream(
             &mut s1,
             &mut cursor,
+            139,
             2500,
             NO_BLOCK_CAP,
             Duration::from_secs(120),
@@ -1427,6 +1789,7 @@ mod tests {
         let out = pump_block_stream(
             &mut s2,
             &mut cursor,
+            139,
             2500,
             NO_BLOCK_CAP,
             Duration::from_secs(120),
@@ -1476,6 +1839,7 @@ mod tests {
         let out = pump_block_stream(
             &mut s,
             &mut cursor,
+            129,
             2500,
             NO_BLOCK_CAP,
             Duration::from_secs(5),
@@ -1506,6 +1870,7 @@ mod tests {
         let err = pump_block_stream(
             &mut s,
             &mut cursor,
+            129,
             usize::MAX >> 8,
             NO_BLOCK_CAP,
             Duration::from_secs(5),
@@ -1544,6 +1909,7 @@ mod tests {
         let out = pump_block_stream(
             &mut s,
             &mut cursor,
+            111,
             1024 * 1024, // huge byte budget -- never trips for 12×16-byte blocks
             5,           // the DEV-5 cap under test
             Duration::from_secs(120),
@@ -1565,6 +1931,136 @@ mod tests {
             vec![false, false, true]
         );
         assert_heights_consecutive(&subs, 100, 111);
+    }
+
+    // ── DEV-6: adaptively-capped requests through pump_block_stream ───────────
+    //
+    // These exercise exactly what `worker`'s retry loop drives when the
+    // GoAway reflex is engaged: `request_end` smaller than `cursor.end`.
+    // `worker` itself isn't unit-testable (it owns a real `LwdClient`), so —
+    // matching this file's existing altitude (`pump_resume_after_midstream_
+    // error_no_duplicates` proves the error-triggered resume contract at
+    // this same layer) — these prove the SUCCESS-triggered continuation
+    // contract: in-order reassembly holds across a halved sub-range feeding
+    // the same (plan_index, sub_index) slot sequence.
+
+    /// A single capped request that completes cleanly at `request_end` (NOT
+    /// `cursor.end`) must report `PumpOutcome::Completed` with `is_last =
+    /// false` and leave `resume_from` exactly one past `request_end`, ready
+    /// for a follow-up request — not `true`/plan-chunk-done, which would
+    /// wrongly tell the reorder stage this plan chunk is finished.
+    #[tokio::test]
+    async fn pump_partial_request_end_below_plan_chunk_end_is_not_last() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(25, 3_355_000, 3_364_999); // true end far above
+        let mut s = stream::iter(
+            linked(3_355_000, 5_000, 550)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            3_359_999, // capped request_end -- half of the plan chunk
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("capped request completes cleanly");
+        assert!(matches!(out, PumpOutcome::Completed));
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        assert_eq!(subs.len(), 1);
+        assert!(
+            !subs[0].is_last,
+            "reaching the CAPPED request_end must not be mistaken for plan-chunk completion"
+        );
+        assert_eq!(
+            cursor.resume_from, 3_360_000,
+            "resume_from lands exactly one past request_end, ready for the follow-up request"
+        );
+    }
+
+    /// Two SEQUENTIAL capped requests against the SAME cursor (what `worker`
+    /// does across a halving step, minus the reconnect) must reassemble in
+    /// strict order with no gaps/dups: dense sub_index across the boundary,
+    /// `is_last` ONLY on the second (the one that reaches the TRUE end), and
+    /// every height 3,355,000..=3,364,999 exactly once.
+    #[tokio::test]
+    async fn pump_multiple_sequential_capped_requests_then_final_is_last() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(25, 3_355_000, 3_364_999);
+
+        // First (capped) request: exactly the first half.
+        let mut s1 = stream::iter(
+            linked(3_355_000, 5_000, 550)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let out1 = pump_block_stream(
+            &mut s1,
+            &mut cursor,
+            3_359_999,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("first capped request completes");
+        assert!(matches!(out1, PumpOutcome::Completed));
+        assert!(cursor.resume_from <= cursor.end, "plan chunk not yet done");
+        let subs_before = cursor.next_sub_index;
+
+        // Second request: the rest, up to the TRUE plan-chunk end this time.
+        let true_end = cursor.end;
+        let mut s2 = stream::iter(
+            linked(cursor.resume_from, true_end - cursor.resume_from + 1, 550)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let out2 = pump_block_stream(
+            &mut s2,
+            &mut cursor,
+            true_end,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS as usize,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("second request completes the plan chunk");
+        assert!(matches!(out2, PumpOutcome::Completed));
+        assert!(cursor.resume_from > cursor.end, "plan chunk now fully done");
+        assert!(
+            cursor.next_sub_index > subs_before,
+            "sub_index continued, not reset"
+        );
+
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        assert_eq!(
+            subs.iter().map(|s| s.sub_index).collect::<Vec<_>>(),
+            (0..subs.len() as u64).collect::<Vec<_>>(),
+            "sub_index dense across the capped-request boundary"
+        );
+        assert_eq!(
+            subs.iter().filter(|s| s.is_last).count(),
+            1,
+            "exactly one is_last, on the request that reached the TRUE end"
+        );
+        assert!(subs.last().expect("nonempty").is_last);
+        assert_heights_consecutive(&subs, 3_355_000, 3_364_999);
     }
 
     // ── AheadGate ──────────────────────────────────────────────────────────────

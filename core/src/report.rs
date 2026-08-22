@@ -70,6 +70,9 @@ pub fn log_pass_summary(outcome: &SyncOutcome, config: &EngineConfig) {
         finished_at_utc = %wall_clock_utc(),
         sparse = config.sparse_persistence,
         write_behind = config.write_behind,
+        // [DEV-6] Adaptive GoAway-halving steps this pass engaged, summed
+        // across every range's fetch workers. Zero in the common case.
+        goaway_splits = outcome.report.fetch.goaway_splits,
         "sync stage split"
     );
 
