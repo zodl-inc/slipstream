@@ -32,7 +32,7 @@ use crate::error::SlipstreamError;
 /// determinism test proves a column is non-deterministic; every addition needs
 /// a Decision-Log entry citing the upstream write site.
 ///
-/// # ALLOWLIST entries (Decision-Log in STATE.md)
+/// # ALLOWLIST entries
 ///
 /// - `("accounts", "uuid")`: random `Uuid::new_v4()` generated at account-import time.
 ///   Write site: `zcash_client_sqlite-0.21.0/src/wallet.rs:464` (`let account_uuid =
@@ -1572,7 +1572,7 @@ mod tests {
     /// included. The lane runs audit-every (verify_sample=1 in the driver), so a
     /// root mismatch would fail loudly; equality of checkpoints + caps proves the
     /// grafted root feeds the same tree the built path computes.
-    /// Heavy (2× 66k-action scans): `cargo test -p slipstream-core --release
+    /// Heavy (2× 66k-action scans): `cargo test -p zodl-slipstream --release
     /// 2026-07-06 sandblasting-era P0 regression: deep-history windows scanned
     /// over a shard whose store row is a ROOT-ONLY leaf (the pass-start
     /// subtree-root ingest installs one for every chain-wide-completed shard)
@@ -1773,7 +1773,7 @@ mod tests {
     /// structurally required by the API but an orchard-only transaction never
     /// invokes them (the stub panics if it ever were).
     /// Heavy (76k-action scan + orchard proving key + proof): run explicitly with
-    /// `cargo test -p slipstream-core --release --lib -- --ignored graft_spend_proof`.
+    /// `cargo test -p zodl-slipstream --release --lib -- --ignored graft_spend_proof`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "heavy: 76k-action scan + orchard proving; run explicitly (use --release)"]
     async fn graft_spend_proof() {

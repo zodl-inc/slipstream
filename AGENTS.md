@@ -35,12 +35,12 @@ Rules:
   `gpuhash/`, and `protogen/`. Use the language's line-comment syntax if
   it is not `//`.
 - Do NOT add the header to:
-  - `vendor/` — vendored forks keep their own upstream license headers
-    and terms; never restamp them.
   - `core/src/grpc_generated/` (and other generated code) — generated
     output is left unstamped.
   - Non-source files: `Cargo.toml`, lockfiles, JSON/YAML config,
-    Markdown docs, protobuf vendored definitions.
+    Markdown docs, protobuf definitions.
+  - Any third-party code vendored into the tree in future: vendored forks
+    keep their own upstream license headers and terms; never restamp them.
 - When copying the header into a new file, copy it exactly — same
   wording, same year, same punctuation — from any existing stamped file
   (e.g. `core/src/lib.rs`).

@@ -18,10 +18,10 @@
 //! Start it first (from repo root):
 //!   Tests/lightwalletd/lightwalletd --no-tls-very-insecure --data-dir /tmp \
 //!     --darkside-very-insecure --log-file /dev/stdout
-//! Then: cargo test -p slipstream-core --features darkside -- --ignored
+//! Then: cargo test -p zodl-slipstream --features darkside -- --ignored
 #![cfg(feature = "darkside")]
 
-use slipstream_core::{config::Endpoint, darkside::DarksideCtl, grpc};
+use zodl_slipstream::{config::Endpoint, darkside::DarksideCtl, grpc};
 
 fn darkside_endpoint() -> Endpoint {
     Endpoint {
@@ -55,7 +55,7 @@ async fn stage_apply_and_read_tip_roundtrip() {
 #[tokio::test]
 #[ignore = "requires local darkside lightwalletd"]
 async fn parallel_fetch_5000_blocks_in_order() {
-    use slipstream_core::{
+    use zodl_slipstream::{
         chunk::chunk_queue,
         fetch::{FetchPlan, run_fetch},
     };

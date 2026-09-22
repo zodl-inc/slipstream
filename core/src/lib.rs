@@ -15,8 +15,8 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 //! Slipstream sync engine core (platform-neutral).
-//! See docs/SLIPSTREAM_DESIGN.md for the architecture and
-//! docs/slipstream/ROADMAP.md for the build plan.
+//! See HOSTING.md for the integration contract and REVIEWING.md for the
+//! module map.
 
 // Storage-independent transport/planning layer — compiled unconditionally.
 pub mod anchor;
@@ -104,13 +104,14 @@ pub use zcash_protocol::consensus::Network;
 pub use zcash_keys::keys::UnifiedFullViewingKey;
 pub use zcash_protocol::consensus::BlockHeight;
 
-/// Crate smoke marker used by the workspace smoke test.
-pub const CRATE_NAME: &str = "slipstream-core";
+/// Crate smoke marker used by the workspace smoke test. Derived from the
+/// package name so it cannot drift from the published crate.
+pub const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn smoke() {
-        assert_eq!(super::CRATE_NAME, "slipstream-core");
+        assert_eq!(super::CRATE_NAME, "zodl-slipstream");
     }
 }

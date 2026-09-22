@@ -6,7 +6,7 @@ question end to end: **what do I call so that a standard Zcash wallet database
 (`data.db`) fills with this wallet's data — and how do I read the results correctly.**
 
 (If you are building an iOS/macOS app on the Swift SDK, you want the higher-level
-integration guide in the SDK repo instead — `docs/slipstream/INTEGRATION_GUIDE.md`. This
+integration guide in the SDK repo instead. This
 document is one level below that: the contract that guide is built on.)
 
 ---
@@ -61,22 +61,22 @@ because some host once computed its own version and shipped a bug.)
 
 ## 2. Two ways in
 
-- **§3 — Rust host:** depend on `slipstream-core` and drive `run_session` directly.
+- **§3 — Rust host:** depend on `zodl-slipstream` and drive `run_session` directly.
   ~100 lines. The `slipstream watch` CLI in this repo is the complete reference.
 - **§4 — Any-language host over the C ABI:** call the `zcashlc_slipstream_*` functions.
   Today those live in `libzcashlc` (the Zcash Swift SDK's Rust library, which links
-  `slipstream-core`); they are self-contained (~600 lines over `slipstream-core`'s
+  `zodl-slipstream`); they are self-contained (~600 lines over `zodl-slipstream`'s
   `ffi_handle` module) and lift directly into your own cdylib if you don't want the rest
   of `libzcashlc`. Everything in §5–§9 (snapshot, events, SQL, provisioning, rules)
   applies identically to both.
 
-## 3. Rust host — `slipstream-core` directly
+## 3. Rust host — `zodl-slipstream` directly
 
 ### 3.1 Prerequisites
 
 ```toml
 [dependencies]
-slipstream-core = "0.3"    # (path/git until the crates.io publish)
+zodl-slipstream = "0.1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 ```
 
@@ -97,7 +97,7 @@ migrations itself — you do NOT need to initialize anything), a lightwalletd en
 
 ```rust
 use std::sync::{Arc, Mutex};
-use slipstream_core::{
+use zodl_slipstream::{
     EngineConfig, Endpoint, Network, Progress, SessionConfig, SessionReporter,
     ffi_handle::{self, SyncState, FfiSlipstreamEvent, derive_snapshot, spawn_supervised},
     session::run_session,
@@ -127,10 +127,10 @@ let pass_lock = Arc::new(tokio::sync::Mutex::new(()));
 // OPTIONAL but recommended: seed the snapshot from persisted wallet state BEFORE the
 // first pass, so a relaunched half-done restore reports its true position and recovery
 // flag from the very first poll ("truthful from open" — see §5).
-if let Ok(session) = slipstream_core::wallet_session::WalletSession::open(
+if let Ok(session) = zodl_slipstream::wallet_session::WalletSession::open(
     Network::MainNetwork, std::path::Path::new("/path/to/data.db"))
 {
-    let _ = slipstream_core::scheduler::seed_progress_from_wallet(&reporter.progress, &session);
+    let _ = zodl_slipstream::scheduler::seed_progress_from_wallet(&reporter.progress, &session);
 }
 
 // Spawn under the supervisor: a panicking pass becomes SyncState::Error + a tag-4 event,
@@ -345,7 +345,7 @@ owns the policy so every host provisions identically (`intent`: 1 = restore, 0 =
 Pass the same `tor_dir` you give `start` when your user enabled Tor — these fetches are
 identifying (they reveal birthday interest). A requested-but-failed Tor bootstrap
 resolves **offline**, never via a silent direct connection. Rust hosts call
-`slipstream_core::anchor::restore_anchor` / `offline_anchor` directly.
+`zodl_slipstream::anchor::restore_anchor` / `offline_anchor` directly.
 
 Feed the result into account creation (your `zcash_client_sqlite` calls, or
 `ufvk`+birthday at `start`). Keys still never cross.
@@ -361,6 +361,8 @@ Feed the result into account creation (your `zcash_client_sqlite` calls, or
 - Treat `state == 2` as "offer retry" (call `start` again). Transient network trouble
   never reaches you — it's retried inside.
 - Keep seeds/spending keys on your side of the boundary, always.
+- Satisfy the AGPL for whatever you build on the engine, or hold a commercial license
+  (§11) — settle this before you ship, especially for App Store distribution.
 
 **You must never:**
 - Compute progress from heights, smooth/clamp the reported progress, or add warm-up
@@ -379,6 +381,40 @@ crates (`zcash_keys`, `zcash_client_backend`, a lightwalletd submit call) — al
 operate on the same `data.db` slipstream maintains. The division is strict by design:
 the engine can be audited, fuzzed and swapped as a pure sync component, and your SDK
 keeps custody exactly where it already is.
+
+## 11. Licensing — the other host responsibility
+
+Slipstream is licensed under the **GNU Affero General Public License, version 3 only**
+(`AGPL-3.0-only`). See `LICENSE`, shipped in the crate.
+
+Hosting Slipstream is not mere aggregation: an SDK that links the engine and calls the
+API in this document is a work based on Slipstream, and the AGPL governs the whole of
+it. Concretely, if you convey your SDK or an application built on it to anyone:
+
+- The **complete corresponding source** of that work must be offered to every recipient
+  under the AGPL — including, per section 13, users who interact with it only over a
+  network and never receive a copy.
+- Keeping your source private, or licensing your SDK under other terms, is not
+  available under the AGPL. This is a condition on conveying, not on use: private
+  in-house deployment and modification carry no publication obligation.
+
+**Apple App Store and equivalent channels.** App Store terms are widely held to be
+incompatible with the AGPL's conditions. No section 7 additional permission is granted
+to AGPL licensees for such channels — see `LICENSE-EXCEPTIONS.md` §2. Official Zodl
+builds distributed there are released by Znewco under separate terms as copyright
+holder; that permission does not extend to you. **If your SDK is destined for the App
+Store, the AGPL is not a viable path** — resolve licensing before you build against
+this document, not after.
+
+**Commercial licensing.** If any of the above does not fit your project, Slipstream is
+dual-licensed and commercial terms are available from Znewco, Inc. — see
+`COMMERCIAL-LICENSE.md`. Use under the AGPL requires no registration, notification, or
+fee.
+
+Nothing here modifies the AGPL or grants any permission beyond it; `LICENSE` and
+`LICENSE-EXCEPTIONS.md` govern. The dependency crates named in §10 (`zcash_keys`,
+`zcash_client_backend`, and the rest of the librustzcash family) are separately licensed
+under MIT/Apache-2.0 by their own copyright holders and are not affected by this section.
 
 ---
 

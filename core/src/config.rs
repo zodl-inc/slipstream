@@ -14,8 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Engine configuration. Defaults are the Sprint-mode values from
-//! docs/SLIPSTREAM_DESIGN.md §4; modes adjust them later (P8).
+//! Engine configuration. Defaults are the Sprint-mode values; modes adjust
+//! them later (P8).
 
 use std::path::PathBuf;
 use std::time::Duration;

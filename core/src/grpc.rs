@@ -447,7 +447,7 @@ mod tests {
         assert!(end.is_none(), "clean end of stream must be Ok(None)");
     }
 
-    // Live-network smoke; run manually: cargo test -p slipstream-core -- --ignored
+    // Live-network smoke; run manually: cargo test -p zodl-slipstream -- --ignored
     #[tokio::test]
     #[ignore = "network"]
     async fn live_lightd_info_smoke() {

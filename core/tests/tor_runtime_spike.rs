@@ -26,7 +26,7 @@
 //! sync-FFI workaround the async engine doesn't need. This is the empirical confirmation.
 //!
 //! `#[ignore]`: live — needs network + a Tor bootstrap. Run for the gate:
-//!   cargo test -p slipstream-core --test tor_runtime_spike -- --ignored --nocapture
+//!   cargo test -p zodl-slipstream --test tor_runtime_spike -- --ignored --nocapture
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "live: needs network + Tor bootstrap; run manually for the T-Tor.0 gate"]

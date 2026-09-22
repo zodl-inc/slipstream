@@ -18,8 +18,8 @@
 //! Subcommands land per phase: `fetch` (P1), `sync` (P2+), `report` (P5).
 
 use clap::{Parser, Subcommand};
-use slipstream_core::{BlockHeight, UnifiedFullViewingKey};
 use zcash_protocol::consensus::Parameters;
+use zodl_slipstream::{BlockHeight, UnifiedFullViewingKey};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -169,12 +169,12 @@ enum Cmd {
         anchor_retention_interval: u32,
         /// Byte budget per fetch sub-chunk (T6.8-S adaptive split; makes dense
         /// "sandblasting" eras traversable). Must be >= 1 MiB.
-        #[arg(long, default_value_t = slipstream_core::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES)]
+        #[arg(long, default_value_t = zodl_slipstream::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES)]
         chunk_split_bytes: usize,
         /// T8.4: in-memory fetch/decode budget (bytes); must be >= 16 MiB. Lower it for
         /// memory-constrained runs — the device path derates this automatically from
         /// ProcessInfo.physicalMemory; this flag is the Mac/CLI equivalent (book ch.19).
-        #[arg(long, default_value_t = slipstream_core::EngineConfig::DEFAULT_MEMORY_BUDGET)]
+        #[arg(long, default_value_t = zodl_slipstream::EngineConfig::DEFAULT_MEMORY_BUDGET)]
         memory_budget_bytes: usize,
         /// T6.9: depth-1 write-behind persistence pipelining (overlap chunk N's
         /// DB commit with chunk N+1's decryption). Requires sparse. Default ON
@@ -340,10 +340,10 @@ enum NetworkArg {
 }
 
 impl NetworkArg {
-    fn to_network(self) -> slipstream_core::Network {
+    fn to_network(self) -> zodl_slipstream::Network {
         match self {
-            NetworkArg::Main => slipstream_core::Network::MainNetwork,
-            NetworkArg::Test => slipstream_core::Network::TestNetwork,
+            NetworkArg::Main => zodl_slipstream::Network::MainNetwork,
+            NetworkArg::Test => zodl_slipstream::Network::TestNetwork,
         }
     }
 
@@ -360,7 +360,7 @@ impl NetworkArg {
 fn resolve_network(
     arg: NetworkArg,
     custom_heights: Option<&str>,
-) -> slipstream_core::SlipstreamNetwork {
+) -> zodl_slipstream::SlipstreamNetwork {
     match custom_heights {
         None => arg.to_network().into(),
         Some(spec) => {
@@ -368,7 +368,7 @@ fn resolve_network(
                 eprintln!("error: --custom-heights: {e}");
                 std::process::exit(2);
             });
-            slipstream_core::SlipstreamNetwork::Custom {
+            zodl_slipstream::SlipstreamNetwork::Custom {
                 constants: arg.to_network_type(),
                 heights,
             }
@@ -377,11 +377,11 @@ fn resolve_network(
 }
 
 /// Parse `--custom-heights` (see the Sync arg doc for the grammar).
-fn parse_custom_heights(spec: &str) -> Result<slipstream_core::CustomActivations, String> {
-    let mut h = slipstream_core::CustomActivations::default();
+fn parse_custom_heights(spec: &str) -> Result<zodl_slipstream::CustomActivations, String> {
+    let mut h = zodl_slipstream::CustomActivations::default();
     for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         if part == "genesis" {
-            h = slipstream_core::CustomActivations::all_from_genesis();
+            h = zodl_slipstream::CustomActivations::all_from_genesis();
             continue;
         }
         let (key, val) = part
@@ -409,7 +409,7 @@ fn parse_custom_heights(spec: &str) -> Result<slipstream_core::CustomActivations
 }
 
 /// Derive and print the UFVK for a BIP-39 mnemonic (see `DeriveUfvk`).
-fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: slipstream_core::Network) {
+fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: zodl_slipstream::Network) {
     let parsed = bip39::Mnemonic::parse(mnemonic).unwrap_or_else(|e| {
         eprintln!("error: invalid mnemonic: {e}");
         std::process::exit(2);
@@ -428,13 +428,13 @@ fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: slipstream_core::Netwo
     eprintln!(
         "hint: slipstream sync --network {} --server <lwd-url> --wallet-dir <dir> --ufvk '<above>' --birthday <height>",
         match network {
-            slipstream_core::Network::MainNetwork => "main",
-            slipstream_core::Network::TestNetwork => "test",
+            zodl_slipstream::Network::MainNetwork => "main",
+            zodl_slipstream::Network::TestNetwork => "test",
         }
     );
 }
 
-fn parse_server(s: &str) -> Result<slipstream_core::Endpoint, String> {
+fn parse_server(s: &str) -> Result<zodl_slipstream::Endpoint, String> {
     let (tls, rest) = if let Some(r) = s.strip_prefix("https://") {
         (true, r)
     } else if let Some(r) = s.strip_prefix("http://") {
@@ -446,7 +446,7 @@ fn parse_server(s: &str) -> Result<slipstream_core::Endpoint, String> {
         .trim_end_matches('/')
         .split_once(':')
         .ok_or_else(|| format!("server must include a port: {s}"))?;
-    Ok(slipstream_core::Endpoint {
+    Ok(zodl_slipstream::Endpoint {
         host: host.to_string(),
         port: port.parse().map_err(|e| format!("bad port: {e}"))?,
         tls,
@@ -469,16 +469,16 @@ fn parse_range(s: &str) -> Result<(u64, u64), String> {
 }
 
 async fn run_fetch_bench(
-    endpoint: &slipstream_core::Endpoint,
+    endpoint: &zodl_slipstream::Endpoint,
     start: u64,
     end: u64,
     chunk: u32,
     streams: usize,
-) -> Result<slipstream_core::fetch::FetchStats, slipstream_core::SlipstreamError> {
-    let (tx, mut rx) = slipstream_core::chunk::chunk_queue(256 * 1024 * 1024);
+) -> Result<zodl_slipstream::fetch::FetchStats, zodl_slipstream::SlipstreamError> {
+    let (tx, mut rx) = zodl_slipstream::chunk::chunk_queue(256 * 1024 * 1024);
     let drain = tokio::spawn(async move { while let Some((_c, _p, _b)) = rx.recv().await {} });
-    let plan = slipstream_core::fetch::FetchPlan::new(start, end, chunk, streams);
-    let stats = slipstream_core::fetch::run_fetch(endpoint, plan, tx, None).await?;
+    let plan = zodl_slipstream::fetch::FetchPlan::new(start, end, chunk, streams);
+    let stats = zodl_slipstream::fetch::run_fetch(endpoint, plan, tx, None).await?;
     let _ = drain.await;
     Ok(stats)
 }
@@ -504,13 +504,13 @@ fn cmd_throttle_proxy(
             std::process::exit(2);
         });
     let cap = if cap_kbps == 0 {
-        slipstream_core::throttle::UNCAPPED
+        zodl_slipstream::throttle::UNCAPPED
     } else {
         cap_kbps * 1024
     };
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
-        let proxy = slipstream_core::throttle::ThrottleProxy::start(listen, target_addr, cap)
+        let proxy = zodl_slipstream::throttle::ThrottleProxy::start(listen, target_addr, cap)
             .await
             .expect("start throttle proxy");
         println!(
@@ -622,7 +622,7 @@ fn uuid_prefix(bytes: &[u8]) -> String {
 /// The Phase C acceptance harness: renders wallet state ONLY from the v2 contract.
 /// If this function ever needs wallet math, the engine API is wrong (ENGINE_API_V2.md §8).
 fn cmd_watch(
-    network: slipstream_core::Network,
+    network: zodl_slipstream::Network,
     server: String,
     wallet_dir: std::path::PathBuf,
     ufvk: Option<String>,
@@ -638,14 +638,14 @@ fn cmd_watch(
         std::process::exit(2)
     });
     let db_path = wallet_dir.join("data.db");
-    let cfg = slipstream_core::EngineConfig::new(network, db_path.clone(), endpoint);
+    let cfg = zodl_slipstream::EngineConfig::new(network, db_path.clone(), endpoint);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
-        let reporter = slipstream_core::SessionReporter {
-            progress: std::sync::Arc::new(slipstream_core::Progress::default()),
+        let reporter = zodl_slipstream::SessionReporter {
+            progress: std::sync::Arc::new(zodl_slipstream::Progress::default()),
             state: std::sync::Arc::new(std::sync::Mutex::new(
-                slipstream_core::ffi_handle::SyncState::Idle,
+                zodl_slipstream::ffi_handle::SyncState::Idle,
             )),
             events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
         };
@@ -653,18 +653,18 @@ fn cmd_watch(
         // wallet (same call the iOS FFI open() makes) — the SECOND-HOST acceptance proof
         // that no host needs pre-first-suggest compensation. Failure = cold snapshot.
         if let Ok(session) =
-            slipstream_core::wallet_session::WalletSession::open(network, &db_path)
+            zodl_slipstream::wallet_session::WalletSession::open(network, &db_path)
             && let Err(e) =
-                slipstream_core::scheduler::seed_progress_from_wallet(&reporter.progress, &session)
+                zodl_slipstream::scheduler::seed_progress_from_wallet(&reporter.progress, &session)
             {
                 eprintln!("warn: E-3 open-time snapshot seed failed ({e}) — starting cold");
             }
-        let scfg = slipstream_core::SessionConfig {
+        let scfg = zodl_slipstream::SessionConfig {
             engine: cfg,
             accounts,
             tor: None,
         };
-        let session = tokio::spawn(slipstream_core::session::run_session(
+        let session = tokio::spawn(zodl_slipstream::session::run_session(
             scfg,
             reporter.clone(),
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -679,10 +679,10 @@ fn cmd_watch(
             // v2 channel 1: the derived snapshot — the SAME derivation the FFI serves
             // (fail-safe recovery latch, monotonic permille, stall clock included).
             let state = *reporter.state.lock().unwrap_or_else(|p| p.into_inner());
-            let snap = slipstream_core::ffi_handle::derive_snapshot(&reporter.progress, state);
+            let snap = zodl_slipstream::ffi_handle::derive_snapshot(&reporter.progress, state);
 
             // Edge signals: drain + print.
-            let drained: Vec<slipstream_core::ffi_handle::FfiSlipstreamEvent> = {
+            let drained: Vec<zodl_slipstream::ffi_handle::FfiSlipstreamEvent> = {
                 let mut ring = reporter.events.lock().unwrap_or_else(|p| p.into_inner());
                 std::mem::take(&mut *ring)
             };
@@ -693,12 +693,12 @@ fn cmd_watch(
             // v2 channel 2 — the DOCUMENTED host rules, verbatim:
             //   balance = is_recovering ? SELECT ext_slipstream_v_recovery_balance : upstream summary
             let balances: Vec<(String, i64, &'static str)> = if snap.is_recovering == 1 {
-                // [issue #4] The view read lives in slipstream-core (`reconcile`);
+                // [issue #4] The view read lives in zodl-slipstream (`reconcile`);
                 // the CLI holds only the short read connection.
                 let mut out = Vec::new();
                 if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-                    if let Ok(rows) = slipstream_core::reconcile::recovery_balances(&conn) {
+                    if let Ok(rows) = zodl_slipstream::reconcile::recovery_balances(&conn) {
                         for (uuid, zat) in rows {
                             out.push((uuid_prefix(&uuid), zat, "Σ reconciled (recovering)"));
                         }
@@ -735,12 +735,12 @@ fn cmd_watch(
 
             //   visible = reconciled OR NOT is_recovering (mined txs only)
             // [issue #4] Served entirely by the slipstream-owned view via
-            // slipstream-core (`reconcile`) — no hand-rolled SQL here.
+            // zodl-slipstream (`reconcile`) — no hand-rolled SQL here.
             let visible: i64 = rusqlite::Connection::open(&db_path)
                 .ok()
                 .and_then(|conn| {
                     let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
-                    slipstream_core::reconcile::visible_mined_tx_count(
+                    zodl_slipstream::reconcile::visible_mined_tx_count(
                         &conn,
                         snap.is_recovering == 1,
                     )
@@ -836,7 +836,7 @@ fn require_gpu_feature_if(requested: bool, flag: &str) {
 /// not a restore) and prints/persists the engine-written BenchSummary.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
-    network: slipstream_core::Network,
+    network: zodl_slipstream::Network,
     server: String,
     alternate_server: Vec<String>,
     ufvk: String,
@@ -885,7 +885,7 @@ fn cmd_bench(
     };
 
     let json_path = json.unwrap_or_else(|| dir.join("bench.json"));
-    let mut cfg = slipstream_core::EngineConfig::new(network, dir.join("data.db"), endpoint);
+    let mut cfg = zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint);
     cfg.gpu_subtree = gpu_subtree;
     // v0.4 Plan A lever (Task 8+): live A/B switch — the whole point of bench.
     cfg.graft_subtree = graft;
@@ -912,7 +912,7 @@ fn cmd_bench(
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let outcome = rt.block_on(async {
-        let progress = std::sync::Arc::new(slipstream_core::Progress::default());
+        let progress = std::sync::Arc::new(zodl_slipstream::Progress::default());
         let ticker_progress = std::sync::Arc::clone(&progress);
         let ticker = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
@@ -929,7 +929,7 @@ fn cmd_bench(
             }
         });
         let result =
-            slipstream_core::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
+            zodl_slipstream::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
         ticker.abort();
         result
     });
@@ -940,7 +940,7 @@ fn cmd_bench(
     });
 
     // The engine no longer presents the pass itself — emit its tracing summary here.
-    slipstream_core::report::log_pass_summary(&outcome, &cfg);
+    zodl_slipstream::report::log_pass_summary(&outcome, &cfg);
 
     // Human table — same numbers as the JSON artifact written below.
     let r = &outcome.report;
@@ -971,7 +971,7 @@ fn cmd_bench(
         "Plan A ceiling (orchard, the dominant combine cost): skip ~{:.0}% of shard builds on this wallet",
         r.census_orchard.graftable_fraction() * 100.0
     );
-    match slipstream_core::report::bench_summary(&outcome).write_json(&json_path) {
+    match zodl_slipstream::report::bench_summary(&outcome).write_json(&json_path) {
         Ok(()) => println!("json: {}", json_path.display()),
         Err(e) => eprintln!(
             "warning: bench JSON write failed at {}: {e}",
@@ -991,7 +991,7 @@ fn cmd_bench(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_sync(
-    network: slipstream_core::SlipstreamNetwork,
+    network: zodl_slipstream::SlipstreamNetwork,
     server: String,
     wallet_dir: std::path::PathBuf,
     ufvk: Option<String>,
@@ -1022,7 +1022,7 @@ fn cmd_sync(
         std::process::exit(2)
     });
 
-    let mut cfg = slipstream_core::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
+    let mut cfg = zodl_slipstream::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
     cfg.fetch_streams = streams;
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
@@ -1036,9 +1036,9 @@ fn cmd_sync(
                 eprintln!("error: --anchor-retention-interval must be greater than zero");
                 std::process::exit(2)
             };
-            Some(slipstream_core::AnchorRetention::new(
+            Some(zodl_slipstream::AnchorRetention::new(
                 zcash_protocol::consensus::BlockHeight::from(floor),
-                slipstream_core::AnchorRetentionInterval::custom(blocks),
+                zodl_slipstream::AnchorRetentionInterval::custom(blocks),
             ))
         }
         None => None,
@@ -1056,7 +1056,7 @@ fn cmd_sync(
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         // Build shared progress state for the CLI ticker (decision D8 poll-based).
-        let progress = std::sync::Arc::new(slipstream_core::Progress::default());
+        let progress = std::sync::Arc::new(zodl_slipstream::Progress::default());
         let ticker_progress = std::sync::Arc::clone(&progress);
 
         // Spawn a 2-second ticker task that prints one line per tick.
@@ -1079,26 +1079,26 @@ fn cmd_sync(
         });
 
         // --follow: run the FULL autonomous engine session (import if --ufvk, resilient initial
-        // pass, then tip-following + mempool) via slipstream_core::session::run_session — the
+        // pass, then tip-following + mempool) via zodl_slipstream::session::run_session — the
         // SAME orchestration the FFI uses. Observability = the ticker above + the engine's own
         // tracing (the "sync stage split" lines). Runs until Ctrl-C; returns only on a
         // non-transient initial error. Replaces the old bespoke loop (which exited on any
         // follow-pass blip — the exact resilience hazard the lift removes).
         if follow {
-            let scfg = slipstream_core::SessionConfig {
+            let scfg = zodl_slipstream::SessionConfig {
                 engine: cfg.clone(),
                 accounts: accounts.clone(),
                 tor: None,
             };
-            let reporter = slipstream_core::SessionReporter {
+            let reporter = zodl_slipstream::SessionReporter {
                 progress: std::sync::Arc::clone(&progress),
                 state: std::sync::Arc::new(std::sync::Mutex::new(
-                    slipstream_core::ffi_handle::SyncState::Done,
+                    zodl_slipstream::ffi_handle::SyncState::Done,
                 )),
                 events: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             };
             println!("follow: running autonomous engine session (Ctrl-C to stop) ...");
-            slipstream_core::session::run_session(
+            zodl_slipstream::session::run_session(
                 scfg,
                 reporter,
                 std::sync::Arc::new(tokio::sync::Mutex::new(())),
@@ -1110,7 +1110,7 @@ fn cmd_sync(
         }
 
         let result =
-            slipstream_core::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
+            zodl_slipstream::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
 
         // Abort the ticker (JoinHandle::abort is fine per spec — no cleanup needed).
         ticker.abort();
@@ -1119,7 +1119,7 @@ fn cmd_sync(
             Ok(outcome) => {
                 // Engine returns a bare result; emit its tracing summary here
                 // (the --follow path gets this via session::run_pass_with_retry).
-                slipstream_core::report::log_pass_summary(&outcome, &cfg);
+                zodl_slipstream::report::log_pass_summary(&outcome, &cfg);
                 let mb = outcome.report.fetch.bytes as f64 / 1_048_576.0;
                 println!(
                     "synced to tip {} in {:.1}s",
@@ -1181,7 +1181,7 @@ fn cmd_sync(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_oracle(
-    network: slipstream_core::Network,
+    network: zodl_slipstream::Network,
     server: String,
     wallet_a: std::path::PathBuf,
     wallet_b: std::path::PathBuf,
@@ -1222,7 +1222,7 @@ fn cmd_oracle(
                   gpu_subtree: bool,
                   persist_depth: usize| {
         let mut cfg =
-            slipstream_core::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
+            zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
         cfg.fetch_streams = streams;
         cfg.chunk_blocks = chunk;
         cfg.sparse_persistence = sparse;
@@ -1241,16 +1241,16 @@ fn cmd_oracle(
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     let verdict = rt.block_on(async {
         println!("oracle: run A (upstream persistence) …");
-        let a = slipstream_core::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), &accounts, None, None).await?;
+        let a = zodl_slipstream::engine::sync_once(&mk_cfg(&wallet_a, false, false, false, 1), &accounts, None, None).await?;
         println!("oracle: run A done — tip {} in {:.1?}", a.chain_tip, a.elapsed);
         println!("oracle: run B (sparse_b={sparse_b} write_behind_b={write_behind_b} gpu_subtree_b={gpu_subtree_b} persist_depth_b={persist_depth_b}) …");
-        let b = slipstream_core::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), &accounts, None, None).await?;
+        let b = zodl_slipstream::engine::sync_once(&mk_cfg(&wallet_b, sparse_b, write_behind_b, gpu_subtree_b, persist_depth_b), &accounts, None, None).await?;
         println!("oracle: run B done — tip {} in {:.1?}", b.chain_tip, b.elapsed);
         if a.chain_tip != b.chain_tip {
             eprintln!("oracle: TIP SKEW (A={} B={}) — rerun when the chain is quiet", a.chain_tip, b.chain_tip);
             std::process::exit(3);
         }
-        slipstream_core::oracle::semantic_diff(&wallet_a.join("data.db"), &wallet_b.join("data.db"))
+        zodl_slipstream::oracle::semantic_diff(&wallet_a.join("data.db"), &wallet_b.join("data.db"))
     });
     match verdict {
         Ok(report) => {
@@ -1279,7 +1279,7 @@ fn cmd_oracle(
 /// one ever were).
 #[allow(clippy::too_many_arguments)]
 fn cmd_send(
-    network: slipstream_core::Network,
+    network: zodl_slipstream::Network,
     server: String,
     wallet_dir: std::path::PathBuf,
     mnemonic: String,
@@ -1320,7 +1320,7 @@ fn cmd_send(
     let ufvk = usk.to_unified_full_viewing_key();
 
     let mut session =
-        slipstream_core::wallet_session::WalletSession::open(network, &wallet_dir.join("data.db"))
+        zodl_slipstream::wallet_session::WalletSession::open(network, &wallet_dir.join("data.db"))
             .expect("open wallet db");
     let db = session.db_mut();
     let accounts = db.get_account_ids().expect("account ids");
@@ -1492,8 +1492,8 @@ fn cmd_send(
         .expect("tokio runtime");
     let (code, message) = rt
         .block_on(async {
-            let mut client = slipstream_core::grpc::connect(&endpoint).await?;
-            slipstream_core::grpc::send_transaction(&mut client, raw).await
+            let mut client = zodl_slipstream::grpc::connect(&endpoint).await?;
+            zodl_slipstream::grpc::send_transaction(&mut client, raw).await
         })
         .expect("broadcast");
     if code == 0 {
@@ -1521,7 +1521,7 @@ fn main() {
         Cmd::Version => {
             println!(
                 "{} {}",
-                slipstream_core::CRATE_NAME,
+                zodl_slipstream::CRATE_NAME,
                 env!("CARGO_PKG_VERSION")
             );
         }
@@ -1770,14 +1770,14 @@ mod tests {
             .expect("valid mnemonic")
             .to_seed("");
         let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
-            &slipstream_core::Network::TestNetwork,
+            &zodl_slipstream::Network::TestNetwork,
             &seed,
             zip32::AccountId::ZERO,
         )
         .expect("derives");
         let encoded = usk
             .to_unified_full_viewing_key()
-            .encode(&slipstream_core::Network::TestNetwork);
+            .encode(&zodl_slipstream::Network::TestNetwork);
         assert!(
             encoded.starts_with("uviewtest1"),
             "testnet UFVK must carry the uviewtest HRP, got {encoded}"
@@ -1987,7 +1987,7 @@ mod tests {
             matches!(
                 cli.cmd,
                 Cmd::Sync {
-                    chunk_split_bytes: slipstream_core::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
+                    chunk_split_bytes: zodl_slipstream::EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
                     ..
                 }
             ),
@@ -2035,7 +2035,7 @@ mod tests {
             matches!(
                 cli.cmd,
                 Cmd::Sync {
-                    memory_budget_bytes: slipstream_core::EngineConfig::DEFAULT_MEMORY_BUDGET,
+                    memory_budget_bytes: zodl_slipstream::EngineConfig::DEFAULT_MEMORY_BUDGET,
                     ..
                 }
             ),
@@ -2090,7 +2090,7 @@ mod tests {
     #[test]
     fn sync_requires_birthday_with_ufvk() {
         // The (ufvk, no birthday) arm errors before any decode, so a placeholder key is fine.
-        let net = slipstream_core::Network::MainNetwork;
+        let net = zodl_slipstream::Network::MainNetwork;
         let result = validate_sync_args(&net, Some("uview1someufvk"), None);
         assert!(result.is_err(), "ufvk without birthday must error");
         let msg = result.unwrap_err();
@@ -2102,14 +2102,14 @@ mod tests {
 
     #[test]
     fn sync_allows_no_ufvk_no_birthday() {
-        let net = slipstream_core::Network::MainNetwork;
+        let net = zodl_slipstream::Network::MainNetwork;
         let result = validate_sync_args(&net, None, None).expect("no args is valid");
         assert!(result.is_empty(), "no ufvk = no accounts to import");
     }
 
     #[test]
     fn sync_allows_ufvk_with_birthday() {
-        let net = slipstream_core::Network::MainNetwork;
+        let net = zodl_slipstream::Network::MainNetwork;
         let accounts = validate_sync_args(&net, Some(VALID_MAINNET_UFVK), Some(800_000))
             .expect("valid ufvk + birthday");
         assert_eq!(accounts.len(), 1, "one account to bootstrap");
@@ -2123,7 +2123,7 @@ mod tests {
     #[test]
     fn sync_rejects_undecodable_ufvk() {
         // Decoding now happens at the CLI boundary: a malformed --ufvk is a clean error.
-        let net = slipstream_core::Network::MainNetwork;
+        let net = zodl_slipstream::Network::MainNetwork;
         let result = validate_sync_args(&net, Some("uview1someufvk"), Some(800_000));
         assert!(result.is_err(), "an undecodable ufvk must error");
     }
@@ -2131,7 +2131,7 @@ mod tests {
     #[test]
     fn sync_allows_birthday_without_ufvk_returns_empty() {
         // birthday with no ufvk: silently ignored (no account to import).
-        let net = slipstream_core::Network::MainNetwork;
+        let net = zodl_slipstream::Network::MainNetwork;
         let result = validate_sync_args(&net, None, Some(800_000)).expect("birthday-only is valid");
         assert!(result.is_empty(), "expected no accounts, got {result:?}");
     }

@@ -30,10 +30,10 @@ use zcash_client_backend::proto::compact_formats::{
 use zcash_client_backend::proto::service::TreeState;
 use zcash_protocol::consensus::BlockHeight;
 
-use slipstream_core::block_source::MemBlockSource;
-use slipstream_core::chunk::Chunk;
-use slipstream_core::persist::{SparseFacade, SparseTreeState};
-use slipstream_core::wallet_session::WalletSession;
+use zodl_slipstream::block_source::MemBlockSource;
+use zodl_slipstream::chunk::Chunk;
+use zodl_slipstream::persist::{SparseFacade, SparseTreeState};
+use zodl_slipstream::wallet_session::WalletSession;
 
 /// See stress_sparse_join.rs for provenance (canonical darkside test seed UFVK).
 const TEST_UFVK: &str = concat!(
@@ -116,7 +116,7 @@ fn synth_blocks(count: u64, outs_per_block: u32) -> Vec<CompactBlock> {
 async fn scan_and_census(dir: std::path::PathBuf) -> Result<(u64, u64, u64), String> {
     let blocks = synth_blocks(BLOCKS, OUTS_PER_BLOCK);
     let db_path = dir.join("data.db");
-    let mut session = WalletSession::open(slipstream_core::Network::MainNetwork, &db_path)
+    let mut session = WalletSession::open(zodl_slipstream::Network::MainNetwork, &db_path)
         .map_err(|e| format!("open: {e}"))?;
     let birthday_ts = TreeState {
         network: "main".into(),
@@ -125,8 +125,8 @@ async fn scan_and_census(dir: std::path::PathBuf) -> Result<(u64, u64, u64), Str
         time: 1,
         ..Default::default()
     };
-    let ufvk = slipstream_core::UnifiedFullViewingKey::decode(
-        &slipstream_core::Network::MainNetwork,
+    let ufvk = zodl_slipstream::UnifiedFullViewingKey::decode(
+        &zodl_slipstream::Network::MainNetwork,
         TEST_UFVK,
     )
     .map_err(|e| format!("ufvk decode: {e}"))?;

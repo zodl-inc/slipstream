@@ -37,14 +37,17 @@
 //! Start the darkside lightwalletd first (from repo root):
 //!   Tests/lightwalletd/lightwalletd --no-tls-very-insecure --data-dir /tmp \
 //!     --darkside-very-insecure --log-file /tmp/t64-lwd.log
-//! Then: cargo test -p slipstream-core --features darkside -- --ignored --test-threads=1
+//! Then: cargo test -p zodl-slipstream --features darkside -- --ignored --test-threads=1
 #![cfg(feature = "darkside")]
 
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use rusqlite::Connection;
-use slipstream_core::{
+use zcash_client_backend::data_api::WalletWrite;
+use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
+use zcash_protocol::consensus::{BlockHeight, Network};
+use zodl_slipstream::{
     chunk::chunk_queue,
     config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
@@ -54,9 +57,6 @@ use slipstream_core::{
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
 };
-use zcash_client_backend::data_api::WalletWrite;
-use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
-use zcash_protocol::consensus::{BlockHeight, Network};
 
 // ---------------------------------------------------------------------------
 // Constants — mirror darkside_sync.rs exactly.
@@ -612,8 +612,8 @@ async fn truncate_rescan_oracle_is_clean() {
             sapling_tree: SAPLING_TREE_128607.into(),
             ..Default::default()
         };
-        let (tx_a, rx_a) = slipstream_core::chunk::chunk_queue(cfg.memory_budget_bytes);
-        let plan_a = slipstream_core::fetch::FetchPlan::new(
+        let (tx_a, rx_a) = zodl_slipstream::chunk::chunk_queue(cfg.memory_budget_bytes);
+        let plan_a = zodl_slipstream::fetch::FetchPlan::new(
             BIRTHDAY_HEIGHT,
             chain_tip_a,
             cfg.chunk_blocks,
@@ -621,10 +621,10 @@ async fn truncate_rescan_oracle_is_clean() {
         );
         let fetch_ep_a = ep.clone();
         let fetch_task_a = tokio::spawn(async move {
-            slipstream_core::fetch::run_fetch(&fetch_ep_a, plan_a, tx_a, None).await
+            zodl_slipstream::fetch::run_fetch(&fetch_ep_a, plan_a, tx_a, None).await
         });
 
-        slipstream_core::scan::scan_chunks_from_treestate(
+        zodl_slipstream::scan::scan_chunks_from_treestate(
             &mut session_a,
             BIRTHDAY_HEIGHT,
             initial_state_a,
@@ -667,8 +667,8 @@ async fn truncate_rescan_oracle_is_clean() {
             sapling_tree: SAPLING_TREE_128607.into(),
             ..Default::default()
         };
-        let (tx_b, rx_b) = slipstream_core::chunk::chunk_queue(cfg.memory_budget_bytes);
-        let plan_b = slipstream_core::fetch::FetchPlan::new(
+        let (tx_b, rx_b) = zodl_slipstream::chunk::chunk_queue(cfg.memory_budget_bytes);
+        let plan_b = zodl_slipstream::fetch::FetchPlan::new(
             BIRTHDAY_HEIGHT,
             chain_tip_b,
             cfg.chunk_blocks,
@@ -676,10 +676,10 @@ async fn truncate_rescan_oracle_is_clean() {
         );
         let fetch_ep_b = ep.clone();
         let fetch_task_b = tokio::spawn(async move {
-            slipstream_core::fetch::run_fetch(&fetch_ep_b, plan_b, tx_b, None).await
+            zodl_slipstream::fetch::run_fetch(&fetch_ep_b, plan_b, tx_b, None).await
         });
 
-        slipstream_core::scan::scan_chunks_from_treestate(
+        zodl_slipstream::scan::scan_chunks_from_treestate(
             &mut session_b,
             BIRTHDAY_HEIGHT,
             initial_state_b,

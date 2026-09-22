@@ -57,10 +57,10 @@ use zcash_client_backend::proto::compact_formats::{
 use zcash_client_backend::proto::service::TreeState;
 use zcash_protocol::consensus::BlockHeight;
 
-use slipstream_core::block_source::MemBlockSource;
-use slipstream_core::chunk::Chunk;
-use slipstream_core::persist::{SparseFacade, SparseTreeState};
-use slipstream_core::wallet_session::WalletSession;
+use zodl_slipstream::block_source::MemBlockSource;
+use zodl_slipstream::chunk::Chunk;
+use zodl_slipstream::persist::{SparseFacade, SparseTreeState};
+use zodl_slipstream::wallet_session::WalletSession;
 
 /// Mainnet UFVK for the canonical darkside test seed. Replica of
 /// `wallet_session::TEST_UFVK` (gated `#[cfg(any(test, feature = "darkside"))]`,
@@ -195,7 +195,7 @@ fn scan_sparse_once(
     anchor_retention: Option<AnchorRetention>,
 ) -> Result<(), String> {
     let db_path = dir.join("data.db");
-    let mut session = WalletSession::open(slipstream_core::Network::MainNetwork, &db_path)
+    let mut session = WalletSession::open(zodl_slipstream::Network::MainNetwork, &db_path)
         .map_err(|e| format!("open: {e}"))?;
     let birthday_ts = TreeState {
         network: "main".into(),
@@ -204,8 +204,8 @@ fn scan_sparse_once(
         time: 1,
         ..Default::default()
     };
-    let ufvk = slipstream_core::UnifiedFullViewingKey::decode(
-        &slipstream_core::Network::MainNetwork,
+    let ufvk = zodl_slipstream::UnifiedFullViewingKey::decode(
+        &zodl_slipstream::Network::MainNetwork,
         STRESS_UFVK,
     )
     .map_err(|e| format!("ufvk decode: {e}"))?;

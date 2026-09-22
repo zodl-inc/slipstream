@@ -284,14 +284,14 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "release-mode 100k sweep: cargo test -p slipstream-core --release -- --ignored combine_batch_cpu_matches_orchard_100k"]
+    #[ignore = "release-mode 100k sweep: cargo test -p zodl-slipstream --release -- --ignored combine_batch_cpu_matches_orchard_100k"]
     fn combine_batch_cpu_matches_orchard_100k() {
         kat(100_000, 0xB473);
     }
 
     /// STOP-rule probe (plan Task 13 Step 4): ns/combine, scalar vs batched,
     /// single-threaded batch walk (rayon width 1 batch) at width 4096.
-    /// Run: cargo test -p slipstream-core --release -- --ignored --nocapture combine_bench
+    /// Run: cargo test -p zodl-slipstream --release -- --ignored --nocapture combine_bench
     #[test]
     #[ignore = "release-mode timing probe"]
     fn combine_bench() {
