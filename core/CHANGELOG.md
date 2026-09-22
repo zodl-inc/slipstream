@@ -1,3 +1,9 @@
+## [0.3.0-alpha.1] - Unreleased
+
+### Added
+- OHTTP (RFC 9458) transport support for privacy-preserving lightwalletd connections
+- Tor routing capability for all connection purposes (clearnet, Tor-only, Tor-over-OHTTP modes)
+- Client trace ID propagation for end-to-end request tracking
 # Changelog
 All notable changes to this library will be documented in this file.
 

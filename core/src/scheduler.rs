@@ -358,7 +358,11 @@ pub async fn run_to_completion(
                 })
             }));
         }
-        let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
+        // Smaller plan chunks when bulk rides OHTTP-over-Tor (whole-chunk buffered responses at
+        // Tor throughput) — connector::bulk_chunk_blocks; unchanged otherwise.
+        let chunk_blocks =
+            crate::connector::bulk_chunk_blocks(config.chunk_blocks, &config.endpoint, tor);
+        let mut plan = FetchPlan::new(start, end, chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
         // [v0.7 P2] Arm the wire-collapse detector only when the engine has
@@ -370,12 +374,17 @@ pub async fn run_to_completion(
         let endpoint = config.endpoint.clone();
         // Clone the progress Arc for the fetch task so it can bump fetched_blocks.
         let fetch_progress = progress.clone();
+        // Tor handle for the bulk workers: only used when the endpoint is an OHTTP gateway
+        // (bulk stays direct for plain hosts — connector::route).
+        let fetch_tor = tor.cloned();
 
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
         let fetch_task =
-            tokio::spawn(async move { run_fetch(&endpoint, plan, tx, fetch_progress).await });
+            tokio::spawn(
+                async move { run_fetch(&endpoint, fetch_tor, plan, tx, fetch_progress).await },
+            );
 
         // scan_chunks runs in the current task using a SEPARATE grpc client so it
         // does not contend with the fetch workers' connections.

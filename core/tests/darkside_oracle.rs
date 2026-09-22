@@ -234,7 +234,7 @@ async fn run_pipeline(
         cfg.fetch_streams,
     );
     let fetch_ep = ep.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
 
     scan_chunks_from_treestate(
         &mut session,
@@ -621,7 +621,7 @@ async fn truncate_rescan_oracle_is_clean() {
         );
         let fetch_ep_a = ep.clone();
         let fetch_task_a = tokio::spawn(async move {
-            zodl_slipstream::fetch::run_fetch(&fetch_ep_a, plan_a, tx_a, None).await
+            zodl_slipstream::fetch::run_fetch(&fetch_ep_a, None, plan_a, tx_a, None).await
         });
 
         zodl_slipstream::scan::scan_chunks_from_treestate(
@@ -676,7 +676,7 @@ async fn truncate_rescan_oracle_is_clean() {
         );
         let fetch_ep_b = ep.clone();
         let fetch_task_b = tokio::spawn(async move {
-            zodl_slipstream::fetch::run_fetch(&fetch_ep_b, plan_b, tx_b, None).await
+            zodl_slipstream::fetch::run_fetch(&fetch_ep_b, None, plan_b, tx_b, None).await
         });
 
         zodl_slipstream::scan::scan_chunks_from_treestate(

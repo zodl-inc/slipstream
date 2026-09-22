@@ -45,7 +45,7 @@ use zcash_client_backend::proto::{
 use crate::{
     chunk::{Chunk, ChunkQueueSender},
     config::{Endpoint, EngineConfig},
-    connector::connect_direct_with_retry,
+    connector::{ConnPurpose, TorConn, connect_via},
     error::SlipstreamError,
     grpc::{self, LwdClient},
     verify::Continuity,
@@ -487,6 +487,7 @@ async fn open_and_pump(
     plan: &FetchPlan,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
+    open_timeout: Duration,
 ) -> Result<PumpOutcome, SlipstreamError> {
     let req = BlockRange {
         start: Some(BlockId {
@@ -501,14 +502,16 @@ async fn open_and_pump(
     };
     // B2 (#1755): response-headers deadline. A server that accepts the request
     // but never answers must fail fast into the worker's retry+reconnect loop.
-    let mut stream = tokio::time::timeout(grpc::UNARY_TIMEOUT, client.get_block_range(req))
+    // (Longer for OHTTP gateways, whose buffered response = the whole chunk —
+    // grpc::range_open_timeout.)
+    let mut stream = tokio::time::timeout(open_timeout, client.get_block_range(req))
         .await
         .map_err(|_| {
             SlipstreamError::Transport(format!(
                 "get_block_range {}..{}: timed out after {}s",
                 cursor.resume_from,
                 cursor.end,
-                grpc::UNARY_TIMEOUT.as_secs()
+                open_timeout.as_secs()
             ))
         })?
         .map_err(|e| {
@@ -532,12 +535,16 @@ async fn open_and_pump(
 async fn worker(
     worker_id: usize,
     endpoint: Endpoint,
+    tor: Option<TorConn>,
     plan: FetchPlan,
     next: Arc<AtomicU64>,
     gate: AheadGate,
     out: mpsc::Sender<SubChunk>,
 ) -> Result<(), SlipstreamError> {
-    let mut client = connect_direct_with_retry(&endpoint).await?;
+    // Bulk is direct (with bounded retry) for plain hosts even with Tor on; for an OHTTP gateway
+    // with Tor on, `connect_via` routes it OHTTP-over-Tor so nothing bypasses the relay/Tor.
+    let mut client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
+    let open_timeout = grpc::range_open_timeout(&endpoint);
     loop {
         let index = next.fetch_add(1, Ordering::Relaxed);
         if index >= plan.chunk_count() {
@@ -559,7 +566,7 @@ async fn worker(
         loop {
             attempt += 1;
             cursor.emitted_this_attempt = false;
-            match open_and_pump(&mut client, &mut cursor, &plan, &gate, &out).await {
+            match open_and_pump(&mut client, &mut cursor, &plan, &gate, &out, open_timeout).await {
                 Ok(PumpOutcome::Completed) => break,
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
                 Err(err) => {
@@ -589,7 +596,7 @@ async fn worker(
                     // Reconnect: the channel may be poisoned after a stream error. Resilient to a
                     // brief server outage (bounded retry-with-backoff) so a transient connect blip
                     // resumes this chunk in place instead of failing it → restarting the whole pass.
-                    client = connect_direct_with_retry(&endpoint).await?;
+                    client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
                 }
             }
         }
@@ -826,8 +833,12 @@ async fn release_ordered(
 ///
 /// `progress` — if `Some`, bumps `fetched_blocks` by the block count of each
 /// ordered sub-chunk as it is released (Relaxed atomic; no cross-counter guarantees).
+///
+/// `tor` — the session's Tor handle when Tor is on. Bulk stays direct for plain hosts; for an
+/// OHTTP gateway it makes the workers dial the relay through Tor (see `connector::route`).
 pub async fn run_fetch(
     endpoint: &Endpoint,
+    tor: Option<TorConn>,
     plan: FetchPlan,
     queue: ChunkQueueSender,
     progress: Option<Arc<Progress>>,
@@ -857,6 +868,7 @@ pub async fn run_fetch(
         handles.push(tokio::spawn(worker(
             worker_id,
             endpoint.clone(),
+            tor.clone(),
             plan.clone(),
             Arc::clone(&next),
             gate.clone(),

@@ -222,7 +222,7 @@ async fn direct_pipeline_scan(
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
     let plan = FetchPlan::new(scan_start, chain_tip, cfg.chunk_blocks, cfg.fetch_streams);
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
 
     // SAPLING_TREE_128607 is correct here because scan_start = BIRTHDAY_HEIGHT = 663150,
     // so from_state.height = 663149, from_state.tree_size = 128607 = START_SAPLING_TREE_SIZE.
@@ -407,7 +407,7 @@ async fn reorg_recovery_produces_correct_tip() {
     );
     let fetch_ep = cfg.endpoint.clone();
     let fetch_task =
-        tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
+        tokio::spawn(async move { run_fetch(&fetch_ep, None, plan_reorg, fetch_tx, None).await });
 
     // from_state for 663201: height=663200, sapling_tree=SAPLING_TREE_128607.
     // The tree size in SAPLING_TREE_128607 is 128607, but the actual tree at 663200 is
@@ -664,7 +664,7 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
     );
     let fetch_ep = cfg.endpoint.clone();
     let fetch_task =
-        tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
+        tokio::spawn(async move { run_fetch(&fetch_ep, None, plan_reorg, fetch_tx, None).await });
 
     let from_state_663200 = TreeState {
         network: "main".into(),
@@ -880,7 +880,7 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
     );
     let fetch_ep = cfg.endpoint.clone();
     let fetch_task =
-        tokio::spawn(async move { run_fetch(&fetch_ep, plan_reorg, fetch_tx, None).await });
+        tokio::spawn(async move { run_fetch(&fetch_ep, None, plan_reorg, fetch_tx, None).await });
 
     let from_state_663200 = TreeState {
         network: "main".into(),

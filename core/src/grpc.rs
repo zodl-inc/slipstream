@@ -55,6 +55,23 @@ pub(crate) const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream means the connection is dead.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Response-headers deadline for `GetBlockRange` against an OHTTP gateway. An OHTTP response is
+/// whole-body-buffered (gateway → relay → client as ONE message), so "headers arrived" means
+/// "the entire chunk has been transferred": [`UNARY_TIMEOUT`] would then bound the full download
+/// of a 10k-block chunk, which a ~34 MB spam-era chunk over Tor (~0.4 MB/s) cannot meet (field
+/// evidence 2026-09-10: the tip range looped `timed out after 30s` forever). Sized just above the
+/// connector's own round-trip cap (100 s) so the pipe's UNAVAILABLE wins when the gateway stalls.
+pub(crate) const OHTTP_RANGE_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Deadline for opening a `GetBlockRange` stream to `endpoint` (see [`OHTTP_RANGE_OPEN_TIMEOUT`]).
+pub(crate) fn range_open_timeout(endpoint: &Endpoint) -> Duration {
+    if crate::ohttp::relay_for(&endpoint.host).is_some() {
+        OHTTP_RANGE_OPEN_TIMEOUT
+    } else {
+        UNARY_TIMEOUT
+    }
+}
+
 fn transport_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Transport(format!("{context}: {e}"))
 }
@@ -163,6 +180,32 @@ where
 /// Open a channel to lightwalletd. TLS uses webpki roots (same trust source
 /// as the upstream tor module).
 pub async fn connect(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
+    // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
+    if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
+        tracing::info!(gateway = %endpoint.host, relay, "lightwalletd via OHTTP (RFC 9458)");
+        let connector = crate::ohttp::OhttpConnector::new(&endpoint.host, relay)
+            .map_err(|e| transport_err("ohttp connector", e))?;
+        // Plain `http://` on purpose: the transport tonic sees is an in-memory pipe to the
+        // in-process h2 server; TLS happens inside the connector, towards the relay. (tonic
+        // refuses an `https://` URI without a tls_config.)
+        let pipe_uri = format!("http://{}:{}", endpoint.host, endpoint.port);
+        let channel = TonicEndpoint::from_shared(pipe_uri)
+            .map_err(|e| transport_err("endpoint uri", e))?
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| {
+                let source = std::error::Error::source(&e)
+                    .map(|s| format!(" ({s})"))
+                    .unwrap_or_default();
+                transport_err(
+                    &format!("ohttp connect {}", endpoint.host),
+                    format!("{e}{source}"),
+                )
+            })?;
+        return Ok(CompactTxStreamerClient::new(channel));
+    }
     let mut ep = TonicEndpoint::from_shared(endpoint.uri())
         .map_err(|e| transport_err("endpoint uri", e))?
         .connect_timeout(std::time::Duration::from_secs(10));

@@ -96,10 +96,16 @@ pub(crate) const FOLLOW_POLL_MIN_SECS: u64 = 10;
 /// Maximum follow-probe sleep (inclusive). Matches the old-SDK jitter ceiling.
 pub(crate) const FOLLOW_POLL_MAX_SECS: u64 = 30;
 
+/// Consecutive follow-tip probe failures after which the engine surfaces `SyncState::Error(3)`
+/// (endpoint unreachable). This allows hosts to react to persistent outages (e.g., switch servers).
+/// The counter resets on any successful probe. Lower than the old escalation-only cap because
+/// surfacing an error enables the host's automatic recovery, which is more valuable than silently
+/// retrying forever.
+pub(crate) const ENDPOINT_UNREACHABLE_THRESHOLD: u32 = 5;
+
 /// Consecutive follow-iteration failures after which the follow loop logs an ESCALATED warning
-/// (likely a connectivity problem). T8.7: a follow-phase failure NEVER surfaces
-/// `SyncState::Error` — the wallet stays synced to `last_tip` and keeps retrying; only the
-/// INITIAL sync's non-transient errors (and panics, via the supervisor) surface Error.
+/// (likely a connectivity problem). Kept higher than `ENDPOINT_UNREACHABLE_THRESHOLD` for backwards
+/// compatibility with logs, but the Error(3) transition happens first.
 pub(crate) const FOLLOW_FAILURE_CAP: u32 = 8;
 
 /// Consecutive mempool-session failures tolerated before mempool monitoring is disabled for THIS
@@ -472,9 +478,18 @@ async fn follow_loop(
             }
             Err(err) if err.is_transient() => {
                 consecutive_failures += 1;
-                // T8.7: a transient probe failure NEVER surfaces Error — the wallet is
-                // already synced; retry on the next tick.
-                if consecutive_failures > FOLLOW_FAILURE_CAP {
+                // After N consecutive failures, surface Error(3) so hosts can react (e.g., switch
+                // servers). Before the threshold, log and retry.
+                if consecutive_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                    tracing::error!(
+                        %err,
+                        consecutive_failures,
+                        "follow tip probe persistently failing — surfacing endpoint unreachable (host can switch servers)"
+                    );
+                    reporter.set_state(SyncState::Error(3));
+                    reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+                    continue;
+                } else if consecutive_failures > FOLLOW_FAILURE_CAP {
                     tracing::warn!(
                         %err,
                         consecutive_failures,
@@ -491,9 +506,17 @@ async fn follow_loop(
             }
             Err(err) => {
                 consecutive_failures += 1;
-                // T8.7: even a non-transient probe error stays OUT of Error — the wallet is
-                // synced; surfacing a hard error for a follow-phase blip is exactly what
-                // internal testers must not see. Retry next tick.
+                // After N consecutive failures, surface Error(3) so hosts can react.
+                if consecutive_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                    tracing::error!(
+                        %err,
+                        consecutive_failures,
+                        "follow tip probe persistently failing (non-transient) — surfacing endpoint unreachable"
+                    );
+                    reporter.set_state(SyncState::Error(3));
+                    reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+                    continue;
+                }
                 tracing::warn!(
                     %err,
                     consecutive_failures,
@@ -530,16 +553,28 @@ async fn follow_loop(
             }
             Err(err) => {
                 consecutive_failures += 1;
-                // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
-                // to last_tip. Revert to Done (NOT Error) and retry on the next tick.
-                tracing::warn!(
-                    %err,
-                    consecutive_failures,
-                    last_tip,
-                    failed_at_utc = %wall_clock_utc(),
-                    "follow catch-up pass failed — staying synced, will retry"
-                );
-                reporter.set_state(SyncState::Done);
+                // After N consecutive failures, surface Error(3) so hosts can react.
+                // Below the threshold, revert to Done (wallet is still synced to last_tip).
+                if consecutive_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                    tracing::error!(
+                        %err,
+                        consecutive_failures,
+                        last_tip,
+                        failed_at_utc = %wall_clock_utc(),
+                        "follow catch-up pass persistently failing — surfacing endpoint unreachable"
+                    );
+                    reporter.set_state(SyncState::Error(3));
+                    reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+                } else {
+                    tracing::warn!(
+                        %err,
+                        consecutive_failures,
+                        last_tip,
+                        failed_at_utc = %wall_clock_utc(),
+                        "follow catch-up pass failed — staying synced, will retry"
+                    );
+                    reporter.set_state(SyncState::Done);
+                }
             }
         }
     }
@@ -728,6 +763,30 @@ mod tests {
         assert_eq!(*r.state.lock().unwrap(), SyncState::Syncing);
         r.set_state(SyncState::Error(2));
         assert_eq!(*r.state.lock().unwrap(), SyncState::Error(2));
+    }
+
+    // ── Endpoint unreachable threshold ───────────────────────────────────────
+
+    #[test]
+    fn endpoint_unreachable_threshold_is_sane() {
+        const {
+            assert!(
+                ENDPOINT_UNREACHABLE_THRESHOLD >= 3,
+                "threshold must be high enough to tolerate brief transient failures"
+            );
+            assert!(
+                ENDPOINT_UNREACHABLE_THRESHOLD <= FOLLOW_FAILURE_CAP,
+                "threshold must be <= escalation cap for coherent log progression"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_unreachable_threshold_is_five() {
+        assert_eq!(
+            ENDPOINT_UNREACHABLE_THRESHOLD, 5,
+            "threshold must be 5 (roughly 1-2 minutes at 10-30s jitter)"
+        );
     }
 
     /// The pass-lock contract `run_session` relies on (Keystone restore race fix, 2026-06-30):

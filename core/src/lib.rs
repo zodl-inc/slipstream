@@ -31,6 +31,7 @@ pub mod events;
 pub mod fetch;
 pub mod grpc;
 pub mod network;
+pub mod ohttp;
 pub mod probe;
 pub mod throttle;
 pub mod treestate;
