@@ -54,14 +54,17 @@
 //! Start the darkside lightwalletd first (from repo root):
 //!   Tests/lightwalletd/lightwalletd --no-tls-very-insecure --data-dir /tmp \
 //!     --darkside-very-insecure --log-file /dev/stdout
-//! Then: cargo test -p slipstream-core --features darkside -- --ignored --test-threads=1
+//! Then: cargo test -p zodl-slipstream --features darkside -- --ignored --test-threads=1
 #![cfg(feature = "darkside")]
 
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use rusqlite::Connection;
-use slipstream_core::{
+use zcash_client_backend::data_api::WalletWrite;
+use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
+use zcash_protocol::consensus::{BlockHeight, Network};
+use zodl_slipstream::{
     chunk::chunk_queue,
     config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
@@ -71,9 +74,6 @@ use slipstream_core::{
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
 };
-use zcash_client_backend::data_api::WalletWrite;
-use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
-use zcash_protocol::consensus::{BlockHeight, Network};
 
 // ---------------------------------------------------------------------------
 // Oracle constants — values extracted from Swift test sources.
@@ -155,7 +155,7 @@ const SAPLING_TREE_128607: &str = concat!(
 
 /// Pre-seed the wallet with account + block 663149 metadata.
 /// Identical to the pattern used in darkside_sync.rs.
-async fn setup_wallet(session: &mut WalletSession, client: &mut slipstream_core::grpc::LwdClient) {
+async fn setup_wallet(session: &mut WalletSession, client: &mut zodl_slipstream::grpc::LwdClient) {
     let birthday_ts = TreeState {
         network: "main".into(),
         height: BIRTHDAY_HEIGHT - 1,

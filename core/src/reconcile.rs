@@ -107,7 +107,7 @@ FROM transactions t";
 /// [API v2 §4.2] Per-account as-recovered balance: Σ `account_balance_delta` over MINED
 /// transactions whose delta is FINAL (reconciled — no dangling shielded spend). This is the
 /// field-validated SDK query (`TransactionRepository.recoveryBalances()`, the "Direction B"
-/// fix of docs/slipstream/2026-06-30-balance-recovery-postmortem.md) moved down into the
+/// fix from the 2026-06-30 balance-recovery postmortem) moved down into the
 /// engine so EVERY host gets a never-over-showing restore balance by SELECTing one view.
 /// Guarantees (tested below): excludes a tx while its delta is transiently wrong (dangling
 /// spend), includes it the moment it links; never over-counts; consistent with the

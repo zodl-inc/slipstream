@@ -20,8 +20,8 @@
 //! (mainnet "sandblasting" ~1.70M–2.00M: hundreds of MB per 10k blocks) stay
 //! memory-bounded and timeout-immune. A reorder stage releases sub-chunks
 //! strictly in (plan_index, sub_index) order — continuity-verified — into the
-//! byte-budgeted ChunkQueue. Design: docs/SLIPSTREAM_DESIGN.md §1/§2.2 (T0);
-//! splitting + resume-from-height retry: STATE.md session 2026-06-12 T6.8-S.
+//! byte-budgeted ChunkQueue. Splitting + resume-from-height retry landed in
+//! run T6.8-S, 2026-06-12.
 
 use std::{
     collections::BTreeMap,

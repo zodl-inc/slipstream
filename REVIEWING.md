@@ -1,7 +1,7 @@
 # Slipstream — Reviewer's Guide
 
 > For Zcash protocol / cryptographic engineers. This is a **map** — where to look and why — not a
-> tutorial. Prose deep-dives live in `docs/book/` (open `index.html`); build journals in `docs/plans/`.
+> tutorial.
 > The engine consumes **canonical** librustzcash — crates.io releases where published; the
 > Ironwood-era family rides `[patch.crates-io]` onto `zcash/librustzcash` main at a pinned rev
 > (see `Cargo.toml`), never a third-party fork. It adds *scheduling,
@@ -57,12 +57,9 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `probe.rs` | v0.7 P1: endpoint probing/racing across `EngineConfig.alternate_endpoints` — picks a healthy server before a pass and feeds the mid-pass failover loop. |
 | `throttle.rs` | v0.7 P0: local TCP throttle proxy (token bucket) — the test-only "weather machine" for simulating sick servers; never on a production path. |
 | `network.rs` | `SlipstreamNetwork` — custom consensus params / activation heights (CLI `--custom-heights`, `--network test`) for exercising Ironwood/NU6.3 against modified-parameter chains pre-activation. |
-| `vendor_shim.rs` | Compatibility shim covering what the un-membered 0.14-based vendor forks used to provide directly, now that the workspace rides orchard 0.15. |
-| `vendor/orchard` (fork, un-membered on the 0.15 graph — standalone KATs only) | v0.5: pinned 0.14.0 + `endo.rs` (GLV decomposition, φ-mapped wNAF table, half-width Straus ladder — 300k-verified constants re-proven in-crate) + the runtime toggles (`set_enabled`); the dead-end lockstep `batch_dh.rs` kernel was removed in v0.6.2. |
-| `vendor/zcash_note_encryption` (fork, un-membered on the 0.15 graph — standalone KATs only) | v0.5: the `BatchDomain::batch_ka_agree_dec` seam (default = per-item byte-for-byte); re-synced verbatim to upstream `release/0.4.2` in v0.6.2. |
 | `error.rs` | `SlipstreamError` + `is_transient` (drives every retry decision). |
 
-`gpuhash/` (crate `slipstream-gpuhash`, cargo feature `gpu`, **default-off**) — wgpu Orchard Sinsemilla
+`gpuhash/` (crate `zodl-slipstream-gpuhash`, cargo feature `gpu`, **default-off**) — wgpu Orchard Sinsemilla
 combine; byte-identical to `MerkleHashOrchard::combine` (KAT-gated). Released builds link zero wgpu.
 
 ## Sync data flow (one pass)
@@ -115,9 +112,8 @@ same thin veneer. No key custody lives here beyond UFVK import (keys are `zcash_
 
 ## Build / run / verify
 ```sh
-cargo test -p slipstream-core -p slipstream-cli                 # the always-green gate
+cargo test -p zodl-slipstream -p slipstream-cli                 # the always-green gate
 cargo run  -p slipstream-cli -- sync   --server <lwd> --wallet-dir <dir> --ufvk <ufvk> --birthday <h>
 cargo run  -p slipstream-cli -- oracle --server <lwd> --wallet-a <a> --wallet-b <b> \
            --ufvk <ufvk> --birthday <h> --sparse-b --write-behind-b   # byte-identity → VERDICT IDENTICAL
 ```
-Architecture prose: `docs/book/index.html`.

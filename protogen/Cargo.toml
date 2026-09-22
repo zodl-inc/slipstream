@@ -1,9 +1,12 @@
 [package]
 name = "slipstream-protogen"
 version = "0.0.1"
-edition = "2024"
-rust-version = "1.90"
-license = "MIT"
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+categories.workspace = true
 publish = false
 
 # One-off codegen runner: regenerates slipstream/core/src/grpc_generated/.

@@ -19,7 +19,7 @@
 //! Graduated verbatim from the Phase A spike (`zcash-gpu-spike/crates/gpu-wgpu`), which proved
 //! the WGSL kernels bit-exact vs `orchard::tree::MerkleHashOrchard::combine` (oracle 0/10M).
 //! The shaders (`field.wgsl` + `pallas.wgsl` + `sinsemilla.wgsl`) are unchanged. Public entry
-//! point: [`orchard_combine_batch`]. Used ONLY behind `slipstream-core`'s `gpu` feature.
+//! point: [`orchard_combine_batch`]. Used ONLY behind `zodl-slipstream`'s `gpu` feature.
 //!
 //! Note: the GPU-infrastructure `unwrap`s in `dispatch_hash` (device poll / buffer map) are a
 //! documented B0 exception to the no-unwrap convention — a GPU device failure is unrecoverable

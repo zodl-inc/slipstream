@@ -1,79 +1,57 @@
 [package]
-name = "slipstream-core"
-# Milestone versioning (see the slipstream repo README "Status"): v0.6.4 = the
-# Ironwood-era snapshot — third-pool (NU6.3) sparse persistence + anchor
-# retention + the librustzcash-main dependency re-ride + failover preview.
-version = "0.6.4"
-edition = "2024"
-rust-version = "1.90"
-license = "MIT"
-publish = false
-
-[features]
-default = ["zcash_client_sqlite"]
-# Issue #4: the zcash_client_sqlite wallet-storage backend (this SPECIFIC sqlite
-# backend, hence the crate-named feature). Gates the storage-consuming half of
-# the crate — WalletSession, the sparse persistence lanes, the ext_slipstream_*
-# schema/migrations, and the engine loop that is (today) hard-wired to them.
-# Without it the crate compiles the storage-independent transport/planning
-# layer only; a future non-sqlite backend slots in beside this gate.
-zcash_client_sqlite = [
-    "dep:zcash_client_sqlite",
-    "dep:rusqlite",
-    "dep:schemerz",
-    "dep:schemerz-rusqlite",
-    "dep:uuid",
+name = "zodl-slipstream"
+description = "A high-performance zcash light wallet sync engine"
+version = "0.2.0"
+authors = [
+    "Lukas Korba <lukas.korba@seznam.cz>",
+    "Kris Nuttycombe <kris@electriccoin.co>"
 ]
-# Hermetic integration tests against a local darkside lightwalletd (see CONVENTIONS).
-# The darkside harness drives WalletSession, so it requires the sqlite backend.
-darkside = ["zcash_client_sqlite"]
-# Phase B: GPU-accelerated Orchard subtree-build (B0). Pulls slipstream-gpuhash + wgpu.
-# OFF by default → the default libzcashlc build never compiles wgpu. The GPU lane
-# exists solely for the sqlite persistence path, so it requires that backend.
-gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+categories.workspace = true
 
 [dependencies]
-thiserror = { workspace = true }
-tracing = { workspace = true } # logging policy per CONVENTIONS.md
+slipstream-gpuhash = { workspace = true, optional = true }
+
 zcash_protocol = { workspace = true }
 zcash_client_backend = { workspace = true }
 zcash_client_sqlite = { workspace = true, optional = true }
 zcash_keys = { workspace = true }
 zcash_primitives = { workspace = true }
+zip32 = { workspace = true }
+zcash_note_encryption = { workspace = true }
+zcash_address = { workspace = true }
+incrementalmerkletree = { workspace = true }
+shardtree = { workspace = true }
+
+sapling = { workspace = true }
+orchard = { workspace = true }
+transparent = { workspace = true }
+zcash_script = { workspace = true }
+
 rusqlite = { workspace = true, optional = true }
-# Issue #4: the ext_slipstream_* schema is created/evolved by schemerz migrations
-# registered with the wallet DB's own migrator (see migrations.rs).
 schemerz = { workspace = true, optional = true }
 schemerz-rusqlite = { workspace = true, optional = true }
+
 uuid = { workspace = true, optional = true }
 secrecy = { workspace = true }
 rand = { workspace = true }
-sapling = { workspace = true }
-orchard = { workspace = true }
-incrementalmerkletree = { workspace = true }
-shardtree = { workspace = true }
-slipstream-gpuhash = { path = "../gpuhash", optional = true } # Phase B `gpu` feature only
-# v0.4 Plan B (batch_sinsemilla.rs): batch-affine combine — same workspace-pinned
-# versions the B0 GPU work introduced; pure CPU, no wgpu, always compiled.
 sinsemilla = { workspace = true }
 pasta_curves = { workspace = true }
 group = { workspace = true }
 ff = { workspace = true }
+
 rayon = { workspace = true }
-zip32 = { workspace = true }
-# v0.4 T10b (oracle testkit): real note encryption for the owned-note fixture in
-# the graft spend-proof — `Domain` trait for epk bytes; orchard supplies the rest.
-zcash_note_encryption = { workspace = true }
-# v0.4 T10b step 2: the pay-to-self ZcashAddress in the spend-proof's zip321
-# request (already in the workspace graph via the FFI — zero new compile weight).
-zcash_address = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 tonic-prost = { workspace = true }
 futures-util = { workspace = true }
-transparent = { workspace = true }
-zcash_script = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -85,6 +63,32 @@ bls12_381 = { workspace = true }
 # deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+default = ["zcash_client_sqlite"]
+# The zcash_client_sqlite wallet-storage backend. Gates the storage-consuming
+# half of the crate — WalletSession, the sparse persistence lanes, the
+# ext_slipstream_* schema/migrations, and the engine loop that is (today)
+# hard-wired to them. Without it the crate compiles the storage-independent
+# transport/planning layer only; a future non-sqlite backend slots in beside
+# this gate.
+zcash_client_sqlite = [
+    "dep:zcash_client_sqlite",
+    "dep:rusqlite",
+    "dep:schemerz",
+    "dep:schemerz-rusqlite",
+    "dep:uuid",
+]
+
+# Hermetic integration tests against a local darkside lightwalletd (see CONVENTIONS).
+# The darkside harness drives WalletSession, so it requires the sqlite backend.
+darkside = ["zcash_client_sqlite"]
+
+# GPU-accelerated Orchard subtree-build (B0). Pulls slipstream-gpuhash + wgpu.
+# OFF by default → the default libzcashlc build never compiles wgpu. The GPU
+# lane exists solely for the sqlite persistence path, so it requires that
+# backend.
+gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
 
 # Integration-test binaries that require the sqlite backend are declared with
 # `required-features`, so `cargo test --no-default-features` SKIPS them instead

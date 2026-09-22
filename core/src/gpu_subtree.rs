@@ -15,7 +15,7 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 //! GPU-OFFLOAD Orchard subtree build (feature `gpu`, Phase B0 — PARKED, default-off;
-//! device matrix 2026-06-15: ~1.1× A14/iPhone, −25% M4, A10 pathological; see STATE.md).
+//! device matrix 2026-06-15: ~1.1× A14/iPhone, −25% M4, A10 pathological).
 //! Since Task 13 the shared lookup-map machinery lives in `lookup_build.rs`; this is
 //! the thin wrapper binding it to the wgpu kernel in `slipstream-gpuhash`.
 

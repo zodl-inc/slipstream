@@ -52,7 +52,7 @@
 //! Start the darkside lightwalletd first (from repo root):
 //!   Tests/lightwalletd/lightwalletd --no-tls-very-insecure --data-dir /tmp \
 //!     --darkside-very-insecure --log-file /dev/stdout
-//! Then: cargo test -p slipstream-core --features darkside -- --ignored --test-threads=1
+//! Then: cargo test -p zodl-slipstream --features darkside -- --ignored --test-threads=1
 #![cfg(feature = "darkside")]
 
 use std::num::NonZeroU32;
@@ -60,7 +60,11 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use rusqlite::Connection;
-use slipstream_core::{
+use zcash_client_backend::data_api::{WalletRead, wallet::ConfirmationsPolicy};
+use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
+use zcash_protocol::consensus::Network;
+use zcash_protocol::value::Zatoshis;
+use zodl_slipstream::{
     chunk::chunk_queue,
     config::{Endpoint, EngineConfig},
     darkside::DarksideCtl,
@@ -70,10 +74,6 @@ use slipstream_core::{
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
 };
-use zcash_client_backend::data_api::{WalletRead, wallet::ConfirmationsPolicy};
-use zcash_client_backend::proto::service::{BlockId, BlockRange, TreeState};
-use zcash_protocol::consensus::Network;
-use zcash_protocol::value::Zatoshis;
 
 // ---------------------------------------------------------------------------
 // Fixture constants — values extracted from Swift test sources listed below.
@@ -870,7 +870,7 @@ const SPENDABILITY_APPLY_HEIGHT: i32 = 663_250;
 /// must live in the Swift seam or the app layer.
 /// (2026-06-11 verdict: PASSED on first run — Rust/DB exonerated; the field bug was the
 /// Swift seam never marking `SDKFlags.chainTipUpdated`, so `ZcashRustBackend.getWalletSummary`
-/// masked `spendableValue` to zero. See STATE.md session log.)
+/// masked `spendableValue` to zero.)
 ///
 /// ## Confirmations-policy provenance (MUST mirror the Swift SDK)
 ///

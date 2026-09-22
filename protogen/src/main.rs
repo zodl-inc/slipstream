@@ -14,7 +14,7 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Regenerates the darkside-control gRPC client into slipstream-core.
+//! Regenerates the darkside-control gRPC client into zodl-slipstream.
 //! Shared walletrpc types are extern-mapped to zcash_client_backend's
 //! generated module so no duplicate prost types exist.
 

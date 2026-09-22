@@ -15,7 +15,7 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 //! Engine → shell surface: a polled `Snapshot` plus a drained `Event` ring
-//! (decision D8 in docs/slipstream/ROADMAP.md). Fields grow in P3; keep
+//! (decision D8). Fields grow in P3; keep
 //! both types additive (`#[non_exhaustive]`).
 
 use std::sync::{

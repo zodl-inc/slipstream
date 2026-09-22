@@ -6,12 +6,6 @@ A high-performance sync engine for Zcash light wallets. Slipstream re-architects
 download → trial-decrypt → commitment-tree → persist pipeline to sync **dramatically faster**
 than the reference path — while producing a **byte-identical** wallet database.
 
-> **Independent project.** Slipstream is a personal R&D project by Lukas Korba. It is **not**
-> an Electric Coin Company, Zcash Foundation, or company product, and carries no endorsement
-> from them. It builds on the official `librustzcash` crates published on crates.io; since
-> v0.5 two of them (`orchard`, `zcash_note_encryption`) are carried as minimally-patched
-> vendored forks — byte-identical output, headed upstream.
-
 > **Reviewing or auditing?** Start with **[`REVIEWING.md`](REVIEWING.md)** — a dense
 > module-and-data-flow map (where to look, and why) written for Zcash protocol engineers.
 
@@ -35,15 +29,13 @@ ZcashLightClientKit on the same wallet.
 Deep history holds up: a real 2019 wallet — ~2.4M blocks including the entire 2022–23
 "sandblasting" spam era — restores in **51 minutes** (M4), a range effectively
 unrestorable on the reference path. On device, Slipstream also beats the Zingo and Zkool
-reference engines. Methodology and full numbers in `docs/`.
+reference engines. See `REVIEWING.md` for the module map.
 
 ## Design — "upstream brain, Slipstream body"
 
 Every cryptographic and wallet-logic decision is delegated to the `librustzcash` crates
 (`zcash_client_backend`, `zcash_client_sqlite`, `shardtree`, `sapling`) — unmodified,
-published on crates.io. Two crates (`orchard`, `zcash_note_encryption`) are vendored under
-`vendor/` as minimally-patched forks carrying the v0.5 trial-decrypt seam (batched-DH hook +
-GLV endomorphism ladder) — byte-identical output, KAT-gated, tracked for upstreaming.
+published on crates.io. 
 
 Slipstream owns only the **orchestration**: parallel block fetch with a device-RAM-scaled byte
 budget, a sparse in-memory commitment tree with a checkpoint-downgrade, a write-behind
@@ -56,11 +48,10 @@ and can be embedded anywhere Rust runs.
 
 | Crate | Role |
 |---|---|
-| `core` — `slipstream-core` | the engine |
+| `core` — `zodl-slipstream` | the engine |
 | `cli` — `slipstream-cli` | benchmark / golden-oracle / A-B harness |
-| `gpuhash` — `slipstream-gpuhash` | **parked** GPU Sinsemilla kernel — off by default; a default build links zero `wgpu` |
-| `protogen` | dev-only gRPC code generator |
-| `vendor/` | the two patched forks (`orchard`, `zcash_note_encryption`), wired via `[patch.crates-io]` |
+| `gpuhash` — `zodl-slipstream-gpuhash` | **parked** GPU Sinsemilla kernel — off by default; a default build links zero `wgpu` |
+| `protogen` — `slipstream-protogen` | dev-only gRPC code generator |
 
 ## Correctness
 
@@ -72,41 +63,17 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p slipstream-core -p slipstream-cli   # the always-green gate (228 + 32 tests)
+cargo test -p zodl-slipstream -p slipstream-cli   # the always-green gate (228 + 32 tests)
 cargo build --workspace                           # full workspace incl. the parked gpuhash
 ```
 
-Edition 2024, Rust 1.90+. Dependencies are published crates.io releases plus the two
-vendored forks under `vendor/`.
+Edition 2024, Rust 1.90+. Dependencies are published crates.io releases.
 
 ## Documentation
 
-- **`docs/book/`** — *The Slipstream Book*: 20 chapters covering architecture, data model,
-  fetch/scan/persist, reorgs, resilience, the correctness oracle, security, privacy,
-  exploitability, performance, and tests. Start at `docs/book/index.html`.
-- **`docs/plans/`** — phase-by-phase design records.
-- **`docs/2026-06-15-perf-spikes-learnings.md`** — what was tried, measured, and parked
-  (GPU offload, deeper write-behind pipelining) and why.
-
-## Status & versioning
-
-| Milestone | What it is |
-|---|---|
-| **v0.1** | Foundation. First engine cut: 64 min → 16 min restore. |
-| **v0.2** | Engine rewrite. ~12× the reference SDK (iPad A10 8:32, iPhone ~1:20). |
-| **v0.2.5** | Restore correctness. Read-side reconciliation view, never-overshoot recovery balance, transient-network retry. |
-| **v0.3** | Engine API v2. Engine-owned wallet semantics: `is_recovering`, monotonic `progress_permille`, `stalled_seconds`, criticality-aware event ring, recovery-balance view, unified wallet-summary FFI. |
-| **v0.3.5** | API v2.1 — thin hosts. Snapshot truthful from open. Self-rationing wallet summary. `tip_fresh`, `tx_set_version`. Progress re-baselines when scan scope expands. `restore_anchor` owns wallet provisioning. |
-| **v0.3.6** | Lifecycle hardening. Wallet file quiescent on stop (writer gate: drain + join). Orphaned scan ranges pruned at open. Session revival with capped backoff. |
-| **v0.4** | "Graft, don't grind" — work reduction, **on by default**. Restores 13–46% faster fleet-wide. Subtree-root grafting (1-in-16 sampling audit; gates included a Halo2-adjudicated spend-from-grafted-witness proof and a 19/19 mainnet root audit) + batch-affine Sinsemilla (~12× the scalar combine). Byte-identical. Kill switches: `ZCASH_GRAFT_SUBTREE=0`, `ZCASH_BATCH_COMBINE=0`. |
-| **v0.5** | Scan pacer — **on by default**. Another 26–42% off restores. Boundary treestate prefetch (server RTT fully hidden; sync times stop swinging with server weather). Gated interleaved enhancement. GLV endomorphism trial-decrypt DH (−24% DH core-time, byte-identical, KAT-gated). Negatives recorded honestly: lockstep batched-DH kernel and local treestate derivation were built, measured, and rejected. Kill switch: `ZCASH_ENDO_MUL=0`. |
-| **v0.5.1** | Sandblasting-era restore fix. Deep-history batches no longer flood the checkpoint store (v0.4 graft interaction — panicked mid-era); damaged wallets self-heal at the next session open. Red-proven regression tests; validated by a full-era 2.4M-block restore. |
-| **v0.6** | The instrument-driven CPU campaign. A18-class scan proven CPU-saturated (wall = CPU ÷ cores), then work deleted where the instruments pointed: skip-below-window nullifier tracking (persist rows −80%), a dedicated persist-lane pool, and the shared per-epk φ-endo window (trial-decrypt GLV tables built once per ephemeral key, reused by both scope ivks; the unread upstream wNAF table is never built). A18 scan_call 28.0 → 25.9 s; DH −12% CPU (A18) / −21% (M4). Four negatives documented: QoS pinning, GLV-lockstep kernel (batch-affine DH closed on Apple Silicon), window-5 tables, pass-2 thinning. Byte-identical, KAT-gated. |
-| **v0.6.1** | Host-layer fix only: the FFI caps `zcash_client_backend`'s tracing spans at WARN (they were flooding os_log/signpost from the scan producer thread; production pass1 3.42 s → 0.47 s). Engine byte-identical to v0.6.0, which is why it was never re-extracted here — folded into v0.6.4. |
-| **v0.6.4** | The Ironwood-era snapshot (the 0.6.2 label went unpublished, and tag 0.6.3 was cut before the manifest bump — the version skips to 0.6.4). Sparse persistence gains the third (Ironwood/NU6.3) shielded pool — seed/flush, nullifier tracking, 3-way cross-pool checkpoint — proven byte-identical to the upstream tree at the same tip on public testnet, including the first alternative-engine spend of an Ironwood note (CLI `send`). Anchor-retention exemption (`EngineConfig.anchor_retention_height` + `--anchor-retention`, default off = byte-identical). Dependency re-ride: the librustzcash family via `[patch.crates-io]` onto `zcash/librustzcash` main (orchard 0.15; shardtree 0.7 / incrementalmerkletree 0.8.2 released, backport pins retired), with engine-owned code shrinking onto upstreamed primitives (rows stage −424 lines). Server-health failover preview (v0.7 P0–P2): endpoint probing/racing (`EngineConfig.alternate_endpoints`), clock-free wire-collapse detector with bounded mid-pass failover, and a throttle-proxy weather machine for tests. CLI: `--network test`, `derive-ufvk`, custom activation heights. Note: the 0.14-based vendor perf forks (GLV endomorphism / batch-DH) are un-membered on the 0.15 graph — v0.5/v0.6's DH-path numbers are historical until a re-vendor onto orchard 0.15. |
-
-This repository is the **v0.6.4** snapshot (tag `0.6.4` once cut), re-extracted from the
-development tree (the Zodl wallet SDK's `slipstream` branch).
+- **`HOSTING.md`** — the crate consumer's guide: what to call, in what order, and how to
+  read the results correctly.
+- **`REVIEWING.md`** — module map for protocol engineers.
 
 ## License
 
