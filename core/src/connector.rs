@@ -130,6 +130,7 @@ const TOR_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Clone)]
 pub struct TorConn {
     client: TorClient<PreferredRuntime>,
+    client_trace_prefix: Option<String>,
 }
 
 impl TorConn {
@@ -140,6 +141,7 @@ impl TorConn {
     pub async fn bootstrap(
         tor_dir: &Path,
         dangerously_trust_everyone: bool,
+        client_trace_prefix: Option<String>,
     ) -> Result<Self, SlipstreamError> {
         let boot =
             |e: &dyn std::fmt::Display| SlipstreamError::Transport(format!("tor bootstrap: {e}"));
@@ -168,12 +170,21 @@ impl TorConn {
             .await
             .map_err(|e| boot(&e))?;
         tracing::debug!("arti Tor client bootstrapped");
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            client_trace_prefix,
+        })
     }
 
     /// Wrap an already-bootstrapped arti client (e.g. one shared with another component).
-    pub fn from_client(client: TorClient<PreferredRuntime>) -> Self {
-        Self { client }
+    pub fn from_client(
+        client: TorClient<PreferredRuntime>,
+        client_trace_prefix: Option<String>,
+    ) -> Self {
+        Self {
+            client,
+            client_trace_prefix,
+        }
     }
 
     /// The underlying arti handle.
@@ -231,9 +242,12 @@ impl TorConn {
                 (TorMode::Default, 1) => self.client.clone(),
                 _ => self.client.isolated_client(),
             };
+            let client_trace_prefix = self.client_trace_prefix.clone();
             let attempt_fut = async {
                 match relay {
-                    Some(relay) => Self::connect_ohttp(client, endpoint, relay).await,
+                    Some(relay) => {
+                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
+                    }
                     None => Self::connect_direct_over_tor(client, endpoint).await,
                 }
             };
@@ -271,15 +285,20 @@ impl TorConn {
         client: TorClient<PreferredRuntime>,
         endpoint: &Endpoint,
         relay: &str,
+        client_trace_prefix: Option<String>,
     ) -> Result<LwdClient, SlipstreamError> {
         tracing::info!(
             gateway = %endpoint.host,
             relay,
             "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
         );
-        let connector =
-            OhttpConnector::with_dialer(&endpoint.host, relay, Dialer::Tor(Box::new(client)), None)
-                .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
+        let connector = OhttpConnector::with_dialer(
+            &endpoint.host,
+            relay,
+            Dialer::Tor(Box::new(client)),
+            client_trace_prefix,
+        )
+        .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
         connector
             .warm_up()
             .await

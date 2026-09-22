@@ -129,6 +129,7 @@ const TOR_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
 const TOR_DIAL_ATTEMPTS: u32 = 3;
 
 /// How the TCP leg towards the relay / gateway is opened.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub enum Dialer {
     /// The device's own network path (the relay sees the device IP, but only ciphertext).
@@ -920,7 +921,7 @@ mod tests {
         let started = std::time::Instant::now();
         let tor = tokio::time::timeout(
             Duration::from_secs(240),
-            TorConn::bootstrap(dir.path(), true),
+            TorConn::bootstrap(dir.path(), true, None),
         )
         .await
         .expect("tor bootstrap within 240s")

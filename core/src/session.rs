@@ -302,7 +302,7 @@ pub async fn run_session(
         Some(ref t) => {
             let mut boot_failures: u32 = 0;
             loop {
-                match TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone).await {
+                match TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone, None).await {
                     Ok(tc) => {
                         tracing::info!(
                             "slipstream Tor bootstrapped (engine-owned isolated circuits)"
