@@ -55,7 +55,7 @@ futures-util = { workspace = true }
 
 
 # Tor and OHTTP transport dependencies
-arti-client = "0.35"
+arti-client = { version = "0.35", default-features = false, features = ["compression", "rustls", "tokio", "onion-service-client"] }
 tor-rtcompat = "0.35"
 aes-gcm = "0.10"
 bhttp = "0.5"
