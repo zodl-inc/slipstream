@@ -923,7 +923,10 @@ impl OhttpClient {
                         );
                         key = self.key_config(true).await?;
                     } else {
-                        return Err(format!("relay/gateway HTTP 422: {}", &body_str[..body_str.len().min(160)]));
+                        return Err(format!(
+                            "relay/gateway HTTP 422: {}",
+                            &body_str[..body_str.len().min(160)]
+                        ));
                     }
                 }
                 other => {
@@ -1330,11 +1333,11 @@ mod tests {
             .decode(&sig_b64)
             .expect("decode sig");
         sig_bytes[0] ^= 0x01; // flip one bit
-        envelope["sig"] = serde_json::Value::String(
-            base64::prelude::BASE64_STANDARD.encode(&sig_bytes)
-        );
+        envelope["sig"] =
+            serde_json::Value::String(base64::prelude::BASE64_STANDARD.encode(&sig_bytes));
         let tampered_json = serde_json::to_vec(&envelope).expect("re-serialize");
-        let tampered_result = verify_signed_config(&tampered_json, "ohttp-gateway-testnet.example");
+        let tampered_result =
+            verify_signed_config(&tampered_json, "ohttp-gateway-testnet.example");
         assert!(
             tampered_result.is_err(),
             "tampered signature must be rejected"
