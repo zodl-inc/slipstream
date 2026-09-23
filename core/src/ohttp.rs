@@ -83,10 +83,10 @@ const RESPONSE_LABEL: &[u8] = b"message/bhttp response";
 /// Embedded Ed25519 public keys for signed OHTTP config verification (C-01 fix).
 /// Mainnet key: matches zodl-inc/zcash-android-wallet-sdk OhttpSignedConfig.kt
 const ED25519_PUBKEY_MAINNET: &str =
-    "38cd475c5bf8c35c0ba2c3e9f0ea21104d50f2dbdd4bf45a1dcb8f927d7e8e12";
+    "REDACTED-SIGNING-PUBKEY-MAINNET";
 /// Testnet key: matches zodl-inc/zcash-android-wallet-sdk OhttpSignedConfig.kt
 const ED25519_PUBKEY_TESTNET: &str =
-    "aa93f0966e7529badc9c959a4566f4b5f1cc76c1f0a70d3baf48c96a12ea8fe0";
+    "REDACTED-SIGNING-PUBKEY-TESTNET";
 
 /// Signed OHTTP config envelope (JSON, fetched from `/ohttp-configs/signed` via relay).
 #[derive(Debug, Deserialize)]
@@ -96,8 +96,8 @@ struct SignedOhttpConfig {
     configs: String, // base64-encoded application/ohttp-keys document
     not_before: u64, // Unix timestamp
     not_after: u64,  // Unix timestamp
-    #[allow(dead_code)] // Present in JSON schema but not used in verification
     key_id: String,
+    #[serde(rename = "sig")]
     signature: String, // base64-encoded Ed25519 signature
 }
 
@@ -380,12 +380,35 @@ fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConf
         return Err(format!("unsupported signed config version: {}", envelope.v));
     }
 
-    // Select the correct public key based on network
-    let pubkey_hex = match envelope.network.as_str() {
-        "mainnet" => ED25519_PUBKEY_MAINNET,
-        "testnet" => ED25519_PUBKEY_TESTNET,
+    // Derive expected network from gateway_host (not from the envelope's own network field)
+    let expected_network = if gateway_host.contains("testnet") {
+        "testnet"
+    } else {
+        "mainnet"
+    };
+
+    // Require envelope network matches configured network
+    if envelope.network != expected_network {
+        return Err(format!(
+            "network mismatch: gateway={}, envelope={}",
+            expected_network, envelope.network
+        ));
+    }
+
+    // Select the correct public key based on configured network
+    let (pubkey_hex, expected_key_id) = match expected_network {
+        "mainnet" => (ED25519_PUBKEY_MAINNET, "ba8a2dbd"),
+        "testnet" => (ED25519_PUBKEY_TESTNET, "a3620fb6"),
         other => return Err(format!("unknown network: {other}")),
     };
+    // Check key_id matches expected value (sha256(pk)[..4] as hex)
+    if envelope.key_id != expected_key_id {
+        return Err(format!(
+            "key_id mismatch: expected {}, got {}",
+            expected_key_id, envelope.key_id
+        ));
+    }
+
     let pubkey_bytes =
         hex::decode(pubkey_hex).map_err(|e| format!("decode embedded pubkey: {e}"))?;
     let verifying_key = VerifyingKey::from_bytes(
@@ -1045,7 +1068,7 @@ mod tests {
             "not_before": not_before,
             "not_after": not_after,
             "key_id": "test-key",
-            "signature": base64::prelude::BASE64_STANDARD.encode(&[0u8; 64]),
+            "signature": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
         let json = serde_json::to_vec(&envelope).unwrap();
@@ -1087,7 +1110,7 @@ mod tests {
             "not_before": not_before,
             "not_after": not_after,
             "key_id": "test-key",
-            "signature": base64::prelude::BASE64_STANDARD.encode(&[0u8; 64]),
+            "signature": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
         let json = serde_json::to_vec(&envelope).unwrap();
@@ -1124,7 +1147,7 @@ mod tests {
             "not_before": not_before,
             "not_after": not_after,
             "key_id": "test-key",
-            "signature": base64::prelude::BASE64_STANDARD.encode(&[0u8; 64]),
+            "signature": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
         let json = serde_json::to_vec(&envelope).unwrap();
@@ -1414,8 +1437,6 @@ mod client_trace {
     /// with the same encapsulated ciphertext, violating nonce-once and triggering gateway 409.
     #[cfg(test)]
     mod c08_retry_tests {
-        use super::*;
-
         /// Test that https() respects the allow_retry parameter.
         /// When allow_retry is false (OHTTP relay POST), h2 errors must NOT retry.
         /// When allow_retry is true (key config GET), h2 errors can retry once.
@@ -1577,8 +1598,7 @@ mod client_trace {
             // - No replay cache on the server
             //
             // The fix: allow_retry: false for OHTTP relay POSTs, allow_retry: true for key config GETs.
-
-            assert!(true, "This test documents the problem fixed by C-08");
+            // This test exists purely to document the C-08 fix reasoning above.
         }
     }
 }
