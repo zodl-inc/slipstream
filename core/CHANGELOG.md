@@ -10,6 +10,11 @@ workspace.
 
 ## [Unreleased]
 
+### Fixed
+- A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the
+  pass-level retry takes over. Previously the other workers kept running and could wait behind
+  the missing chunk indefinitely, leaving the pass in `Syncing` with no progress.
+
 ## [0.2.0] - 2026-08-19
 
 ### Changed
