@@ -96,6 +96,7 @@ struct SignedOhttpConfig {
     configs: String, // base64-encoded application/ohttp-keys document
     not_before: u64, // Unix timestamp
     not_after: u64,  // Unix timestamp
+    #[allow(dead_code)] // Present in JSON schema but not used in verification
     key_id: String,
     signature: String, // base64-encoded Ed25519 signature
 }
@@ -564,8 +565,6 @@ fn parse_https(url: &str) -> Result<HttpsTarget, String> {
 struct OhttpClient {
     gateway_host: String,
     relay: HttpsTarget,
-    /// C-01 fix: Path to signed config endpoint (fetched through relay, not direct to gateway)
-    signed_config_path: String,
     key_config: Mutex<Option<KeyConfig>>,
     tls: Arc<rustls::ClientConfig>,
     dialer: Dialer,
@@ -603,8 +602,6 @@ impl OhttpClient {
         Ok(Self {
             gateway_host: gateway_host.to_string(),
             relay: parse_https(relay_url)?,
-            // C-01 fix: Fetch signed config through relay, not direct to gateway
-            signed_config_path: format!("https://{gateway_host}/ohttp-configs/signed"),
             key_config: Mutex::new(None),
             tls: Arc::new(tls),
             dialer,
@@ -768,23 +765,21 @@ impl OhttpClient {
 
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
         // C-01 fix: Check cache expiry based on not_after timestamp
-        if !refresh {
-            if let Some(k) = self.key_config.lock().await.as_ref() {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(|e| format!("system time: {e}"))?
-                    .as_secs();
-                // Refresh 60s before expiry to avoid races
-                if now + 60 < k.not_after {
-                    return Ok(k.clone());
-                }
-                tracing::info!(
-                    gateway = %self.gateway_host,
-                    not_after = k.not_after,
-                    now,
-                    "ohttp: cached key config expired, refreshing"
-                );
+        if !refresh && let Some(k) = self.key_config.lock().await.as_ref() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("system time: {e}"))?
+                .as_secs();
+            // Refresh 60s before expiry to avoid races
+            if now + 60 < k.not_after {
+                return Ok(k.clone());
             }
+            tracing::info!(
+                gateway = %self.gateway_host,
+                not_after = k.not_after,
+                now,
+                "ohttp: cached key config expired, refreshing"
+            );
         }
 
         // C-01 fix: Fetch signed config through relay host at /ohttp-configs/signed
