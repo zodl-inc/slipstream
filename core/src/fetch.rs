@@ -482,6 +482,7 @@ async fn pump_block_stream<S>(
     progress_deadline: Duration,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
+    progress: Option<&Progress>,
 ) -> Result<PumpOutcome, SlipstreamError>
 where
     S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
@@ -530,6 +531,11 @@ where
                 return flush_then_fail(splitter.finish(), cursor, gate, out, err).await;
             }
         };
+        // Liveness: data arriving is forward progress even while the
+        // sub-chunk is still accumulating (the stall clock hosts watch).
+        if let Some(p) = progress {
+            p.touch();
+        }
         if let Some((blocks, bytes)) = splitter.push(block) {
             if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
                 return Ok(PumpOutcome::ConsumerGone);
@@ -563,6 +569,7 @@ async fn open_and_pump(
     plan: &FetchPlan,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
+    progress: Option<&Progress>,
 ) -> Result<PumpOutcome, SlipstreamError> {
     let req = BlockRange {
         start: Some(BlockId {
@@ -601,6 +608,7 @@ async fn open_and_pump(
         plan.chunk_timeout,
         gate,
         out,
+        progress,
     )
     .await
 }
@@ -612,6 +620,7 @@ async fn worker(
     next: Arc<AtomicU64>,
     gate: AheadGate,
     out: mpsc::Sender<SubChunk>,
+    progress: Option<Arc<Progress>>,
 ) -> Result<(), SlipstreamError> {
     let mut client = connect_direct_with_retry(&endpoint).await?;
     loop {
@@ -635,7 +644,16 @@ async fn worker(
         loop {
             attempt += 1;
             cursor.emitted_this_attempt = false;
-            match open_and_pump(&mut client, &mut cursor, &plan, &gate, &out).await {
+            match open_and_pump(
+                &mut client,
+                &mut cursor,
+                &plan,
+                &gate,
+                &out,
+                progress.as_deref(),
+            )
+            .await
+            {
                 Ok(PumpOutcome::Completed) => break,
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
                 Err(err) => {
@@ -1002,6 +1020,7 @@ pub async fn run_fetch(
             Arc::clone(&next),
             gate.clone(),
             tx.clone(),
+            progress.clone(),
         ));
     }
     drop(tx); // release loop ends when all workers finish
@@ -1247,6 +1266,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("pump");
@@ -1296,6 +1316,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("pump");
@@ -1331,6 +1352,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("short stream must error");
@@ -1373,6 +1395,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("attempt 1 must surface the stream error");
@@ -1397,6 +1420,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("attempt 2 completes");
@@ -1445,6 +1469,7 @@ mod tests {
             Duration::from_secs(5),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("slow-but-progressing stream must complete");
@@ -1475,6 +1500,7 @@ mod tests {
             Duration::from_secs(5),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("a slow but progressing stream must complete");
@@ -1527,6 +1553,7 @@ mod tests {
             Duration::from_secs(5),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("must complete, not end short");
@@ -1558,6 +1585,7 @@ mod tests {
             Duration::from_secs(5),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("silence must fail the attempt");
@@ -1610,6 +1638,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("the stream error must still fail the attempt");
@@ -1641,6 +1670,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("silence must still fail the attempt");
@@ -1669,6 +1699,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("a short stream must still fail the attempt");
@@ -1699,6 +1730,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("the stream error must still fail the attempt");
@@ -1710,6 +1742,44 @@ mod tests {
         );
         assert_eq!(cursor.resume_from, 100);
         assert!(!cursor.emitted_this_attempt);
+    }
+
+    /// Liveness: every block received moves the stall clock, even while the
+    /// sub-chunk it belongs to is still accumulating (nothing emitted yet).
+    #[tokio::test(start_paused = true)]
+    async fn pump_touches_progress_on_every_received_block() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let progress = Progress::default();
+        progress.last_progress_unix.store(0, Ordering::Relaxed);
+        // Block 100, then silence well inside the 30 s idle timeout.
+        let mut s = Box::pin(
+            stream::iter(vec![Ok::<_, tonic::Status>(block_sized(100, 1000))])
+                .chain(stream::pending()),
+        );
+        let pumped = tokio::time::timeout(
+            Duration::from_secs(10),
+            pump_block_stream(
+                &mut s,
+                &mut cursor,
+                usize::MAX >> 8,
+                Duration::from_secs(120),
+                &gate,
+                &tx,
+                Some(&progress),
+            ),
+        )
+        .await;
+        assert!(pumped.is_err(), "the pump is still waiting for block 101");
+        assert!(
+            progress.last_progress_unix_secs() > 0,
+            "receiving block 100 must stamp the stall clock"
+        );
+        assert!(
+            drain_subs(&mut rx).is_empty(),
+            "nothing was emitted — the stamp came from the receive itself"
+        );
     }
 
     // ── AheadGate ──────────────────────────────────────────────────────────────

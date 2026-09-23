@@ -10,6 +10,12 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- `stalled_seconds` (and `Progress::last_progress_unix`) now also move whenever data arrives from
+  the server during a pass — every streamed block and every successful metadata response, direct
+  or over Tor — not only when a counter moves. A slow but working pass no longer reads as stalled,
+  so hosts that restart stalled passes stop restarting healthy ones.
+
 ### Fixed
 - A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the
   pass-level retry takes over (or, when wire failover is armed, the engine fails over to an

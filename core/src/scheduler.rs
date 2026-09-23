@@ -344,15 +344,18 @@ pub async fn run_to_completion(
         {
             let ep = config.endpoint.clone();
             let tor_owned = tor.cloned();
+            let boundary_progress = progress.clone();
             tx.set_boundary_fetcher(std::sync::Arc::new(move |end_height| {
                 let ep = ep.clone();
                 let tor_owned = tor_owned.clone();
+                let progress = boundary_progress.clone();
                 tokio::spawn(async move {
                     crate::grpc::retry_get_tree_state(
                         &ep,
                         end_height,
                         "boundary prefetch (fetch-side)",
                         tor_owned.as_ref(),
+                        progress,
                     )
                     .await
                 })

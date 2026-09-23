@@ -173,6 +173,13 @@ pub async fn run_enhancement(
             let Some((txid, want_enhance, fetched)) = pending.next().await else {
                 break;
             };
+            if fetched.is_ok() {
+                // Liveness: each GetTransaction answer is forward progress — over Tor
+                // these take seconds each and most never store a transaction.
+                if let Some(p) = &progress {
+                    p.touch();
+                }
+            }
             stats.fetch_wait += fetch_started.elapsed();
             let store_started = std::time::Instant::now();
             apply_txid_fetch(
@@ -429,6 +436,9 @@ async fn apply_address_request(
     let raw_txs = grpc::get_taddress_txids(client, filter)
         .await
         .map_err(|e| SlipstreamError::Wallet(format!("get_taddress_txids: {e}")))?;
+    if let Some(p) = progress {
+        p.touch(); // liveness: the address-history answer is forward progress
+    }
 
     let tx_status_filter = tia.tx_status_filter().clone();
     let block_range_end_for_notify = block_range_end;

@@ -69,8 +69,10 @@ pub struct Progress {
     /// states (Done / Error) — the fail-safe latch that previously lived in the Swift
     /// SDK ("a dead pass can never wedge Restoring") now holds for every host.
     pub recovering: AtomicU64,
-    /// Unix seconds of the last forward progress (any counter bump / pass start).
-    /// The snapshot derives `stalled_seconds = now − this` while Syncing.
+    /// Unix seconds of the last forward progress: any counter bump, a pass start,
+    /// or data arriving from the server during a pass (every streamed block and
+    /// every successful metadata response, direct or over Tor). The snapshot
+    /// derives `stalled_seconds = now − this` while Syncing.
     pub last_progress_unix: AtomicU64,
     /// Session-monotonic progress floor in permille (0..=1000). The snapshot fetch-maxes
     /// the raw `scanned / pass_total` ratio into this and reports the floor, so reported
@@ -239,7 +241,8 @@ impl Progress {
     // ── API v2 (ENGINE_API_V2.md §4.4) ──
 
     /// Stamp `last_progress_unix` with the current wall-clock second. Called by every
-    /// counter bump and at pass start; the snapshot derives stalledness from it.
+    /// counter bump, at pass start, and whenever server data arrives during a pass; the
+    /// snapshot derives stalledness from it.
     #[inline]
     pub fn touch(&self) {
         let now = std::time::SystemTime::now()
