@@ -833,9 +833,17 @@ async fn release_ordered(
 /// progress. The first worker failure now aborts every other worker and fails
 /// the fetch immediately; it is a `Transport` error, so the pass-level retry
 /// ladder takes over. A release error aborts the workers the same way.
+///
+/// When `failover` is armed (`Some`), a worker giving up is treated as the full
+/// wire stall the wire-collapse detector would eventually have raised on its
+/// own: the failure is remapped to `WireCollapse` (0.0 MB/s, the arm's floor)
+/// so the engine's failover loop switches to an alternate endpoint at once
+/// instead of retrying the same one. Worker panics and release errors are
+/// unaffected by `failover` either way.
 async fn supervise_fetch<R>(
     release: R,
     mut workers: JoinSet<Result<(), SlipstreamError>>,
+    failover: Option<WireFailoverArm>,
 ) -> Result<ReleaseSummary, SlipstreamError>
 where
     R: std::future::Future<Output = Result<ReleaseSummary, SlipstreamError>>,
@@ -854,6 +862,13 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     workers.abort_all();
+                    if let Some(arm) = failover {
+                        warn!(%err, "fetch worker gave up — failing over as a full wire stall");
+                        return Err(SlipstreamError::WireCollapse {
+                            measured_mbps: 0.0,
+                            floor_mbps: arm.floor_mbps,
+                        });
+                    }
                     return Err(err);
                 }
                 Err(join_err) => {
@@ -931,6 +946,7 @@ pub async fn run_fetch(
             plan.failover,
         ),
         workers,
+        plan.failover,
     )
     .await?;
 
@@ -1669,10 +1685,12 @@ mod tests {
         workers.spawn(pending_worker(&dropped));
         let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
 
-        let outcome =
-            tokio::time::timeout(Duration::from_secs(600), supervise_fetch(release, workers))
-                .await
-                .expect("supervisor must not hang behind the failed chunk");
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            supervise_fetch(release, workers, None),
+        )
+        .await
+        .expect("supervisor must not hang behind the failed chunk");
 
         let err = outcome.expect_err("a failed worker fails the fetch");
         assert!(
@@ -1699,7 +1717,7 @@ mod tests {
                 ..Default::default()
             })
         };
-        let summary = supervise_fetch(release, workers)
+        let summary = supervise_fetch(release, workers, None)
             .await
             .expect("all workers succeeded");
         assert_eq!(summary.blocks, 7);
@@ -1714,7 +1732,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Err::<ReleaseSummary, _>(SlipstreamError::Transport("continuity broken".into()))
         };
-        let err = supervise_fetch(release, workers)
+        let err = supervise_fetch(release, workers, None)
             .await
             .expect_err("a release error fails the fetch");
         assert!(err.to_string().contains("continuity broken"), "got: {err}");
@@ -1729,7 +1747,7 @@ mod tests {
             panic!("synthetic worker panic");
         });
         let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
-        let err = supervise_fetch(release, workers)
+        let err = supervise_fetch(release, workers, None)
             .await
             .expect_err("a panicked worker fails the fetch");
         assert!(
@@ -1748,9 +1766,68 @@ mod tests {
             Err(SlipstreamError::Transport("late failure".into()))
         });
         let release = async { Ok(ReleaseSummary::default()) };
-        let err = supervise_fetch(release, workers)
+        let err = supervise_fetch(release, workers, None)
             .await
             .expect_err("the late worker error must surface");
         assert!(err.to_string().contains("late failure"), "got: {err}");
+    }
+
+    /// When wire failover is armed, a worker giving up must be treated as the
+    /// full wire stall the detector would eventually have raised on its own —
+    /// so the engine's failover loop can switch endpoints immediately instead
+    /// of retrying the one that just gave up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_fails_over_when_armed_and_a_worker_gives_up() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(SlipstreamError::Transport("plan chunk 8 gave up".into()))
+        });
+        workers.spawn(pending_worker(&dropped));
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let arm = WireFailoverArm::default();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            supervise_fetch(release, workers, Some(arm)),
+        )
+        .await
+        .expect("supervisor must not hang behind the failed chunk");
+
+        let err = outcome.expect_err("a failed worker fails the fetch");
+        match err {
+            SlipstreamError::WireCollapse {
+                measured_mbps,
+                floor_mbps,
+            } => {
+                assert_eq!(measured_mbps, 0.0);
+                assert_eq!(floor_mbps, arm.floor_mbps);
+            }
+            other => panic!("expected WireCollapse, got: {other}"),
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the still-running worker must be aborted"
+        );
+    }
+
+    /// Armed failover must not swallow a genuine worker panic into a
+    /// WireCollapse — a panic is a bug, not a wire-quality signal.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_maps_worker_panic_to_transport_error_even_when_armed() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(release, workers, Some(WireFailoverArm::default()))
+            .await
+            .expect_err("a panicked worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::Transport(ref m) if m.contains("worker panicked")),
+            "got: {err}"
+        );
     }
 }
