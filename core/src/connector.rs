@@ -443,7 +443,7 @@ impl Connector {
 /// Free-function form of [`Connector::connect`] for call sites that already thread `endpoint`
 /// (from `EngineConfig`) and an optional Tor handle separately — avoids restructuring the run
 /// path around the bundled [`Connector`]. Per-call policy: with `tor` `Some` every purpose rides
-/// Tor (bulk on the default circuit, metadata on its own — see [`route`]); with `tor` `None`,
+/// Tor (bulk on the default circuit, metadata on its own — see `route` helper); with `tor` `None`,
 /// `connect_direct_with_retry` → `grpc::connect`, which already speaks OHTTP to gateways over the
 /// direct relay leg.
 pub async fn connect_via(

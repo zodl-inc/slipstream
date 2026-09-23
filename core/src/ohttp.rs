@@ -39,8 +39,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite};
 use serde::Deserialize;
+use tokio::io::{AsyncRead, AsyncWrite};
 
 use aes_gcm::{
     Aes128Gcm, KeyInit, Nonce,
@@ -82,20 +82,22 @@ const RESPONSE_LABEL: &[u8] = b"message/bhttp response";
 
 /// Embedded Ed25519 public keys for signed OHTTP config verification (C-01 fix).
 /// Mainnet key: matches zodl-inc/zcash-android-wallet-sdk OhttpSignedConfig.kt
-const ED25519_PUBKEY_MAINNET: &str = "38cd475c5bf8c35c0ba2c3e9f0ea21104d50f2dbdd4bf45a1dcb8f927d7e8e12";
+const ED25519_PUBKEY_MAINNET: &str =
+    "38cd475c5bf8c35c0ba2c3e9f0ea21104d50f2dbdd4bf45a1dcb8f927d7e8e12";
 /// Testnet key: matches zodl-inc/zcash-android-wallet-sdk OhttpSignedConfig.kt
-const ED25519_PUBKEY_TESTNET: &str = "aa93f0966e7529badc9c959a4566f4b5f1cc76c1f0a70d3baf48c96a12ea8fe0";
+const ED25519_PUBKEY_TESTNET: &str =
+    "aa93f0966e7529badc9c959a4566f4b5f1cc76c1f0a70d3baf48c96a12ea8fe0";
 
 /// Signed OHTTP config envelope (JSON, fetched from `/ohttp-configs/signed` via relay).
 #[derive(Debug, Deserialize)]
 struct SignedOhttpConfig {
     v: u8,
     network: String,
-    configs: String,          // base64-encoded application/ohttp-keys document
-    not_before: u64,          // Unix timestamp
-    not_after: u64,           // Unix timestamp
+    configs: String, // base64-encoded application/ohttp-keys document
+    not_before: u64, // Unix timestamp
+    not_after: u64,  // Unix timestamp
     key_id: String,
-    signature: String,        // base64-encoded Ed25519 signature
+    signature: String, // base64-encoded Ed25519 signature
 }
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
@@ -352,7 +354,11 @@ impl KeyConfig {
                 let kdf = rd_u16(&mut pos)?;
                 let aead = rd_u16(&mut pos)?;
                 if kdf == KDF_ID && aead == AEAD_ID {
-                    return Ok(Self { key_id, public_key, not_after });
+                    return Ok(Self {
+                        key_id,
+                        public_key,
+                        not_after,
+                    });
                 }
             }
             pos = end;
@@ -366,8 +372,8 @@ impl KeyConfig {
 fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConfig, String> {
     use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-    let envelope: SignedOhttpConfig = serde_json::from_slice(json_bytes)
-        .map_err(|e| format!("signed config JSON parse: {e}"))?;
+    let envelope: SignedOhttpConfig =
+        serde_json::from_slice(json_bytes).map_err(|e| format!("signed config JSON parse: {e}"))?;
 
     if envelope.v != 1 {
         return Err(format!("unsupported signed config version: {}", envelope.v));
@@ -379,29 +385,41 @@ fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConf
         "testnet" => ED25519_PUBKEY_TESTNET,
         other => return Err(format!("unknown network: {other}")),
     };
-    let pubkey_bytes = hex::decode(pubkey_hex)
-        .map_err(|e| format!("decode embedded pubkey: {e}"))?;
+    let pubkey_bytes =
+        hex::decode(pubkey_hex).map_err(|e| format!("decode embedded pubkey: {e}"))?;
     let verifying_key = VerifyingKey::from_bytes(
-        pubkey_bytes.as_slice().try_into()
+        pubkey_bytes
+            .as_slice()
+            .try_into()
             .map_err(|_| "invalid pubkey length")?,
     )
     .map_err(|e| format!("invalid Ed25519 pubkey: {e}"))?;
 
     // Decode base64 fields
     use base64::prelude::*;
-    let configs_bytes = BASE64_STANDARD.decode(&envelope.configs)
+    let configs_bytes = BASE64_STANDARD
+        .decode(&envelope.configs)
         .map_err(|e| format!("decode configs base64: {e}"))?;
-    let signature_bytes = BASE64_STANDARD.decode(&envelope.signature)
+    let signature_bytes = BASE64_STANDARD
+        .decode(&envelope.signature)
         .map_err(|e| format!("decode signature base64: {e}"))?;
     let signature = Signature::from_bytes(
-        signature_bytes.as_slice().try_into()
+        signature_bytes
+            .as_slice()
+            .try_into()
             .map_err(|_| "invalid signature length")?,
     );
 
     // Build the message to verify: "zodl-ohttp-configs-v1" || 0x00 || network || 0x00 ||
     // u64be(not_before) || u64be(not_after) || configs
     let mut message = Vec::with_capacity(
-        b"zodl-ohttp-configs-v1".len() + 1 + envelope.network.len() + 1 + 8 + 8 + configs_bytes.len()
+        b"zodl-ohttp-configs-v1".len()
+            + 1
+            + envelope.network.len()
+            + 1
+            + 8
+            + 8
+            + configs_bytes.len(),
     );
     message.extend_from_slice(b"zodl-ohttp-configs-v1");
     message.push(0x00);
@@ -412,7 +430,8 @@ fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConf
     message.extend_from_slice(&configs_bytes);
 
     // Verify signature (fail closed)
-    verifying_key.verify(&message, &signature)
+    verifying_key
+        .verify(&message, &signature)
         .map_err(|_| "Ed25519 signature verification failed")?;
 
     // Check validity window with ±60s tolerance
@@ -1038,7 +1057,10 @@ mod tests {
         let result = verify_signed_config(&json, "ohttp-gateway-testnet.example");
 
         // MUST reject the invalid signature
-        assert!(result.is_err(), "verify_signed_config must reject invalid signature");
+        assert!(
+            result.is_err(),
+            "verify_signed_config must reject invalid signature"
+        );
         let err = result.unwrap_err();
         assert!(
             err.contains("signature verification failed") || err.contains("Ed25519"),
@@ -1061,7 +1083,7 @@ mod tests {
             .unwrap()
             .as_secs();
         let not_before = now - 7200; // 2 hours ago
-        let not_after = now - 3600;  // 1 hour ago (expired)
+        let not_after = now - 3600; // 1 hour ago (expired)
 
         let envelope = serde_json::json!({
             "v": 1,
@@ -1078,7 +1100,10 @@ mod tests {
 
         assert!(result.is_err(), "must reject expired config");
         let err = result.unwrap_err();
-        assert!(err.contains("expired"), "error must indicate expiration, got: {err}");
+        assert!(
+            err.contains("expired"),
+            "error must indicate expiration, got: {err}"
+        );
     }
 
     /// C-01 fix test: Verify that configs with too-long validity windows are rejected.
@@ -1414,8 +1439,7 @@ mod client_trace {
 
             // Check signature has allow_retry parameter
             assert!(
-                source.contains("async fn https(") &&
-                source.contains("allow_retry: bool,"),
+                source.contains("async fn https(") && source.contains("allow_retry: bool,"),
                 "C-08 fix: https() must have allow_retry: bool parameter"
             );
 
@@ -1427,9 +1451,9 @@ mod client_trace {
 
             // Check the comment explaining the fix
             assert!(
-                source.contains("C-08") &&
-                source.contains("OHTTP relay POST") &&
-                source.contains("nonce-once"),
+                source.contains("C-08")
+                    && source.contains("OHTTP relay POST")
+                    && source.contains("nonce-once"),
                 "C-08 fix: https() must document why OHTTP relay POSTs cannot retry"
             );
         }
@@ -1451,10 +1475,10 @@ mod client_trace {
             //       false,  // C-08: never retry OHTTP relay POST
             //   ).await?;
             assert!(
-                source.contains("async fn round_trip(&self, bhttp_request: &[u8])") &&
-                source.contains("self.https(") &&
-                source.contains("Some(\"message/ohttp-req\")") &&
-                source.contains("false, // C-08: never retry OHTTP relay POST"),
+                source.contains("async fn round_trip(&self, bhttp_request: &[u8])")
+                    && source.contains("self.https(")
+                    && source.contains("Some(\"message/ohttp-req\")")
+                    && source.contains("false, // C-08: never retry OHTTP relay POST"),
                 "C-08 fix: round_trip() must call https() with allow_retry: false for OHTTP relay POST"
             );
 
@@ -1462,9 +1486,9 @@ mod client_trace {
             // This proves that key-rotation retry (the outer loop in round_trip) re-encapsulates,
             // while h2-connection retry (inside https) does not.
             assert!(
-                source.contains("for attempt in 0..2 {") &&
-                source.contains("let (enc_req, ctx) = encapsulate(&key, bhttp_request)?;") &&
-                source.contains("self.https("),
+                source.contains("for attempt in 0..2 {")
+                    && source.contains("let (enc_req, ctx) = encapsulate(&key, bhttp_request)?;")
+                    && source.contains("self.https("),
                 "round_trip() must encapsulate before each https() call (key rotation retry is safe)"
             );
         }
@@ -1486,11 +1510,11 @@ mod client_trace {
             //       true,  // allow_retry: key config GET can safely retry
             //   ).await?;
             assert!(
-                source.contains("async fn key_config(&self, refresh: bool)") &&
-                source.contains("self.https(") &&
-                source.contains("Method::GET") &&
-                source.contains("\"application/json\"") &&
-                source.contains("true, // allow_retry: key config GET can safely retry"),
+                source.contains("async fn key_config(&self, refresh: bool)")
+                    && source.contains("self.https(")
+                    && source.contains("Method::GET")
+                    && source.contains("\"application/json\"")
+                    && source.contains("true, // allow_retry: key config GET can safely retry"),
                 "C-08 fix: key_config() must call https() with allow_retry: true for GET requests"
             );
         }
@@ -1519,20 +1543,20 @@ mod client_trace {
 
             // Verify the flow described above exists in the code
             assert!(
-                source.contains("pub async fn send(&self, req: &[u8])") &&
-                source.contains("self.engine.round_trip(req)"),
+                source.contains("pub async fn send(&self, req: &[u8])")
+                    && source.contains("self.engine.round_trip(req)"),
                 "OhttpEngine.send() must call round_trip()"
             );
 
             assert!(
-                source.contains("async fn round_trip(&self, bhttp_request: &[u8])") &&
-                source.contains("encapsulate(&key, bhttp_request)"),
+                source.contains("async fn round_trip(&self, bhttp_request: &[u8])")
+                    && source.contains("encapsulate(&key, bhttp_request)"),
                 "round_trip() must call encapsulate() to seal the request"
             );
 
             assert!(
-                source.contains("fn encapsulate(key: &KeyConfig, plaintext: &[u8])") &&
-                source.contains("§4.3"),
+                source.contains("fn encapsulate(key: &KeyConfig, plaintext: &[u8])")
+                    && source.contains("§4.3"),
                 "encapsulate() must implement RFC 9458 §4.3 (request encapsulation)"
             );
         }
