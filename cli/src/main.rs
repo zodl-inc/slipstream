@@ -478,7 +478,7 @@ async fn run_fetch_bench(
     let (tx, mut rx) = zodl_slipstream::chunk::chunk_queue(256 * 1024 * 1024);
     let drain = tokio::spawn(async move { while let Some((_c, _p, _b)) = rx.recv().await {} });
     let plan = zodl_slipstream::fetch::FetchPlan::new(start, end, chunk, streams);
-    let stats = zodl_slipstream::fetch::run_fetch(endpoint, plan, tx, None).await?;
+    let stats = zodl_slipstream::fetch::run_fetch(endpoint, None, plan, tx, None).await?;
     let _ = drain.await;
     Ok(stats)
 }
