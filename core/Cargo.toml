@@ -90,6 +90,8 @@ bls12_381 = { workspace = true }
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = "0.3"
+# For live signed-config verification tests
+reqwest = "0.12"
 
 [features]
 default = ["zcash_client_sqlite"]
