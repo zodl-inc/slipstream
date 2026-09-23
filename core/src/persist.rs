@@ -3513,10 +3513,18 @@ impl PersistLane {
             .clone()
             .map(crate::events::WalletWriterGate::hold);
         self.in_flight_span = span;
+        let liveness = self.progress.clone();
         self.in_flight = Some(tokio::task::spawn_blocking(move || {
             let _gate = gate;
             let started = std::time::Instant::now();
             let result = job(&mut db, &mut sparse).map(|()| started.elapsed());
+            // Liveness: a finished commit is forward progress for the stall clock
+            // even though no counter moves.
+            if result.is_ok()
+                && let Some(p) = &liveness
+            {
+                p.touch();
+            }
             (db, sparse, result)
         }));
         Ok(())
@@ -4143,6 +4151,60 @@ mod write_behind_tests {
         assert!(
             lane.total_busy() >= Duration::from_millis(140),
             "busy accounted"
+        );
+    }
+
+    /// Liveness: a finished deferred commit is forward progress for the stall
+    /// clock even though no counter moves (a slow device finishing a range).
+    #[tokio::test]
+    async fn lane_successful_commit_touches_attached_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lane = lane(dir.path());
+        let progress: crate::events::ProgressArc = Arc::new(crate::events::Progress::default());
+        progress
+            .last_progress_unix
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        lane.attach_writer_gate(Arc::clone(&progress));
+        lane.submit_job((1, 1), Box::new(|_db, _sparse| Ok(())))
+            .await
+            .expect("submit");
+        lane.drain().await.expect("drain");
+        assert!(
+            progress.last_progress_unix_secs() > 0,
+            "a completed commit must stamp the stall clock"
+        );
+    }
+
+    /// Liveness counterpart: a commit that FAILS is not forward progress — the
+    /// stall clock must stay untouched so a genuinely stuck pass still stalls.
+    #[tokio::test]
+    async fn lane_failed_commit_does_not_touch_progress() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut lane = lane(dir.path());
+        let progress: crate::events::ProgressArc = Arc::new(crate::events::Progress::default());
+        progress
+            .last_progress_unix
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        lane.attach_writer_gate(Arc::clone(&progress));
+        lane.submit_job(
+            (1, 1),
+            Box::new(|_db, _sparse| {
+                Err(SqliteClientError::CorruptedData(
+                    "synthetic commit failure".into(),
+                ))
+            }),
+        )
+        .await
+        .expect("submit of the failing unit itself succeeds");
+        let err = lane.drain().await.unwrap_err();
+        assert!(
+            err.to_string().contains("synthetic commit failure"),
+            "got: {err}"
+        );
+        assert_eq!(
+            progress.last_progress_unix_secs(),
+            0,
+            "a failed commit must not stamp the stall clock"
         );
     }
 

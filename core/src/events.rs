@@ -70,9 +70,10 @@ pub struct Progress {
     /// SDK ("a dead pass can never wedge Restoring") now holds for every host.
     pub recovering: AtomicU64,
     /// Unix seconds of the last forward progress: any counter bump, a pass start,
-    /// or data arriving from the server during a pass (every streamed block and
-    /// every successful metadata response, direct or over Tor). The snapshot
-    /// derives `stalled_seconds = now − this` while Syncing.
+    /// data arriving from the server during a pass (every streamed block and
+    /// every successful metadata response, direct or over Tor), or a unit of
+    /// local work completing (a persisted chunk, the range-end tree build). The
+    /// snapshot derives `stalled_seconds = now − this` while Syncing.
     pub last_progress_unix: AtomicU64,
     /// Session-monotonic progress floor in permille (0..=1000). The snapshot fetch-maxes
     /// the raw `scanned / pass_total` ratio into this and reports the floor, so reported

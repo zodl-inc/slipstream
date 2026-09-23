@@ -335,7 +335,7 @@ pub async fn scan_chunks(
         client,
         range_start,
         rx,
-        progress,
+        progress.clone(),
         config,
         skipped_keys,
         &mut wb,
@@ -366,6 +366,9 @@ pub async fn scan_chunks(
                 // v0.4 Plan A: build the range-end/tip shard the accumulators still
                 // hold (success path only — on errors the buffer resumes the shard).
                 tokio::task::block_in_place(|| wb.lane.finish_graft_blocking())?;
+                if let Some(p) = &progress {
+                    p.touch(); // liveness: the range-end tree build finished
+                }
                 stats.final_drain = final_drain_elapsed;
                 stats.persist_wait = wb.lane.total_wait();
                 stats.persist_busy = wb.lane.total_busy();

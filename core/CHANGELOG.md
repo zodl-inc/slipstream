@@ -15,6 +15,9 @@ workspace.
   the server during a pass — every streamed block and every successful metadata response, direct
   or over Tor — not only when a counter moves. A slow but working pass no longer reads as stalled,
   so hosts that restart stalled passes stop restarting healthy ones.
+- Completing a write-behind persist unit and building the range-end tree now also count as
+  forward progress for `stalled_seconds`, so a long local-only tail (a slow device finishing a
+  range) no longer reads as stalled.
 
 ### Fixed
 - A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the
