@@ -253,14 +253,16 @@ the engine notes the lowest block it had not yet handed to the scanner. The pass
 fails and is retried — or, when wire failover is armed, fails over to another endpoint
 instead; either way, the give-up counts. Once the download has given up twice at that same
 block, with no more than ten minutes between give-ups, the second span runs from the first
-of them, whatever the retried passes do meanwhile. It lasts until a later download hands
-that block to the scanner, a pass completes, or a new session starts. A server that cannot
-deliver a block range is therefore reported as stalled, instead of being retried out of
-the host's sight. A pass that fails before its download starts (for example, with no
-network) never counts, nor does a fetch that failed after delivering every block. The
-engine supplies the fact; the host owns the policy (the Swift SDK restarts a pass that
-stays stalled for 120 s, at most three times per engine handle, and reports each restart
-and the final give-up).
+of them, whatever the retried passes do meanwhile, for as long as that block's latest
+give-up is at most ten minutes old. It ends when a later download hands that block to the
+scanner, a pass completes, a new session starts, or a sync attempt fails without its
+download giving up: a pass that fails before its download starts, or the tip check between
+passes failing (for example, with no network). A server that cannot deliver a block range
+is therefore reported as stalled, instead of being retried out of the host's sight, while
+a device that loses its network is not: its failing attempts end the span. A fetch that
+failed after delivering every block never starts one. The engine supplies the fact; the
+host owns the policy (the Swift SDK restarts a pass that stays stalled for 120 s, at most
+three times per engine handle, and reports each restart and the final give-up).
 
 ### 5.4 `tx_set_version` — the one transaction rule
 A monotonic counter that bumps **exactly when the stored transaction set changes**: a

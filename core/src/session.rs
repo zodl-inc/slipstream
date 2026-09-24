@@ -203,6 +203,9 @@ pub(crate) async fn run_pass_with_retry(
                 return Ok(outcome);
             }
             Err(err) => {
+                // A failed attempt that did not give up its download ends every
+                // download-failure run (see `Progress::note_attempt_failed`).
+                progress.note_attempt_failed();
                 attempt += 1;
                 match should_retry(&err, attempt) {
                     Some(sleep_dur) => {
@@ -476,6 +479,9 @@ async fn follow_loop(
             }
             Err(err) if err.is_transient() => {
                 consecutive_failures += 1;
+                // The tip check could not reach the server, so no download is failing
+                // (see `Progress::note_attempt_failed`).
+                reporter.progress.note_attempt_failed();
                 // T8.7: a transient probe failure NEVER surfaces Error — the wallet is
                 // already synced; retry on the next tick.
                 if consecutive_failures > FOLLOW_FAILURE_CAP {
@@ -495,6 +501,9 @@ async fn follow_loop(
             }
             Err(err) => {
                 consecutive_failures += 1;
+                // The tip check could not reach the server, so no download is failing
+                // (see `Progress::note_attempt_failed`).
+                reporter.progress.note_attempt_failed();
                 // T8.7: even a non-transient probe error stays OUT of Error — the wallet is
                 // synced; surfacing a hard error for a follow-phase blip is exactly what
                 // internal testers must not see. Retry next tick.
@@ -770,5 +779,36 @@ mod tests {
         let _reacquired = tokio::time::timeout(Duration::from_millis(500), lock.lock())
             .await
             .expect("an aborted pass must release pass_lock so the restart can proceed");
+    }
+
+    /// A pass that fails without its download giving up — here a configuration the engine
+    /// rejects before any network I/O — ends every download-failure run: nothing shows the
+    /// download is still failing.
+    #[tokio::test]
+    async fn a_pass_that_fails_without_a_give_up_ends_every_download_failure_run() {
+        let progress = Arc::new(Progress::default());
+        progress.note_download_gave_up(500);
+        progress.note_download_gave_up(500);
+        progress.note_attempt_failed(); // the attempt that gave up has ended
+        assert_eq!(progress.download_failures().len(), 1);
+
+        let mut cfg = EngineConfig::new(
+            crate::Network::TestNetwork,
+            std::path::PathBuf::from("/tmp/slipstream-attempt-failed-test.db"),
+            crate::config::Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+        );
+        cfg.fetch_streams = 0; // `validate()` rejects this before any I/O
+        let err = run_pass_with_retry(&cfg, &[], &progress, None)
+            .await
+            .expect_err("an invalid configuration fails the pass");
+        assert!(matches!(err, SlipstreamError::Config(_)), "got: {err}");
+        assert!(
+            progress.download_failures().is_empty(),
+            "a pass that failed without a give-up ends every run"
+        );
     }
 }

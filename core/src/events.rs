@@ -20,7 +20,7 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 
 /// Current wall-clock time in whole Unix seconds (0 if the clock reads before the epoch).
@@ -40,7 +40,9 @@ pub const DOWNLOAD_FAILURE_STALL_STREAK: u32 = 2;
 /// Give-ups at the same block more than this many seconds apart are separate runs. The time in
 /// between was not spent failing that download: for example, the device was offline and every
 /// pass failed before its download started. It sits well above the few minutes between
-/// consecutive give-ups when a server keeps failing a range.
+/// consecutive give-ups when a server keeps failing a range. A run also stops counting toward
+/// `stalled_seconds` once its latest give-up is older than this: see
+/// [`Progress::download_failure_secs`].
 pub const DOWNLOAD_FAILURE_RUN_GAP_SECS: u64 = 600;
 
 /// A safety bound on how many runs [`Progress`] keeps. Runs normally hold only the one or two
@@ -49,11 +51,12 @@ const MAX_DOWNLOAD_FAILURE_RUNS: usize = 8;
 
 /// A run of block-download give-ups at one block (see [`Progress::note_download_gave_up`]).
 ///
-/// There is one run per block. A run ends in one of three ways: a later release of its block to
+/// There is one run per block. A run ends in one of four ways: a later release of its block to
 /// the scanner ([`Progress::note_blocks_released`]), a completed pass
-/// ([`Progress::note_pass_completed`]), or a new session ([`Progress::begin_session`]). A give-up
-/// at its block more than [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] after the previous one starts the run
-/// over.
+/// ([`Progress::note_pass_completed`]), a sync attempt that failed without its download giving up
+/// ([`Progress::note_attempt_failed`]), or a new session ([`Progress::begin_session`]). A give-up
+/// at its block more than [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] after the previous one starts it
+/// over, and until then it counts only while live.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadFailure {
     /// Give-ups at `at_height` in this run.
@@ -159,8 +162,13 @@ pub struct Progress {
     /// [`Self::note_download_gave_up`]). Deliberately NOT reset by [`Self::begin_pass`]: a run
     /// spans the retried passes it is about. A run ends when a later release covers its block
     /// ([`Self::note_blocks_released`]); every run ends when a pass completes
-    /// ([`Self::note_pass_completed`]) or a new session begins ([`Self::begin_session`]).
+    /// ([`Self::note_pass_completed`]), a sync attempt fails without its download giving up
+    /// ([`Self::note_attempt_failed`]), or a new session begins ([`Self::begin_session`]).
     download_failures: std::sync::Mutex<std::collections::BTreeMap<u64, DownloadFailure>>,
+    /// Whether the block download gave up since the last sync attempt ended: set by every
+    /// give-up, spent by [`Self::note_attempt_failed`], and cleared by
+    /// [`Self::note_pass_completed`] and [`Self::begin_session`].
+    download_gave_up_this_attempt: AtomicBool,
 }
 
 /// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
@@ -317,7 +325,8 @@ impl Progress {
     /// order (ChainTip, FoundNote and Verify ranges come before Historic ones, and truncation
     /// rewinds), so a give-up at one block says nothing about another. Each run ends when a
     /// later release covers its block ([`Self::note_blocks_released`]), a pass completes
-    /// ([`Self::note_pass_completed`]), or a new session begins ([`Self::begin_session`]).
+    /// ([`Self::note_pass_completed`]), a sync attempt fails without its download giving up
+    /// ([`Self::note_attempt_failed`]), or a new session begins ([`Self::begin_session`]).
     /// Should more than a handful of blocks have runs at once, the one that failed least
     /// recently is dropped.
     pub fn note_download_gave_up(&self, at_height: u64) {
@@ -362,6 +371,8 @@ impl Progress {
             };
             (run, evicted)
         };
+        self.download_gave_up_this_attempt
+            .store(true, Ordering::SeqCst);
         if run.streak == DOWNLOAD_FAILURE_STALL_STREAK {
             tracing::warn!(
                 at_height = run.at_height,
@@ -381,6 +392,8 @@ impl Progress {
 
     /// A pass completed: the download got past whatever it failed on before, so every run ends.
     pub fn note_pass_completed(&self) {
+        self.download_gave_up_this_attempt
+            .store(false, Ordering::SeqCst);
         self.clear_download_failures("pass completed");
     }
 
@@ -388,7 +401,25 @@ impl Progress {
     /// ends, so the session's first give-up at any block starts a new run instead of extending
     /// one from before the restart.
     pub fn begin_session(&self) {
+        self.download_gave_up_this_attempt
+            .store(false, Ordering::SeqCst);
         self.clear_download_failures("new session");
+    }
+
+    /// A sync attempt failed: a pass, or the tip check between passes. If the block download
+    /// gave up during that attempt, the failure is the download's and every run stays.
+    /// Otherwise the attempt failed for another reason — typically it could not reach the
+    /// server at all, as when the device is offline — so nothing shows the download is still
+    /// failing, and every run ends. Without this, a run from before the device went offline
+    /// would keep reporting its growing span through every pass that fails before its download
+    /// starts.
+    pub fn note_attempt_failed(&self) {
+        if !self
+            .download_gave_up_this_attempt
+            .swap(false, Ordering::SeqCst)
+        {
+            self.clear_download_failures("sync attempt failed without its download giving up");
+        }
     }
 
     /// A fetch handed `first_height..=last_height` to the scanner: every run whose block falls
@@ -458,14 +489,18 @@ impl Progress {
     }
 
     /// Seconds the block download has kept failing at the same block, as of `now_unix`: the
-    /// longest time since a run's first give-up, over the runs with at least
-    /// [`DOWNLOAD_FAILURE_STALL_STREAK`] give-ups; 0 when no run has that many.
+    /// longest time since a run's first give-up, over the live runs — latest give-up at most
+    /// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] old — with at least
+    /// [`DOWNLOAD_FAILURE_STALL_STREAK`] give-ups; 0 when no run qualifies. A run that has gone
+    /// quiet for longer than the gap no longer counts: the download is not shown to be failing
+    /// any more, and its next give-up starts the run over.
     pub fn download_failure_secs(&self, now_unix: u64) -> u64 {
         self.download_failures
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .values()
             .filter(|run| run.streak >= DOWNLOAD_FAILURE_STALL_STREAK)
+            .filter(|run| now_unix.saturating_sub(run.last_unix) <= DOWNLOAD_FAILURE_RUN_GAP_SECS)
             .map(|run| now_unix.saturating_sub(run.since_unix))
             .max()
             .unwrap_or(0)
@@ -1095,8 +1130,8 @@ mod tests {
         p.note_download_gave_up_at(300, 900); // the oldest run, but a single give-up
         p.note_download_gave_up_at(100, 1_000);
         p.note_download_gave_up_at(200, 1_200);
-        p.note_download_gave_up_at(100, 1_300);
-        p.note_download_gave_up_at(200, 1_400);
+        p.note_download_gave_up_at(100, 1_400); // still live at 2_000: within the gap
+        p.note_download_gave_up_at(200, 1_600); // still live at 2_000: within the gap
         assert_eq!(
             p.download_failure_secs(2_000),
             1_000,
@@ -1248,6 +1283,75 @@ mod tests {
             p.download_failures(),
             vec![run(1, 900, 5_000, 5_000)],
             "the ended run must not linger beside the new one"
+        );
+    }
+
+    // ── live runs and failed sync attempts ───────────────────────────────────
+
+    #[test]
+    fn a_run_stops_counting_once_its_latest_give_up_is_older_than_the_gap() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        assert_eq!(
+            p.download_failure_secs(1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS),
+            10 + DOWNLOAD_FAILURE_RUN_GAP_SECS,
+            "still live at exactly the gap"
+        );
+        assert_eq!(
+            p.download_failure_secs(1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1),
+            0,
+            "no give-up for longer than the gap: the run no longer counts"
+        );
+    }
+
+    /// Two give-ups, then nothing more for longer than the gap while the engine keeps showing
+    /// signs of life: the stall fact is only the time since the latest progress stamp, however
+    /// old the run's first give-up is.
+    #[test]
+    fn an_inactive_run_does_not_hide_a_fresh_progress_stamp() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        let now = 1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1;
+        p.last_progress_unix.store(now - 5, Ordering::Relaxed);
+        assert_eq!(p.stall_secs(now), 5);
+    }
+
+    #[test]
+    fn an_attempt_that_failed_without_a_give_up_ends_every_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(200, 1_005);
+        p.note_attempt_failed(); // the attempt that gave up
+        assert_eq!(
+            p.download_failures().len(),
+            2,
+            "an attempt that failed because the download gave up keeps every run"
+        );
+        p.note_attempt_failed(); // an attempt that failed without giving up
+        assert!(
+            p.download_failures().is_empty(),
+            "an attempt that failed without its download giving up ends every run"
+        );
+    }
+
+    #[test]
+    fn each_attempt_that_gave_up_keeps_the_run_going() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_attempt_failed();
+        p.note_download_gave_up_at(100, 1_020);
+        p.note_attempt_failed();
+        assert_eq!(
+            p.download_failures().first().map(|run| run.streak),
+            Some(2),
+            "every failed attempt gave up at the block: the run continues"
+        );
+        p.note_attempt_failed();
+        assert!(
+            p.download_failures().is_empty(),
+            "the give-up was spent by the attempt before; this one failed without one"
         );
     }
 }
