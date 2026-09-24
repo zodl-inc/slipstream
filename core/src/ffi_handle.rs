@@ -71,8 +71,10 @@ pub struct FfiSlipstreamSnapshot {
     /// Blessed progress value, 0..=1000, session-monotonic (never regresses while the
     /// handle lives). Done forces 1000. Replaces host-side % math.
     pub progress_permille: u16,
-    /// Seconds since the last forward progress while state == Syncing; 0 otherwise.
-    /// The host keeps the policy (log vs restart); the engine supplies the fact.
+    /// Seconds without forward progress while state == Syncing; 0 otherwise — the longer of the
+    /// time since the last progress and the time the block download has kept failing at the
+    /// same block (see HOSTING.md §5.3). The host keeps the policy (log vs restart); the engine
+    /// supplies the fact.
     pub stalled_seconds: u32,
     // ── API v2.1 E-4 (appended at END for padding stability) ──
     /// Monotonic version of the wallet's stored transaction set (see
@@ -767,7 +769,7 @@ mod tests {
     }
 
     /// While Syncing, `stalled_seconds` reports a block download that keeps failing at the same
-    /// height even though the retried passes keep stamping progress; in any other state it
+    /// block even though the retried passes keep stamping progress; in any other state it
     /// stays 0.
     #[test]
     fn snapshot_reports_a_repeatedly_failing_download_while_syncing() {

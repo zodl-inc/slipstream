@@ -218,7 +218,8 @@ pub struct ScanStatsTotals {
     pub orchard_received: u64,
 }
 
-/// Aborts the wrapped task when dropped, instead of leaving it to keep running detached.
+/// Requests an abort of the wrapped task when dropped, instead of leaving it to keep running
+/// detached.
 ///
 /// A plain `JoinHandle` that is only awaited on the normal path is not enough: an early `?`
 /// return, or the enclosing future being dropped outright (a host restart aborts the SESSION
@@ -226,8 +227,13 @@ pub struct ScanStatsTotals {
 /// the per-range fetch task below, an orphan keeps fetching after its scanner is gone — its
 /// worker eventually exhausts its retries and records a download give-up into whatever
 /// `Progress` it still holds, corrupting a session that has already started fresh (see
-/// `Progress::begin_session`). Aborting an already-finished task is a no-op, so the normal
-/// path (`.await` to a result) is unaffected.
+/// `Progress::begin_session`).
+///
+/// The guarantee is limited: dropping the wrapper requests the abort, and the task stops at
+/// its next `.await`. `abort()` does not wait for that. A fetch task spends its life at
+/// awaits, so an aborted pass's fetch practically cannot record into a later session, but
+/// nothing here waits until it is gone. Aborting an already-finished task is a no-op, so the
+/// normal path (`.await` to a result) is unaffected.
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
 
 impl<T> Drop for AbortOnDrop<T> {

@@ -10,6 +10,13 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `events`: `DownloadFailure`, `DOWNLOAD_FAILURE_STALL_STREAK`, `DOWNLOAD_FAILURE_RUN_GAP_SECS`,
+  and the `Progress` methods `note_download_gave_up`, `note_blocks_released`,
+  `note_pass_completed`, `begin_session`, `download_failures`, `download_failure_secs` and
+  `stall_secs`. They track, per block, a block download that keeps giving up, and derive from it
+  the stall fact the snapshot reports as `stalled_seconds`.
+
 ### Changed
 - `stalled_seconds` (and `Progress::last_progress_unix`) now also move whenever data arrives from
   the server during a pass — every streamed block and every metadata message (a subtree root, an
@@ -19,12 +26,17 @@ workspace.
 - Completing a write-behind persist unit and building the range-end tree now also count as
   forward progress for `stalled_seconds`, so a long local-only tail (a slow device finishing a
   range) no longer reads as stalled.
-- `stalled_seconds` also counts a block download that keeps failing: once the download has given
-  up twice without getting past the height where it first stopped, it reports the time since that
-  first give-up whenever that is longer, until the download gets past that height, a pass
-  completes, or a new session starts. A server that cannot deliver a block range therefore still
-  reads as stalled even though every failed pass is retried at once. Passes that fail before their
-  download starts, for example with no network, do not count.
+- `stalled_seconds` also counts a block download that keeps failing at the same block: once the
+  download has given up twice at one block, with no more than ten minutes between give-ups, it
+  reports the time since the first of them whenever that is longer, until a later download hands
+  that block to the scanner, a pass completes, or a new session starts. Give-ups are tracked per
+  block, so failures at other blocks neither extend nor hide a run. A server that cannot deliver a
+  block range therefore still reads as stalled even though every failed pass is retried. Passes
+  that fail before their download starts, for example with no network, do not count, nor does a
+  fetch that failed after delivering every block.
+- `grpc::get_subtree_roots`, `grpc::get_taddress_txids`, `grpc::get_address_utxos` and
+  `transparent::refresh_utxos` take a new `progress: Option<&Progress>` argument, stamped for
+  every message received.
 
 ### Fixed
 - A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the
