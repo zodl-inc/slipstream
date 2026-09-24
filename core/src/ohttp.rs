@@ -472,6 +472,36 @@ fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConf
         ));
     }
 
+    // Check validity window with ±60s tolerance (BEFORE signature verification - fail fast)
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("system time: {e}"))?
+        .as_secs();
+    const TOLERANCE_SECS: u64 = 60;
+    if now + TOLERANCE_SECS < envelope.not_before {
+        return Err(format!(
+            "signed config not yet valid (not_before={}, now={})",
+            envelope.not_before, now
+        ));
+    }
+    if now > envelope.not_after + TOLERANCE_SECS {
+        return Err(format!(
+            "signed config expired (not_after={}, now={})",
+            envelope.not_after, now
+        ));
+    }
+
+    // Enforce ≤24h validity window (BEFORE signature verification - fail fast)
+    let validity_duration = envelope.not_after.saturating_sub(envelope.not_before);
+    const MAX_VALIDITY_SECS: u64 = 24 * 60 * 60;
+    if validity_duration > MAX_VALIDITY_SECS {
+        return Err(format!(
+            "signed config validity window too long: {}s (max {}s)",
+            validity_duration, MAX_VALIDITY_SECS
+        ));
+    }
+
+    // NOW verify signature (after cheap temporal checks pass)
     let signature_bytes = BASE64_STANDARD
         .decode(&envelope.signature)
         .map_err(|e| format!("decode signature base64: {e}"))?;
@@ -505,35 +535,6 @@ fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConf
     verifying_key
         .verify(&message, &signature)
         .map_err(|_| "Ed25519 signature verification failed")?;
-
-    // Check validity window with ±60s tolerance
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system time: {e}"))?
-        .as_secs();
-    const TOLERANCE_SECS: u64 = 60;
-    if now + TOLERANCE_SECS < envelope.not_before {
-        return Err(format!(
-            "signed config not yet valid (not_before={}, now={})",
-            envelope.not_before, now
-        ));
-    }
-    if now > envelope.not_after + TOLERANCE_SECS {
-        return Err(format!(
-            "signed config expired (not_after={}, now={})",
-            envelope.not_after, now
-        ));
-    }
-
-    // Enforce ≤24h validity window
-    let validity_duration = envelope.not_after.saturating_sub(envelope.not_before);
-    const MAX_VALIDITY_SECS: u64 = 24 * 60 * 60;
-    if validity_duration > MAX_VALIDITY_SECS {
-        return Err(format!(
-            "signed config validity window too long: {}s (max {}s)",
-            validity_duration, MAX_VALIDITY_SECS
-        ));
-    }
 
     tracing::info!(
         gateway = %gateway_host,
