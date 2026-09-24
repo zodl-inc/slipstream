@@ -1325,7 +1325,7 @@ mod tests {
         );
 
         // Tamper test: flip one byte of the signature
-        let mut tampered = testnet_resp.to_vec();
+        let tampered = testnet_resp.to_vec();
         let mut envelope: serde_json::Value =
             serde_json::from_slice(&tampered).expect("parse for tamper");
         let sig_b64 = envelope["sig"].as_str().expect("sig field").to_string();
