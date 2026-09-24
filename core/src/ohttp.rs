@@ -115,6 +115,9 @@ pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
 /// Process-wide default client trace prefix for OHTTP connections (set once from JNI).
 static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 
+/// Process-wide relay URL override for testing (debug builds only).
+static RELAY_URL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
+
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
 /// Called from JNI when TorRuntime is created. Only allowed in debug builds (P7).
 pub fn set_default_client_trace_prefix(prefix: Option<String>) {
@@ -129,6 +132,19 @@ pub fn set_default_client_trace_prefix(prefix: Option<String>) {
     }
 }
 
+/// Override relay URL for testing (e.g., relay-simulator). Only allowed in debug builds.
+pub fn set_relay_url_override(url: Option<String>) {
+    #[cfg(debug_assertions)]
+    {
+        let _ = RELAY_URL_OVERRIDE.set(url);
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = (url, &RELAY_URL_OVERRIDE);
+        tracing::warn!("set_relay_url_override called in release build (ignored)");
+    }
+}
+
 /// Get the default client trace prefix.
 fn get_default_client_trace_prefix() -> Option<String> {
     DEFAULT_CLIENT_TRACE_PREFIX
@@ -138,10 +154,28 @@ fn get_default_client_trace_prefix() -> Option<String> {
 
 /// Relay URL for a given gateway host. One relay per gateway: mainnet and testnet gateways use
 /// different HPKE keys, and an RFC 9458 relay has a single fixed gateway target.
+///
+/// Uses Fastly-hosted relays in production (temporary hostnames; final hostnames will be
+/// set in COR-1830). Debug builds can override via [`set_relay_url_override`] for local testing.
 pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
+    // Debug builds: check for override first
+    #[cfg(debug_assertions)]
+    {
+        if let Some(Some(override_url)) = RELAY_URL_OVERRIDE.get() {
+            // SAFETY: We leak the string to get a 'static lifetime. This is acceptable because
+            // the override is set once at startup in debug builds only.
+            return Some(Box::leak(override_url.clone().into_boxed_str()));
+        }
+    }
+
+    // Production relay URLs (Fastly-hosted; final hostnames pending COR-1830)
     match gateway_host {
-        "ohttp-gateway-testnet.example" => Some("https://testnet-simulator-relay.example.invalid/relay"),
-        "ohttp-gateway.example" => Some("https://simulator-relay.example.invalid/relay"),
+        "ohttp-gateway-testnet.example" => {
+            Some("https://testnet-relay.example.invalid/relay")
+        }
+        "ohttp-gateway.example" => {
+            Some("https://mainnet-relay.example.invalid/relay")
+        }
         _ => None,
     }
 }
