@@ -119,17 +119,14 @@ static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 static RELAY_URL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
-/// Called from JNI when TorRuntime is created. Only allowed in debug builds (P7).
+/// Called from JNI/FFI when the engine or TorRuntime is created.
+///
+/// Debug-only gating (P7) is the caller's job: the Android SDK passes a prefix only when its
+/// own `BuildConfig.DEBUG` is true, the Swift SDK only under `#if DEBUG`. It cannot be a
+/// `cfg(debug_assertions)` gate here because the mobile SDKs always build this crate with the
+/// release profile, which silently dropped the prefix in debug app builds too.
 pub fn set_default_client_trace_prefix(prefix: Option<String>) {
-    #[cfg(debug_assertions)]
-    {
-        let _ = DEFAULT_CLIENT_TRACE_PREFIX.set(prefix);
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (prefix, &DEFAULT_CLIENT_TRACE_PREFIX);
-        tracing::warn!("set_default_client_trace_prefix called in release build (ignored)");
-    }
+    let _ = DEFAULT_CLIENT_TRACE_PREFIX.set(prefix);
 }
 
 /// Override relay URL for testing (e.g., relay-simulator). Only allowed in debug builds.
