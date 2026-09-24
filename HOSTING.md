@@ -243,16 +243,29 @@ round, and **force-released on terminal states** — a dead pass can never wedge
 persist your own restoring flag.
 
 ### 5.3 `stalled_seconds`
-Seconds since the engine last made forward progress, while `state == 1`; 0 otherwise. Forward
-progress is any counter moving, the start of a pass — every retried pass restarts the clock —
-or data arriving from the server during the pass: every streamed block and every metadata
-message, direct or over Tor. Forward progress also includes a unit of local work completing (a
-persisted chunk, the range-end tree build). A pass whose data keeps arriving is not reported
-as stalled; a growing value means neither data nor local work has moved. A pass the engine
-cannot complete — for example a block range the server cannot deliver — fails and is retried
-by the engine itself rather than accumulating stall time. The engine supplies the fact; the
-host owns the policy (the Swift SDK restarts a pass that stays stalled for 120 s, at most
-three times per engine handle, and reports each restart and the final give-up).
+Seconds the engine has gone without forward progress, while `state == 1`; 0 otherwise. It
+is the longer of two spans. The first runs from the last forward progress: any counter
+moving, the start of a pass, data arriving from the server during the pass (every streamed
+block and every metadata message, direct or over Tor), or a unit of local work completing
+(a persisted chunk, the range-end tree build). So a pass whose data keeps arriving is not
+reported by the first span. When a fetch worker gives up with blocks still undelivered,
+the engine notes the lowest block it had not yet handed to the scanner. The pass then
+fails and is retried — or, when wire failover is armed, fails over to another endpoint
+instead; either way, the give-up counts. Once the download has given up twice at that same
+block, with no more than ten minutes between give-ups, the second span runs from the first
+of them, whatever the retried passes do meanwhile, for as long as that block's latest
+give-up is at most ten minutes old. It ends when a later download hands that block to the
+scanner, a pass completes, a new session starts, or a sync attempt fails without its
+download giving up — for example a pass that fails before its download starts, or a failed
+tip check between passes, as happens with no network. A server that cannot deliver a block
+range is therefore reported as stalled, instead of being retried out of the host's sight,
+while a device that loses its network is not: its failing attempts end the span. The same
+rule means a server whose passes only sometimes reach the download (one that also fails
+some of its metadata calls, say) is reported later, or not at all: each pass that fails
+before its download ends the count. A fetch that failed after delivering every block never
+starts one. The engine supplies the fact; the host owns the policy (the Swift SDK restarts
+a pass that stays stalled for 120 s, at most three times per engine handle, and reports
+each restart and the final give-up).
 
 ### 5.4 `tx_set_version` — the one transaction rule
 A monotonic counter that bumps **exactly when the stored transaction set changes**: a

@@ -218,6 +218,41 @@ pub struct ScanStatsTotals {
     pub orchard_received: u64,
 }
 
+/// Requests an abort of the wrapped task when dropped, instead of leaving it to keep running
+/// detached.
+///
+/// A plain `JoinHandle` that is only awaited on the normal path is not enough: an early `?`
+/// return, or the enclosing future being dropped outright (a host restart aborts the SESSION
+/// task, not this one), skips the `.await` and leaves the spawned task running orphaned. For
+/// the per-range fetch task below, an orphan keeps fetching after its scanner is gone — its
+/// worker eventually exhausts its retries and records a download give-up into whatever
+/// `Progress` it still holds, corrupting a session that has already started fresh (see
+/// `Progress::begin_session`).
+///
+/// The guarantee is limited: dropping the wrapper requests the abort, and the task stops at
+/// its next `.await`. `abort()` does not wait for that. A fetch task spends its life at
+/// awaits, so an aborted pass's fetch practically cannot record into a later session, but
+/// nothing here waits until it is gone. Aborting an already-finished task is a no-op, so the
+/// normal path (`.await` to a result) is unaffected.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
 /// Process every suggested range until none remain. The caller has already
 /// run update_chain_tip + put_subtree_roots (engine.rs).
 ///
@@ -377,8 +412,12 @@ pub async fn run_to_completion(
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
-        let fetch_task =
-            tokio::spawn(async move { run_fetch(&endpoint, plan, tx, fetch_progress).await });
+        // Wrapped in AbortOnDrop: if `connect_via` below fails (`?` returns early) or this
+        // whole future is dropped (a host restart aborts the session, not this task), the
+        // fetch task is aborted instead of orphaned (see `AbortOnDrop`'s doc).
+        let fetch_task = AbortOnDrop(tokio::spawn(async move {
+            run_fetch(&endpoint, plan, tx, fetch_progress).await
+        }));
 
         // scan_chunks runs in the current task using a SEPARATE grpc client so it
         // does not contend with the fetch workers' connections.
@@ -917,5 +956,27 @@ mod tests {
             "statuses_set must sum across ranges"
         );
         assert_eq!(report.enhance.skipped, 1, "skipped must sum across ranges");
+    }
+
+    // ── AbortOnDrop: an orphaned fetch task must not keep running ──────────────
+
+    /// Dropped before it is ever awaited, the wrapper must stop the wrapped task instead of
+    /// leaving it to run detached — the exact shape of the bug where an orphaned fetch task
+    /// kept running after its session was abandoned and recorded a give-up into the NEXT
+    /// session's fresh `Progress` count.
+    #[tokio::test(start_paused = true)]
+    async fn abort_on_drop_stops_the_task_before_it_sets_its_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_in_task = flag.clone();
+        let task = AbortOnDrop(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            flag_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        drop(task);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted task must never set the flag"
+        );
     }
 }

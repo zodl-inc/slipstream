@@ -20,8 +20,55 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+
+/// Current wall-clock time in whole Unix seconds (0 if the clock reads before the epoch).
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A block download that has given up this many times at the same block, each give-up within
+/// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] of the one before, counts toward `stalled_seconds` from its
+/// first give-up (see [`Progress::download_failure_secs`]). Two: the engine's own retry gets one
+/// chance first.
+pub const DOWNLOAD_FAILURE_STALL_STREAK: u32 = 2;
+
+/// Give-ups at the same block more than this many seconds apart are separate runs. The time in
+/// between was not spent failing that download: for example, a synced wallet sitting idle between
+/// catch-up passes, or the engine busy downloading other ranges. It sits well above the few
+/// minutes between consecutive give-ups when a server keeps failing a range. A run also stops
+/// counting toward `stalled_seconds` once its latest give-up is older than this: see
+/// [`Progress::download_failure_secs`].
+pub const DOWNLOAD_FAILURE_RUN_GAP_SECS: u64 = 600;
+
+/// A safety bound on how many runs [`Progress`] keeps. Runs normally hold only the one or two
+/// blocks the download is stuck on, because a later release removes each run.
+const MAX_DOWNLOAD_FAILURE_RUNS: usize = 8;
+
+/// A run of block-download give-ups at one block (see [`Progress::note_download_gave_up`]).
+///
+/// There is one run per block. A run ends in one of four ways: a later release of its block to
+/// the scanner ([`Progress::note_blocks_released`]), a completed pass
+/// ([`Progress::note_pass_completed`]), a sync attempt that failed without its download giving up
+/// ([`Progress::note_attempt_failed`]), or a new session ([`Progress::begin_session`]). A give-up
+/// at its block more than [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] after the previous one starts it
+/// over, and until then it counts only while live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadFailure {
+    /// Give-ups at `at_height` in this run.
+    pub streak: u32,
+    /// The block the download could not deliver: the lowest block not yet handed to the scanner
+    /// when it gave up. Give-ups at any other block belong to that block's own run.
+    pub at_height: u64,
+    /// Unix seconds of the run's first give-up.
+    pub since_unix: u64,
+    /// Unix seconds of the run's latest give-up.
+    pub last_unix: u64,
+}
 
 /// Shared engine progress for poll-based consumers (decision D8).
 ///
@@ -73,7 +120,8 @@ pub struct Progress {
     /// data arriving from the server during a pass (every streamed block and
     /// every metadata message, direct or over Tor), or a unit of
     /// local work completing (a persisted chunk, the range-end tree build). The
-    /// snapshot derives `stalled_seconds = now − this` while Syncing.
+    /// snapshot's `stalled_seconds` (while Syncing) is the longer of `now − this` and the
+    /// time the block download has kept failing at the same block — see [`Self::stall_secs`].
     pub last_progress_unix: AtomicU64,
     /// Session-monotonic progress floor in permille (0..=1000). The snapshot fetch-maxes
     /// the raw `scanned / pass_total` ratio into this and reports the floor, so reported
@@ -110,6 +158,17 @@ pub struct Progress {
     /// Deliberately NOT reset by [`Self::begin_pass`] — an orphan outlives its pass by
     /// definition.
     pub wallet_writers: AtomicUsize,
+    /// The runs of block-download give-ups, one per block, keyed by `at_height` (see
+    /// [`Self::note_download_gave_up`]). Deliberately NOT reset by [`Self::begin_pass`]: a run
+    /// spans the retried passes it is about. A run ends when a later release covers its block
+    /// ([`Self::note_blocks_released`]); every run ends when a pass completes
+    /// ([`Self::note_pass_completed`]), a sync attempt fails without its download giving up
+    /// ([`Self::note_attempt_failed`]), or a new session begins ([`Self::begin_session`]).
+    download_failures: std::sync::Mutex<std::collections::BTreeMap<u64, DownloadFailure>>,
+    /// Whether the block download gave up since the last sync attempt ended: set by every
+    /// give-up, spent by [`Self::note_attempt_failed`], and cleared by
+    /// [`Self::note_pass_completed`] and [`Self::begin_session`].
+    download_gave_up_this_attempt: AtomicBool,
 }
 
 /// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
@@ -247,11 +306,218 @@ impl Progress {
     /// snapshot derives stalledness from it.
     #[inline]
     pub fn touch(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = unix_now_secs();
         self.last_progress_unix.store(now, Ordering::Relaxed);
+    }
+
+    /// Record that the block download gave up: a fetch worker failed (or panicked) and failed
+    /// the fetch while `at_height` was the lowest block not yet released to the scanner.
+    ///
+    /// A failed pass is retried, and its retries show signs of life — a pass start, metadata
+    /// answers, scans of new blocks near the tip — so a server that can never deliver a block
+    /// range would otherwise keep the stall clock fresh forever, and the host's stall recovery
+    /// would never see it.
+    ///
+    /// There is one run per block. A give-up at `at_height` no more than
+    /// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] after that block's previous one continues its run; a
+    /// later one starts the run over. A give-up at any other block starts or continues that
+    /// block's own run and never touches this one: scan ranges are not downloaded in height
+    /// order (ChainTip, FoundNote and Verify ranges come before Historic ones, and truncation
+    /// rewinds), so a give-up at one block says nothing about another. Each run ends when a
+    /// later release covers its block ([`Self::note_blocks_released`]), a pass completes
+    /// ([`Self::note_pass_completed`]), a sync attempt fails without its download giving up
+    /// ([`Self::note_attempt_failed`]), or a new session begins ([`Self::begin_session`]).
+    /// Should more than a handful of blocks have runs at once, the one that failed least
+    /// recently is dropped.
+    pub fn note_download_gave_up(&self, at_height: u64) {
+        self.note_download_gave_up_at(at_height, unix_now_secs());
+    }
+
+    /// [`Self::note_download_gave_up`] with an explicit clock (tests).
+    pub(crate) fn note_download_gave_up_at(&self, at_height: u64, now_unix: u64) {
+        let (run, evicted) = {
+            let mut runs = self
+                .download_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let run = match runs.get(&at_height) {
+                Some(run)
+                    if now_unix.saturating_sub(run.last_unix) <= DOWNLOAD_FAILURE_RUN_GAP_SECS =>
+                {
+                    DownloadFailure {
+                        streak: run.streak.saturating_add(1),
+                        last_unix: now_unix,
+                        ..*run
+                    }
+                }
+                _ => DownloadFailure {
+                    streak: 1,
+                    at_height,
+                    since_unix: now_unix,
+                    last_unix: now_unix,
+                },
+            };
+            runs.insert(at_height, run);
+            let evicted = if runs.len() > MAX_DOWNLOAD_FAILURE_RUNS {
+                // The run that failed least recently — never the one just recorded.
+                let least_recent = runs
+                    .values()
+                    .filter(|other| other.at_height != at_height)
+                    .min_by_key(|other| other.last_unix)
+                    .map(|other| other.at_height);
+                least_recent.and_then(|height| runs.remove(&height))
+            } else {
+                None
+            };
+            (run, evicted)
+        };
+        self.download_gave_up_this_attempt
+            .store(true, Ordering::SeqCst);
+        if run.streak == DOWNLOAD_FAILURE_STALL_STREAK {
+            tracing::warn!(
+                at_height = run.at_height,
+                since_unix = run.since_unix,
+                "block download keeps giving up at the same height — stall time counts from its first give-up"
+            );
+        }
+        if let Some(evicted) = evicted {
+            tracing::info!(
+                streak = evicted.streak,
+                at_height = evicted.at_height,
+                reason = "least recently failed of too many runs",
+                "block download failure run cleared"
+            );
+        }
+    }
+
+    /// A pass completed: the download got past whatever it failed on before, so every run ends.
+    pub fn note_pass_completed(&self) {
+        self.download_gave_up_this_attempt
+            .store(false, Ordering::SeqCst);
+        self.clear_download_failures("pass completed");
+    }
+
+    /// A new sync session starts (a host start or restart). It gets a fresh count: every run
+    /// ends, so the session's first give-up at any block starts a new run instead of extending
+    /// one from before the restart.
+    pub fn begin_session(&self) {
+        self.download_gave_up_this_attempt
+            .store(false, Ordering::SeqCst);
+        self.clear_download_failures("new session");
+    }
+
+    /// A sync attempt failed: a pass, or the tip check between passes. If the block download
+    /// gave up during that attempt, the failure is the download's and every run stays.
+    /// Otherwise the attempt failed for another reason — typically it could not reach the
+    /// server at all, as when the device is offline — so nothing shows the download is still
+    /// failing, and every run ends. Without this, a run from before the device went offline
+    /// would keep reporting its growing span through every pass that fails before its download
+    /// starts.
+    pub fn note_attempt_failed(&self) {
+        if !self
+            .download_gave_up_this_attempt
+            .swap(false, Ordering::SeqCst)
+        {
+            self.clear_download_failures("sync attempt failed without its download giving up");
+        }
+    }
+
+    /// A fetch handed `first_height..=last_height` to the scanner: every run whose block falls
+    /// in that span ends, because the download got past the block it had stopped at. Runs at
+    /// other blocks are untouched.
+    ///
+    /// Without this, a run started in one scan range (say ChainTip) would last through the
+    /// hours-long Historic download that follows it in the same pass, and keep counting as a
+    /// stall long after its block was delivered. Does nothing when no run's block is in the
+    /// span.
+    pub fn note_blocks_released(&self, first_height: u64, last_height: u64) {
+        if first_height > last_height {
+            return;
+        }
+        let ended: Vec<DownloadFailure> = {
+            let mut runs = self
+                .download_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let covered: Vec<u64> = runs
+                .range(first_height..=last_height)
+                .map(|(&height, _)| height)
+                .collect();
+            covered
+                .into_iter()
+                .filter_map(|height| runs.remove(&height))
+                .collect()
+        };
+        for run in ended {
+            tracing::info!(
+                streak = run.streak,
+                at_height = run.at_height,
+                reason = "download got past it",
+                "block download failure run cleared"
+            );
+        }
+    }
+
+    /// Ends every run (see [`Self::note_pass_completed`], [`Self::begin_session`] and
+    /// [`Self::note_attempt_failed`]).
+    fn clear_download_failures(&self, reason: &str) {
+        let cleared = {
+            let mut runs = self
+                .download_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let cleared = runs.len();
+            runs.clear();
+            cleared
+        };
+        if cleared > 0 {
+            tracing::info!(
+                runs = cleared,
+                reason,
+                "block download failure runs cleared"
+            );
+        }
+    }
+
+    /// The current runs of block-download give-ups, one per block, in ascending block order.
+    pub fn download_failures(&self) -> Vec<DownloadFailure> {
+        self.download_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .copied()
+            .collect()
+    }
+
+    /// Seconds the block download has kept failing at the same block, as of `now_unix`: the
+    /// longest time since a run's first give-up, over the live runs — latest give-up at most
+    /// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] old — with at least
+    /// [`DOWNLOAD_FAILURE_STALL_STREAK`] give-ups; 0 when no run qualifies. A run that has gone
+    /// quiet for longer than the gap no longer counts: the download is not shown to be failing
+    /// any more, and its next give-up starts the run over.
+    pub fn download_failure_secs(&self, now_unix: u64) -> u64 {
+        self.download_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter(|run| run.streak >= DOWNLOAD_FAILURE_STALL_STREAK)
+            .filter(|run| now_unix.saturating_sub(run.last_unix) <= DOWNLOAD_FAILURE_RUN_GAP_SECS)
+            .map(|run| now_unix.saturating_sub(run.since_unix))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The stall fact as of `now_unix`: the longer of the time since the last progress stamp
+    /// (0 before the first stamp) and [`Self::download_failure_secs`]. The FFI snapshot
+    /// reports it as `stalled_seconds` while Syncing, and 0 otherwise.
+    pub fn stall_secs(&self, now_unix: u64) -> u64 {
+        let last = self.last_progress_unix_secs();
+        let since_progress = if last == 0 {
+            0
+        } else {
+            now_unix.saturating_sub(last)
+        };
+        since_progress.max(self.download_failure_secs(now_unix))
     }
 
     /// Scheduler: set whether the pass is still inside the recovery (restore backfill)
@@ -751,5 +1017,342 @@ mod tests {
         );
         // …and climbs monotonically again within the new scope.
         assert_eq!(p.permille_floor(300), 300);
+    }
+
+    // ── download-failure runs (the repeated-give-up stall span) ──────────────────
+
+    /// A run as [`Progress::download_failures`] reports it.
+    fn run(streak: u32, at_height: u64, since_unix: u64, last_unix: u64) -> DownloadFailure {
+        DownloadFailure {
+            streak,
+            at_height,
+            since_unix,
+            last_unix,
+        }
+    }
+
+    #[test]
+    fn a_give_up_at_the_same_block_within_the_gap_continues_its_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(100, 1_020);
+        assert_eq!(
+            p.download_failures(),
+            vec![run(3, 100, 1_000, 1_020)],
+            "the streak goes up; the run keeps its block and its first give-up"
+        );
+    }
+
+    #[test]
+    fn a_give_up_at_a_different_block_starts_its_own_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(150, 1_500);
+        p.note_download_gave_up_at(90, 1_600);
+        assert_eq!(
+            p.download_failures(),
+            vec![
+                run(1, 90, 1_600, 1_600),
+                run(2, 100, 1_000, 1_010),
+                run(1, 150, 1_500, 1_500),
+            ],
+            "a block above and a block below each start their own run; block 100's is untouched"
+        );
+    }
+
+    /// Scan ranges are not downloaded in height order, so the retried passes can also give up
+    /// at other blocks in between: a block stuck at H keeps its run through them, and the span
+    /// counts from H's first give-up.
+    #[test]
+    fn a_stuck_block_keeps_its_run_while_give_ups_elsewhere_interleave() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(500, 1_000); // H
+        p.note_download_gave_up_at(900, 1_100); // T
+        p.note_download_gave_up_at(500, 1_200); // H
+        p.note_download_gave_up_at(900, 1_300); // T
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 500, 1_000, 1_200), run(2, 900, 1_100, 1_300)]
+        );
+        assert_eq!(
+            p.download_failure_secs(1_400),
+            400,
+            "counted from H's first give-up"
+        );
+    }
+
+    /// Same-block give-ups far apart are separate runs: in between, the download was not failing
+    /// there (for example, a synced wallet sitting idle between catch-up passes, or the engine
+    /// busy downloading other ranges).
+    #[test]
+    fn a_same_block_give_up_after_the_gap_starts_the_run_over() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(100, 1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1);
+        assert_eq!(p.download_failures(), vec![run(1, 100, 1_611, 1_611)]);
+        assert_eq!(
+            p.download_failure_secs(2_000),
+            0,
+            "a run that starts over needs its second give-up again"
+        );
+    }
+
+    #[test]
+    fn a_same_block_give_up_exactly_the_gap_later_continues_the_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_000 + DOWNLOAD_FAILURE_RUN_GAP_SECS);
+        assert_eq!(p.download_failures(), vec![run(2, 100, 1_000, 1_600)]);
+    }
+
+    #[test]
+    fn download_failure_counts_only_from_the_second_give_up() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        assert_eq!(
+            p.download_failure_secs(1_300),
+            0,
+            "one give-up: the engine's own retry gets its chance"
+        );
+        p.note_download_gave_up_at(100, 1_050);
+        assert_eq!(
+            p.download_failure_secs(1_300),
+            300,
+            "counted from the FIRST give-up of the run"
+        );
+    }
+
+    #[test]
+    fn download_failure_secs_is_the_longest_of_the_qualifying_runs() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(300, 900); // the oldest run, but a single give-up
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(200, 1_200);
+        p.note_download_gave_up_at(100, 1_500); // still live at 2_000: within the gap
+        p.note_download_gave_up_at(200, 1_600); // still live at 2_000: within the gap
+        assert_eq!(
+            p.download_failure_secs(2_000),
+            1_000,
+            "block 100's run is the longest of those with two give-ups"
+        );
+    }
+
+    #[test]
+    fn a_completed_pass_or_a_new_session_clears_every_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(200, 1_020);
+        p.note_pass_completed();
+        assert_eq!(p.download_failures(), vec![]);
+        assert_eq!(p.download_failure_secs(2_000), 0);
+
+        p.note_download_gave_up_at(100, 3_000);
+        p.note_download_gave_up_at(100, 3_010);
+        p.note_download_gave_up_at(200, 3_020);
+        p.begin_session();
+        assert_eq!(p.download_failures(), vec![]);
+        assert_eq!(p.download_failure_secs(4_000), 0);
+    }
+
+    #[test]
+    fn pass_starts_touches_and_counters_leave_the_runs_alone() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.begin_pass();
+        p.touch();
+        p.add_scanned(5);
+        p.add_ranges_completed();
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 100, 1_000, 1_010)],
+            "a pass start, a stamp or a counter never ends a run"
+        );
+    }
+
+    #[test]
+    fn stall_secs_is_the_longer_of_the_two_spans() {
+        let p = Progress::default();
+        assert_eq!(
+            p.stall_secs(5_000),
+            0,
+            "no stamp and no run: nothing to report"
+        );
+        p.last_progress_unix.store(1_000, Ordering::Relaxed);
+        assert_eq!(
+            p.stall_secs(1_100),
+            100,
+            "no run: the time since the last stamp"
+        );
+        p.note_download_gave_up_at(100, 900);
+        p.note_download_gave_up_at(100, 950);
+        p.last_progress_unix.store(1_090, Ordering::Relaxed);
+        assert_eq!(
+            p.stall_secs(1_100),
+            200,
+            "a fresh stamp must not hide a download that keeps failing"
+        );
+    }
+
+    /// Runs normally hold only the block or two the download is stuck on, but they are bounded:
+    /// a ninth block evicts the run that failed least recently, whatever its height.
+    #[test]
+    fn a_ninth_block_evicts_the_least_recently_failed_run() {
+        let p = Progress::default();
+        for (i, height) in (100..=800).step_by(100).enumerate() {
+            p.note_download_gave_up_at(height, 1_000 + 10 * i as u64);
+        }
+        // Block 100 fails again, so block 200 (last failed at 1_010) is now the least recent.
+        p.note_download_gave_up_at(100, 1_080);
+        p.note_download_gave_up_at(900, 1_090);
+        let runs = p.download_failures();
+        assert_eq!(
+            runs.iter().map(|run| run.at_height).collect::<Vec<_>>(),
+            vec![100, 300, 400, 500, 600, 700, 800, 900],
+            "block 200's run is the one evicted"
+        );
+        assert_eq!(
+            runs[0],
+            run(2, 100, 1_000, 1_080),
+            "the survivors keep their runs"
+        );
+    }
+
+    // ── note_blocks_released: a run also ends when a release covers its block ──
+
+    #[test]
+    fn a_release_ends_only_the_run_whose_block_it_covers() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(300, 1_000);
+        p.note_download_gave_up_at(300, 1_010);
+        p.note_download_gave_up_at(105, 1_020);
+        p.note_download_gave_up_at(105, 1_030);
+        p.note_blocks_released(100, 110);
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 300, 1_000, 1_010)],
+            "the release got past block 105, not block 300"
+        );
+    }
+
+    #[test]
+    fn a_release_covering_several_runs_ends_them_all() {
+        let p = Progress::default();
+        for height in [99, 100, 107, 110, 111] {
+            p.note_download_gave_up_at(height, 1_000);
+        }
+        p.note_blocks_released(100, 110);
+        assert_eq!(
+            p.download_failures()
+                .iter()
+                .map(|run| run.at_height)
+                .collect::<Vec<_>>(),
+            vec![99, 111],
+            "every run from block 100 through block 110 ends; blocks 99 and 111 were not released"
+        );
+    }
+
+    #[test]
+    fn a_release_that_does_not_cover_a_runs_block_keeps_it() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(105, 1_000);
+        p.note_download_gave_up_at(105, 1_010);
+        p.note_blocks_released(50, 99);
+        p.note_blocks_released(110, 100); // a reversed span covers nothing
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 105, 1_000, 1_010)],
+            "a release that never reaches the run's block must not end it"
+        );
+    }
+
+    /// A give-up in the ChainTip range starts a run, and the retried pass re-fetches that range
+    /// successfully, so the run ends right there instead of lingering through the Historic
+    /// download that follows. A later give-up at a lower block (Historic ranges lie behind
+    /// ChainTip) is a different problem and starts a fresh run of its own.
+    #[test]
+    fn a_give_up_after_the_run_ended_starts_a_fresh_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(1_003, 1_000);
+        p.note_blocks_released(1_000, 1_010);
+        p.note_download_gave_up_at(900, 5_000);
+        assert_eq!(
+            p.download_failures(),
+            vec![run(1, 900, 5_000, 5_000)],
+            "the ended run must not linger beside the new one"
+        );
+    }
+
+    // ── live runs and failed sync attempts ───────────────────────────────────
+
+    #[test]
+    fn a_run_stops_counting_once_its_latest_give_up_is_older_than_the_gap() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        assert_eq!(
+            p.download_failure_secs(1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS),
+            10 + DOWNLOAD_FAILURE_RUN_GAP_SECS,
+            "still live at exactly the gap"
+        );
+        assert_eq!(
+            p.download_failure_secs(1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1),
+            0,
+            "no give-up for longer than the gap: the run no longer counts"
+        );
+    }
+
+    /// Two give-ups, then nothing more for longer than the gap while the engine keeps showing
+    /// signs of life: the stall fact is only the time since the latest progress stamp, however
+    /// old the run's first give-up is.
+    #[test]
+    fn an_inactive_run_does_not_hide_a_fresh_progress_stamp() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        let now = 1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1;
+        p.last_progress_unix.store(now - 5, Ordering::Relaxed);
+        assert_eq!(p.stall_secs(now), 5);
+    }
+
+    #[test]
+    fn an_attempt_that_failed_without_a_give_up_ends_every_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(200, 1_005);
+        p.note_attempt_failed(); // the attempt that gave up
+        assert_eq!(
+            p.download_failures().len(),
+            2,
+            "an attempt that failed because the download gave up keeps every run"
+        );
+        p.note_attempt_failed(); // an attempt that failed without giving up
+        assert!(
+            p.download_failures().is_empty(),
+            "an attempt that failed without its download giving up ends every run"
+        );
+    }
+
+    #[test]
+    fn each_attempt_that_gave_up_keeps_the_run_going() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_attempt_failed();
+        p.note_download_gave_up_at(100, 1_020);
+        p.note_attempt_failed();
+        assert_eq!(
+            p.download_failures().first().map(|run| run.streak),
+            Some(2),
+            "every failed attempt gave up at the block: the run continues"
+        );
+        p.note_attempt_failed();
+        assert!(
+            p.download_failures().is_empty(),
+            "the give-up was spent by the attempt before; this one failed without one"
+        );
     }
 }

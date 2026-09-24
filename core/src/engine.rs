@@ -57,7 +57,7 @@ use crate::{
 /// hand cannot be relied on — and this is the evidence that it cannot — it should be
 /// derived from something that moves on its own (git describe at build time) rather
 /// than maintained.
-pub const ENGINE_BUILD: &str = "2026-09-24.v0.9-stall-liveness";
+pub const ENGINE_BUILD: &str = "2026-09-24.v0.12-download-failure-stall";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick
@@ -422,6 +422,11 @@ pub async fn sync_once(
         wire_switches,
         persist_lane,
     };
+
+    // A completed pass got past whatever the block download failed on before.
+    if let Some(ref p) = progress {
+        p.note_pass_completed();
+    }
 
     Ok(outcome)
 }
