@@ -263,7 +263,7 @@ pub async fn sync_once(
         session.import_account(ufvk, birthday_ts)?;
     }
 
-    let roots = grpc::get_subtree_roots(&mut client).await?;
+    let roots = grpc::get_subtree_roots(&mut client, progress.as_deref()).await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -288,7 +288,7 @@ pub async fn sync_once(
     // sync.rs:108-121 ("We do this before we perform any shielded scanning, to ensure
     // that we discover any UTXOs between the old fully-scanned height and the current
     // chain tip.").
-    let transparent = refresh_utxos(&mut session, &mut client).await?;
+    let transparent = refresh_utxos(&mut session, &mut client, progress.as_deref()).await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }

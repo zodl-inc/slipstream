@@ -12,9 +12,10 @@ workspace.
 
 ### Changed
 - `stalled_seconds` (and `Progress::last_progress_unix`) now also move whenever data arrives from
-  the server during a pass — every streamed block and every successful metadata response, direct
-  or over Tor — not only when a counter moves. A slow but working pass no longer reads as stalled,
-  so hosts that restart stalled passes stop restarting healthy ones.
+  the server during a pass — every streamed block and every metadata message (a subtree root, an
+  address-history transaction, a UTXO), direct or over Tor — not only when a counter moves. A slow
+  but working pass no longer reads as stalled, so hosts that restart stalled passes stop
+  restarting healthy ones.
 - Completing a write-behind persist unit and building the range-end tree now also count as
   forward progress for `stalled_seconds`, so a long local-only tail (a slow device finishing a
   range) no longer reads as stalled.

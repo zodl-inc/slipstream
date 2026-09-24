@@ -433,7 +433,7 @@ async fn apply_address_request(
         }),
     };
 
-    let raw_txs = grpc::get_taddress_txids(client, filter)
+    let raw_txs = grpc::get_taddress_txids(client, filter, progress)
         .await
         .map_err(|e| SlipstreamError::Wallet(format!("get_taddress_txids: {e}")))?;
     if let Some(p) = progress {

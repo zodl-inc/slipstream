@@ -71,7 +71,7 @@ pub struct Progress {
     pub recovering: AtomicU64,
     /// Unix seconds of the last forward progress: any counter bump, a pass start,
     /// data arriving from the server during a pass (every streamed block and
-    /// every successful metadata response, direct or over Tor), or a unit of
+    /// every metadata message, direct or over Tor), or a unit of
     /// local work completing (a persisted chunk, the range-end tree build). The
     /// snapshot derives `stalled_seconds = now − this` while Syncing.
     pub last_progress_unix: AtomicU64,
