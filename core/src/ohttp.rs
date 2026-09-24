@@ -168,13 +168,17 @@ pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
         }
     }
 
-    // Production relay URLs (Fastly-hosted; final hostnames pending COR-1830)
+    // Production relay URLs
     match gateway_host {
         "ohttp-gateway-testnet.example" => {
+            // Fastly dev relay (serves /ohttp-configs + /relay)
             Some("https://testnet-relay.example.invalid/relay")
         }
         "ohttp-gateway.example" => {
-            Some("https://mainnet-relay.example.invalid/relay")
+            // TODO(COR-1830): Switch to mainnet-relay.example.invalid/relay once
+            // Fastly prod relay serves /ohttp-configs (currently 501; only POST /relay works).
+            // Mainnet clients fetch signed key config via the relay.
+            Some("https://simulator-relay.example.invalid/relay")
         }
         _ => None,
     }
