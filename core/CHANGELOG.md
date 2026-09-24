@@ -19,6 +19,12 @@ workspace.
 - Completing a write-behind persist unit and building the range-end tree now also count as
   forward progress for `stalled_seconds`, so a long local-only tail (a slow device finishing a
   range) no longer reads as stalled.
+- `stalled_seconds` also counts a block download that keeps failing: once the download has given
+  up twice without getting past the height where it first stopped, it reports the time since that
+  first give-up whenever that is longer, until a pass completes or a new session starts. A server
+  that cannot deliver a block range therefore still reads as stalled even though every failed
+  pass is retried at once. Passes that fail before their download starts, for example with no
+  network, do not count.
 
 ### Fixed
 - A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the

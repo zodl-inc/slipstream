@@ -823,11 +823,14 @@ struct ReleaseSummary {
 /// advancing to plan chunk N+1 only after N's `is_last`. Each release also
 /// advances the AheadGate floor so the worker owning the floor plan chunk
 /// streams unthrottled and budget held by newly-floored sub-chunks drains.
+///
+/// After each release `unreleased_from` holds the lowest height not yet handed to the scanner.
 async fn release_ordered(
     rx: &mut mpsc::Receiver<SubChunk>,
     queue: &ChunkQueueSender,
     progress: Option<&Arc<Progress>>,
     floor: &AtomicU64,
+    unreleased_from: &AtomicU64,
     started: Instant,
     failover: Option<WireFailoverArm>,
 ) -> Result<ReleaseSummary, SlipstreamError> {
@@ -878,6 +881,8 @@ async fn release_ordered(
                 ..
             } = sub;
             continuity.verify_blocks(&blocks)?;
+            // Where the download stands once this sub-chunk is released.
+            let released_through = blocks.last().map(|b| b.height);
             let chunk = Chunk::from_blocks(emitted_chunks, blocks);
             let chunk_block_count = chunk.blocks.len() as u64;
             summary.blocks += chunk_block_count;
@@ -890,6 +895,9 @@ async fn release_ordered(
                 p.add_fetched(chunk_block_count);
             }
             queue.send(chunk).await?;
+            if let Some(height) = released_through {
+                unreleased_from.store(height + 1, Ordering::Release);
+            }
             emitted_chunks += 1;
             // Ahead-budget permit held until the ChunkQueue takes over.
             drop(permit);
@@ -915,6 +923,14 @@ async fn release_ordered(
     Ok(summary)
 }
 
+/// A worker failure (error or panic) fails the fetch: the download gave up with
+/// `unreleased_from` as the lowest block it had not handed to the scanner.
+fn note_give_up(progress: Option<&Progress>, unreleased_from: &AtomicU64) {
+    if let Some(p) = progress {
+        p.note_download_gave_up(unreleased_from.load(Ordering::Acquire));
+    }
+}
+
 /// Drives the ordered release while supervising the fetch workers.
 ///
 /// A worker that gives up on its plan chunk (retry budget exhausted, or its
@@ -931,10 +947,17 @@ async fn release_ordered(
 /// so the engine's failover loop switches to an alternate endpoint at once
 /// instead of retrying the same one. Worker panics and release errors are
 /// unaffected by `failover` either way.
+///
+/// Every worker failure — an error or a panic, armed or not — is also recorded on `progress` as
+/// a download give-up at `unreleased_from`, the lowest block the ordered release has not handed
+/// to the scanner (see `Progress::note_download_gave_up`). A release error is not a download
+/// give-up and is not recorded.
 async fn supervise_fetch<R>(
     release: R,
     mut workers: JoinSet<Result<(), SlipstreamError>>,
     failover: Option<WireFailoverArm>,
+    progress: Option<&Progress>,
+    unreleased_from: &AtomicU64,
 ) -> Result<ReleaseSummary, SlipstreamError>
 where
     R: std::future::Future<Output = Result<ReleaseSummary, SlipstreamError>>,
@@ -953,6 +976,7 @@ where
                 Ok(Ok(())) => {}
                 Ok(Err(err)) => {
                     workers.abort_all();
+                    note_give_up(progress, unreleased_from);
                     if let Some(arm) = failover {
                         warn!(%err, "fetch worker gave up — failing over as a full wire stall");
                         return Err(SlipstreamError::WireCollapse {
@@ -964,6 +988,7 @@ where
                 }
                 Err(join_err) => {
                     workers.abort_all();
+                    note_give_up(progress, unreleased_from);
                     return Err(SlipstreamError::Transport(format!(
                         "worker panicked: {join_err}"
                     )));
@@ -1011,6 +1036,10 @@ pub async fn run_fetch(
     // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
     let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
 
+    // The lowest block not yet handed to the scanner: where the download stands if a worker
+    // gives up (see `supervise_fetch`).
+    let unreleased_from = AtomicU64::new(plan.start);
+
     let mut workers = JoinSet::new();
     for worker_id in 0..plan.streams.max(1) {
         workers.spawn(worker(
@@ -1034,11 +1063,14 @@ pub async fn run_fetch(
             &queue,
             progress.as_ref(),
             &floor,
+            &unreleased_from,
             started,
             plan.failover,
         ),
         workers,
         plan.failover,
+        progress.as_deref(),
+        &unreleased_from,
     )
     .await?;
 
@@ -1956,9 +1988,17 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
-            .await
-            .expect("release");
+        let summary = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
         assert_eq!(summary.plans_released, 3);
         assert_eq!(summary.blocks, 60);
         drop(qtx);
@@ -2008,9 +2048,17 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
-            .await
-            .expect("release");
+        let summary = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
         assert_eq!(summary.plans_released, 2);
         drop(qtx);
         let mut released_heights = Vec::new();
@@ -2035,9 +2083,17 @@ mod tests {
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let err = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
-            .await
-            .expect_err("gap must fail");
+        let err = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect_err("gap must fail");
         assert!(
             matches!(err, SlipstreamError::Discontinuity { at: 200, .. }),
             "got: {err}"
@@ -2082,7 +2138,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(600),
-            supervise_fetch(release, workers, None),
+            supervise_fetch(release, workers, None, None, &AtomicU64::new(0)),
         )
         .await
         .expect("supervisor must not hang behind the failed chunk");
@@ -2112,7 +2168,7 @@ mod tests {
                 ..Default::default()
             })
         };
-        let summary = supervise_fetch(release, workers, None)
+        let summary = supervise_fetch(release, workers, None, None, &AtomicU64::new(0))
             .await
             .expect("all workers succeeded");
         assert_eq!(summary.blocks, 7);
@@ -2127,7 +2183,7 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Err::<ReleaseSummary, _>(SlipstreamError::Transport("continuity broken".into()))
         };
-        let err = supervise_fetch(release, workers, None)
+        let err = supervise_fetch(release, workers, None, None, &AtomicU64::new(0))
             .await
             .expect_err("a release error fails the fetch");
         assert!(err.to_string().contains("continuity broken"), "got: {err}");
@@ -2142,7 +2198,7 @@ mod tests {
             panic!("synthetic worker panic");
         });
         let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
-        let err = supervise_fetch(release, workers, None)
+        let err = supervise_fetch(release, workers, None, None, &AtomicU64::new(0))
             .await
             .expect_err("a panicked worker fails the fetch");
         assert!(
@@ -2161,7 +2217,7 @@ mod tests {
             Err(SlipstreamError::Transport("late failure".into()))
         });
         let release = async { Ok(ReleaseSummary::default()) };
-        let err = supervise_fetch(release, workers, None)
+        let err = supervise_fetch(release, workers, None, None, &AtomicU64::new(0))
             .await
             .expect_err("the late worker error must surface");
         assert!(err.to_string().contains("late failure"), "got: {err}");
@@ -2185,7 +2241,7 @@ mod tests {
 
         let outcome = tokio::time::timeout(
             Duration::from_secs(600),
-            supervise_fetch(release, workers, Some(arm)),
+            supervise_fetch(release, workers, Some(arm), None, &AtomicU64::new(0)),
         )
         .await
         .expect("supervisor must not hang behind the failed chunk");
@@ -2217,12 +2273,132 @@ mod tests {
             panic!("synthetic worker panic");
         });
         let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
-        let err = supervise_fetch(release, workers, Some(WireFailoverArm::default()))
-            .await
-            .expect_err("a panicked worker fails the fetch");
+        let err = supervise_fetch(
+            release,
+            workers,
+            Some(WireFailoverArm::default()),
+            None,
+            &AtomicU64::new(0),
+        )
+        .await
+        .expect_err("a panicked worker fails the fetch");
         assert!(
             matches!(err, SlipstreamError::Transport(ref m) if m.contains("worker panicked")),
             "got: {err}"
         );
+    }
+
+    // ── download-failure stall: the release cursor and give-up records ────────
+
+    /// After each ordered release the cursor names the lowest block not yet handed to the
+    /// scanner; a sub-chunk that cannot be released yet (its predecessor never came) does not
+    /// move it.
+    #[tokio::test]
+    async fn release_advances_the_unreleased_cursor_past_each_released_subchunk() {
+        let all = linked(100, 30, 64);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, false, all[0..10].to_vec()))
+            .await
+            .expect("send");
+        // Plan 1 arrives, but plan 0's tail never does: plan 1 cannot be released.
+        tx.send(sub(1, 0, true, all[20..30].to_vec()))
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(0);
+        let unreleased_from = AtomicU64::new(100);
+        release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &unreleased_from,
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("the release ends when the channel closes");
+        assert_eq!(
+            unreleased_from.load(Ordering::Acquire),
+            110,
+            "blocks 100..=109 were released; 110 is the first that was not"
+        );
+    }
+
+    /// A worker that gives up is recorded as a download give-up at the release cursor.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_a_worker_give_up_at_the_release_cursor() {
+        let progress = Progress::default();
+        let unreleased_from = AtomicU64::new(1_234);
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async { Err(SlipstreamError::Transport("plan chunk 8 gave up".into())) });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        supervise_fetch(release, workers, None, Some(&progress), &unreleased_from)
+            .await
+            .expect_err("a failed worker fails the fetch");
+        let run = progress
+            .download_failure()
+            .expect("the give-up is recorded");
+        assert_eq!((run.streak, run.at_height), (1, 1_234));
+    }
+
+    /// Armed failover still maps the give-up to WireCollapse — and still records it.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_a_worker_give_up_when_armed_too() {
+        let progress = Progress::default();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async { Err(SlipstreamError::Transport("plan chunk 8 gave up".into())) });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(
+            release,
+            workers,
+            Some(WireFailoverArm::default()),
+            Some(&progress),
+            &AtomicU64::new(500),
+        )
+        .await
+        .expect_err("a failed worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::WireCollapse { .. }),
+            "got: {err}"
+        );
+        assert_eq!(
+            progress.download_failure().map(|run| run.at_height),
+            Some(500)
+        );
+    }
+
+    /// A panicked worker also stopped the download: it is recorded like a give-up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_a_worker_panic_as_a_give_up() {
+        let progress = Progress::default();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        supervise_fetch(release, workers, None, Some(&progress), &AtomicU64::new(42))
+            .await
+            .expect_err("a panicked worker fails the fetch");
+        assert_eq!(
+            progress.download_failure().map(|run| run.at_height),
+            Some(42)
+        );
+    }
+
+    /// A release error (continuity, a gone consumer) is not a download give-up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_does_not_record_a_release_error_as_a_give_up() {
+        let progress = Progress::default();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(std::future::pending::<Result<(), SlipstreamError>>());
+        let release = async {
+            Err::<ReleaseSummary, _>(SlipstreamError::Transport("continuity broken".into()))
+        };
+        supervise_fetch(release, workers, None, Some(&progress), &AtomicU64::new(7))
+            .await
+            .expect_err("a release error fails the fetch");
+        assert_eq!(progress.download_failure(), None);
     }
 }

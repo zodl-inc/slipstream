@@ -280,6 +280,10 @@ pub async fn run_session(
     // panic/cancel, so even a panicking old pass frees the lock cleanly.
     let _pass_guard = pass_lock.lock().await;
 
+    // A new session gets a fresh block-download failure count: a host start or restart is a
+    // new attempt (see `Progress::begin_session`).
+    reporter.progress.begin_session();
+
     // Notify SyncStarted (tag=1) — emitted exactly ONCE, before any retry or follow pass.
     reporter.push_event(FfiSlipstreamEvent { tag: 1, value: 0 });
 
