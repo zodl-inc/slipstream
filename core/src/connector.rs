@@ -393,17 +393,19 @@ impl Service<Uri> for TorTcpConnector {
     }
 }
 
-/// Plan-chunk cap (blocks per `GetBlockRange`) when bulk goes OHTTP-over-Tor. An OHTTP response
-/// is one buffered message, so a chunk is downloaded whole before any block can be scanned; at
-/// Tor throughput (~0.4 MB/s observed) a 10k-block spam-era chunk (~34 MB) takes minutes and
-/// stalls the pipeline, while 2k blocks (~7 MB) keep every round trip well inside the OHTTP
-/// deadlines and let progress advance. Plain (non-Tor) OHTTP keeps the configured size.
-pub const TOR_OHTTP_MAX_CHUNK_BLOCKS: u32 = 2_000;
+/// Plan-chunk cap (blocks per `GetBlockRange`) whenever bulk goes over OHTTP, with or without
+/// Tor. An OHTTP response is one buffered message, so a chunk is downloaded whole before any
+/// block can be scanned, and the gateway rejects upstream responses over its size cap. A
+/// 10k-block spam-era chunk (~height 1.7M+) exceeded the gateway's 256 MiB cap on mainnet and
+/// stalled restores; 2k blocks keep every response bounded and let progress advance (at Tor
+/// throughput, ~0.4 MB/s observed, it also keeps each round trip inside the OHTTP deadlines).
+/// Direct gRPC streams incrementally and keeps the configured size.
+pub const OHTTP_MAX_CHUNK_BLOCKS: u32 = 2_000;
 
-/// Effective `chunk_blocks` for a bulk fetch of `endpoint` with the given Tor handle.
-pub fn bulk_chunk_blocks(configured: u32, endpoint: &Endpoint, tor: Option<&TorConn>) -> u32 {
-    if tor.is_some() && crate::ohttp::relay_for(&endpoint.host).is_some() {
-        configured.min(TOR_OHTTP_MAX_CHUNK_BLOCKS)
+/// Effective `chunk_blocks` for a bulk fetch of `endpoint`.
+pub fn bulk_chunk_blocks(configured: u32, endpoint: &Endpoint) -> u32 {
+    if crate::ohttp::relay_for(&endpoint.host).is_some() {
+        configured.min(OHTTP_MAX_CHUNK_BLOCKS)
     } else {
         configured
     }
@@ -553,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_chunk_cap_applies_only_to_ohttp_over_tor() {
+    fn bulk_chunk_cap_applies_to_ohttp_only() {
         let gw = Endpoint {
             host: "ohttp-gateway-testnet.example".into(),
             port: 443,
@@ -564,17 +566,16 @@ mod tests {
             port: 443,
             tls: true,
         };
-        // No Tor handle: configured size everywhere (a live TorConn needs a bootstrap, so the
-        // Tor-on branch is covered by the constant + the ignored live test).
-        assert_eq!(bulk_chunk_blocks(10_000, &gw, None), 10_000);
-        assert_eq!(bulk_chunk_blocks(10_000, &plain, None), 10_000);
+        assert_eq!(bulk_chunk_blocks(10_000, &gw), OHTTP_MAX_CHUNK_BLOCKS);
+        assert_eq!(bulk_chunk_blocks(500, &gw), 500);
+        assert_eq!(bulk_chunk_blocks(10_000, &plain), 10_000);
         const {
             assert!(
-                TOR_OHTTP_MAX_CHUNK_BLOCKS >= 100,
+                OHTTP_MAX_CHUNK_BLOCKS >= 100,
                 "must satisfy EngineConfig's chunk_blocks >= 100"
             )
         };
-        const { assert!(TOR_OHTTP_MAX_CHUNK_BLOCKS < crate::config::EngineConfig::DEFAULT_CHUNK_BLOCKS) };
+        const { assert!(OHTTP_MAX_CHUNK_BLOCKS < crate::config::EngineConfig::DEFAULT_CHUNK_BLOCKS) };
     }
 
     #[test]

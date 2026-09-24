@@ -358,10 +358,10 @@ pub async fn run_to_completion(
                 })
             }));
         }
-        // Smaller plan chunks when bulk rides OHTTP-over-Tor (whole-chunk buffered responses at
-        // Tor throughput) — connector::bulk_chunk_blocks; unchanged otherwise.
+        // Smaller plan chunks when bulk rides OHTTP (whole-chunk buffered responses, gateway
+        // response cap) — connector::bulk_chunk_blocks; unchanged for direct gRPC.
         let chunk_blocks =
-            crate::connector::bulk_chunk_blocks(config.chunk_blocks, &config.endpoint, tor);
+            crate::connector::bulk_chunk_blocks(config.chunk_blocks, &config.endpoint);
         let mut plan = FetchPlan::new(start, end, chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
