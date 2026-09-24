@@ -238,10 +238,8 @@ fn generators_u32() -> &'static [u32] {
             bytes.extend_from_slice(&x.to_repr());
             bytes.extend_from_slice(&y.to_repr());
         }
-        bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
+        let (words, _) = bytes.as_chunks::<4>();
+        words.iter().copied().map(u32::from_le_bytes).collect()
     })
 }
 
