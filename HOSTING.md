@@ -256,13 +256,16 @@ block, with no more than ten minutes between give-ups, the second span runs from
 of them, whatever the retried passes do meanwhile, for as long as that block's latest
 give-up is at most ten minutes old. It ends when a later download hands that block to the
 scanner, a pass completes, a new session starts, or a sync attempt fails without its
-download giving up: a pass that fails before its download starts, or the tip check between
-passes failing (for example, with no network). A server that cannot deliver a block range
-is therefore reported as stalled, instead of being retried out of the host's sight, while
-a device that loses its network is not: its failing attempts end the span. A fetch that
-failed after delivering every block never starts one. The engine supplies the fact; the
-host owns the policy (the Swift SDK restarts a pass that stays stalled for 120 s, at most
-three times per engine handle, and reports each restart and the final give-up).
+download giving up — for example a pass that fails before its download starts, or a failed
+tip check between passes, as happens with no network. A server that cannot deliver a block
+range is therefore reported as stalled, instead of being retried out of the host's sight,
+while a device that loses its network is not: its failing attempts end the span. The same
+rule means a server whose passes only sometimes reach the download (one that also fails
+some of its metadata calls, say) is reported later, or not at all: each pass that fails
+before its download ends the count. A fetch that failed after delivering every block never
+starts one. The engine supplies the fact; the host owns the policy (the Swift SDK restarts
+a pass that stays stalled for 120 s, at most three times per engine handle, and reports
+each restart and the final give-up).
 
 ### 5.4 `tx_set_version` — the one transaction rule
 A monotonic counter that bumps **exactly when the stored transaction set changes**: a

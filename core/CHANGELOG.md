@@ -34,8 +34,10 @@ workspace.
   the tip check between passes — fails without its download giving up, for example with no
   network. Give-ups are tracked per block, so failures at other blocks neither extend nor hide a
   run. A server that cannot deliver a block range therefore still reads as stalled even though
-  every failed pass is retried, while a device that goes offline does not. A fetch that failed
-  after delivering every block does not count.
+  every failed pass is retried, while a device that goes offline does not. A server whose passes
+  only sometimes reach the download is reported later, or not at all, since each pass that fails
+  before its download ends the count. A fetch that failed after delivering every block does not
+  count.
 - `grpc::get_subtree_roots`, `grpc::get_taddress_txids`, `grpc::get_address_utxos` and
   `transparent::refresh_utxos` take a new `progress: Option<&Progress>` argument, stamped for
   every message received.

@@ -38,10 +38,10 @@ pub(crate) fn unix_now_secs() -> u64 {
 pub const DOWNLOAD_FAILURE_STALL_STREAK: u32 = 2;
 
 /// Give-ups at the same block more than this many seconds apart are separate runs. The time in
-/// between was not spent failing that download: for example, the device was offline and every
-/// pass failed before its download started. It sits well above the few minutes between
-/// consecutive give-ups when a server keeps failing a range. A run also stops counting toward
-/// `stalled_seconds` once its latest give-up is older than this: see
+/// between was not spent failing that download: for example, a synced wallet sitting idle between
+/// catch-up passes, or the engine busy downloading other ranges. It sits well above the few
+/// minutes between consecutive give-ups when a server keeps failing a range. A run also stops
+/// counting toward `stalled_seconds` once its latest give-up is older than this: see
 /// [`Progress::download_failure_secs`].
 pub const DOWNLOAD_FAILURE_RUN_GAP_SECS: u64 = 600;
 
@@ -458,7 +458,8 @@ impl Progress {
         }
     }
 
-    /// Ends every run (see [`Self::note_pass_completed`] and [`Self::begin_session`]).
+    /// Ends every run (see [`Self::note_pass_completed`], [`Self::begin_session`] and
+    /// [`Self::note_attempt_failed`]).
     fn clear_download_failures(&self, reason: &str) {
         let cleared = {
             let mut runs = self
@@ -1083,8 +1084,8 @@ mod tests {
     }
 
     /// Same-block give-ups far apart are separate runs: in between, the download was not failing
-    /// there (for example, the device was offline and every pass failed before its download
-    /// started).
+    /// there (for example, a synced wallet sitting idle between catch-up passes, or the engine
+    /// busy downloading other ranges).
     #[test]
     fn a_same_block_give_up_after_the_gap_starts_the_run_over() {
         let p = Progress::default();
@@ -1130,7 +1131,7 @@ mod tests {
         p.note_download_gave_up_at(300, 900); // the oldest run, but a single give-up
         p.note_download_gave_up_at(100, 1_000);
         p.note_download_gave_up_at(200, 1_200);
-        p.note_download_gave_up_at(100, 1_400); // still live at 2_000: within the gap
+        p.note_download_gave_up_at(100, 1_500); // still live at 2_000: within the gap
         p.note_download_gave_up_at(200, 1_600); // still live at 2_000: within the gap
         assert_eq!(
             p.download_failure_secs(2_000),
