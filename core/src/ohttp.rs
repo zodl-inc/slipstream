@@ -1131,7 +1131,7 @@ mod tests {
             "configs": base64::prelude::BASE64_STANDARD.encode(&config_doc),
             "not_before": not_before,
             "not_after": not_after,
-            "key_id": "test-key",
+            "key_id": "a3620fb6",
             "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
@@ -1173,7 +1173,7 @@ mod tests {
             "configs": base64::prelude::BASE64_STANDARD.encode(&config_doc),
             "not_before": not_before,
             "not_after": not_after,
-            "key_id": "test-key",
+            "key_id": "a3620fb6",
             "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
@@ -1210,7 +1210,7 @@ mod tests {
             "configs": base64::prelude::BASE64_STANDARD.encode(&config_doc),
             "not_before": not_before,
             "not_after": not_after,
-            "key_id": "test-key",
+            "key_id": "a3620fb6",
             "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
