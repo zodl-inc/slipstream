@@ -1132,7 +1132,7 @@ mod tests {
             "not_before": not_before,
             "not_after": not_after,
             "key_id": "test-key",
-            "signature": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
+            "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
         let json = serde_json::to_vec(&envelope).unwrap();
@@ -1174,7 +1174,7 @@ mod tests {
             "not_before": not_before,
             "not_after": not_after,
             "key_id": "test-key",
-            "signature": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
+            "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
         let json = serde_json::to_vec(&envelope).unwrap();
@@ -1211,7 +1211,7 @@ mod tests {
             "not_before": not_before,
             "not_after": not_after,
             "key_id": "test-key",
-            "signature": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
+            "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
 
         let json = serde_json::to_vec(&envelope).unwrap();
