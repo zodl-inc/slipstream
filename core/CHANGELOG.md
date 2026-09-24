@@ -15,6 +15,11 @@ workspace.
   pass-level retry takes over (or, when wire failover is armed, the engine fails over to an
   alternate endpoint at once). Previously the other workers kept running and could wait behind
   the missing chunk indefinitely, leaving the pass in `Syncing` with no progress.
+- A slow block stream no longer fails its attempt and re-downloads its sub-chunk when
+  `chunk_timeout` elapses: the blocks received so far are handed on as a shorter sub-chunk and
+  the stream continues. When a stream errors, goes silent, or ends early, the blocks it already
+  delivered are handed on before the attempt is retried, so the retry resumes after them instead
+  of downloading them again.
 
 ## [0.2.0] - 2026-08-19
 

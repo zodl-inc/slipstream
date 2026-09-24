@@ -65,12 +65,11 @@ pub struct FetchPlan {
     /// that emitted at least one sub-chunk resets the counter (T6.8-S: resume
     /// makes retries cheap — each re-downloads at most one partial sub-chunk).
     pub retries_per_chunk: u32,
-    /// Per-SUB-chunk progress deadline (T6.8-S): the time budget to accumulate
-    /// ONE sub-chunk (≤ `split_bytes`), reset on every emitted sub-chunk.
-    /// Replaces the old whole-chunk timeout, which a healthy-but-huge
-    /// sandblasting chunk could never meet (field failure 2026-06-12: 10k-block
-    /// chunks of ~hundreds of MB looped `chunk fetch timed out` forever). A
-    /// genuinely stalled stream dies faster via grpc::STREAM_IDLE_TIMEOUT.
+    /// Per-SUB-chunk flush interval (T6.8-S, liveness rework): when a sub-chunk
+    /// has not filled within this time, the blocks received so far are emitted as
+    /// a shorter sub-chunk and the stream continues — a slow stream is never
+    /// failed or re-downloaded for being slow. A stream that delivers nothing
+    /// dies via `grpc::STREAM_IDLE_TIMEOUT` instead.
     pub chunk_timeout: Duration,
     /// Byte budget per emitted sub-chunk (estimated wire bytes). Normal-era
     /// 10k-block chunks (~1–6 MB) stay single sub-chunks; sandblasting chunks
@@ -280,6 +279,23 @@ impl ChunkSplitter {
             Some((self.acc, self.acc_bytes))
         }
     }
+
+    /// Flush whatever has accumulated as a (short) sub-chunk and keep splitting
+    /// from empty; `None` when nothing is buffered. The pump's deadline uses it
+    /// so a slow stream hands on the blocks it already received.
+    pub(crate) fn take_partial(&mut self) -> Option<(Vec<CompactBlock>, usize)> {
+        if self.acc.is_empty() {
+            return None;
+        }
+        let blocks = std::mem::take(&mut self.acc);
+        let bytes = std::mem::replace(&mut self.acc_bytes, 0);
+        Some((blocks, bytes))
+    }
+
+    /// Height of the newest buffered block, if any.
+    pub(crate) fn last_height(&self) -> Option<u64> {
+        self.acc.last().map(|b| b.height)
+    }
 }
 
 // ── T6.8-S fetch-ahead admission control ───────────────────────────────────────
@@ -412,21 +428,53 @@ async fn emit_sub_chunk(
     true
 }
 
+/// Ends a failing attempt: hands the blocks it already received (`tail`, the
+/// splitter's buffer) on as a partial sub-chunk (`is_last = false`), which
+/// advances `resume_from` so the worker's retry resumes after them, then fails
+/// with `err`. Flushes only when the tail does not end at `cursor.end`: the
+/// plan chunk's final block is never emitted from an error path (only a clean
+/// end carries `is_last`), so such a tail is left for the retry. Returns
+/// `Ok(ConsumerGone)` when the reorder stage is gone, as the other emit sites do.
+async fn flush_then_fail(
+    tail: Option<(Vec<CompactBlock>, usize)>,
+    cursor: &mut PlanChunkCursor,
+    gate: &AheadGate,
+    out: &mpsc::Sender<SubChunk>,
+    err: SlipstreamError,
+) -> Result<PumpOutcome, SlipstreamError> {
+    if let Some((blocks, bytes)) = tail
+        && blocks.last().map(|b| b.height) != Some(cursor.end)
+    {
+        debug!(
+            plan_index = cursor.plan_index,
+            blocks = blocks.len(),
+            "attempt failing — handing on the blocks received so far"
+        );
+        if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
+            return Ok(PumpOutcome::ConsumerGone);
+        }
+    }
+    Err(err)
+}
+
 /// Streams one (possibly resumed) plan-chunk request into byte-budgeted
 /// sub-chunks. Generic over the message stream so hermetic tests can inject
 /// synthetic/flaky streams (production passes tonic's `Streaming`).
 ///
-/// Deadline semantics (T6.8-S): `progress_deadline` bounds the accumulation of
-/// any ONE sub-chunk, measured between emissions — admission/backpressure time
-/// is excluded because the timer resets when an emission completes. A
-/// stalled-but-open stream dies earlier via the per-message
+/// Deadline semantics: `progress_deadline` bounds how long received blocks
+/// wait before being handed on. When it elapses with blocks buffered, they are
+/// emitted as a partial sub-chunk (never the plan chunk's final block, which
+/// only the clean-end flush emits with `is_last`), and the timer restarts.
+/// Admission/backpressure time is excluded because the timer resets when an
+/// emission completes. A silent stream dies via the per-message
 /// grpc::STREAM_IDLE_TIMEOUT inside `next_with_idle_timeout`.
 ///
-/// A clean stream end BEFORE `cursor.end` (short/empty delivery) is a
-/// retryable Transport error: emitting the partial tail would either lose the
-/// missing blocks silently or feed scan an empty chunk; the worker retries
-/// from `resume_from` instead (the un-emitted tail is discarded by design —
-/// resume re-downloads at most one sub-chunk's worth).
+/// Failure semantics: a failing attempt — a stream error, the idle timeout, or
+/// a clean end BEFORE `cursor.end` (short/empty delivery) — hands on what it
+/// received before returning its retryable Transport error (see
+/// [`flush_then_fail`]), so the worker's retry resumes after those blocks
+/// instead of downloading them again. Only a clean end that reaches
+/// `cursor.end` carries `is_last`.
 async fn pump_block_stream<S>(
     stream: &mut S,
     cursor: &mut PlanChunkCursor,
@@ -444,10 +492,16 @@ where
     );
     let mut splitter = ChunkSplitter::new(split_bytes);
     // tokio Instant (not std) so start_paused tests drive the deadline.
-    let mut last_progress = tokio::time::Instant::now();
+    let mut last_emit = tokio::time::Instant::now();
     loop {
-        let Some(item) = grpc::next_with_idle_timeout(stream, &ctx).await? else {
-            // Clean end of stream: flush the tail iff it completes the plan chunk.
+        let item = match grpc::next_with_idle_timeout(stream, &ctx).await {
+            Ok(item) => item,
+            // Idle timeout: the stream went silent.
+            Err(err) => return flush_then_fail(splitter.finish(), cursor, gate, out, err).await,
+        };
+        let Some(item) = item else {
+            // Clean end of stream: the tail carries `is_last` iff it completes the
+            // plan chunk; a short delivery hands on what it got and fails.
             return match splitter.finish() {
                 Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(cursor.end) => {
                     if emit_sub_chunk(cursor, blocks, bytes, true, gate, out).await {
@@ -458,27 +512,46 @@ where
                 }
                 tail => {
                     let got = tail
+                        .as_ref()
                         .and_then(|(blocks, _)| blocks.last().map(|b| b.height))
                         .unwrap_or_else(|| cursor.resume_from.saturating_sub(1));
-                    Err(SlipstreamError::Transport(format!(
+                    let err = SlipstreamError::Transport(format!(
                         "{ctx}: stream ended short at {got}, expected {}",
                         cursor.end
-                    )))
+                    ));
+                    flush_then_fail(tail, cursor, gate, out, err).await
                 }
             };
         };
-        let block = item.map_err(|e| SlipstreamError::Transport(format!("{ctx}: {e}")))?;
-        if last_progress.elapsed() > progress_deadline {
-            return Err(SlipstreamError::Transport(format!(
-                "{ctx}: no completed sub-chunk within {}s",
-                progress_deadline.as_secs()
-            )));
-        }
+        let block = match item {
+            Ok(block) => block,
+            Err(status) => {
+                let err = SlipstreamError::Transport(format!("{ctx}: {status}"));
+                return flush_then_fail(splitter.finish(), cursor, gate, out, err).await;
+            }
+        };
         if let Some((blocks, bytes)) = splitter.push(block) {
             if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
                 return Ok(PumpOutcome::ConsumerGone);
             }
-            last_progress = tokio::time::Instant::now();
+            last_emit = tokio::time::Instant::now();
+        } else if last_emit.elapsed() >= progress_deadline
+            && splitter.last_height() != Some(cursor.end)
+        {
+            // Slow but alive: hand on what has arrived instead of failing the
+            // attempt and re-downloading it. The plan chunk's final block is never
+            // flushed here — the clean-end flush below carries `is_last`.
+            if let Some((blocks, bytes)) = splitter.take_partial() {
+                debug!(
+                    plan_index = cursor.plan_index,
+                    blocks = blocks.len(),
+                    "sub-chunk deadline reached — handing on the blocks received so far"
+                );
+                if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
+                    return Ok(PumpOutcome::ConsumerGone);
+                }
+                last_emit = tokio::time::Instant::now();
+            }
         }
     }
 }
@@ -809,7 +882,7 @@ async fn release_ordered(
                         subs = plan_subs,
                         blocks = plan_blocks,
                         mb = plan_bytes / (1024 * 1024),
-                        "plan chunk split into sub-chunks (dense era)"
+                        "plan chunk split into sub-chunks"
                     );
                 }
                 summary.plans_released += 1;
@@ -977,7 +1050,7 @@ pub async fn run_fetch(
 mod tests {
     use super::*;
     use crate::chunk::chunk_queue;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     #[test]
     fn plan_chunking_covers_range_exactly() {
@@ -1130,6 +1203,30 @@ mod tests {
         assert!(ChunkSplitter::new(1000).finish().is_none());
     }
 
+    #[test]
+    fn splitter_take_partial_flushes_and_resets() {
+        let mut sp = ChunkSplitter::new(1 << 30);
+        assert!(sp.take_partial().is_none(), "nothing buffered yet");
+        for h in 100..103 {
+            assert!(sp.push(block_sized(h, 1000)).is_none());
+        }
+        assert_eq!(sp.last_height(), Some(102));
+        let (blocks, bytes) = sp.take_partial().expect("three blocks buffered");
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            vec![100, 101, 102]
+        );
+        assert!(bytes > 0);
+        assert!(
+            sp.take_partial().is_none(),
+            "the flush empties the splitter"
+        );
+        assert_eq!(sp.last_height(), None);
+        assert!(sp.push(block_sized(103, 1000)).is_none());
+        let (tail, _) = sp.finish().expect("splitting continues after a flush");
+        assert_eq!(tail.iter().map(|b| b.height).collect::<Vec<_>>(), vec![103]);
+    }
+
     // ── pump_block_stream ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1216,7 +1313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pump_short_stream_errors_without_emitting_tail() {
+    async fn pump_short_stream_hands_on_its_tail_then_errors() {
         let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
         let gate = open_gate();
         let mut cursor = test_cursor(0, 100, 119);
@@ -1244,17 +1341,20 @@ mod tests {
             subs.iter().all(|s| !s.is_last),
             "no is_last on a short stream"
         );
-        // 12 blocks at 2/sub-chunk → 5 emitted (10 blocks), 2-block tail discarded.
-        let emitted_through = subs.last().and_then(|s| s.blocks.last()).map(|b| b.height);
         assert_eq!(
-            cursor.resume_from,
-            emitted_through.expect("subs emitted") + 1
+            subs.iter().map(|s| s.sub_index).collect::<Vec<_>>(),
+            (0..subs.len() as u64).collect::<Vec<_>>(),
+            "sub_index dense from 0"
         );
+        // 12 blocks at 2/sub-chunk → 5 full sub-chunks (10 blocks), then the
+        // 2-block tail is handed on before the error: every block exactly once.
+        assert_heights_consecutive(&subs, 100, 111);
+        assert_eq!(cursor.resume_from, 112, "the retry resumes after the tail");
     }
 
-    /// THE retry-resume contract (T6.8-S): a mid-plan-chunk failure after
-    /// sub-chunk emission resumes from the next un-emitted height; the consumer
-    /// sees every height exactly once and the sub_index sequence stays dense.
+    /// THE retry-resume contract (T6.8-S): a mid-plan-chunk failure hands on
+    /// what it received and resumes from the next height; the consumer sees
+    /// every height exactly once and the sub_index sequence stays dense.
     #[tokio::test]
     async fn pump_resume_after_midstream_error_no_duplicates() {
         let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
@@ -1278,8 +1378,9 @@ mod tests {
         .expect_err("attempt 1 must surface the stream error");
         assert!(err.to_string().contains("backend dropped"), "got: {err}");
         assert!(cursor.emitted_this_attempt, "attempt 1 made progress");
-        // 18 blocks at 2/sub-chunk → 8 sub-chunks (16 blocks) emitted; 2 discarded.
-        assert_eq!(cursor.resume_from, 116, "resume = last emitted height + 1");
+        // 18 blocks at 2/sub-chunk → 8 full sub-chunks (16 blocks), then the
+        // 2-block tail is handed on before the error.
+        assert_eq!(cursor.resume_from, 118, "resume = last received height + 1");
         let subs_before = cursor.next_sub_index;
 
         // Attempt 2 (the worker's retry): resume_from..=end, clean.
@@ -1352,10 +1453,12 @@ mod tests {
         assert_heights_consecutive(&drain_subs(&mut rx), 100, 129);
     }
 
-    /// No emission within the deadline (budget never fills) → progress timeout.
+    /// Slow but alive: the budget never fills, yet the deadline no longer fails
+    /// the attempt — the blocks received so far are handed on and the stream
+    /// continues to a clean end. Nothing is re-downloaded.
     #[tokio::test(start_paused = true)]
-    async fn pump_deadline_fires_without_subchunk_progress() {
-        let (tx, _rx) = mpsc::channel::<SubChunk>(64);
+    async fn pump_deadline_emits_partial_subchunk_instead_of_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
         let gate = open_gate();
         let mut cursor = test_cursor(0, 100, 129);
         let mut s = Box::pin(stream::unfold(100u64, |h| async move {
@@ -1365,7 +1468,89 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some((Ok::<_, tonic::Status>(block_sized(h, 1000)), h + 1))
         }));
-        // Budget is huge → nothing ever emits → the 5s progress deadline fires.
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(5),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("a slow but progressing stream must complete");
+        assert!(matches!(out, PumpOutcome::Completed));
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        assert!(
+            subs.len() > 1,
+            "the deadline must hand on partial sub-chunks"
+        );
+        assert_eq!(
+            subs.iter().filter(|s| s.is_last).count(),
+            1,
+            "exactly one final marker"
+        );
+        assert!(
+            subs.last().expect("non-empty").is_last,
+            "the final marker comes last"
+        );
+        assert_heights_consecutive(&subs, 100, 129);
+        assert_eq!(cursor.resume_from, 130);
+        assert!(cursor.emitted_this_attempt);
+    }
+
+    /// The deadline must never flush the plan chunk's LAST block as a partial:
+    /// only the clean-end flush carries `is_last`, and a flushed final block
+    /// would leave nothing for it ("stream ended short").
+    #[tokio::test(start_paused = true)]
+    async fn pump_deadline_never_flushes_the_plan_end_as_partial() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 102);
+        // Arrivals at t=1s (100), t=7s (101: deadline passed → flush [100,101]),
+        // t=13s (102 = plan end: deadline passed again, but must NOT flush).
+        let delays = [1u64, 6, 6];
+        let mut s = Box::pin(stream::unfold(0usize, move |i| async move {
+            if i >= delays.len() {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(delays[i])).await;
+            Some((
+                Ok::<_, tonic::Status>(block_sized(100 + i as u64, 1000)),
+                i + 1,
+            ))
+        }));
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(5),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect("must complete, not end short");
+        assert!(matches!(out, PumpOutcome::Completed));
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        let shape: Vec<(Vec<u64>, bool)> = subs
+            .iter()
+            .map(|s| (s.blocks.iter().map(|b| b.height).collect(), s.is_last))
+            .collect();
+        assert_eq!(shape, vec![(vec![100, 101], false), (vec![102], true)]);
+    }
+
+    /// A stream that goes silent still fails the attempt (idle timeout); the
+    /// deadline change does not keep a dead stream alive.
+    #[tokio::test(start_paused = true)]
+    async fn pump_silent_stream_still_fails_via_idle_timeout() {
+        let (tx, _rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut s = Box::pin(
+            stream::iter(vec![Ok::<_, tonic::Status>(block_sized(100, 1000))])
+                .chain(stream::pending()),
+        );
         let err = pump_block_stream(
             &mut s,
             &mut cursor,
@@ -1375,16 +1560,156 @@ mod tests {
             &tx,
         )
         .await
-        .expect_err("no progress must time out");
+        .expect_err("silence must fail the attempt");
+        assert!(err.to_string().contains("idle timeout"), "got: {err}");
+        assert_eq!(
+            cursor.resume_from, 101,
+            "the block received before the silence was handed on"
+        );
+    }
+
+    /// A failing attempt hands on exactly the blocks it received — as non-final
+    /// sub-chunks — so the worker's retry resumes after them.
+    fn assert_handed_on_before_failing(
+        subs: &[SubChunk],
+        cursor: &PlanChunkCursor,
+        from: u64,
+        to: u64,
+    ) {
         assert!(
-            err.to_string().contains("no completed sub-chunk"),
+            subs.iter().all(|s| !s.is_last),
+            "a failing attempt never carries is_last"
+        );
+        assert_heights_consecutive(subs, from, to);
+        assert_eq!(
+            cursor.resume_from,
+            to + 1,
+            "the retry resumes after the handed-on blocks"
+        );
+        assert!(
+            cursor.emitted_this_attempt,
+            "handing on counts as progress for the retry budget"
+        );
+    }
+
+    /// A stream error after N blocks hands those blocks on before failing, so the
+    /// retry does not download them again.
+    #[tokio::test]
+    async fn pump_stream_error_hands_on_received_blocks_before_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut items: Vec<Result<CompactBlock, tonic::Status>> =
+            linked(100, 5, 1000).into_iter().map(Ok).collect();
+        items.push(Err(tonic::Status::unavailable("backend dropped")));
+        let mut s = stream::iter(items);
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect_err("the stream error must still fail the attempt");
+        assert!(err.to_string().contains("backend dropped"), "got: {err}");
+        drop(tx);
+        assert_handed_on_before_failing(&drain_subs(&mut rx), &cursor, 100, 104);
+    }
+
+    /// A stream that goes silent after N blocks hands those blocks on before the
+    /// idle timeout fails the attempt.
+    #[tokio::test(start_paused = true)]
+    async fn pump_idle_stream_hands_on_received_blocks_before_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut s = Box::pin(
+            stream::iter(
+                linked(100, 5, 1000)
+                    .into_iter()
+                    .map(Ok::<_, tonic::Status>)
+                    .collect::<Vec<_>>(),
+            )
+            .chain(stream::pending()),
+        );
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect_err("silence must still fail the attempt");
+        assert!(err.to_string().contains("idle timeout"), "got: {err}");
+        drop(tx);
+        assert_handed_on_before_failing(&drain_subs(&mut rx), &cursor, 100, 104);
+    }
+
+    /// A stream that ends cleanly after N blocks, short of the plan end, hands
+    /// those blocks on before failing the attempt.
+    #[tokio::test]
+    async fn pump_short_end_hands_on_received_blocks_before_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut s = stream::iter(
+            linked(100, 5, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect_err("a short stream must still fail the attempt");
+        assert!(
+            err.to_string().contains("ended short at 104, expected 129"),
             "got: {err}"
         );
-        assert!(!cursor.emitted_this_attempt);
-        assert_eq!(
-            cursor.resume_from, 100,
-            "no emission → resume from plan start"
+        drop(tx);
+        assert_handed_on_before_failing(&drain_subs(&mut rx), &cursor, 100, 104);
+    }
+
+    /// A failing attempt never emits the plan chunk's final block: only a clean
+    /// end carries `is_last`, so a buffered tail that already reaches the plan
+    /// end is left for the retry.
+    #[tokio::test]
+    async fn pump_error_after_the_plan_end_block_hands_nothing_on() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 102);
+        let mut items: Vec<Result<CompactBlock, tonic::Status>> =
+            linked(100, 3, 1000).into_iter().map(Ok).collect();
+        items.push(Err(tonic::Status::unavailable("backend dropped")));
+        let mut s = stream::iter(items);
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+        )
+        .await
+        .expect_err("the stream error must still fail the attempt");
+        assert!(err.to_string().contains("backend dropped"), "got: {err}");
+        drop(tx);
+        assert!(
+            drain_subs(&mut rx).is_empty(),
+            "the plan end is never flushed"
         );
+        assert_eq!(cursor.resume_from, 100);
+        assert!(!cursor.emitted_this_attempt);
     }
 
     // ── AheadGate ──────────────────────────────────────────────────────────────
