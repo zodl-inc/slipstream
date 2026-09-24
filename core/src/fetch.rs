@@ -882,6 +882,7 @@ async fn release_ordered(
             } = sub;
             continuity.verify_blocks(&blocks)?;
             // Where the download stands once this sub-chunk is released.
+            let released_from = blocks.first().map(|b| b.height);
             let released_through = blocks.last().map(|b| b.height);
             let chunk = Chunk::from_blocks(emitted_chunks, blocks);
             let chunk_block_count = chunk.blocks.len() as u64;
@@ -897,6 +898,10 @@ async fn release_ordered(
             queue.send(chunk).await?;
             if let Some(height) = released_through {
                 unreleased_from.store(height + 1, Ordering::Release);
+            }
+            if let (Some(p), Some(first), Some(last)) = (progress, released_from, released_through)
+            {
+                p.note_blocks_released(first, last);
             }
             emitted_chunks += 1;
             // Ahead-budget permit held until the ChunkQueue takes over.
@@ -2400,5 +2405,69 @@ mod tests {
             .await
             .expect_err("a release error fails the fetch");
         assert_eq!(progress.download_failure(), None);
+    }
+
+    // ── release_ordered: a release can end an in-progress download-failure run ────
+
+    /// A run recorded at a height the release actually reaches ends: the download got past it.
+    #[tokio::test]
+    async fn release_ordered_ends_a_run_the_release_covers() {
+        let progress = Arc::new(Progress::default());
+        progress.note_download_gave_up_at(105, 1_000);
+        progress.note_download_gave_up_at(105, 1_010);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, true, linked(100, 10, 64))) // heights 100..=109, covers 105
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(0);
+        release_ordered(
+            &mut rx,
+            &qtx,
+            Some(&progress),
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
+        assert_eq!(
+            progress.download_failure(),
+            None,
+            "the release covers height 105 and ends the run"
+        );
+    }
+
+    /// A run recorded at a height the release does not reach survives, streak unchanged.
+    #[tokio::test]
+    async fn release_ordered_keeps_a_run_the_release_does_not_cover() {
+        let progress = Arc::new(Progress::default());
+        progress.note_download_gave_up_at(105, 1_000);
+        progress.note_download_gave_up_at(105, 1_010);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, true, linked(100, 5, 64))) // heights 100..=104, does not reach 105
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(0);
+        release_ordered(
+            &mut rx,
+            &qtx,
+            Some(&progress),
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
+        assert_eq!(
+            progress.download_failure().map(|run| run.streak),
+            Some(2),
+            "the release never reaches height 105 — the run must survive"
+        );
     }
 }

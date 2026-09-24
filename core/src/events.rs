@@ -37,14 +37,17 @@ pub(crate) fn unix_now_secs() -> u64 {
 pub const DOWNLOAD_FAILURE_STALL_STREAK: u32 = 2;
 
 /// A run of block-download give-ups that have not got past the same height (see
-/// [`Progress::note_download_gave_up`]).
+/// [`Progress::note_download_gave_up`]). Ends when a later fetch hands `at_height` to the
+/// scanner ([`Progress::note_blocks_released`]), a pass completes
+/// ([`Progress::note_pass_completed`]), or a new session begins ([`Progress::begin_session`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadFailure {
     /// Give-ups in a row at or below `at_height`.
     pub streak: u32,
     /// The lowest height the download could not deliver when the run began. A later give-up at
-    /// or below it continues the run; one above it means the download got further, and starts a
-    /// new run.
+    /// or below it continues the run; one above it starts a new run. The run also ends outright
+    /// once a fetch hands this height to the scanner (see [`Progress::note_blocks_released`]) —
+    /// the download got past the point where it stopped.
     pub at_height: u64,
     /// Unix seconds of the run's first give-up.
     pub since_unix: u64,
@@ -140,7 +143,8 @@ pub struct Progress {
     pub wallet_writers: AtomicUsize,
     /// The current run of block-download give-ups (see [`Self::note_download_gave_up`]).
     /// Deliberately NOT reset by [`Self::begin_pass`]: a run spans the retried passes it is
-    /// about. Cleared by [`Self::note_pass_completed`] and [`Self::begin_session`].
+    /// about. Cleared by [`Self::note_blocks_released`] (the download got past the run's
+    /// height), [`Self::note_pass_completed`], and [`Self::begin_session`].
     download_failure: std::sync::Mutex<Option<DownloadFailure>>,
 }
 
@@ -290,8 +294,9 @@ impl Progress {
     /// metadata answers, scans of new blocks near the tip — so a server that can never deliver
     /// a block range would otherwise keep the stall clock fresh forever, and the host's stall
     /// recovery would never see it. A give-up at or below the height where the current run
-    /// began continues the run; one above it starts a new run. Cleared by a completed pass
-    /// ([`Self::note_pass_completed`]) and by a new session ([`Self::begin_session`]).
+    /// began continues the run; one above it starts a new run. The run ends once a later fetch
+    /// gets past its height ([`Self::note_blocks_released`]), a pass completes
+    /// ([`Self::note_pass_completed`]), or a new session begins ([`Self::begin_session`]).
     pub fn note_download_gave_up(&self, at_height: u64) {
         self.note_download_gave_up_at(at_height, unix_now_secs());
     }
@@ -332,6 +337,30 @@ impl Progress {
     /// first give-up starts a new run instead of extending one from before the restart.
     pub fn begin_session(&self) {
         self.clear_download_failure("new session");
+    }
+
+    /// A fetch handed `first_height..=last_height` to the scanner: if the current run's
+    /// `at_height` falls in that span, the download just got past the point where it stopped,
+    /// so the run ends — the same effect as [`Self::note_pass_completed`], but as soon as the
+    /// SPECIFIC height clears instead of waiting for the whole pass.
+    ///
+    /// Without this, a run started in one scan range (say ChainTip) would survive an
+    /// hours-long Historic download that follows it in the same pass, and an unrelated
+    /// transient give-up at a lower height later on would extend that stale run instead of
+    /// starting its own — scan heights are not monotonic across ranges (ChainTip/FoundNote/
+    /// Verify precede Historic, and continuity truncation can rewind), so "later, lower height"
+    /// does not mean "the same problem". Does nothing if the run's height is outside the
+    /// released span, or there is no run.
+    pub fn note_blocks_released(&self, first_height: u64, last_height: u64) {
+        let run = *self
+            .download_failure
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let covers =
+            run.is_some_and(|run| first_height <= run.at_height && run.at_height <= last_height);
+        if covers {
+            self.clear_download_failure("download got past it");
+        }
     }
 
     fn clear_download_failure(&self, reason: &str) {
@@ -986,6 +1015,56 @@ mod tests {
             p.stall_secs(1_100),
             200,
             "a fresh stamp must not hide a download that keeps failing"
+        );
+    }
+
+    // ── note_blocks_released: a run also ends when the download gets past its height ──
+
+    #[test]
+    fn a_release_covering_the_runs_height_ends_it() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(105, 1_000);
+        p.note_download_gave_up_at(105, 1_010);
+        p.note_blocks_released(100, 110);
+        assert_eq!(
+            p.download_failure(),
+            None,
+            "a release spanning the run's height means the download got past it"
+        );
+    }
+
+    #[test]
+    fn a_release_that_does_not_cover_the_runs_height_keeps_it() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(105, 1_000);
+        p.note_download_gave_up_at(105, 1_010);
+        p.note_blocks_released(50, 99);
+        assert_eq!(
+            p.download_failure().map(|run| run.streak),
+            Some(2),
+            "a release that never reaches the run's height must not end it"
+        );
+    }
+
+    /// The review scenario: a give-up in the ChainTip range starts a run; the retried pass
+    /// re-fetches that same range successfully, so the run ends right there instead of
+    /// surviving the hour-long Historic download that follows. A later, unrelated give-up at a
+    /// LOWER height (Historic ranges run behind ChainTip) must therefore start a fresh run
+    /// rather than extending the one that already ended.
+    #[test]
+    fn a_give_up_after_the_run_ended_starts_a_fresh_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(1_003, 1_000);
+        p.note_blocks_released(1_000, 1_010);
+        p.note_download_gave_up_at(900, 5_000);
+        assert_eq!(
+            p.download_failure(),
+            Some(DownloadFailure {
+                streak: 1,
+                at_height: 900,
+                since_unix: 5_000
+            }),
+            "the ended run must not extend to a later, unrelated give-up"
         );
     }
 }
