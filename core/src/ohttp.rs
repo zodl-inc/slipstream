@@ -124,7 +124,7 @@ pub fn set_default_client_trace_prefix(prefix: Option<String>) {
     }
     #[cfg(not(debug_assertions))]
     {
-        let _ = (prefix, DEFAULT_CLIENT_TRACE_PREFIX);
+        let _ = (prefix, &DEFAULT_CLIENT_TRACE_PREFIX);
         tracing::warn!("set_default_client_trace_prefix called in release build (ignored)");
     }
 }
