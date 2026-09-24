@@ -242,7 +242,8 @@ impl Progress {
     // ── API v2 (ENGINE_API_V2.md §4.4) ──
 
     /// Stamp `last_progress_unix` with the current wall-clock second. Called by every
-    /// counter bump, at pass start, and whenever server data arrives during a pass; the
+    /// counter bump, at pass start, whenever server data arrives during a pass, and when a
+    /// unit of local work completes (a persisted chunk, the range-end tree build); the
     /// snapshot derives stalledness from it.
     #[inline]
     pub fn touch(&self) {
