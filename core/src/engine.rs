@@ -257,13 +257,22 @@ pub async fn sync_once(
         }
         let birthday_ts =
             grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1).await?;
+        if let Some(ref p) = progress {
+            p.touch(); // liveness: a server response is forward progress
+        }
         session.import_account(ufvk, birthday_ts)?;
     }
 
     let roots = grpc::get_subtree_roots(&mut client).await?;
+    if let Some(ref p) = progress {
+        p.touch(); // liveness: a server response is forward progress
+    }
     session.put_subtree_roots(&roots)?;
 
     let tip = grpc::get_latest_block_height(&mut client).await?;
+    if let Some(ref p) = progress {
+        p.touch(); // liveness: a server response is forward progress
+    }
     session.update_chain_tip(tip)?;
     info!(tip, "chain tip updated");
 
@@ -280,6 +289,9 @@ pub async fn sync_once(
     // that we discover any UTXOs between the old fully-scanned height and the current
     // chain tip.").
     let transparent = refresh_utxos(&mut session, &mut client).await?;
+    if let Some(ref p) = progress {
+        p.touch(); // liveness: a server response is forward progress
+    }
 
     // T6.1: per-pass dedupe set for TransactionsInvolvingAddress skip keys.
     // Scope = one sync pass (all interleaved/per-range/final runs share it).

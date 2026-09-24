@@ -18,7 +18,7 @@
 //! `rust/src/tor.rs` uses (`CompactTxStreamerClient<Channel>`) so a Tor-backed
 //! channel can be swapped in later (P8) without touching callers.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
 use tonic::transport::{Channel, ClientTlsConfig, Endpoint as TonicEndpoint};
@@ -94,6 +94,7 @@ pub(crate) async fn retry_get_tree_state(
     height: u64,
     context: &str,
     tor: Option<&crate::connector::TorConn>,
+    progress: Option<Arc<crate::events::Progress>>,
 ) -> Result<zcash_client_backend::proto::service::TreeState, SlipstreamError> {
     let mut attempt: u32 = 0;
     loop {
@@ -107,7 +108,14 @@ pub(crate) async fn retry_get_tree_state(
         )
         .await?;
         match get_tree_state(&mut client, height).await {
-            Ok(ts) => return Ok(ts),
+            Ok(ts) => {
+                // Liveness: a server response is forward progress (tree states ride
+                // isolated Tor circuits when Tor is on and can take seconds each).
+                if let Some(p) = &progress {
+                    p.touch();
+                }
+                return Ok(ts);
+            }
             Err(err) if err.is_transient() && attempt < TREESTATE_RETRY_MAX => {
                 attempt += 1;
                 let backoff = treestate_retry_backoff(attempt);
@@ -481,7 +489,7 @@ mod tests {
         // PASS_RETRY_MAX=2 means 3 total attempts; all will fail with Transport.
         // The test just confirms that: (a) it returns a Transport error (not panic),
         // and (b) the function exists and is callable.
-        let result = retry_get_tree_state(&ep, 1_000_000, "test-context", None).await;
+        let result = retry_get_tree_state(&ep, 1_000_000, "test-context", None, None).await;
         assert!(
             matches!(result, Err(SlipstreamError::Transport(_))),
             "unroutable endpoint must yield Transport error, got: {result:?}"
