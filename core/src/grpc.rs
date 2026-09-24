@@ -168,6 +168,37 @@ where
         })
 }
 
+/// Collects a server stream's messages under per-message idle deadlines
+/// ([`STREAM_IDLE_TIMEOUT`]), mapping each one with `map` and stamping `progress` as it
+/// arrives.
+///
+/// Liveness is per message, not per answer: a healthy stream that delivers a message every 20 s
+/// never trips the 30 s idle timeout, and it must not read as stalled while it is still being
+/// collected either — a host that restarts a pass after 120 s without progress would otherwise
+/// throw the half-collected answer away and ask for it again. An error item or an idle timeout
+/// ends the collection with an error and stamps nothing.
+async fn collect_stream<T, U, S>(
+    stream: &mut S,
+    context: &str,
+    stream_label: &str,
+    progress: Option<&crate::events::Progress>,
+    mut map: impl FnMut(T) -> Result<U, SlipstreamError>,
+) -> Result<Vec<U>, SlipstreamError>
+where
+    S: futures_util::Stream<Item = Result<T, tonic::Status>> + Unpin,
+{
+    let mut collected = Vec::new();
+    while let Some(item) = next_with_idle_timeout(stream, context).await? {
+        let message =
+            item.map_err(|e| SlipstreamError::Transport(format!("{stream_label}: {e}")))?;
+        if let Some(p) = progress {
+            p.touch(); // liveness: a message from the server arrived
+        }
+        collected.push(map(message)?);
+    }
+    Ok(collected)
+}
+
 /// Open a channel to lightwalletd. TLS uses webpki roots (same trust source
 /// as the upstream tor module).
 pub async fn connect(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
@@ -232,38 +263,51 @@ pub struct SubtreeRoots {
     pub orchard: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
 }
 
-/// One pool's subtree-root stream, collected under per-message idle deadlines (B2).
+/// One pool's subtree-root stream, collected under per-message idle deadlines (B2); every root
+/// received stamps `progress`.
 async fn collect_subtree_roots<H: HashSer>(
     client: &mut LwdClient,
     protocol: ShieldedProtocol,
     label: &str,
+    progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<CommitmentTreeRoot<H>>, SlipstreamError> {
     let mut req = GetSubtreeRootsArg::default();
     req.set_shielded_protocol(protocol);
     let context = format!("get_subtree_roots({label})");
     let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
-    let mut roots = Vec::new();
-    while let Some(item) = next_with_idle_timeout(&mut stream, &context).await? {
-        let r =
-            item.map_err(|e| SlipstreamError::Transport(format!("subtree root stream: {e}")))?;
-        let node = H::read(&r.root_hash[..])
-            .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
-        roots.push(CommitmentTreeRoot::from_parts(
-            zcash_protocol::consensus::BlockHeight::from_u32(r.completing_block_height as u32),
-            node,
-        ));
-    }
-    Ok(roots)
+    collect_stream(
+        &mut stream,
+        &context,
+        "subtree root stream",
+        progress,
+        |r| {
+            let node = H::read(&r.root_hash[..])
+                .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
+            Ok(CommitmentTreeRoot::from_parts(
+                zcash_protocol::consensus::BlockHeight::from_u32(r.completing_block_height as u32),
+                node,
+            ))
+        },
+    )
+    .await
 }
 
-pub async fn get_subtree_roots(client: &mut LwdClient) -> Result<SubtreeRoots, SlipstreamError> {
-    let sapling_roots =
-        collect_subtree_roots::<sapling::Node>(client, ShieldedProtocol::Sapling, "sapling")
-            .await?;
+pub async fn get_subtree_roots(
+    client: &mut LwdClient,
+    progress: Option<&crate::events::Progress>,
+) -> Result<SubtreeRoots, SlipstreamError> {
+    let sapling_roots = collect_subtree_roots::<sapling::Node>(
+        client,
+        ShieldedProtocol::Sapling,
+        "sapling",
+        progress,
+    )
+    .await?;
     let orchard_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
         client,
         ShieldedProtocol::Orchard,
         "orchard",
+        progress,
     )
     .await?;
     Ok(SubtreeRoots {
@@ -325,20 +369,23 @@ pub async fn get_transaction(
     }
 }
 
-/// Stream raw transactions involving a transparent address in a height range.
+/// Stream raw transactions involving a transparent address in a height range; every
+/// transaction received stamps `progress`.
 pub async fn get_taddress_txids(
     client: &mut LwdClient,
     filter: TransparentAddressBlockFilter,
+    progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<RawTransaction>, SlipstreamError> {
     let mut stream =
         with_unary_timeout("get_taddress_txids", client.get_taddress_txids(filter)).await?;
-    let mut txs = Vec::new();
-    while let Some(item) = next_with_idle_timeout(&mut stream, "get_taddress_txids").await? {
-        txs.push(
-            item.map_err(|e| SlipstreamError::Transport(format!("taddress txid stream: {e}")))?,
-        );
-    }
-    Ok(txs)
+    collect_stream(
+        &mut stream,
+        "get_taddress_txids",
+        "taddress txid stream",
+        progress,
+        Ok,
+    )
+    .await
 }
 
 /// Opens a `GetMempoolStream` session (T8.2). The server pushes raw mempool
@@ -363,11 +410,13 @@ pub async fn open_mempool_stream(
         .map_err(|status| SlipstreamError::Transport(format!("get_mempool_stream: {status}")))
 }
 
-/// Collect UTXOs for the given transparent addresses from `start_height`.
+/// Collect UTXOs for the given transparent addresses from `start_height`; every UTXO received
+/// stamps `progress`.
 pub async fn get_address_utxos(
     client: &mut LwdClient,
     addresses: Vec<String>,
     start_height: u64,
+    progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<GetAddressUtxosReply>, SlipstreamError> {
     let mut stream = with_unary_timeout(
         "get_address_utxos",
@@ -378,11 +427,14 @@ pub async fn get_address_utxos(
         }),
     )
     .await?;
-    let mut utxos = Vec::new();
-    while let Some(item) = next_with_idle_timeout(&mut stream, "get_address_utxos").await? {
-        utxos.push(item.map_err(|e| SlipstreamError::Transport(format!("utxo stream: {e}")))?);
-    }
-    Ok(utxos)
+    collect_stream(
+        &mut stream,
+        "get_address_utxos",
+        "utxo stream",
+        progress,
+        Ok,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -453,6 +505,70 @@ mod tests {
             .await
             .expect("no timeout");
         assert!(end.is_none(), "clean end of stream must be Ok(None)");
+    }
+
+    /// A long, healthy metadata stream is progress WHILE it is being collected: every message
+    /// stamps the stall clock as it arrives. This stream delivers two messages and then goes
+    /// silent, so the collection itself dies of the idle timeout — yet the clock was stamped.
+    #[tokio::test(start_paused = true)]
+    async fn collect_stream_stamps_progress_per_message_before_the_stream_ends() {
+        let progress = crate::events::Progress::default();
+        let mut stream = futures_util::stream::iter(vec![Ok::<u32, tonic::Status>(1), Ok(2)])
+            .chain(futures_util::stream::pending());
+        let err = collect_stream(
+            &mut stream,
+            "healthy_then_silent",
+            "test stream",
+            Some(&progress),
+            Ok,
+        )
+        .await
+        .expect_err("a stream that goes silent still dies of the idle timeout");
+        assert!(
+            err.to_string().contains("stream idle timeout"),
+            "got: {err}"
+        );
+        assert_ne!(
+            progress.last_progress_unix_secs(),
+            0,
+            "each received message must stamp the clock"
+        );
+    }
+
+    /// An error item fails the collection with the stream's label and is not progress.
+    #[tokio::test]
+    async fn collect_stream_does_not_stamp_progress_for_an_error_item() {
+        let progress = crate::events::Progress::default();
+        let mut stream = futures_util::stream::iter(vec![Err::<u32, tonic::Status>(
+            tonic::Status::unavailable("gone"),
+        )]);
+        let err = collect_stream(&mut stream, "failing", "test stream", Some(&progress), Ok)
+            .await
+            .expect_err("an error item fails the collection");
+        assert!(err.to_string().contains("test stream: "), "got: {err}");
+        assert_eq!(
+            progress.last_progress_unix_secs(),
+            0,
+            "an error item is not progress"
+        );
+    }
+
+    /// A healthy stream is mapped message by message and ends cleanly.
+    #[tokio::test]
+    async fn collect_stream_maps_every_message_and_ends_cleanly() {
+        let progress = crate::events::Progress::default();
+        let mut stream = futures_util::stream::iter(vec![Ok::<u32, tonic::Status>(3), Ok(4)]);
+        let out = collect_stream(
+            &mut stream,
+            "healthy",
+            "test stream",
+            Some(&progress),
+            |m| Ok(m * 10),
+        )
+        .await
+        .expect("clean end");
+        assert_eq!(out, vec![30, 40]);
+        assert_ne!(progress.last_progress_unix_secs(), 0);
     }
 
     // Live-network smoke; run manually: cargo test -p zodl-slipstream -- --ignored

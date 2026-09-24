@@ -245,14 +245,14 @@ persist your own restoring flag.
 ### 5.3 `stalled_seconds`
 Seconds since the engine last made forward progress, while `state == 1`; 0 otherwise. Forward
 progress is any counter moving, the start of a pass — every retried pass restarts the clock —
-or data arriving from the server during the pass: every streamed block and every successful
-metadata response, direct or over Tor. Forward progress also includes a unit of local work
-completing (a persisted chunk, the range-end tree build). A pass whose data keeps arriving is
-not reported as stalled; a growing value means neither data nor local work has moved. A pass
-the engine cannot complete — for example a block range the server cannot deliver — fails and
-is retried by the engine itself rather than accumulating stall time. The engine supplies the
-fact; the host owns the policy (the Swift SDK restarts a pass that stays stalled for 120 s, at
-most three times per engine handle, and reports each restart and the final give-up).
+or data arriving from the server during the pass: every streamed block and every metadata
+message, direct or over Tor. Forward progress also includes a unit of local work completing (a
+persisted chunk, the range-end tree build). A pass whose data keeps arriving is not reported
+as stalled; a growing value means neither data nor local work has moved. A pass the engine
+cannot complete — for example a block range the server cannot deliver — fails and is retried
+by the engine itself rather than accumulating stall time. The engine supplies the fact; the
+host owns the policy (the Swift SDK restarts a pass that stays stalled for 120 s, at most
+three times per engine handle, and reports each restart and the final give-up).
 
 ### 5.4 `tx_set_version` — the one transaction rule
 A monotonic counter that bumps **exactly when the stored transaction set changes**: a
