@@ -264,6 +264,9 @@ impl WalletSession {
         self.db
             .put_orchard_subtree_roots(0, &roots.orchard)
             .map_err(|e| wallet_err("put_orchard_subtree_roots", e))?;
+        self.db
+            .put_ironwood_subtree_roots(0, &roots.ironwood)
+            .map_err(|e| wallet_err("put_ironwood_subtree_roots", e))?;
         Ok(())
     }
 

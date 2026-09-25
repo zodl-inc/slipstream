@@ -218,10 +218,11 @@ pub async fn get_tree_state(
     .await
 }
 
-/// Collected subtree roots for both pools (Sapling first, Orchard second).
+/// Collected subtree roots for all three pools (Sapling, Orchard, Ironwood).
 pub struct SubtreeRoots {
     pub sapling: Vec<CommitmentTreeRoot<sapling::Node>>,
     pub orchard: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
+    pub ironwood: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
 }
 
 /// One pool's subtree-root stream, collected under per-message idle deadlines (B2).
@@ -258,9 +259,16 @@ pub async fn get_subtree_roots(client: &mut LwdClient) -> Result<SubtreeRoots, S
         "orchard",
     )
     .await?;
+    let ironwood_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
+        client,
+        ShieldedProtocol::Ironwood,
+        "ironwood",
+    )
+    .await?;
     Ok(SubtreeRoots {
         sapling: sapling_roots,
         orchard: orchard_roots,
+        ironwood: ironwood_roots,
     })
 }
 

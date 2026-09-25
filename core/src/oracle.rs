@@ -1559,6 +1559,7 @@ mod tests {
                         zcash_protocol::consensus::BlockHeight::from(end_height as u32),
                         node,
                     )],
+                    ironwood: vec![],
                 };
                 session.put_subtree_roots(&roots)?;
             }
@@ -1629,6 +1630,7 @@ mod tests {
                 let roots = crate::grpc::SubtreeRoots {
                     sapling: vec![CommitmentTreeRoot::from_parts(h, sap_node)],
                     orchard: vec![CommitmentTreeRoot::from_parts(h, orch_node)],
+                    ironwood: vec![],
                 };
                 session.put_subtree_roots(&roots)
             },
