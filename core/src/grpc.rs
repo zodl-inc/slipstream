@@ -222,6 +222,16 @@ pub async fn get_tree_state(
 pub struct SubtreeRoots {
     pub sapling: Vec<CommitmentTreeRoot<sapling::Node>>,
     pub orchard: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
+    // Ironwood now grafts from the server too, mirroring Sapling/Orchard — see
+    // put_subtree_roots in wallet_session.rs. Fixes a SubtreeDiscontinuity that could occur
+    // when one account's Ironwood tree state was seeded near the chain tip (e.g. a freshly
+    // created wallet, whose birthday defaults to the latest bundled checkpoint) before another
+    // account's historical catch-up scan (e.g. an imported hardware-wallet account with an
+    // older birthday) passed through the Ironwood activation boundary. Unlike Sapling/Orchard,
+    // Ironwood previously had no server-authoritative full-history refresh each pass, so its
+    // locally-seeded shard indices could be a sparse, discontinuous set instead of the
+    // complete 0..N range every other pool maintains.
+    pub ironwood: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
 }
 
 /// One pool's subtree-root stream, collected under per-message idle deadlines (B2).
@@ -258,9 +268,16 @@ pub async fn get_subtree_roots(client: &mut LwdClient) -> Result<SubtreeRoots, S
         "orchard",
     )
     .await?;
+    let ironwood_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
+        client,
+        ShieldedProtocol::Ironwood,
+        "ironwood",
+    )
+    .await?;
     Ok(SubtreeRoots {
         sapling: sapling_roots,
         orchard: orchard_roots,
+        ironwood: ironwood_roots,
     })
 }
 
