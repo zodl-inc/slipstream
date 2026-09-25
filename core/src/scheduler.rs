@@ -209,6 +209,9 @@ pub struct SyncReport {
 pub struct FetchStatsTotals {
     pub blocks: u64,
     pub bytes: u64,
+    /// \[DEV-6\] Adaptive GoAway-halving steps summed across every range's
+    /// `FetchStats::goaway_splits` in this pass. See that field's doc.
+    pub goaway_splits: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -361,6 +364,9 @@ pub async fn run_to_completion(
         let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
+        // DEV-5: block-count-budgeted sub-chunk splitting (h2 frame-count
+        // protection survival — see EngineConfig::chunk_split_blocks's doc).
+        plan.split_blocks = config.chunk_split_blocks;
         // [v0.7 P2] Arm the wire-collapse detector only when the engine has
         // somewhere to fail over TO (and the kill switch is on). Tor passes
         // never have alternates armed (the probe is skipped there too).
@@ -503,6 +509,7 @@ pub async fn run_to_completion(
         report.ranges_processed += 1;
         report.fetch.blocks += fetch_stats.blocks;
         report.fetch.bytes += fetch_stats.bytes;
+        report.fetch.goaway_splits += fetch_stats.goaway_splits;
         report.fetch_elapsed += fetch_stats.elapsed;
         // [v0.7 P0] wire health: pass-total bytes + the worst sustained
         // 5 s window across ranges (skip windowless ranges, e.g. tiny tips).
@@ -811,6 +818,7 @@ mod tests {
         let t = FetchStatsTotals::default();
         assert_eq!(t.blocks, 0);
         assert_eq!(t.bytes, 0);
+        assert_eq!(t.goaway_splits, 0);
     }
 
     #[test]
@@ -859,6 +867,7 @@ mod tests {
         report.ranges_processed += 1;
         report.fetch.blocks += 10_000;
         report.fetch.bytes += 1_024 * 1_024;
+        report.fetch.goaway_splits += 2; // [DEV-6]
         report.scan.blocks += 9_500;
         report.scan.sapling_received += 3;
         report.scan.orchard_received += 7;
@@ -866,6 +875,7 @@ mod tests {
         assert_eq!(report.ranges_processed, 1);
         assert_eq!(report.fetch.blocks, 10_000);
         assert_eq!(report.fetch.bytes, 1_024 * 1_024);
+        assert_eq!(report.fetch.goaway_splits, 2);
         assert_eq!(report.scan.blocks, 9_500);
         assert_eq!(report.scan.sapling_received, 3);
         assert_eq!(report.scan.orchard_received, 7);
@@ -873,9 +883,14 @@ mod tests {
         // Second range accumulation.
         report.ranges_processed += 1;
         report.fetch.blocks += 5_000;
+        report.fetch.goaway_splits += 1; // [DEV-6] a second range also engaged the reflex
         report.scan.blocks += 5_000;
         assert_eq!(report.ranges_processed, 2);
         assert_eq!(report.fetch.blocks, 15_000);
+        assert_eq!(
+            report.fetch.goaway_splits, 3,
+            "accumulates across ranges like blocks/bytes"
+        );
         assert_eq!(report.scan.blocks, 14_500);
     }
 

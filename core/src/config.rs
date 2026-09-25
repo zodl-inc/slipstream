@@ -113,6 +113,26 @@ pub struct EngineConfig {
     /// bound memory and make fetch retry/resume granular at the cost of more
     /// scan commits. Must be >= 1 MiB.
     pub chunk_split_bytes: usize,
+    /// \[DEV-5\] Block-count budget per emitted fetch sub-chunk, applied
+    /// ALONGSIDE `chunk_split_bytes` — the splitter completes a sub-chunk
+    /// whenever EITHER cap would be exceeded by the next block, whichever
+    /// fires first. Exists because the byte cap alone is blind to a
+    /// MIDDLE-density regime the sandblasting-era sizing note above never
+    /// anticipated: a 10,000-block plan chunk at ~500–600 B/block (~5–6 MB)
+    /// stays comfortably under the 8 MiB byte budget and therefore ships as
+    /// ONE gRPC stream carrying ~10,000 individual response messages — and a
+    /// single stream that long has been field-reproduced (three independent
+    /// clients, identical range 3,355,000..3,364,999 — see
+    /// `DEV-5-FRAMECAP-REPORT.md`) tripping the server's h2 per-stream
+    /// frame-count protection (`GoAway b"too_many_data_frames"
+    /// ENHANCE_YOUR_CALM`), which stalls the pass 30–90s through the
+    /// fetch-worker retry ladder (`fetch.rs`) plus `session.rs`'s pass-level
+    /// 5s/15s backoff. Sandblasting-era chunks are unaffected — the byte cap
+    /// already splits them into ~250–500-block pieces, far under this
+    /// budget — so this cap only bites in the untouched middle band. Must be
+    /// at least 100 (mirrors `chunk_blocks`'s own floor — a smaller value
+    /// would fragment even a healthy stream into a silly number of RPCs).
+    pub chunk_split_blocks: u32,
     /// When `Some(ms)`, the scan splits fetch-chunks into time-targeted sub-batches
     /// (~ms each) for finer commits and progress updates on slow devices — at the cost
     /// of one full `put_blocks` commit + shardtree checkpoint per sub-batch (measured
@@ -220,6 +240,18 @@ impl EngineConfig {
     /// the default path emits exactly one sub-chunk per plan chunk; a
     /// sandblasting-era chunk (~hundreds of MB) splits into many (T6.8-S).
     pub const DEFAULT_CHUNK_SPLIT_BYTES: usize = 8 * 1024 * 1024;
+    /// \[DEV-5\] 5,000 blocks — exactly half of the default `chunk_blocks`
+    /// (10,000). Chosen so a middle-density plan chunk that stays under the
+    /// byte cap (the exact shape that trips the server's h2 frame-count
+    /// protection; see `chunk_split_blocks`'s own doc) is cut into exactly 2
+    /// sub-chunks instead of 1 — halving the frames-per-stream count for the
+    /// observed failing range (3,355,000..3,364,999, ~10,000 messages on one
+    /// stream) with margin, while leaving genuinely sparse eras (which never
+    /// approach 5,000 blocks before the byte cap would matter first) at a
+    /// single, unfragmented sub-chunk. Dense (sandblasting) chunks are
+    /// untouched: the byte cap already splits them far below this floor, so
+    /// this default never multiplies their sub-chunk count further.
+    pub const DEFAULT_CHUNK_SPLIT_BLOCKS: u32 = 5_000;
     /// Run an interleaved enhancement pass every 3 completed chunks by default (T6.1).
     pub const DEFAULT_ENHANCE_EVERY_CHUNKS: u32 = 3;
 
@@ -239,6 +271,7 @@ impl EngineConfig {
             chunk_blocks: Self::DEFAULT_CHUNK_BLOCKS,
             memory_budget_bytes: Self::DEFAULT_MEMORY_BUDGET,
             chunk_split_bytes: Self::DEFAULT_CHUNK_SPLIT_BYTES,
+            chunk_split_blocks: Self::DEFAULT_CHUNK_SPLIT_BLOCKS,
             scan_batch_target_ms: None,
             enhance_every_chunks: Self::DEFAULT_ENHANCE_EVERY_CHUNKS,
             sparse_persistence: true,
@@ -274,6 +307,11 @@ impl EngineConfig {
         if self.chunk_split_bytes < 1024 * 1024 {
             return Err(SlipstreamError::Config(
                 "chunk_split_bytes must be >= 1 MiB".into(),
+            ));
+        }
+        if self.chunk_split_blocks < 100 {
+            return Err(SlipstreamError::Config(
+                "chunk_split_blocks must be >= 100".into(),
             ));
         }
         if let Some(ms) = self.scan_batch_target_ms
@@ -492,6 +530,9 @@ mod tests {
         assert!(c.sparse_persistence);
         // T6.8-S: byte-budgeted sub-chunk splitting defaults to 8 MiB.
         assert_eq!(c.chunk_split_bytes, 8 * 1024 * 1024);
+        // DEV-5: block-count sub-chunk splitting defaults to 5,000 (half of
+        // the default chunk_blocks).
+        assert_eq!(c.chunk_split_blocks, 5_000);
         // T6.9 flip (2026-06-12): write-behind defaults ON (oracle-clean at all
         // levels; darkside 14/14 incl. WB variants; kill switch retained).
         assert!(c.write_behind);
@@ -524,6 +565,29 @@ mod tests {
         let mut c = config();
         c.chunk_split_bytes = 1024 * 1024;
         assert!(c.validate().is_ok());
+    }
+
+    // ── DEV-5: chunk_split_blocks ──────────────────────────────────────────
+
+    #[test]
+    fn tiny_chunk_split_blocks_rejected() {
+        let mut c = config();
+        c.chunk_split_blocks = 99;
+        assert!(matches!(c.validate(), Err(SlipstreamError::Config(_))));
+    }
+
+    #[test]
+    fn chunk_split_blocks_floor_accepted() {
+        let mut c = config();
+        c.chunk_split_blocks = 100;
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn chunk_split_blocks_zero_rejected() {
+        let mut c = config();
+        c.chunk_split_blocks = 0;
+        assert!(matches!(c.validate(), Err(SlipstreamError::Config(_))));
     }
 
     #[test]
@@ -625,6 +689,14 @@ mod tests {
         assert_eq!(
             small.chunk_split_bytes,
             EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES
+        );
+        // DEV-5: chunk_split_blocks is a network-protocol budget (frames per
+        // h2 stream), not a memory budget — device-memory derating must never
+        // touch it, on any device class.
+        assert_eq!(
+            small.chunk_split_blocks,
+            EngineConfig::DEFAULT_CHUNK_SPLIT_BLOCKS,
+            "chunk_split_blocks must not be derated by device memory"
         );
         small.validate().expect("derated config must validate");
     }
