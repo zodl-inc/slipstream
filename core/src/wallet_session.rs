@@ -264,10 +264,6 @@ impl WalletSession {
         self.db
             .put_orchard_subtree_roots(0, &roots.orchard)
             .map_err(|e| wallet_err("put_orchard_subtree_roots", e))?;
-        // Graft Ironwood from the server too — same treatment as Sapling/Orchard above.
-        // Fetches the complete 0..N subtree-root list every pass, so db_shard_indices stays
-        // fully continuous regardless of which account's birthday-anchored treestate fetch
-        // seeded the local sparse tree first (see grpc.rs SubtreeRoots comment).
         self.db
             .put_ironwood_subtree_roots(0, &roots.ironwood)
             .map_err(|e| wallet_err("put_ironwood_subtree_roots", e))?;
