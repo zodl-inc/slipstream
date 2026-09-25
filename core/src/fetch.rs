@@ -35,7 +35,10 @@ use std::{
 use crate::events::Progress;
 
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    task::JoinSet,
+};
 use tracing::{debug, info, warn};
 use zcash_client_backend::proto::{
     compact_formats::CompactBlock,
@@ -821,6 +824,71 @@ async fn release_ordered(
     Ok(summary)
 }
 
+/// Drives the ordered release while supervising the fetch workers.
+///
+/// A worker that gives up on its plan chunk (retry budget exhausted, or its
+/// reconnect failed) used to surface only after the release loop ended. But the
+/// release loop waits for exactly that chunk, and the workers ahead of it block
+/// on the ahead budget once it is spent — so the pass hung in `Syncing` with no
+/// progress. The first worker failure now aborts every other worker and fails
+/// the fetch immediately; it is a `Transport` error, so the pass-level retry
+/// ladder takes over. A release error aborts the workers the same way.
+///
+/// When `failover` is armed (`Some`), a worker giving up is treated as the full
+/// wire stall the wire-collapse detector would eventually have raised on its
+/// own: the failure is remapped to `WireCollapse` (0.0 MB/s, the arm's floor)
+/// so the engine's failover loop switches to an alternate endpoint at once
+/// instead of retrying the same one. Worker panics and release errors are
+/// unaffected by `failover` either way.
+async fn supervise_fetch<R>(
+    release: R,
+    mut workers: JoinSet<Result<(), SlipstreamError>>,
+    failover: Option<WireFailoverArm>,
+) -> Result<ReleaseSummary, SlipstreamError>
+where
+    R: std::future::Future<Output = Result<ReleaseSummary, SlipstreamError>>,
+{
+    tokio::pin!(release);
+    let mut released: Option<ReleaseSummary> = None;
+    loop {
+        if workers.is_empty()
+            && let Some(summary) = released.take()
+        {
+            return Ok(summary);
+        }
+        tokio::select! {
+            biased;
+            Some(joined) = workers.join_next(), if !workers.is_empty() => match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    workers.abort_all();
+                    if let Some(arm) = failover {
+                        warn!(%err, "fetch worker gave up — failing over as a full wire stall");
+                        return Err(SlipstreamError::WireCollapse {
+                            measured_mbps: 0.0,
+                            floor_mbps: arm.floor_mbps,
+                        });
+                    }
+                    return Err(err);
+                }
+                Err(join_err) => {
+                    workers.abort_all();
+                    return Err(SlipstreamError::Transport(format!(
+                        "worker panicked: {join_err}"
+                    )));
+                }
+            },
+            result = &mut release, if released.is_none() => match result {
+                Ok(summary) => released = Some(summary),
+                Err(err) => {
+                    workers.abort_all();
+                    return Err(err);
+                }
+            },
+        }
+    }
+}
+
 /// Fetch `plan.start..=plan.end` with `plan.streams` workers; emits ordered,
 /// continuity-verified chunks into `queue`. Returns stats on success.
 ///
@@ -852,48 +920,36 @@ pub async fn run_fetch(
     // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
     let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
 
-    let mut handles = Vec::with_capacity(plan.streams);
+    let mut workers = JoinSet::new();
     for worker_id in 0..plan.streams.max(1) {
-        handles.push(tokio::spawn(worker(
+        workers.spawn(worker(
             worker_id,
             endpoint.clone(),
             plan.clone(),
             Arc::clone(&next),
             gate.clone(),
             tx.clone(),
-        )));
+        ));
     }
     drop(tx); // release loop ends when all workers finish
 
-    // On early error, abort workers explicitly: a dropped JoinHandle only detaches
-    // the task, which would otherwise hold its socket until the next send fails.
-    let abort_all = |handles: &Vec<tokio::task::JoinHandle<Result<(), SlipstreamError>>>| {
-        for h in handles {
-            h.abort();
-        }
-    };
-
-    let summary = match release_ordered(
-        &mut rx,
-        &queue,
-        progress.as_ref(),
-        &floor,
-        started,
+    // Workers are supervised WHILE the ordered release runs: one that gives up
+    // fails the fetch now (see `supervise_fetch`) instead of after a release
+    // that is waiting for its chunk.
+    let summary = supervise_fetch(
+        release_ordered(
+            &mut rx,
+            &queue,
+            progress.as_ref(),
+            &floor,
+            started,
+            plan.failover,
+        ),
+        workers,
         plan.failover,
     )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            abort_all(&handles);
-            return Err(e);
-        }
-    };
+    .await?;
 
-    for h in handles {
-        h.await
-            .map_err(|e| SlipstreamError::Transport(format!("worker panicked: {e}")))??;
-    }
     if summary.plans_released != chunk_count {
         return Err(SlipstreamError::Transport(format!(
             "fetch incomplete: released {}/{chunk_count} plan chunks",
@@ -1589,6 +1645,188 @@ mod tests {
             .expect_err("gap must fail");
         assert!(
             matches!(err, SlipstreamError::Discontinuity { at: 200, .. }),
+            "got: {err}"
+        );
+    }
+
+    // ── supervise_fetch: a failed worker fails the fetch at once ──────────────
+
+    /// Drop guard that records the task it lives in being aborted (dropped).
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_worker(
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<(), SlipstreamError>> + Send + 'static {
+        let guard = DropFlag(Arc::clone(dropped));
+        async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// The field hang: one worker gives up on its chunk while another waits
+    /// forever (blocked on the ahead budget behind that chunk) and the release
+    /// waits for the missing chunk. The supervisor must fail at once and abort
+    /// the waiting worker instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_returns_first_worker_error_and_aborts_the_rest() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(SlipstreamError::Transport("plan chunk 8 gave up".into()))
+        });
+        workers.spawn(pending_worker(&dropped));
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            supervise_fetch(release, workers, None),
+        )
+        .await
+        .expect("supervisor must not hang behind the failed chunk");
+
+        let err = outcome.expect_err("a failed worker fails the fetch");
+        assert!(
+            err.to_string().contains("plan chunk 8 gave up"),
+            "got: {err}"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the still-running worker must be aborted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_returns_release_summary_when_all_workers_succeed() {
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            workers.spawn(async { Ok(()) });
+        }
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(ReleaseSummary {
+                blocks: 7,
+                ..Default::default()
+            })
+        };
+        let summary = supervise_fetch(release, workers, None)
+            .await
+            .expect("all workers succeeded");
+        assert_eq!(summary.blocks, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_propagates_release_error_and_aborts_workers() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(pending_worker(&dropped));
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err::<ReleaseSummary, _>(SlipstreamError::Transport("continuity broken".into()))
+        };
+        let err = supervise_fetch(release, workers, None)
+            .await
+            .expect_err("a release error fails the fetch");
+        assert!(err.to_string().contains("continuity broken"), "got: {err}");
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst), "workers must be aborted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_maps_worker_panic_to_transport_error() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(release, workers, None)
+            .await
+            .expect_err("a panicked worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::Transport(ref m) if m.contains("worker panicked")),
+            "got: {err}"
+        );
+    }
+
+    /// Old semantics kept: a worker error that is only joined after the release
+    /// finished still fails the fetch.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reports_worker_error_joined_after_release_finished() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Err(SlipstreamError::Transport("late failure".into()))
+        });
+        let release = async { Ok(ReleaseSummary::default()) };
+        let err = supervise_fetch(release, workers, None)
+            .await
+            .expect_err("the late worker error must surface");
+        assert!(err.to_string().contains("late failure"), "got: {err}");
+    }
+
+    /// When wire failover is armed, a worker giving up must be treated as the
+    /// full wire stall the detector would eventually have raised on its own —
+    /// so the engine's failover loop can switch endpoints immediately instead
+    /// of retrying the one that just gave up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_fails_over_when_armed_and_a_worker_gives_up() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(SlipstreamError::Transport("plan chunk 8 gave up".into()))
+        });
+        workers.spawn(pending_worker(&dropped));
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let arm = WireFailoverArm::default();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            supervise_fetch(release, workers, Some(arm)),
+        )
+        .await
+        .expect("supervisor must not hang behind the failed chunk");
+
+        let err = outcome.expect_err("a failed worker fails the fetch");
+        match err {
+            SlipstreamError::WireCollapse {
+                measured_mbps,
+                floor_mbps,
+            } => {
+                assert_eq!(measured_mbps, 0.0);
+                assert_eq!(floor_mbps, arm.floor_mbps);
+            }
+            other => panic!("expected WireCollapse, got: {other}"),
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the still-running worker must be aborted"
+        );
+    }
+
+    /// Armed failover must not swallow a genuine worker panic into a
+    /// WireCollapse — a panic is a bug, not a wire-quality signal.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_maps_worker_panic_to_transport_error_even_when_armed() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(release, workers, Some(WireFailoverArm::default()))
+            .await
+            .expect_err("a panicked worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::Transport(ref m) if m.contains("worker panicked")),
             "got: {err}"
         );
     }
