@@ -575,6 +575,42 @@ mod tests {
         );
     }
 
+    /// [h16-2 pin] A same-pass retry (e.g. a ScanContinuity truncate-and-re-suggest) can
+    /// re-fetch and re-count blocks an earlier attempt in the SAME pass already counted, so
+    /// `fetched`/`scanned` can exceed `pass_total` within one pass — each term must clamp to
+    /// `pass_total` independently instead of overflowing the blend past its intended
+    /// half-weight share. Unaffected by the h16-1 baseline (default 0), so this already held
+    /// before h16-2; pinned here as regression coverage for the reviewer's round.
+    #[test]
+    fn fetched_exceeding_pass_total_stays_clamped() {
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.set_pass_total(100);
+        p.add_fetched(150); // exceeds pass_total
+        p.add_scanned(150); // exceeds pass_total
+        let snap = handle_in(SyncState::Syncing, p).snapshot();
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "fetched/scanned beyond pass_total must clamp to it, not overflow the blend"
+        );
+    }
+
+    /// [h16-2 pin] `pass_total == 0` (no suggest round has run yet, or a degenerate empty
+    /// pass) must read the pass start alone, not divide-by-zero into 0 and mask a known
+    /// GLOBAL position. Unaffected by the h16-1 baseline (both clamp to a 0 pass_total
+    /// regardless of the baseline), so this already held before h16-2; pinned here as
+    /// regression coverage for the reviewer's round.
+    #[test]
+    fn pass_total_zero_with_start_set_reads_the_start() {
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.set_pass_start_permille(620);
+        // pass_total left at 0 (default).
+        let snap = handle_in(SyncState::Syncing, p).snapshot();
+        assert_eq!(
+            snap.progress_permille, 620,
+            "pass_total == 0 must read the pass start, not divide by zero into 0"
+        );
+    }
+
     #[test]
     fn ffi_snapshot_counter_fields_roundtrip() {
         // Build a fake Progress, set the new counters, and verify they surface in snapshot().

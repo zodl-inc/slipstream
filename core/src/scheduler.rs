@@ -153,6 +153,23 @@ pub(crate) fn update_pass_progress(
     rebaselined
 }
 
+/// [h16-2] How much of an aborted range's work survives a `ScanContinuity` truncate: the
+/// span below `rewind_height` (clamped to the aborted range's own bounds), which the
+/// truncate does NOT discard. The ScanContinuity branch (`run_to_completion`) credits this
+/// to `scanned_so_far_in_pass` right after the truncate, so the next suggest round's
+/// baseline snapshot (h16-1) folds it in — without this, `pass_total` would cover only the
+/// small repair range while `fetched`/`scanned` still held the whole aborted range, so the
+/// blend would read the still-in-flight repair as already done.
+pub(crate) fn scan_continuity_repair_credit(
+    start: u64,
+    end_exclusive: u64,
+    rewind_height: u64,
+) -> u64 {
+    rewind_height
+        .saturating_sub(start)
+        .min(end_exclusive.saturating_sub(start))
+}
+
 /// [API v2.1 E-3] Seed the snapshot atomics from PERSISTED wallet state, so the snapshot is
 /// truthful from `open()` — before the first suggest round — and hosts never compensate for
 /// a pre-pass snapshot that "lies" (the ENGINE_API_V2.md §0 known gap: `is_recovering` read
@@ -548,6 +565,14 @@ pub async fn run_to_completion(
                 .truncate_to_height(BlockHeight::from(rewind_height))
                 .map_err(|e| SlipstreamError::Wallet(format!("truncate_to_height: {e}")))?;
 
+            // [h16-2] The truncate discards blocks above rewind_height, but the blocks
+            // BELOW it (the surviving prefix of the aborted range) are still done — credit
+            // them now so the next suggest round's baseline snapshot (h16-1) folds them
+            // into scanned_so_far_in_pass instead of leaving pass_total cover only the
+            // small repair range while fetched/scanned still hold the whole aborted range.
+            scanned_so_far_in_pass +=
+                scan_continuity_repair_credit(start, end_exclusive, u64::from(rewind_height));
+
             report.reorgs_recovered += 1;
             if let Some(ref p) = progress {
                 p.add_reorg();
@@ -883,6 +908,71 @@ mod tests {
         assert_eq!(
             snap.progress_permille, 1000,
             "the pass reaches 1000 only once the remaining 1.1M are fetched AND scanned"
+        );
+    }
+
+    /// [h16-2] Reviewer's example on 10c9f633 (PR #14 review round): a 10k-block range
+    /// breaks continuity at height 9,000 (rewind to 8,990, matching upstream's
+    /// `at.saturating_sub(10)`). The blocks below 8,990 stay done after the truncate — this
+    /// test credits them to `scanned_so_far_in_pass` the same way the real ScanContinuity
+    /// branch does (via `scan_continuity_repair_credit`, the exact formula that branch
+    /// calls; driving a live ScanContinuity error needs a full darkside scan failure, so the
+    /// branch's OWN wiring is verified by reading, not by this test — see the report). No
+    /// birthday is seeded (`global_floor_permille` returns `None` on `None`, per
+    /// `global_floor_degenerate_inputs_yield_none`), isolating the fetched/scanned/pass_total
+    /// interaction from h16-1's separate `pass_start_permille` stretch.
+    #[test]
+    fn continuity_repair_credits_the_surviving_prefix_not_the_whole_range() {
+        let p = Progress::default();
+        let mut scanned_so_far_in_pass = 0u64;
+
+        // Round 1: the range about to break is [0, 10_000) — "a 10k-block range".
+        let (start, end_exclusive) = (0u64, 10_000u64);
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, end_exclusive - start, None);
+        assert_eq!(p.pass_total(), 10_000);
+
+        // The break: fetch ran ahead to the whole range (f=10,000); scan got to 9,000
+        // (s=9,000) before the continuity error at height 9,000.
+        p.add_fetched(10_000);
+        p.add_scanned(9_000);
+
+        // ScanContinuity { at: 9_000 } -> rewind_height = 9_000 - 10 = 8_990 (at is u32,
+        // matching error.rs's ScanContinuity::at and the branch's own rewind_height).
+        let at: u32 = 9_000;
+        let rewind_height = at.saturating_sub(10);
+        assert_eq!(rewind_height, 8_990);
+
+        // The fix under test: credit the surviving prefix right after the truncate, via the
+        // SAME formula (`scan_continuity_repair_credit`) the production branch calls.
+        scanned_so_far_in_pass +=
+            scan_continuity_repair_credit(start, end_exclusive, u64::from(rewind_height));
+        assert_eq!(scanned_so_far_in_pass, 8_990);
+
+        // Next suggest round: the repair range is [8_990, 10_000) -> 1_010 remaining
+        // ("T ≈ 1,010" in the reviewer's own notation for the UNCREDITED pre-fix total —
+        // post-fix, T is the credited 8_990 plus this 1_010 repair range).
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_010, None);
+        assert_eq!(
+            p.pass_total(),
+            10_000,
+            "T = the credited 8_990 + the 1_010 repair range"
+        );
+
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 899,
+            "right after the rewind the reading must be ~900, not 1000 mid-repair \
+             (no pass start is seeded here, so this is the pass-local ratio alone: \
+             fetched (10,000−1,010=8,990) + scanned (9,000−10=8,990) over 2×10,000)"
+        );
+
+        // The repair completes: the remaining 1_010 blocks are fetched and scanned.
+        p.add_fetched(1_010);
+        p.add_scanned(1_010);
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "reaches 1000 only once the repair completes"
         );
     }
 
