@@ -208,12 +208,12 @@ pub async fn sync_once(
 
     let started = Instant::now();
 
-    // Reset per-pass ratio counters (scanned/fetched/pass_total/range_end/spendable).
-    // The FFI handle — and therefore this Progress — outlives individual passes
-    // (Swift opens it once in prepare(); stop()/start() reuse it across app
+    // Reset per-pass ratio counters (scanned/fetched/pass_total/range_end/spendable/
+    // pass_start). The FFI handle — and therefore this Progress — outlives individual
+    // passes (Swift opens it once in prepare(); stop()/start() reuse it across app
     // background/foreground cycles), so stale pass-1 counters would corrupt pass-2's
-    // scanned/pass_total ratio. Monotonic delta counters (enhanced_txs,
-    // ranges_completed, reorgs_recovered) are deliberately left untouched.
+    // progress blend. Monotonic delta counters (enhanced_txs, ranges_completed,
+    // reorgs_recovered) are deliberately left untouched.
     if let Some(ref p) = progress {
         p.begin_pass();
     }

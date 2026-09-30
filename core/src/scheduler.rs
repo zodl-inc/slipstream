@@ -342,6 +342,16 @@ pub async fn run_to_completion(
                         birthday = wallet_birthday,
                         "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
                     );
+                    // [h10] The pass start follows the re-baseline: the scope grew UNDER
+                    // this running pass, so the pass's own progress must stretch from the
+                    // re-baselined position too, or it would still stretch from the stale
+                    // pre-expansion start and under-report the re-scan's climb.
+                    p.set_pass_start_permille(seed);
+                } else {
+                    // [h10] First suggest round of the pass latches the start; later rounds
+                    // of the same pass keep it — the pass's reported progress is measured
+                    // from where the GLOBAL position stood when the pass began.
+                    p.set_pass_start_permille_if_unset(seed);
                 }
                 let _ = p.permille_floor(seed);
             }
