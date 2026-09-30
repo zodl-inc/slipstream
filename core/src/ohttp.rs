@@ -1112,11 +1112,16 @@ pub async fn http_round_trip(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    // Parse URL to extract host, port, path
-    let uri = url.parse::<http::Uri>().map_err(|e| format!("invalid URL: {e}"))?;
+    // Parse URL to extract scheme, host, path for BHTTP encoding
+    let uri = url
+        .parse::<http::Uri>()
+        .map_err(|e| format!("invalid URL: {e}"))?;
     let host = uri.host().ok_or("URL has no host")?.to_string();
-    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
-    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+    let path = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
     let scheme = uri.scheme_str().unwrap_or("https");
 
     // Get relay URL for this gateway
