@@ -53,8 +53,10 @@ pub struct FfiSlipstreamSnapshot {
     // ── T5.5 counter-based progress fields (appended at END for padding stability) ──
     /// Total blocks in the current pass. Set (not accumulated) by the scheduler each time
     /// suggest_scan_ranges returns: value = scanned_so_far + sum(all returned ranges).
-    /// Denominator for counter-based progress: min(fetched_blocks, pass_total_blocks) +
-    /// min(scanned_blocks, pass_total_blocks), each weighed half — see `progress_permille`.
+    /// Denominator for the blessed progress (`progress_permille`): `fetched_blocks` and
+    /// `scanned_blocks`, each first measured from the per-round baseline the scheduler
+    /// snapshots at the same time (so blocks a re-baselined pass already credited are not
+    /// counted a second time), then clamped to this total, weighed half each.
     pub pass_total_blocks: u64,
     /// Spendable hint: 0 = not yet spendable; 1 = a ChainTip-priority range has completed
     /// scanning (≈ SBS funds-spendable semantics). Latches to 1; never resets within a pass.
@@ -71,6 +73,15 @@ pub struct FfiSlipstreamSnapshot {
     pub is_recovering: u8,
     /// Blessed progress value, 0..=1000, session-monotonic (never regresses while the
     /// handle lives). Done forces 1000. Replaces host-side % math.
+    ///
+    /// Computed as a two-stage blend: the pass's own progress is `fetched_blocks` and
+    /// `scanned_blocks`, each relative to the pass's per-round baseline and clamped to
+    /// `pass_total_blocks`, weighed half each (see `pass_total_blocks`); that pass-local
+    /// fraction is then stretched from the pass's own starting position — its GLOBAL
+    /// position when the pass began, or wherever the scan scope last expanded under it —
+    /// up to 1000, so a resync's reading climbs from where the wallet already stood instead
+    /// of restarting at 0. The stretched result is folded into the session-monotonic floor,
+    /// which only ever rises — the reason this field never regresses.
     pub progress_permille: u16,
     /// Seconds without forward progress while state == Syncing; 0 otherwise — the longer of the
     /// time since the last progress and the time the block download has kept failing at the
