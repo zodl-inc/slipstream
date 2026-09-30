@@ -1352,61 +1352,88 @@ mod tests {
         );
     }
 
-    /// Verify that `http_round_trip` only connects to the relay, never the origin.
+    /// Behavioral test: `http_round_trip` only connects to the relay, never the origin.
     /// OHTTP's privacy guarantee depends on the gateway receiving requests only from
     /// the relay's IP - direct connections to the origin would leak the client IP.
-    #[test]
-    fn http_round_trip_relay_only_no_origin_connection() {
-        let source = include_str!("ohttp.rs");
+    ///
+    /// Test approach: Set up a local fake relay that records connections, call
+    /// http_round_trip with origin="https://origin.invalid/api" (unresolvable .invalid TLD),
+    /// assert exactly one POST to relay with content-type message/ohttp-req, zero to origin.
+    /// If http_round_trip tried to connect to origin.invalid, it would fail DNS resolution.
+    #[tokio::test]
+    async fn http_round_trip_relay_only_no_origin_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
-        // http_round_trip must exist and be public
-        assert!(
-            source.contains("pub async fn http_round_trip("),
-            "http_round_trip must be public"
-        );
+        // Bind fake relay to random available port
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake relay");
+        let relay_addr = listener.local_addr().expect("relay addr");
 
-        // It must create an OhttpClient and call round_trip() exactly once
-        assert!(
-            source.contains("let client = OhttpClient::new(")
-                && source.contains("client.round_trip(&bhttp_request).await?;"),
-            "http_round_trip must delegate to OhttpClient::round_trip"
-        );
+        // Override relay URL to point to our fake relay (debug builds only)
+        set_relay_url_override(Some(format!("http://127.0.0.1:{}", relay_addr.port())));
 
-        // Verify round_trip() only POSTs to the relay (via self.https with relay target)
-        assert!(
-            source.contains("async fn round_trip(&self, bhttp_request: &[u8])")
-                && source.contains("self.https(")
-                && source.contains("&self.relay")
-                && source.contains("Method::POST"),
-            "round_trip must POST only to self.relay"
-        );
+        // Spawn fake relay task: accept one connection, read HTTP request, verify it's POST with
+        // content-type message/ohttp-req, then return a minimal response (can be error - we only
+        // care about the request side for this test).
+        let relay_task = tokio::spawn(async move {
+            let (mut socket, _peer) = listener
+                .accept()
+                .await
+                .expect("fake relay accept connection");
 
-        // The origin URL (parsed from the `url` parameter) must ONLY be used for
-        // BHTTP encoding (scheme/host/path fields), never for direct connection
-        assert!(
-            source.contains("bhttp::Message::request(")
-                && source.contains("scheme.as_bytes().to_vec()")
-                && source.contains("host.as_bytes().to_vec()"),
-            "origin host must only be used for BHTTP encoding, not connection"
-        );
+            // Read HTTP request line + headers until \r\n\r\n
+            let mut buf = vec![0u8; 4096];
+            let n = socket.read(&mut buf).await.expect("read request");
+            let request = String::from_utf8_lossy(&buf[..n]);
 
-        // Crucially, http_round_trip must NOT contain any direct dial to the origin:
-        // - No `dialer.dial(host, ...)` where host comes from the url parameter
-        // - No TcpStream::connect to parsed uri.host()
-        // - All connections go through OhttpClient, which only dials self.relay
+            // Assert it's a POST with content-type message/ohttp-req
+            assert!(
+                request.starts_with("POST "),
+                "relay must receive POST, got: {}",
+                request.lines().next().unwrap_or("")
+            );
+            assert!(
+                request.contains("content-type: message/ohttp-req")
+                    || request.contains("Content-Type: message/ohttp-req"),
+                "relay must receive content-type message/ohttp-req"
+            );
+
+            // Return minimal HTTP response (gateway would normally decrypt and forward, but we
+            // don't have the HPKE key - just return 500 to end the connection)
+            let response = b"HTTP/1.1 500 Test\r\nContent-Length: 0\r\n\r\n";
+            let _ = socket.write_all(response).await;
+
+            // Return success marker
+            "relay received POST"
+        });
+
+        // Call http_round_trip with origin URL on unresolvable host origin.invalid.
+        // If http_round_trip tried to connect to this origin, it would fail DNS resolution
+        // before reaching here. Success proves it only connects to the relay.
+        let result = http_round_trip(
+            "test-gateway.zodl.com", // Any gateway name (relay override is active)
+            Dialer::Direct,
+            "POST",
+            "https://origin.invalid/api/vote", // Unresolvable .invalid TLD
+            &[("content-type".to_string(), "application/json".to_string())],
+            b"{\"vote\": 1}",
+        )
+        .await;
+
+        // The call will fail (fake relay returns 500, or OHTTP decapsulation fails), but that's
+        // expected - we're testing connection behavior, not end-to-end success.
+        // The assertion is: relay_task completes successfully, proving exactly one POST to relay.
+        let relay_result = relay_task.await.expect("relay task join");
+        assert_eq!(relay_result, "relay received POST");
+
+        // If http_round_trip had tried to connect to origin.invalid, we'd never reach here
+        // (DNS resolution error for .invalid TLD). The fact that we got this far, and relay_task
+        // completed, proves http_round_trip only connected to the relay at 127.0.0.1.
         assert!(
-            !source.contains("http_round_trip")
-                || (!source[source.find("pub async fn http_round_trip(").unwrap()
-                    ..source
-                        .find("async fn round_trip(&self, bhttp_request: &[u8])")
-                        .unwrap()]
-                    .contains("TcpStream::connect")
-                    && !source[source.find("pub async fn http_round_trip(").unwrap()
-                        ..source
-                            .find("async fn round_trip(&self, bhttp_request: &[u8])")
-                            .unwrap()]
-                        .contains("dialer.dial(&host,")),
-            "http_round_trip must never directly connect to the origin host"
+            result.is_err(),
+            "Expected fake relay to cause error (we only test connection behavior)"
         );
     }
 
