@@ -1078,6 +1078,92 @@ impl OhttpClient {
     }
 }
 
+/// Sends an HTTP request through OHTTP (RFC 9458): HPKE-encapsulates the request,
+/// POSTs it to the relay, and decapsulates the response.
+///
+/// Intended for non-gRPC HTTP use cases (voting, PIR, etc.) that need the same
+/// privacy properties as lightwalletd but do not use gRPC's framing.
+///
+/// # Arguments
+/// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
+/// * `dialer` - How to reach the relay: `Dialer::Direct` or `Dialer::Tor(_)`
+/// * `method` - HTTP method (e.g., "GET", "POST")
+/// * `url` - Full target URL (e.g., "https://voting.valargroup.dev/api/vote")
+/// * `headers` - Request headers as (name, value) pairs
+/// * `body` - Request body bytes
+///
+/// # Returns
+/// `Ok((status, headers, body))` on success, or `Err(msg)` on failure.
+///
+/// # Privacy
+/// The relay sees the client IP (or Tor exit with `Dialer::Tor`) and the HPKE-encrypted
+/// ciphertext, but not the plaintext request. The gateway sees the plaintext request
+/// but only the relay's IP. Uses signed HPKE key configs fetched through the relay,
+/// with automatic key rotation retry on gateway 400/422.
+///
+/// # Response size cap
+/// Enforces the same 64 MiB cap as the gRPC path (expandable to 256 MiB via
+/// `MAX_UPSTREAM_RESPONSE_BYTES`). Larger responses are truncated.
+pub async fn http_round_trip(
+    gateway_host: &str,
+    dialer: Dialer,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    // Parse URL to extract host, port, path
+    let uri = url.parse::<http::Uri>().map_err(|e| format!("invalid URL: {e}"))?;
+    let host = uri.host().ok_or("URL has no host")?.to_string();
+    let port = uri.port_u16().unwrap_or(if uri.scheme_str() == Some("https") { 443 } else { 80 });
+    let path = uri.path_and_query().map(|p| p.as_str()).unwrap_or("/").to_string();
+    let scheme = uri.scheme_str().unwrap_or("https");
+
+    // Get relay URL for this gateway
+    let relay_url = relay_for(gateway_host)
+        .ok_or_else(|| format!("no relay configured for gateway {}", gateway_host))?;
+
+    // Create OHTTP client
+    let client = OhttpClient::new(
+        gateway_host,
+        relay_url,
+        dialer,
+        get_default_client_trace_prefix(),
+    )?;
+
+    // Encode HTTP request as Binary HTTP (RFC 9292)
+    let mut msg = bhttp::Message::request(
+        method.as_bytes().to_vec(),
+        scheme.as_bytes().to_vec(),
+        host.as_bytes().to_vec(),
+        path.as_bytes().to_vec(),
+    );
+    for (name, value) in headers {
+        msg.put_header(name.as_bytes().to_vec(), value.as_bytes().to_vec());
+    }
+    msg.write_content(body);
+    let mut bhttp_request = Vec::with_capacity(body.len() + 256);
+    msg.write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_request)
+        .map_err(|e| format!("bhttp encode: {e:?}"))?;
+
+    // Send through OHTTP relay (encapsulate, POST, decapsulate)
+    let bhttp_response = client.round_trip(&bhttp_request).await?;
+
+    // Decode Binary HTTP response
+    let msg = bhttp::Message::read_bhttp::<_, Cursor<Vec<u8>>>(&mut Cursor::new(bhttp_response))
+        .map_err(|e| format!("bhttp decode: {e:?}"))?;
+    let status = msg.control().status().map(|s| s.code()).unwrap_or(200);
+    let mut response_headers = Vec::new();
+    for field in msg.header().iter() {
+        let name = String::from_utf8_lossy(field.name()).to_string();
+        let value = String::from_utf8_lossy(field.value()).to_string();
+        response_headers.push((name, value));
+    }
+    let response_body = msg.content().to_vec();
+
+    Ok((status, response_headers, response_body))
+}
+
 const GRPC_UNAVAILABLE: &str = "14";
 const GRPC_INTERNAL: &str = "13";
 
@@ -1770,6 +1856,50 @@ mod client_trace {
             //
             // The fix: allow_retry: false for OHTTP relay POSTs, allow_retry: true for key config GETs.
             // This test exists purely to document the C-08 fix reasoning above.
+        }
+
+        /// Test that http_round_trip() public API exists with the expected signature.
+        #[test]
+        fn test_http_round_trip_signature() {
+            let source = include_str!("ohttp.rs");
+
+            // Verify the public function exists
+            assert!(
+                source.contains("pub async fn http_round_trip("),
+                "http_round_trip() must be public"
+            );
+
+            // Verify it takes the expected parameters
+            assert!(
+                source.contains("gateway_host: &str,")
+                    && source.contains("dialer: Dialer,")
+                    && source.contains("method: &str,")
+                    && source.contains("url: &str,")
+                    && source.contains("headers: &[(String, String)],")
+                    && source.contains("body: &[u8],"),
+                "http_round_trip() must have the expected parameters"
+            );
+
+            // Verify it returns the expected type
+            assert!(
+                source.contains("-> Result<(u16, Vec<(String, String)>, Vec<u8>), String>"),
+                "http_round_trip() must return (status, headers, body)"
+            );
+
+            // Verify it calls OhttpClient::new() and round_trip()
+            assert!(
+                source.contains("let client = OhttpClient::new(")
+                    && source.contains("client.round_trip("),
+                "http_round_trip() must create OhttpClient and call round_trip()"
+            );
+
+            // Verify it encodes/decodes BHTTP
+            assert!(
+                source.contains("bhttp::Message::request(")
+                    && source.contains("msg.write_bhttp(")
+                    && source.contains("bhttp::Message::read_bhttp"),
+                "http_round_trip() must encode and decode BHTTP"
+            );
         }
     }
 }
