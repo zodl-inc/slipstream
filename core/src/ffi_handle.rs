@@ -271,9 +271,24 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
         // blocks an earlier attempt in the SAME pass already counted, so `fetched` (and
         // `scanned`) can exceed `pass_total` within one pass — the clamp keeps such a
         // retry's over-count from giving its term more than its intended half-weight share.
+        //
+        // [h16-1] Each term is measured from the pass-local BASELINE the scheduler
+        // snapshots every suggest round (`Progress::set_pass_baseline`), not from the raw
+        // counter: the raw `fetched_blocks`/`scanned_blocks` counters are shared with other
+        // readers (this snapshot's own `fetched_blocks`/`scanned_blocks` fields below, and
+        // the CLI ticker) and so are never zeroed mid-pass, but a scope-expansion
+        // re-baseline (`rebaseline_floor_if_scope_expanded`) folds already-credited work
+        // into the new `pass_start_permille` — without subtracting the baseline here, that
+        // same work would ALSO inflate this pass-local ratio and double-count it.
         let pass_total = p.pass_total();
-        let fetched_capped = p.fetched().min(pass_total);
-        let scanned_capped = p.scanned().min(pass_total);
+        let fetched_capped = p
+            .fetched()
+            .saturating_sub(p.pass_base_fetched())
+            .min(pass_total);
+        let scanned_capped = p
+            .scanned()
+            .saturating_sub(p.pass_base_scanned())
+            .min(pass_total);
         let pass_permille = fetched_capped
             .saturating_add(scanned_capped)
             .saturating_mul(1000)

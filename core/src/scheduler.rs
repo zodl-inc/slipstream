@@ -85,6 +85,74 @@ pub(crate) fn global_floor_permille(
     Some(scanned.saturating_mul(1000) / span)
 }
 
+/// [h16-1] One suggest round's progress bookkeeping: set the pass total and seed/re-baseline
+/// the session floor + pass start from the GLOBAL seed. Extracted from the `run_to_completion`
+/// loop body (behaviour unchanged by the extraction itself) so it can be driven directly in
+/// tests without a live fetch/scan pass — everything here is pure atomic bookkeeping over an
+/// already-known range-length sum, no network I/O. Reads `p.chain_tip()` live, like the inline
+/// block it replaces. Returns whether this round re-baselined the session floor (test hook;
+/// `run_to_completion` ignores it).
+pub(crate) fn update_pass_progress(
+    p: &Progress,
+    scanned_so_far_in_pass: &mut u64,
+    sum_remaining: u64,
+    wallet_birthday: Option<u64>,
+) -> bool {
+    // [h16-1] Snapshot the pass-local blend baseline BEFORE the pass total is set: from
+    // this moment, `derive_snapshot` reads `fetched()`/`scanned()` relative to this
+    // baseline instead of raw, so blocks already credited to `scanned_so_far_in_pass`
+    // (this pass's completed-range tally) are not counted a second time against the new
+    // total. At this instant the pass-local counters equal the work the pass has credited.
+    p.set_pass_baseline(
+        p.fetched().saturating_sub(*scanned_so_far_in_pass),
+        p.scanned().saturating_sub(*scanned_so_far_in_pass),
+    );
+    p.set_pass_total(*scanned_so_far_in_pass + sum_remaining);
+    // [API v2 §4.4 / Phase E] Seed the session-monotonic floor with the GLOBAL position.
+    // fetch_max semantics: the seed can only RAISE the floor, and re-seeding every suggest
+    // round tracks global progress as ranges complete. Two behaviours fall out for free:
+    // a cold-launch catch-up starts at ~99.9% instead of flashing 0% (the old Swift
+    // summary floor), and a relaunched restore RESUMES near its true position instead of
+    // 0% (the old Swift monotonic floor could not survive a relaunch).
+    let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining) else {
+        return false;
+    };
+    // [API v2.1 E-5] Scope-expansion re-baseline: an imported account with an
+    // older birthday (or a rewind) grows the span under the session floor —
+    // without this, the ~1000 floor from the previous scope's Done would mask
+    // the whole re-scan at ~100% (the host used to bypass every floor with
+    // `forceCounterProgressUntilDone`; the blessed permille now reads the
+    // genuine climb by itself).
+    let rebaselined = p.rebaseline_floor_if_scope_expanded(seed);
+    if rebaselined {
+        info!(
+            seed,
+            birthday = wallet_birthday,
+            "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
+        );
+        // [h10] The pass start follows the re-baseline: the scope grew UNDER
+        // this running pass, so the pass's own progress must stretch from the
+        // re-baselined position too, or it would still stretch from the stale
+        // pre-expansion start and under-report the re-scan's climb.
+        p.set_pass_start_permille(seed);
+        // [h16-1] The new start already includes everything credited so far: fold the
+        // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
+        // counters, so the next blend reads 0 pass-local progress against the fresh
+        // `sum_remaining`-only total below, instead of replaying the pre-expansion
+        // credit a second time against the new (smaller, re-baselined) denominator.
+        *scanned_so_far_in_pass = 0;
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(sum_remaining);
+    } else {
+        // [h10] First suggest round of the pass latches the start; later rounds
+        // of the same pass keep it — the pass's reported progress is measured
+        // from where the GLOBAL position stood when the pass began.
+        p.set_pass_start_permille_if_unset(seed);
+    }
+    let _ = p.permille_floor(seed);
+    rebaselined
+}
+
 /// [API v2.1 E-3] Seed the snapshot atomics from PERSISTED wallet state, so the snapshot is
 /// truthful from `open()` — before the first suggest round — and hosts never compensate for
 /// a pre-pass snapshot that "lies" (the ENGINE_API_V2.md §0 known gap: `is_recovering` read
@@ -321,40 +389,12 @@ pub async fn run_to_completion(
                     e.saturating_sub(s)
                 })
                 .sum();
-            p.set_pass_total(scanned_so_far_in_pass + sum_remaining);
-            // [API v2 §4.4 / Phase E] Seed the session-monotonic floor with the GLOBAL position.
-            // fetch_max semantics: the seed can only RAISE the floor, and re-seeding every suggest
-            // round tracks global progress as ranges complete. Two behaviours fall out for free:
-            // a cold-launch catch-up starts at ~99.9% instead of flashing 0% (the old Swift
-            // summary floor), and a relaunched restore RESUMES near its true position instead of
-            // 0% (the old Swift monotonic floor could not survive a relaunch).
-            if let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining)
-            {
-                // [API v2.1 E-5] Scope-expansion re-baseline: an imported account with an
-                // older birthday (or a rewind) grows the span under the session floor —
-                // without this, the ~1000 floor from the previous scope's Done would mask
-                // the whole re-scan at ~100% (the host used to bypass every floor with
-                // `forceCounterProgressUntilDone`; the blessed permille now reads the
-                // genuine climb by itself).
-                if p.rebaseline_floor_if_scope_expanded(seed) {
-                    info!(
-                        seed,
-                        birthday = wallet_birthday,
-                        "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
-                    );
-                    // [h10] The pass start follows the re-baseline: the scope grew UNDER
-                    // this running pass, so the pass's own progress must stretch from the
-                    // re-baselined position too, or it would still stretch from the stale
-                    // pre-expansion start and under-report the re-scan's climb.
-                    p.set_pass_start_permille(seed);
-                } else {
-                    // [h10] First suggest round of the pass latches the start; later rounds
-                    // of the same pass keep it — the pass's reported progress is measured
-                    // from where the GLOBAL position stood when the pass began.
-                    p.set_pass_start_permille_if_unset(seed);
-                }
-                let _ = p.permille_floor(seed);
-            }
+            update_pass_progress(
+                p,
+                &mut scanned_so_far_in_pass,
+                sum_remaining,
+                wallet_birthday,
+            );
         }
 
         // block_range() returns a Range<BlockHeight> where .end is END-EXCLUSIVE
@@ -687,6 +727,7 @@ pub async fn run_to_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi_handle::{SyncState, derive_snapshot};
 
     #[test]
     fn sync_report_default_is_zero() {
@@ -759,6 +800,90 @@ mod tests {
         );
         // Remaining exceeding the span clamps to 0 rather than underflowing.
         assert_eq!(global_floor_permille(1_100, Some(1_000), 5_000), Some(0));
+    }
+
+    /// [h16-1] Reviewer's example on 10c9f633 (PR #14 review round): an older-birthday
+    /// account import expands the scan scope mid-pass. Drives the real suggest-round
+    /// accounting (`update_pass_progress`) across three rounds, polling the FFI snapshot
+    /// between them the way a host would — the poll matters because `derive_snapshot`
+    /// itself latches the session floor (`Progress::permille_floor`), and the pre-fix bug's
+    /// inflated reading re-latches a floor high enough to wrongly trigger ANOTHER
+    /// re-baseline on the very next round (the reviewer's "fires again on every round").
+    #[test]
+    fn scope_expansion_rebaseline_does_not_double_count_or_oscillate() {
+        let p = Progress::default();
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1; // pre-import birthday: span 1,000,000
+        const B0: u64 = TIP - 2_000_000 + 1; // post-import (older) birthday: span 2,000,000
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+
+        // Round 1: the pass's first suggest round, no expansion yet — a 1,000,000-block
+        // span with everything still remaining, so the seed (and the latched start) is 0.
+        let rebaselined =
+            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        assert!(!rebaselined, "first round of a pass is never a re-baseline");
+        assert_eq!(p.pass_start_permille(), Some(0));
+
+        // This pass scans 900k of its original 1M-block span before anything changes.
+        p.add_fetched(900_000);
+        p.add_scanned(900_000);
+        scanned_so_far_in_pass += 900_000;
+
+        // A host poll between suggest rounds (polling is continuous in practice) latches
+        // the session floor at 900 before the import lands.
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 900,
+            "900k/1M fetched+scanned, no start stretch yet (start=0) ⇒ 900"
+        );
+
+        // Round 2: an older-birthday account is imported — the scope expands to a
+        // 2,000,000-block span with 1,100,000 remaining (the reviewer's own example).
+        // seed = (2,000,000 − 1,100,000) × 1000 / 2,000,000 = 450, far enough below the
+        // 900 floor to read as scope expansion, not noise.
+        let rebaselined =
+            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_100_000, Some(B0));
+        assert!(
+            rebaselined,
+            "450 is >50‰ below the 900 floor ⇒ scope expansion"
+        );
+        assert_eq!(p.pass_start_permille(), Some(450));
+
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 450,
+            "right after the re-baseline the reading must be the new start alone (450), \
+             not the pre-expansion 900k/900k double-counted against the new 1.1M total"
+        );
+
+        // Round 3: the very next suggest round, nothing scanned since round 2 — the seed
+        // is still 450, which must NOT read as a further expansion against the now-correct
+        // 450 floor (pre-fix, the round-2 poll above re-inflates the floor and this round
+        // wrongly re-baselines again).
+        let rebaselined_again =
+            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_100_000, Some(B0));
+        assert!(
+            !rebaselined_again,
+            "the next suggest round must not re-baseline again"
+        );
+
+        // The repair climbs from 450 to 1000 as the remaining 1.1M blocks are fetched and
+        // scanned — not instantly, and not before both are done.
+        p.add_fetched(1_100_000);
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 725,
+            "everything fetched, nothing scanned since the re-baseline: half-weighted climb \
+             off the 450 start"
+        );
+
+        p.add_scanned(1_100_000);
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "the pass reaches 1000 only once the remaining 1.1M are fetched AND scanned"
+        );
     }
 
     // ── [API v2.1 E-3] truthful-from-open seed ─────────────────────────────────

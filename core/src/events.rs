@@ -144,6 +144,21 @@ pub struct Progress {
     /// restarting at 0 and staying invisible until the pass-local ratio alone crosses that
     /// same global position. Read with [`Self::pass_start_permille`].
     pass_start_permille: AtomicU64,
+    /// [h16-1] `fetched_blocks`/`scanned_blocks` value (respectively) that the pass-local
+    /// blend's numerators are measured FROM, snapshotted by the scheduler every suggest
+    /// round (see [`Self::set_pass_baseline`]) just before it sets `pass_total_blocks`. The
+    /// FFI snapshot's `pass_permille` term uses `fetched() − pass_base_fetched()` (clamped
+    /// to `pass_total`) in place of the raw counter, so blocks this pass already credited to
+    /// `scanned_so_far_in_pass` before the snapshot — e.g. the ones folded into a scope
+    /// expansion's re-baselined `pass_start_permille` — are not counted a SECOND time
+    /// against the new total. `fetched_blocks`/`scanned_blocks` themselves are never zeroed
+    /// mid-pass (other readers need the raw counters: the FFI snapshot's own
+    /// `fetched_blocks`/`scanned_blocks` fields, and the CLI ticker), so this baseline is
+    /// the offset, not a reset. Reset to 0 by [`Self::begin_pass`]. Read with
+    /// [`Self::pass_base_fetched`] / [`Self::pass_base_scanned`].
+    pass_base_fetched: AtomicU64,
+    /// [h16-1] See [`Self::pass_base_fetched`] — the `scanned_blocks` counterpart.
+    pass_base_scanned: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -207,6 +222,8 @@ impl Default for Progress {
             last_progress_unix: AtomicU64::new(0),
             progress_permille_floor: AtomicU64::new(0),
             pass_start_permille: AtomicU64::new(u64::MAX),
+            pass_base_fetched: AtomicU64::new(0),
+            pass_base_scanned: AtomicU64::new(0),
             tip_refreshes: AtomicU64::new(0),
             tx_set_version: AtomicU64::new(0),
             wallet_writers: AtomicUsize::new(0),
@@ -656,6 +673,28 @@ impl Progress {
             .store(seed.min(1000), Ordering::Relaxed);
     }
 
+    /// [h16-1] Snapshot the pass-local blend baseline: `fetched`/`scanned` reads that the
+    /// FFI snapshot's `pass_permille` term measures FROM (see the `pass_base_fetched` field
+    /// doc). Called by the scheduler on every suggest round, and again — to different
+    /// values — when a scope expansion re-baselines the session floor.
+    #[inline]
+    pub fn set_pass_baseline(&self, fetched: u64, scanned: u64) {
+        self.pass_base_fetched.store(fetched, Ordering::Relaxed);
+        self.pass_base_scanned.store(scanned, Ordering::Relaxed);
+    }
+
+    /// Read the pass-local fetched baseline (see [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn pass_base_fetched(&self) -> u64 {
+        self.pass_base_fetched.load(Ordering::Relaxed)
+    }
+
+    /// Read the pass-local scanned baseline (see [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn pass_base_scanned(&self) -> u64 {
+        self.pass_base_scanned.load(Ordering::Relaxed)
+    }
+
     /// Reset the per-pass RATIO counters at the start of a sync pass.
     ///
     /// The FFI handle outlives individual sync passes (Swift `prepare()` opens it once;
@@ -666,9 +705,10 @@ impl Progress {
     ///
     /// Resets: `scanned_blocks`, `fetched_blocks`, `pass_total_blocks`,
     /// `current_range_end`, the `spendable_hint` latch (the new pass's ChainTip
-    /// range re-latches it within seconds, mirroring old-SDK per-sync semantics), and
+    /// range re-latches it within seconds, mirroring old-SDK per-sync semantics),
     /// `pass_start_permille` (back to unset — the new pass has not had a suggest round
-    /// yet; see [`Self::pass_start_permille`]).
+    /// yet; see [`Self::pass_start_permille`]), and the `pass_base_fetched`/
+    /// `pass_base_scanned` blend baseline (back to 0 — see [`Self::set_pass_baseline`]).
     ///
     /// Deliberately NOT reset (monotonic per handle — Swift consumes these as deltas
     /// via strict-greater/last-seen comparisons): `enhanced_txs`, `ranges_completed`,
@@ -680,6 +720,8 @@ impl Progress {
         self.current_range_end.store(0, Ordering::Relaxed);
         self.spendable_hint.store(0, Ordering::Relaxed);
         self.pass_start_permille.store(u64::MAX, Ordering::Relaxed);
+        self.pass_base_fetched.store(0, Ordering::Relaxed);
+        self.pass_base_scanned.store(0, Ordering::Relaxed);
         // v2: a new pass starts the stall clock fresh. `recovering` and the permille
         // floor are deliberately NOT reset — recovering is recomputed on the first
         // suggest round, and the floor is session-monotonic by contract (§4.4).
@@ -1077,6 +1119,36 @@ mod tests {
             2,
             "tx_set_version is monotonic per handle"
         );
+    }
+
+    /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
+    /// and — like the other per-pass ratio state — resets to 0 on `begin_pass()`.
+    #[test]
+    fn pass_baseline_defaults_to_zero_and_resets_on_begin_pass() {
+        let p = Progress::default();
+        assert_eq!(p.pass_base_fetched(), 0, "unset on a fresh handle");
+        assert_eq!(p.pass_base_scanned(), 0, "unset on a fresh handle");
+
+        p.set_pass_baseline(12_345, 6_789);
+        assert_eq!(p.pass_base_fetched(), 12_345);
+        assert_eq!(p.pass_base_scanned(), 6_789);
+
+        // A later suggest round re-snapshots to different values (store, not add).
+        p.set_pass_baseline(1, 2);
+        assert_eq!(
+            p.pass_base_fetched(),
+            1,
+            "set_pass_baseline overwrites, not adds"
+        );
+        assert_eq!(
+            p.pass_base_scanned(),
+            2,
+            "set_pass_baseline overwrites, not adds"
+        );
+
+        p.begin_pass();
+        assert_eq!(p.pass_base_fetched(), 0, "begin_pass resets the baseline");
+        assert_eq!(p.pass_base_scanned(), 0, "begin_pass resets the baseline");
     }
 
     /// [API v2.1 E-5] The floor re-baselines when the scope EXPANDS (seed materially below
