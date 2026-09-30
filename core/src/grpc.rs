@@ -315,6 +315,7 @@ pub async fn get_subtree_roots(
         client,
         ShieldedProtocol::Ironwood,
         "ironwood",
+        progress,
     )
     .await?;
     Ok(SubtreeRoots {
