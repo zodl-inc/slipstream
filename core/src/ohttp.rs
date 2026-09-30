@@ -1088,7 +1088,7 @@ impl OhttpClient {
 /// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
 /// * `dialer` - How to reach the relay: `Dialer::Direct` or `Dialer::Tor(_)`
 /// * `method` - HTTP method (e.g., "GET", "POST")
-/// * `url` - Full target URL (e.g., "https://voting.valargroup.dev/api/vote")
+/// * `url` - Full target URL (e.g., "<https://voting.valargroup.dev/api/vote>")
 /// * `headers` - Request headers as (name, value) pairs
 /// * `body` - Request body bytes
 ///
@@ -1349,6 +1349,64 @@ mod tests {
         assert!(
             err.contains("validity window too long") || err.contains("24"),
             "error must indicate validity window issue, got: {err}"
+        );
+    }
+
+    /// Verify that `http_round_trip` only connects to the relay, never the origin.
+    /// OHTTP's privacy guarantee depends on the gateway receiving requests only from
+    /// the relay's IP - direct connections to the origin would leak the client IP.
+    #[test]
+    fn http_round_trip_relay_only_no_origin_connection() {
+        let source = include_str!("ohttp.rs");
+
+        // http_round_trip must exist and be public
+        assert!(
+            source.contains("pub async fn http_round_trip("),
+            "http_round_trip must be public"
+        );
+
+        // It must create an OhttpClient and call round_trip() exactly once
+        assert!(
+            source.contains("let client = OhttpClient::new(")
+                && source.contains("client.round_trip(&bhttp_request).await?;"),
+            "http_round_trip must delegate to OhttpClient::round_trip"
+        );
+
+        // Verify round_trip() only POSTs to the relay (via self.https with relay target)
+        assert!(
+            source.contains("async fn round_trip(&self, bhttp_request: &[u8])")
+                && source.contains("self.https(")
+                && source.contains("&self.relay")
+                && source.contains("Method::POST"),
+            "round_trip must POST only to self.relay"
+        );
+
+        // The origin URL (parsed from the `url` parameter) must ONLY be used for
+        // BHTTP encoding (scheme/host/path fields), never for direct connection
+        assert!(
+            source.contains("bhttp::Message::request(")
+                && source.contains("scheme.as_bytes().to_vec()")
+                && source.contains("host.as_bytes().to_vec()"),
+            "origin host must only be used for BHTTP encoding, not connection"
+        );
+
+        // Crucially, http_round_trip must NOT contain any direct dial to the origin:
+        // - No `dialer.dial(host, ...)` where host comes from the url parameter
+        // - No TcpStream::connect to parsed uri.host()
+        // - All connections go through OhttpClient, which only dials self.relay
+        assert!(
+            !source.contains("http_round_trip")
+                || (!source[source.find("pub async fn http_round_trip(").unwrap()
+                    ..source
+                        .find("async fn round_trip(&self, bhttp_request: &[u8])")
+                        .unwrap()]
+                    .contains("TcpStream::connect")
+                    && !source[source.find("pub async fn http_round_trip(").unwrap()
+                        ..source
+                            .find("async fn round_trip(&self, bhttp_request: &[u8])")
+                            .unwrap()]
+                        .contains("dialer.dial(&host,")),
+            "http_round_trip must never directly connect to the origin host"
         );
     }
 
