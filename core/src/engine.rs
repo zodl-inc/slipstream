@@ -57,7 +57,7 @@ use crate::{
 /// hand cannot be relied on — and this is the evidence that it cannot — it should be
 /// derived from something that moves on its own (git describe at build time) rather
 /// than maintained.
-pub const ENGINE_BUILD: &str = "2026-08-02.v0.8-ironwood-migration";
+pub const ENGINE_BUILD: &str = "2026-09-24.v0.12-download-failure-stall";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick
@@ -257,13 +257,22 @@ pub async fn sync_once(
         }
         let birthday_ts =
             grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1).await?;
+        if let Some(ref p) = progress {
+            p.touch(); // liveness: a server response is forward progress
+        }
         session.import_account(ufvk, birthday_ts)?;
     }
 
-    let roots = grpc::get_subtree_roots(&mut client).await?;
+    let roots = grpc::get_subtree_roots(&mut client, progress.as_deref()).await?;
+    if let Some(ref p) = progress {
+        p.touch(); // liveness: a server response is forward progress
+    }
     session.put_subtree_roots(&roots)?;
 
     let tip = grpc::get_latest_block_height(&mut client).await?;
+    if let Some(ref p) = progress {
+        p.touch(); // liveness: a server response is forward progress
+    }
     session.update_chain_tip(tip)?;
     info!(tip, "chain tip updated");
 
@@ -279,7 +288,10 @@ pub async fn sync_once(
     // sync.rs:108-121 ("We do this before we perform any shielded scanning, to ensure
     // that we discover any UTXOs between the old fully-scanned height and the current
     // chain tip.").
-    let transparent = refresh_utxos(&mut session, &mut client).await?;
+    let transparent = refresh_utxos(&mut session, &mut client, progress.as_deref()).await?;
+    if let Some(ref p) = progress {
+        p.touch(); // liveness: a server response is forward progress
+    }
 
     // T6.1: per-pass dedupe set for TransactionsInvolvingAddress skip keys.
     // Scope = one sync pass (all interleaved/per-range/final runs share it).
@@ -410,6 +422,11 @@ pub async fn sync_once(
         wire_switches,
         persist_lane,
     };
+
+    // A completed pass got past whatever the block download failed on before.
+    if let Some(ref p) = progress {
+        p.note_pass_completed();
+    }
 
     Ok(outcome)
 }

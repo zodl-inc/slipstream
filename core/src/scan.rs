@@ -335,7 +335,7 @@ pub async fn scan_chunks(
         client,
         range_start,
         rx,
-        progress,
+        progress.clone(),
         config,
         skipped_keys,
         &mut wb,
@@ -366,6 +366,9 @@ pub async fn scan_chunks(
                 // v0.4 Plan A: build the range-end/tip shard the accumulators still
                 // hold (success path only — on errors the buffer resumes the shard).
                 tokio::task::block_in_place(|| wb.lane.finish_graft_blocking())?;
+                if let Some(p) = &progress {
+                    p.touch(); // liveness: the range-end tree build finished
+                }
                 stats.final_drain = final_drain_elapsed;
                 stats.persist_wait = wb.lane.total_wait();
                 stats.persist_busy = wb.lane.total_busy();
@@ -424,8 +427,14 @@ async fn scan_chunks_inner(
     // State for the FIRST chunk: seed treestate at (range_start - 1).
     // T6.8-H2: uses retry_get_tree_state (up to 3 attempts, reconnect on retry)
     // instead of bare get_tree_state — a single 30s server stall was FATAL here.
-    let mut next_state =
-        grpc::retry_get_tree_state(&endpoint, range_start - 1, "initial seed", tor).await?;
+    let mut next_state = grpc::retry_get_tree_state(
+        &endpoint,
+        range_start - 1,
+        "initial seed",
+        tor,
+        progress.clone(),
+    )
+    .await?;
 
     // ── v0.5 local treestate (2026-07-06 pacer plan) ─────────────────────────
     // When enabled, every boundary AFTER the seeded first sub-batch is served
@@ -533,12 +542,14 @@ async fn scan_chunks_inner(
                     Some(tokio::spawn({
                         let ep = endpoint.clone();
                         let tor_owned = tor.cloned();
+                        let progress = progress.clone();
                         async move {
                             grpc::retry_get_tree_state(
                                 &ep,
                                 sub_end,
                                 "chunk-boundary prefetch",
                                 tor_owned.as_ref(),
+                                progress,
                             )
                             .await
                         }

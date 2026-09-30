@@ -71,8 +71,10 @@ pub struct FfiSlipstreamSnapshot {
     /// Blessed progress value, 0..=1000, session-monotonic (never regresses while the
     /// handle lives). Done forces 1000. Replaces host-side % math.
     pub progress_permille: u16,
-    /// Seconds since the last forward progress while state == Syncing; 0 otherwise.
-    /// The host keeps the policy (log vs restart); the engine supplies the fact.
+    /// Seconds without forward progress while state == Syncing; 0 otherwise — the longer of the
+    /// time since the last progress and the time the block download has kept failing at the
+    /// same block (see HOSTING.md §5.3). The host keeps the policy (log vs restart); the engine
+    /// supplies the fact.
     pub stalled_seconds: u32,
     // ── API v2.1 E-4 (appended at END for padding stability) ──
     /// Monotonic version of the wallet's stored transaction set (see
@@ -274,20 +276,12 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             SyncState::Done | SyncState::Error(_) => 0u8,
             _ => u8::from(p.recovering()),
         };
-        // Stall clock: only meaningful while actively syncing; 0 when idle/terminal or before
-        // the first progress stamp.
+        // Stall fact: only meaningful while actively syncing; 0 when idle/terminal. The longer
+        // of the time since the last progress stamp and a repeatedly failing download's span
+        // (`Progress::stall_secs`).
         let stalled_seconds = match state {
             SyncState::Syncing => {
-                let last = p.last_progress_unix_secs();
-                if last == 0 {
-                    0
-                } else {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    u32::try_from(now.saturating_sub(last)).unwrap_or(u32::MAX)
-                }
+                u32::try_from(p.stall_secs(crate::events::unix_now_secs())).unwrap_or(u32::MAX)
             }
             _ => 0u32,
         };
@@ -408,45 +402,49 @@ mod tests {
         assert_eq!(p.permille_floor(0), 1000, "floor persists at max");
     }
 
+    /// A handle around `progress` in `state`, for snapshot tests (no task, no network).
+    fn handle_in(
+        state: SyncState,
+        progress: std::sync::Arc<crate::events::Progress>,
+    ) -> SlipstreamHandle {
+        SlipstreamHandle {
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("tokio runtime"),
+            progress,
+            state: std::sync::Arc::new(Mutex::new(state)),
+            events: std::sync::Arc::new(Mutex::new(Vec::new())),
+            task: None,
+            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            total_memory_bytes: 0,
+        }
+    }
+
     /// [API v2 §4.4] Terminal states force is_recovering = 0 (the fail-safe latch), and Done
     /// forces progress to 1000 — a dead or finished pass can never wedge a "Restoring" UI or
     /// show partial progress.
     #[test]
     fn snapshot_terminal_states_apply_v2_latches() {
-        let mk = |state: SyncState, progress: std::sync::Arc<crate::events::Progress>| {
-            SlipstreamHandle {
-                runtime: tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .expect("tokio runtime"),
-                progress,
-                state: std::sync::Arc::new(Mutex::new(state)),
-                events: std::sync::Arc::new(Mutex::new(Vec::new())),
-                task: None,
-                pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-                endpoint: Endpoint {
-                    host: "localhost".into(),
-                    port: 9067,
-                    tls: false,
-                },
-                wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
-                network: zcash_protocol::consensus::Network::TestNetwork,
-                total_memory_bytes: 0,
-            }
-        };
-
         // Syncing + recovering flag set → surfaces as recovering, permille from counters.
         let p1 = std::sync::Arc::new(crate::events::Progress::default());
         p1.set_recovering(true);
         p1.set_pass_total(1000);
         p1.add_scanned(250);
-        let snap = mk(SyncState::Syncing, p1.clone()).snapshot();
+        let snap = handle_in(SyncState::Syncing, p1.clone()).snapshot();
         assert_eq!(snap.is_recovering, 1);
         assert_eq!(snap.progress_permille, 250);
 
         // Error → latch forces NOT recovering even though the live flag is still true.
-        let snap = mk(SyncState::Error(2), p1.clone()).snapshot();
+        let snap = handle_in(SyncState::Error(2), p1.clone()).snapshot();
         assert_eq!(
             snap.is_recovering, 0,
             "Error must release the recovery gate"
@@ -457,7 +455,7 @@ mod tests {
         );
 
         // Done → recovery off AND progress forced to (and floored at) 1000.
-        let snap = mk(SyncState::Done, p1).snapshot();
+        let snap = handle_in(SyncState::Done, p1).snapshot();
         assert_eq!(snap.is_recovering, 0, "Done must clear recovering");
         assert_eq!(
             snap.progress_permille, 1000,
@@ -768,5 +766,25 @@ mod tests {
         // Ring must be empty after drain.
         let ring = handle.events.lock().unwrap();
         assert!(ring.is_empty());
+    }
+
+    /// While Syncing, `stalled_seconds` reports a block download that keeps failing at the same
+    /// block even though the retried passes keep stamping progress; in any other state it
+    /// stays 0.
+    #[test]
+    fn snapshot_reports_a_repeatedly_failing_download_while_syncing() {
+        let now = crate::events::unix_now_secs();
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.note_download_gave_up_at(500, now - 300);
+        p.note_download_gave_up_at(500, now - 200);
+        p.touch(); // a retried pass's fresh sign of life
+        let syncing = handle_in(SyncState::Syncing, p.clone()).snapshot();
+        assert!(
+            syncing.stalled_seconds >= 300,
+            "counted from the first give-up, got {}",
+            syncing.stalled_seconds
+        );
+        let done = handle_in(SyncState::Done, p).snapshot();
+        assert_eq!(done.stalled_seconds, 0, "only Syncing reports a stall");
     }
 }

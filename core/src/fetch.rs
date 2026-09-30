@@ -35,7 +35,10 @@ use std::{
 use crate::events::Progress;
 
 use prost::Message;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::{
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
+    task::JoinSet,
+};
 use tracing::{debug, info, warn};
 use zcash_client_backend::proto::{
     compact_formats::CompactBlock,
@@ -62,12 +65,11 @@ pub struct FetchPlan {
     /// that emitted at least one sub-chunk resets the counter (T6.8-S: resume
     /// makes retries cheap — each re-downloads at most one partial sub-chunk).
     pub retries_per_chunk: u32,
-    /// Per-SUB-chunk progress deadline (T6.8-S): the time budget to accumulate
-    /// ONE sub-chunk (≤ `split_bytes`), reset on every emitted sub-chunk.
-    /// Replaces the old whole-chunk timeout, which a healthy-but-huge
-    /// sandblasting chunk could never meet (field failure 2026-06-12: 10k-block
-    /// chunks of ~hundreds of MB looped `chunk fetch timed out` forever). A
-    /// genuinely stalled stream dies faster via grpc::STREAM_IDLE_TIMEOUT.
+    /// Per-SUB-chunk flush interval (T6.8-S, liveness rework): when a sub-chunk
+    /// has not filled within this time, the blocks received so far are emitted as
+    /// a shorter sub-chunk and the stream continues — a slow stream is never
+    /// failed or re-downloaded for being slow. A stream that delivers nothing
+    /// dies via `grpc::STREAM_IDLE_TIMEOUT` instead.
     pub chunk_timeout: Duration,
     /// Byte budget per emitted sub-chunk (estimated wire bytes). Normal-era
     /// 10k-block chunks (~1–6 MB) stay single sub-chunks; sandblasting chunks
@@ -277,6 +279,23 @@ impl ChunkSplitter {
             Some((self.acc, self.acc_bytes))
         }
     }
+
+    /// Flush whatever has accumulated as a (short) sub-chunk and keep splitting
+    /// from empty; `None` when nothing is buffered. The pump's deadline uses it
+    /// so a slow stream hands on the blocks it already received.
+    pub(crate) fn take_partial(&mut self) -> Option<(Vec<CompactBlock>, usize)> {
+        if self.acc.is_empty() {
+            return None;
+        }
+        let blocks = std::mem::take(&mut self.acc);
+        let bytes = std::mem::replace(&mut self.acc_bytes, 0);
+        Some((blocks, bytes))
+    }
+
+    /// Height of the newest buffered block, if any.
+    pub(crate) fn last_height(&self) -> Option<u64> {
+        self.acc.last().map(|b| b.height)
+    }
 }
 
 // ── T6.8-S fetch-ahead admission control ───────────────────────────────────────
@@ -409,21 +428,53 @@ async fn emit_sub_chunk(
     true
 }
 
+/// Ends a failing attempt: hands the blocks it already received (`tail`, the
+/// splitter's buffer) on as a partial sub-chunk (`is_last = false`), which
+/// advances `resume_from` so the worker's retry resumes after them, then fails
+/// with `err`. Flushes only when the tail does not end at `cursor.end`: the
+/// plan chunk's final block is never emitted from an error path (only a clean
+/// end carries `is_last`), so such a tail is left for the retry. Returns
+/// `Ok(ConsumerGone)` when the reorder stage is gone, as the other emit sites do.
+async fn flush_then_fail(
+    tail: Option<(Vec<CompactBlock>, usize)>,
+    cursor: &mut PlanChunkCursor,
+    gate: &AheadGate,
+    out: &mpsc::Sender<SubChunk>,
+    err: SlipstreamError,
+) -> Result<PumpOutcome, SlipstreamError> {
+    if let Some((blocks, bytes)) = tail
+        && blocks.last().map(|b| b.height) != Some(cursor.end)
+    {
+        debug!(
+            plan_index = cursor.plan_index,
+            blocks = blocks.len(),
+            "attempt failing — handing on the blocks received so far"
+        );
+        if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
+            return Ok(PumpOutcome::ConsumerGone);
+        }
+    }
+    Err(err)
+}
+
 /// Streams one (possibly resumed) plan-chunk request into byte-budgeted
 /// sub-chunks. Generic over the message stream so hermetic tests can inject
 /// synthetic/flaky streams (production passes tonic's `Streaming`).
 ///
-/// Deadline semantics (T6.8-S): `progress_deadline` bounds the accumulation of
-/// any ONE sub-chunk, measured between emissions — admission/backpressure time
-/// is excluded because the timer resets when an emission completes. A
-/// stalled-but-open stream dies earlier via the per-message
+/// Deadline semantics: `progress_deadline` bounds how long received blocks
+/// wait before being handed on. When it elapses with blocks buffered, they are
+/// emitted as a partial sub-chunk (never the plan chunk's final block, which
+/// only the clean-end flush emits with `is_last`), and the timer restarts.
+/// Admission/backpressure time is excluded because the timer resets when an
+/// emission completes. A silent stream dies via the per-message
 /// grpc::STREAM_IDLE_TIMEOUT inside `next_with_idle_timeout`.
 ///
-/// A clean stream end BEFORE `cursor.end` (short/empty delivery) is a
-/// retryable Transport error: emitting the partial tail would either lose the
-/// missing blocks silently or feed scan an empty chunk; the worker retries
-/// from `resume_from` instead (the un-emitted tail is discarded by design —
-/// resume re-downloads at most one sub-chunk's worth).
+/// Failure semantics: a failing attempt — a stream error, the idle timeout, or
+/// a clean end BEFORE `cursor.end` (short/empty delivery) — hands on what it
+/// received before returning its retryable Transport error (see
+/// [`flush_then_fail`]), so the worker's retry resumes after those blocks
+/// instead of downloading them again. Only a clean end that reaches
+/// `cursor.end` carries `is_last`.
 async fn pump_block_stream<S>(
     stream: &mut S,
     cursor: &mut PlanChunkCursor,
@@ -431,6 +482,7 @@ async fn pump_block_stream<S>(
     progress_deadline: Duration,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
+    progress: Option<&Progress>,
 ) -> Result<PumpOutcome, SlipstreamError>
 where
     S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
@@ -441,10 +493,16 @@ where
     );
     let mut splitter = ChunkSplitter::new(split_bytes);
     // tokio Instant (not std) so start_paused tests drive the deadline.
-    let mut last_progress = tokio::time::Instant::now();
+    let mut last_emit = tokio::time::Instant::now();
     loop {
-        let Some(item) = grpc::next_with_idle_timeout(stream, &ctx).await? else {
-            // Clean end of stream: flush the tail iff it completes the plan chunk.
+        let item = match grpc::next_with_idle_timeout(stream, &ctx).await {
+            Ok(item) => item,
+            // Idle timeout: the stream went silent.
+            Err(err) => return flush_then_fail(splitter.finish(), cursor, gate, out, err).await,
+        };
+        let Some(item) = item else {
+            // Clean end of stream: the tail carries `is_last` iff it completes the
+            // plan chunk; a short delivery hands on what it got and fails.
             return match splitter.finish() {
                 Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(cursor.end) => {
                     if emit_sub_chunk(cursor, blocks, bytes, true, gate, out).await {
@@ -455,27 +513,51 @@ where
                 }
                 tail => {
                     let got = tail
+                        .as_ref()
                         .and_then(|(blocks, _)| blocks.last().map(|b| b.height))
                         .unwrap_or_else(|| cursor.resume_from.saturating_sub(1));
-                    Err(SlipstreamError::Transport(format!(
+                    let err = SlipstreamError::Transport(format!(
                         "{ctx}: stream ended short at {got}, expected {}",
                         cursor.end
-                    )))
+                    ));
+                    flush_then_fail(tail, cursor, gate, out, err).await
                 }
             };
         };
-        let block = item.map_err(|e| SlipstreamError::Transport(format!("{ctx}: {e}")))?;
-        if last_progress.elapsed() > progress_deadline {
-            return Err(SlipstreamError::Transport(format!(
-                "{ctx}: no completed sub-chunk within {}s",
-                progress_deadline.as_secs()
-            )));
+        let block = match item {
+            Ok(block) => block,
+            Err(status) => {
+                let err = SlipstreamError::Transport(format!("{ctx}: {status}"));
+                return flush_then_fail(splitter.finish(), cursor, gate, out, err).await;
+            }
+        };
+        // Liveness: data arriving is forward progress even while the
+        // sub-chunk is still accumulating (the stall clock hosts watch).
+        if let Some(p) = progress {
+            p.touch();
         }
         if let Some((blocks, bytes)) = splitter.push(block) {
             if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
                 return Ok(PumpOutcome::ConsumerGone);
             }
-            last_progress = tokio::time::Instant::now();
+            last_emit = tokio::time::Instant::now();
+        } else if last_emit.elapsed() >= progress_deadline
+            && splitter.last_height() != Some(cursor.end)
+        {
+            // Slow but alive: hand on what has arrived instead of failing the
+            // attempt and re-downloading it. The plan chunk's final block is never
+            // flushed here — the clean-end flush below carries `is_last`.
+            if let Some((blocks, bytes)) = splitter.take_partial() {
+                debug!(
+                    plan_index = cursor.plan_index,
+                    blocks = blocks.len(),
+                    "sub-chunk deadline reached — handing on the blocks received so far"
+                );
+                if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
+                    return Ok(PumpOutcome::ConsumerGone);
+                }
+                last_emit = tokio::time::Instant::now();
+            }
         }
     }
 }
@@ -487,6 +569,7 @@ async fn open_and_pump(
     plan: &FetchPlan,
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
+    progress: Option<&Progress>,
 ) -> Result<PumpOutcome, SlipstreamError> {
     let req = BlockRange {
         start: Some(BlockId {
@@ -525,6 +608,7 @@ async fn open_and_pump(
         plan.chunk_timeout,
         gate,
         out,
+        progress,
     )
     .await
 }
@@ -536,6 +620,7 @@ async fn worker(
     next: Arc<AtomicU64>,
     gate: AheadGate,
     out: mpsc::Sender<SubChunk>,
+    progress: Option<Arc<Progress>>,
 ) -> Result<(), SlipstreamError> {
     let mut client = connect_direct_with_retry(&endpoint).await?;
     loop {
@@ -559,7 +644,16 @@ async fn worker(
         loop {
             attempt += 1;
             cursor.emitted_this_attempt = false;
-            match open_and_pump(&mut client, &mut cursor, &plan, &gate, &out).await {
+            match open_and_pump(
+                &mut client,
+                &mut cursor,
+                &plan,
+                &gate,
+                &out,
+                progress.as_deref(),
+            )
+            .await
+            {
                 Ok(PumpOutcome::Completed) => break,
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
                 Err(err) => {
@@ -729,11 +823,14 @@ struct ReleaseSummary {
 /// advancing to plan chunk N+1 only after N's `is_last`. Each release also
 /// advances the AheadGate floor so the worker owning the floor plan chunk
 /// streams unthrottled and budget held by newly-floored sub-chunks drains.
+///
+/// After each release `unreleased_from` holds the lowest height not yet handed to the scanner.
 async fn release_ordered(
     rx: &mut mpsc::Receiver<SubChunk>,
     queue: &ChunkQueueSender,
     progress: Option<&Arc<Progress>>,
     floor: &AtomicU64,
+    unreleased_from: &AtomicU64,
     started: Instant,
     failover: Option<WireFailoverArm>,
 ) -> Result<ReleaseSummary, SlipstreamError> {
@@ -784,6 +881,9 @@ async fn release_ordered(
                 ..
             } = sub;
             continuity.verify_blocks(&blocks)?;
+            // Where the download stands once this sub-chunk is released.
+            let released_from = blocks.first().map(|b| b.height);
+            let released_through = blocks.last().map(|b| b.height);
             let chunk = Chunk::from_blocks(emitted_chunks, blocks);
             let chunk_block_count = chunk.blocks.len() as u64;
             summary.blocks += chunk_block_count;
@@ -796,6 +896,13 @@ async fn release_ordered(
                 p.add_fetched(chunk_block_count);
             }
             queue.send(chunk).await?;
+            if let Some(height) = released_through {
+                unreleased_from.store(height + 1, Ordering::Release);
+            }
+            if let (Some(p), Some(first), Some(last)) = (progress, released_from, released_through)
+            {
+                p.note_blocks_released(first, last);
+            }
             emitted_chunks += 1;
             // Ahead-budget permit held until the ChunkQueue takes over.
             drop(permit);
@@ -806,7 +913,7 @@ async fn release_ordered(
                         subs = plan_subs,
                         blocks = plan_blocks,
                         mb = plan_bytes / (1024 * 1024),
-                        "plan chunk split into sub-chunks (dense era)"
+                        "plan chunk split into sub-chunks"
                     );
                 }
                 summary.plans_released += 1;
@@ -819,6 +926,97 @@ async fn release_ordered(
         }
     }
     Ok(summary)
+}
+
+/// A worker failure (error or panic) fails the fetch: the download gave up with
+/// `unreleased_from` as the lowest block it had not handed to the scanner. Records nothing once
+/// `unreleased_from` is past `plan_end`: every block of the plan was already handed on.
+fn note_give_up(progress: Option<&Progress>, unreleased_from: &AtomicU64, plan_end: u64) {
+    let at_height = unreleased_from.load(Ordering::Acquire);
+    if let Some(p) = progress
+        && at_height <= plan_end
+    {
+        p.note_download_gave_up(at_height);
+    }
+}
+
+/// Drives the ordered release while supervising the fetch workers.
+///
+/// A worker that gives up on its plan chunk (retry budget exhausted, or its
+/// reconnect failed) used to surface only after the release loop ended. But the
+/// release loop waits for exactly that chunk, and the workers ahead of it block
+/// on the ahead budget once it is spent — so the pass hung in `Syncing` with no
+/// progress. The first worker failure now aborts every other worker and fails
+/// the fetch immediately; it is a `Transport` error, so the pass-level retry
+/// ladder takes over. A release error aborts the workers the same way.
+///
+/// When `failover` is armed (`Some`), a worker giving up is treated as the full
+/// wire stall the wire-collapse detector would eventually have raised on its
+/// own: the failure is remapped to `WireCollapse` (0.0 MB/s, the arm's floor)
+/// so the engine's failover loop switches to an alternate endpoint at once
+/// instead of retrying the same one. Worker panics and release errors are
+/// unaffected by `failover` either way.
+///
+/// Every worker failure — an error or a panic, armed or not — is also recorded on `progress` as
+/// a download give-up at `unreleased_from`, the lowest block the ordered release has not handed
+/// to the scanner (see `Progress::note_download_gave_up`), as long as that block is within the
+/// plan (`unreleased_from <= plan_end`). The fetch starts a worker per stream whatever its chunk
+/// count, so an idle spare worker that cannot connect can fail it after every block was
+/// already released; the cursor then reads `plan_end + 1`, a block no release of this plan will
+/// ever cover, and nothing is recorded — the fetch still fails. A release error is not a
+/// download give-up and is not recorded.
+async fn supervise_fetch<R>(
+    release: R,
+    mut workers: JoinSet<Result<(), SlipstreamError>>,
+    failover: Option<WireFailoverArm>,
+    progress: Option<&Progress>,
+    unreleased_from: &AtomicU64,
+    plan_end: u64,
+) -> Result<ReleaseSummary, SlipstreamError>
+where
+    R: std::future::Future<Output = Result<ReleaseSummary, SlipstreamError>>,
+{
+    tokio::pin!(release);
+    let mut released: Option<ReleaseSummary> = None;
+    loop {
+        if workers.is_empty()
+            && let Some(summary) = released.take()
+        {
+            return Ok(summary);
+        }
+        tokio::select! {
+            biased;
+            Some(joined) = workers.join_next(), if !workers.is_empty() => match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    workers.abort_all();
+                    note_give_up(progress, unreleased_from, plan_end);
+                    if let Some(arm) = failover {
+                        warn!(%err, "fetch worker gave up — failing over as a full wire stall");
+                        return Err(SlipstreamError::WireCollapse {
+                            measured_mbps: 0.0,
+                            floor_mbps: arm.floor_mbps,
+                        });
+                    }
+                    return Err(err);
+                }
+                Err(join_err) => {
+                    workers.abort_all();
+                    note_give_up(progress, unreleased_from, plan_end);
+                    return Err(SlipstreamError::Transport(format!(
+                        "worker panicked: {join_err}"
+                    )));
+                }
+            },
+            result = &mut release, if released.is_none() => match result {
+                Ok(summary) => released = Some(summary),
+                Err(err) => {
+                    workers.abort_all();
+                    return Err(err);
+                }
+            },
+        }
+    }
 }
 
 /// Fetch `plan.start..=plan.end` with `plan.streams` workers; emits ordered,
@@ -852,48 +1050,45 @@ pub async fn run_fetch(
     // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
     let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
 
-    let mut handles = Vec::with_capacity(plan.streams);
+    // The lowest block not yet handed to the scanner: where the download stands if a worker
+    // gives up (see `supervise_fetch`).
+    let unreleased_from = AtomicU64::new(plan.start);
+
+    let mut workers = JoinSet::new();
     for worker_id in 0..plan.streams.max(1) {
-        handles.push(tokio::spawn(worker(
+        workers.spawn(worker(
             worker_id,
             endpoint.clone(),
             plan.clone(),
             Arc::clone(&next),
             gate.clone(),
             tx.clone(),
-        )));
+            progress.clone(),
+        ));
     }
     drop(tx); // release loop ends when all workers finish
 
-    // On early error, abort workers explicitly: a dropped JoinHandle only detaches
-    // the task, which would otherwise hold its socket until the next send fails.
-    let abort_all = |handles: &Vec<tokio::task::JoinHandle<Result<(), SlipstreamError>>>| {
-        for h in handles {
-            h.abort();
-        }
-    };
-
-    let summary = match release_ordered(
-        &mut rx,
-        &queue,
-        progress.as_ref(),
-        &floor,
-        started,
+    // Workers are supervised WHILE the ordered release runs: one that gives up
+    // fails the fetch now (see `supervise_fetch`) instead of after a release
+    // that is waiting for its chunk.
+    let summary = supervise_fetch(
+        release_ordered(
+            &mut rx,
+            &queue,
+            progress.as_ref(),
+            &floor,
+            &unreleased_from,
+            started,
+            plan.failover,
+        ),
+        workers,
         plan.failover,
+        progress.as_deref(),
+        &unreleased_from,
+        plan.end,
     )
-    .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            abort_all(&handles);
-            return Err(e);
-        }
-    };
+    .await?;
 
-    for h in handles {
-        h.await
-            .map_err(|e| SlipstreamError::Transport(format!("worker panicked: {e}")))??;
-    }
     if summary.plans_released != chunk_count {
         return Err(SlipstreamError::Transport(format!(
             "fetch incomplete: released {}/{chunk_count} plan chunks",
@@ -921,7 +1116,7 @@ pub async fn run_fetch(
 mod tests {
     use super::*;
     use crate::chunk::chunk_queue;
-    use futures_util::stream;
+    use futures_util::{StreamExt, stream};
 
     #[test]
     fn plan_chunking_covers_range_exactly() {
@@ -1074,6 +1269,30 @@ mod tests {
         assert!(ChunkSplitter::new(1000).finish().is_none());
     }
 
+    #[test]
+    fn splitter_take_partial_flushes_and_resets() {
+        let mut sp = ChunkSplitter::new(1 << 30);
+        assert!(sp.take_partial().is_none(), "nothing buffered yet");
+        for h in 100..103 {
+            assert!(sp.push(block_sized(h, 1000)).is_none());
+        }
+        assert_eq!(sp.last_height(), Some(102));
+        let (blocks, bytes) = sp.take_partial().expect("three blocks buffered");
+        assert_eq!(
+            blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            vec![100, 101, 102]
+        );
+        assert!(bytes > 0);
+        assert!(
+            sp.take_partial().is_none(),
+            "the flush empties the splitter"
+        );
+        assert_eq!(sp.last_height(), None);
+        assert!(sp.push(block_sized(103, 1000)).is_none());
+        let (tail, _) = sp.finish().expect("splitting continues after a flush");
+        assert_eq!(tail.iter().map(|b| b.height).collect::<Vec<_>>(), vec![103]);
+    }
+
     // ── pump_block_stream ──────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1094,6 +1313,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("pump");
@@ -1143,6 +1363,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("pump");
@@ -1160,7 +1381,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pump_short_stream_errors_without_emitting_tail() {
+    async fn pump_short_stream_hands_on_its_tail_then_errors() {
         let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
         let gate = open_gate();
         let mut cursor = test_cursor(0, 100, 119);
@@ -1178,6 +1399,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("short stream must error");
@@ -1188,17 +1410,20 @@ mod tests {
             subs.iter().all(|s| !s.is_last),
             "no is_last on a short stream"
         );
-        // 12 blocks at 2/sub-chunk → 5 emitted (10 blocks), 2-block tail discarded.
-        let emitted_through = subs.last().and_then(|s| s.blocks.last()).map(|b| b.height);
         assert_eq!(
-            cursor.resume_from,
-            emitted_through.expect("subs emitted") + 1
+            subs.iter().map(|s| s.sub_index).collect::<Vec<_>>(),
+            (0..subs.len() as u64).collect::<Vec<_>>(),
+            "sub_index dense from 0"
         );
+        // 12 blocks at 2/sub-chunk → 5 full sub-chunks (10 blocks), then the
+        // 2-block tail is handed on before the error: every block exactly once.
+        assert_heights_consecutive(&subs, 100, 111);
+        assert_eq!(cursor.resume_from, 112, "the retry resumes after the tail");
     }
 
-    /// THE retry-resume contract (T6.8-S): a mid-plan-chunk failure after
-    /// sub-chunk emission resumes from the next un-emitted height; the consumer
-    /// sees every height exactly once and the sub_index sequence stays dense.
+    /// THE retry-resume contract (T6.8-S): a mid-plan-chunk failure hands on
+    /// what it received and resumes from the next height; the consumer sees
+    /// every height exactly once and the sub_index sequence stays dense.
     #[tokio::test]
     async fn pump_resume_after_midstream_error_no_duplicates() {
         let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
@@ -1217,13 +1442,15 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect_err("attempt 1 must surface the stream error");
         assert!(err.to_string().contains("backend dropped"), "got: {err}");
         assert!(cursor.emitted_this_attempt, "attempt 1 made progress");
-        // 18 blocks at 2/sub-chunk → 8 sub-chunks (16 blocks) emitted; 2 discarded.
-        assert_eq!(cursor.resume_from, 116, "resume = last emitted height + 1");
+        // 18 blocks at 2/sub-chunk → 8 full sub-chunks (16 blocks), then the
+        // 2-block tail is handed on before the error.
+        assert_eq!(cursor.resume_from, 118, "resume = last received height + 1");
         let subs_before = cursor.next_sub_index;
 
         // Attempt 2 (the worker's retry): resume_from..=end, clean.
@@ -1240,6 +1467,7 @@ mod tests {
             Duration::from_secs(120),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("attempt 2 completes");
@@ -1288,6 +1516,7 @@ mod tests {
             Duration::from_secs(5),
             &gate,
             &tx,
+            None,
         )
         .await
         .expect("slow-but-progressing stream must complete");
@@ -1296,10 +1525,12 @@ mod tests {
         assert_heights_consecutive(&drain_subs(&mut rx), 100, 129);
     }
 
-    /// No emission within the deadline (budget never fills) → progress timeout.
+    /// Slow but alive: the budget never fills, yet the deadline no longer fails
+    /// the attempt — the blocks received so far are handed on and the stream
+    /// continues to a clean end. Nothing is re-downloaded.
     #[tokio::test(start_paused = true)]
-    async fn pump_deadline_fires_without_subchunk_progress() {
-        let (tx, _rx) = mpsc::channel::<SubChunk>(64);
+    async fn pump_deadline_emits_partial_subchunk_instead_of_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
         let gate = open_gate();
         let mut cursor = test_cursor(0, 100, 129);
         let mut s = Box::pin(stream::unfold(100u64, |h| async move {
@@ -1309,7 +1540,91 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(1)).await;
             Some((Ok::<_, tonic::Status>(block_sized(h, 1000)), h + 1))
         }));
-        // Budget is huge → nothing ever emits → the 5s progress deadline fires.
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(5),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect("a slow but progressing stream must complete");
+        assert!(matches!(out, PumpOutcome::Completed));
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        assert!(
+            subs.len() > 1,
+            "the deadline must hand on partial sub-chunks"
+        );
+        assert_eq!(
+            subs.iter().filter(|s| s.is_last).count(),
+            1,
+            "exactly one final marker"
+        );
+        assert!(
+            subs.last().expect("non-empty").is_last,
+            "the final marker comes last"
+        );
+        assert_heights_consecutive(&subs, 100, 129);
+        assert_eq!(cursor.resume_from, 130);
+        assert!(cursor.emitted_this_attempt);
+    }
+
+    /// The deadline must never flush the plan chunk's LAST block as a partial:
+    /// only the clean-end flush carries `is_last`, and a flushed final block
+    /// would leave nothing for it ("stream ended short").
+    #[tokio::test(start_paused = true)]
+    async fn pump_deadline_never_flushes_the_plan_end_as_partial() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 102);
+        // Arrivals at t=1s (100), t=7s (101: deadline passed → flush [100,101]),
+        // t=13s (102 = plan end: deadline passed again, but must NOT flush).
+        let delays = [1u64, 6, 6];
+        let mut s = Box::pin(stream::unfold(0usize, move |i| async move {
+            if i >= delays.len() {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(delays[i])).await;
+            Some((
+                Ok::<_, tonic::Status>(block_sized(100 + i as u64, 1000)),
+                i + 1,
+            ))
+        }));
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(5),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect("must complete, not end short");
+        assert!(matches!(out, PumpOutcome::Completed));
+        drop(tx);
+        let subs = drain_subs(&mut rx);
+        let shape: Vec<(Vec<u64>, bool)> = subs
+            .iter()
+            .map(|s| (s.blocks.iter().map(|b| b.height).collect(), s.is_last))
+            .collect();
+        assert_eq!(shape, vec![(vec![100, 101], false), (vec![102], true)]);
+    }
+
+    /// A stream that goes silent still fails the attempt (idle timeout); the
+    /// deadline change does not keep a dead stream alive.
+    #[tokio::test(start_paused = true)]
+    async fn pump_silent_stream_still_fails_via_idle_timeout() {
+        let (tx, _rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut s = Box::pin(
+            stream::iter(vec![Ok::<_, tonic::Status>(block_sized(100, 1000))])
+                .chain(stream::pending()),
+        );
         let err = pump_block_stream(
             &mut s,
             &mut cursor,
@@ -1317,17 +1632,200 @@ mod tests {
             Duration::from_secs(5),
             &gate,
             &tx,
+            None,
         )
         .await
-        .expect_err("no progress must time out");
+        .expect_err("silence must fail the attempt");
+        assert!(err.to_string().contains("idle timeout"), "got: {err}");
+        assert_eq!(
+            cursor.resume_from, 101,
+            "the block received before the silence was handed on"
+        );
+    }
+
+    /// A failing attempt hands on exactly the blocks it received — as non-final
+    /// sub-chunks — so the worker's retry resumes after them.
+    fn assert_handed_on_before_failing(
+        subs: &[SubChunk],
+        cursor: &PlanChunkCursor,
+        from: u64,
+        to: u64,
+    ) {
         assert!(
-            err.to_string().contains("no completed sub-chunk"),
+            subs.iter().all(|s| !s.is_last),
+            "a failing attempt never carries is_last"
+        );
+        assert_heights_consecutive(subs, from, to);
+        assert_eq!(
+            cursor.resume_from,
+            to + 1,
+            "the retry resumes after the handed-on blocks"
+        );
+        assert!(
+            cursor.emitted_this_attempt,
+            "handing on counts as progress for the retry budget"
+        );
+    }
+
+    /// A stream error after N blocks hands those blocks on before failing, so the
+    /// retry does not download them again.
+    #[tokio::test]
+    async fn pump_stream_error_hands_on_received_blocks_before_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut items: Vec<Result<CompactBlock, tonic::Status>> =
+            linked(100, 5, 1000).into_iter().map(Ok).collect();
+        items.push(Err(tonic::Status::unavailable("backend dropped")));
+        let mut s = stream::iter(items);
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect_err("the stream error must still fail the attempt");
+        assert!(err.to_string().contains("backend dropped"), "got: {err}");
+        drop(tx);
+        assert_handed_on_before_failing(&drain_subs(&mut rx), &cursor, 100, 104);
+    }
+
+    /// A stream that goes silent after N blocks hands those blocks on before the
+    /// idle timeout fails the attempt.
+    #[tokio::test(start_paused = true)]
+    async fn pump_idle_stream_hands_on_received_blocks_before_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut s = Box::pin(
+            stream::iter(
+                linked(100, 5, 1000)
+                    .into_iter()
+                    .map(Ok::<_, tonic::Status>)
+                    .collect::<Vec<_>>(),
+            )
+            .chain(stream::pending()),
+        );
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect_err("silence must still fail the attempt");
+        assert!(err.to_string().contains("idle timeout"), "got: {err}");
+        drop(tx);
+        assert_handed_on_before_failing(&drain_subs(&mut rx), &cursor, 100, 104);
+    }
+
+    /// A stream that ends cleanly after N blocks, short of the plan end, hands
+    /// those blocks on before failing the attempt.
+    #[tokio::test]
+    async fn pump_short_end_hands_on_received_blocks_before_failing() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut s = stream::iter(
+            linked(100, 5, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect_err("a short stream must still fail the attempt");
+        assert!(
+            err.to_string().contains("ended short at 104, expected 129"),
             "got: {err}"
         );
+        drop(tx);
+        assert_handed_on_before_failing(&drain_subs(&mut rx), &cursor, 100, 104);
+    }
+
+    /// A failing attempt never emits the plan chunk's final block: only a clean
+    /// end carries `is_last`, so a buffered tail that already reaches the plan
+    /// end is left for the retry.
+    #[tokio::test]
+    async fn pump_error_after_the_plan_end_block_hands_nothing_on() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 102);
+        let mut items: Vec<Result<CompactBlock, tonic::Status>> =
+            linked(100, 3, 1000).into_iter().map(Ok).collect();
+        items.push(Err(tonic::Status::unavailable("backend dropped")));
+        let mut s = stream::iter(items);
+        let err = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect_err("the stream error must still fail the attempt");
+        assert!(err.to_string().contains("backend dropped"), "got: {err}");
+        drop(tx);
+        assert!(
+            drain_subs(&mut rx).is_empty(),
+            "the plan end is never flushed"
+        );
+        assert_eq!(cursor.resume_from, 100);
         assert!(!cursor.emitted_this_attempt);
-        assert_eq!(
-            cursor.resume_from, 100,
-            "no emission → resume from plan start"
+    }
+
+    /// Liveness: every block received moves the stall clock, even while the
+    /// sub-chunk it belongs to is still accumulating (nothing emitted yet).
+    #[tokio::test(start_paused = true)]
+    async fn pump_touches_progress_on_every_received_block() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let progress = Progress::default();
+        progress.last_progress_unix.store(0, Ordering::Relaxed);
+        // Block 100, then silence well inside the 30 s idle timeout.
+        let mut s = Box::pin(
+            stream::iter(vec![Ok::<_, tonic::Status>(block_sized(100, 1000))])
+                .chain(stream::pending()),
+        );
+        let pumped = tokio::time::timeout(
+            Duration::from_secs(10),
+            pump_block_stream(
+                &mut s,
+                &mut cursor,
+                usize::MAX >> 8,
+                Duration::from_secs(120),
+                &gate,
+                &tx,
+                Some(&progress),
+            ),
+        )
+        .await;
+        assert!(pumped.is_err(), "the pump is still waiting for block 101");
+        assert!(
+            progress.last_progress_unix_secs() > 0,
+            "receiving block 100 must stamp the stall clock"
+        );
+        assert!(
+            drain_subs(&mut rx).is_empty(),
+            "nothing was emitted — the stamp came from the receive itself"
         );
     }
 
@@ -1505,9 +2003,17 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
-            .await
-            .expect("release");
+        let summary = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
         assert_eq!(summary.plans_released, 3);
         assert_eq!(summary.blocks, 60);
         drop(qtx);
@@ -1557,9 +2063,17 @@ mod tests {
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
-            .await
-            .expect("release");
+        let summary = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
         assert_eq!(summary.plans_released, 2);
         drop(qtx);
         let mut released_heights = Vec::new();
@@ -1584,12 +2098,462 @@ mod tests {
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
         let floor = AtomicU64::new(0);
-        let err = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
-            .await
-            .expect_err("gap must fail");
+        let err = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect_err("gap must fail");
         assert!(
             matches!(err, SlipstreamError::Discontinuity { at: 200, .. }),
             "got: {err}"
+        );
+    }
+
+    // ── supervise_fetch: a failed worker fails the fetch at once ──────────────
+
+    /// Drop guard that records the task it lives in being aborted (dropped).
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn pending_worker(
+        dropped: &Arc<std::sync::atomic::AtomicBool>,
+    ) -> impl std::future::Future<Output = Result<(), SlipstreamError>> + Send + 'static {
+        let guard = DropFlag(Arc::clone(dropped));
+        async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+            Ok(())
+        }
+    }
+
+    /// The field hang: one worker gives up on its chunk while another waits
+    /// forever (blocked on the ahead budget behind that chunk) and the release
+    /// waits for the missing chunk. The supervisor must fail at once and abort
+    /// the waiting worker instead of hanging.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_returns_first_worker_error_and_aborts_the_rest() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(SlipstreamError::Transport("plan chunk 8 gave up".into()))
+        });
+        workers.spawn(pending_worker(&dropped));
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            supervise_fetch(release, workers, None, None, &AtomicU64::new(0), 0),
+        )
+        .await
+        .expect("supervisor must not hang behind the failed chunk");
+
+        let err = outcome.expect_err("a failed worker fails the fetch");
+        assert!(
+            err.to_string().contains("plan chunk 8 gave up"),
+            "got: {err}"
+        );
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the still-running worker must be aborted"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_returns_release_summary_when_all_workers_succeed() {
+        let mut workers = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            workers.spawn(async { Ok(()) });
+        }
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Ok(ReleaseSummary {
+                blocks: 7,
+                ..Default::default()
+            })
+        };
+        let summary = supervise_fetch(release, workers, None, None, &AtomicU64::new(0), 0)
+            .await
+            .expect("all workers succeeded");
+        assert_eq!(summary.blocks, 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_propagates_release_error_and_aborts_workers() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(pending_worker(&dropped));
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            Err::<ReleaseSummary, _>(SlipstreamError::Transport("continuity broken".into()))
+        };
+        let err = supervise_fetch(release, workers, None, None, &AtomicU64::new(0), 0)
+            .await
+            .expect_err("a release error fails the fetch");
+        assert!(err.to_string().contains("continuity broken"), "got: {err}");
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst), "workers must be aborted");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn supervise_maps_worker_panic_to_transport_error() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(release, workers, None, None, &AtomicU64::new(0), 0)
+            .await
+            .expect_err("a panicked worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::Transport(ref m) if m.contains("worker panicked")),
+            "got: {err}"
+        );
+    }
+
+    /// Old semantics kept: a worker error that is only joined after the release
+    /// finished still fails the fetch.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_reports_worker_error_joined_after_release_finished() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Err(SlipstreamError::Transport("late failure".into()))
+        });
+        let release = async { Ok(ReleaseSummary::default()) };
+        let err = supervise_fetch(release, workers, None, None, &AtomicU64::new(0), 0)
+            .await
+            .expect_err("the late worker error must surface");
+        assert!(err.to_string().contains("late failure"), "got: {err}");
+    }
+
+    /// When wire failover is armed, a worker giving up must be treated as the
+    /// full wire stall the detector would eventually have raised on its own —
+    /// so the engine's failover loop can switch endpoints immediately instead
+    /// of retrying the one that just gave up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_fails_over_when_armed_and_a_worker_gives_up() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Err(SlipstreamError::Transport("plan chunk 8 gave up".into()))
+        });
+        workers.spawn(pending_worker(&dropped));
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let arm = WireFailoverArm::default();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(600),
+            supervise_fetch(release, workers, Some(arm), None, &AtomicU64::new(0), 0),
+        )
+        .await
+        .expect("supervisor must not hang behind the failed chunk");
+
+        let err = outcome.expect_err("a failed worker fails the fetch");
+        match err {
+            SlipstreamError::WireCollapse {
+                measured_mbps,
+                floor_mbps,
+            } => {
+                assert_eq!(measured_mbps, 0.0);
+                assert_eq!(floor_mbps, arm.floor_mbps);
+            }
+            other => panic!("expected WireCollapse, got: {other}"),
+        }
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "the still-running worker must be aborted"
+        );
+    }
+
+    /// Armed failover must not swallow a genuine worker panic into a
+    /// WireCollapse — a panic is a bug, not a wire-quality signal.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_maps_worker_panic_to_transport_error_even_when_armed() {
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(
+            release,
+            workers,
+            Some(WireFailoverArm::default()),
+            None,
+            &AtomicU64::new(0),
+            0,
+        )
+        .await
+        .expect_err("a panicked worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::Transport(ref m) if m.contains("worker panicked")),
+            "got: {err}"
+        );
+    }
+
+    // ── download-failure stall: the release cursor and give-up records ────────
+
+    /// After each ordered release the cursor names the lowest block not yet handed to the
+    /// scanner; a sub-chunk that cannot be released yet (its predecessor never came) does not
+    /// move it.
+    #[tokio::test]
+    async fn release_advances_the_unreleased_cursor_past_each_released_subchunk() {
+        let all = linked(100, 30, 64);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, false, all[0..10].to_vec()))
+            .await
+            .expect("send");
+        // Plan 1 arrives, but plan 0's tail never does: plan 1 cannot be released.
+        tx.send(sub(1, 0, true, all[20..30].to_vec()))
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(0);
+        let unreleased_from = AtomicU64::new(100);
+        release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &floor,
+            &unreleased_from,
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("the release ends when the channel closes");
+        assert_eq!(
+            unreleased_from.load(Ordering::Acquire),
+            110,
+            "blocks 100..=109 were released; 110 is the first that was not"
+        );
+    }
+
+    /// A worker that gives up is recorded as a download give-up at the release cursor — also
+    /// when the cursor sits on the plan's last block, which is then still undelivered.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_a_worker_give_up_at_the_release_cursor() {
+        let progress = Progress::default();
+        let unreleased_from = AtomicU64::new(1_234);
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async { Err(SlipstreamError::Transport("plan chunk 8 gave up".into())) });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        supervise_fetch(
+            release,
+            workers,
+            None,
+            Some(&progress),
+            &unreleased_from,
+            1_234,
+        )
+        .await
+        .expect_err("a failed worker fails the fetch");
+        let runs = progress.download_failures();
+        assert_eq!(
+            runs.iter()
+                .map(|run| (run.streak, run.at_height))
+                .collect::<Vec<_>>(),
+            vec![(1, 1_234)],
+            "the give-up is recorded at the cursor"
+        );
+    }
+
+    /// Armed failover still maps the give-up to WireCollapse — and still records it.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_a_worker_give_up_when_armed_too() {
+        let progress = Progress::default();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async { Err(SlipstreamError::Transport("plan chunk 8 gave up".into())) });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(
+            release,
+            workers,
+            Some(WireFailoverArm::default()),
+            Some(&progress),
+            &AtomicU64::new(500),
+            999,
+        )
+        .await
+        .expect_err("a failed worker fails the fetch");
+        assert!(
+            matches!(err, SlipstreamError::WireCollapse { .. }),
+            "got: {err}"
+        );
+        assert_eq!(
+            progress
+                .download_failures()
+                .iter()
+                .map(|run| run.at_height)
+                .collect::<Vec<_>>(),
+            vec![500]
+        );
+    }
+
+    /// A panicked worker also stopped the download: it is recorded like a give-up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_a_worker_panic_as_a_give_up() {
+        let progress = Progress::default();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            panic!("synthetic worker panic");
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        supervise_fetch(
+            release,
+            workers,
+            None,
+            Some(&progress),
+            &AtomicU64::new(42),
+            99,
+        )
+        .await
+        .expect_err("a panicked worker fails the fetch");
+        assert_eq!(
+            progress
+                .download_failures()
+                .iter()
+                .map(|run| run.at_height)
+                .collect::<Vec<_>>(),
+            vec![42]
+        );
+    }
+
+    /// A release error (continuity, a gone consumer) is not a download give-up.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_does_not_record_a_release_error_as_a_give_up() {
+        let progress = Progress::default();
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(std::future::pending::<Result<(), SlipstreamError>>());
+        let release = async {
+            Err::<ReleaseSummary, _>(SlipstreamError::Transport("continuity broken".into()))
+        };
+        supervise_fetch(
+            release,
+            workers,
+            None,
+            Some(&progress),
+            &AtomicU64::new(7),
+            99,
+        )
+        .await
+        .expect_err("a release error fails the fetch");
+        assert_eq!(progress.download_failures(), vec![]);
+    }
+
+    /// The fetch starts a worker per stream whatever its chunk count, so an idle spare worker
+    /// that cannot connect can fail it after every block was already handed to the scanner.
+    /// The cursor then reads one past the plan end, a block no release of this fetch will ever
+    /// cover: the fetch still fails, but no give-up is recorded.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_records_nothing_once_every_block_was_released() {
+        let progress = Progress::default();
+        let plan_end = 1_999;
+        let mut workers = tokio::task::JoinSet::new();
+        workers.spawn(async {
+            Err(SlipstreamError::Transport(
+                "spare worker could not connect".into(),
+            ))
+        });
+        let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
+        let err = supervise_fetch(
+            release,
+            workers,
+            None,
+            Some(&progress),
+            &AtomicU64::new(plan_end + 1),
+            plan_end,
+        )
+        .await
+        .expect_err("the failed worker still fails the fetch");
+        assert!(
+            err.to_string().contains("spare worker could not connect"),
+            "got: {err}"
+        );
+        assert_eq!(
+            progress.download_failures(),
+            vec![],
+            "nothing is left to deliver, so there is no stuck block to record"
+        );
+    }
+
+    // ── release_ordered: a release can end an in-progress download-failure run ────
+
+    /// A run recorded at a block the release actually reaches ends: the download got past it.
+    #[tokio::test]
+    async fn release_ordered_ends_a_run_the_release_covers() {
+        let progress = Arc::new(Progress::default());
+        progress.note_download_gave_up_at(105, 1_000);
+        progress.note_download_gave_up_at(105, 1_010);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, true, linked(100, 10, 64))) // heights 100..=109, covers 105
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(0);
+        release_ordered(
+            &mut rx,
+            &qtx,
+            Some(&progress),
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
+        assert_eq!(
+            progress.download_failures(),
+            vec![],
+            "the release covers block 105 and ends the run"
+        );
+    }
+
+    /// A run recorded at a block the release does not reach survives, streak unchanged.
+    #[tokio::test]
+    async fn release_ordered_keeps_a_run_the_release_does_not_cover() {
+        let progress = Arc::new(Progress::default());
+        progress.note_download_gave_up_at(105, 1_000);
+        progress.note_download_gave_up_at(105, 1_010);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, true, linked(100, 5, 64))) // heights 100..=104, does not reach 105
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(0);
+        release_ordered(
+            &mut rx,
+            &qtx,
+            Some(&progress),
+            &floor,
+            &AtomicU64::new(0),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect("release");
+        assert_eq!(
+            progress
+                .download_failures()
+                .iter()
+                .map(|run| run.streak)
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the release never reaches block 105 — the run must survive"
         );
     }
 }
