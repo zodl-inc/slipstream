@@ -364,11 +364,6 @@ pub async fn run_to_completion(
     // backfill window). A read failure degrades to "not recovering" rather than failing the
     // pass — the flag is presentation state, never correctness state.
     let recover_until: Option<u64> = session.max_recover_until().unwrap_or_default();
-    // [API v2 §4.4 / Phase E] The wallet's oldest birthday, read once per pass alongside the
-    // recovery ceiling: with the chain tip and the remaining queue it seeds the global permille
-    // floor each suggest round (below). A read failure degrades to "no seed" — presentation
-    // state, never correctness state.
-    let wallet_birthday: Option<u64> = session.min_birthday().unwrap_or_default();
     // [API v2.1 E-4] Pass-start baseline for the boundary tx-set signature check (see the
     // range-boundary block at the bottom of the loop). `None` (read failure) = the first
     // successful boundary read becomes the baseline without bumping.
@@ -406,6 +401,14 @@ pub async fn run_to_completion(
                     e.saturating_sub(s)
                 })
                 .sum();
+            // [h16-4] Read every suggest round, not once per pass: an account imported
+            // BETWEEN two rounds of the same pass, with an older birthday, widens the span
+            // above (sum_remaining grows) while a pass-level read would still hold the
+            // stale, newer birthday — once sum_remaining exceeds that stale span,
+            // global_floor_permille saturates to 0 and the re-baseline below stretches from
+            // 0 instead of the true global position. A read failure degrades to `None`,
+            // exactly as before.
+            let wallet_birthday: Option<u64> = session.min_birthday().unwrap_or_default();
             update_pass_progress(
                 p,
                 &mut scanned_so_far_in_pass,
@@ -908,6 +911,94 @@ mod tests {
         assert_eq!(
             snap.progress_permille, 1000,
             "the pass reaches 1000 only once the remaining 1.1M are fetched AND scanned"
+        );
+    }
+
+    /// [h16-4] The fix under test: `run_to_completion` now reads `session.min_birthday()`
+    /// fresh every suggest round instead of once per pass. Drives two rounds against a REAL
+    /// `WalletSession` (not the hardcoded `Some(B1)`/`Some(B0)` literals the sibling test
+    /// above uses): round 1 sees the single TEST_UFVK account (birthday 663_150, tip
+    /// 700_000, via `wallet_with_account`); between rounds a second, older-birthday account
+    /// lands via a real `create_account` import — the same synthetic `[7u8; 32]` filler seed
+    /// `oracle.rs`'s `t10b_fixture`/`t10b_prepare` already uses to create a spending account
+    /// in these unit tests, never a real wallet's key material — before round 2's read.
+    ///
+    /// Contrasts the STALE seed a once-per-pass read would still feed in (birthday still
+    /// 663_150: remaining 60_000 now exceeds that pre-import 36_851 span, so
+    /// `global_floor_permille` saturates to 0 — the exact bug from the brief) against the
+    /// FRESH seed a per-round read reaches (birthday 600_000: seed 400) — `pass_start_permille`
+    /// must land on 400, the true global position, not 0. The re-baseline MATH itself (this is
+    /// a `rebaseline_floor_if_scope_expanded` case, `50 + 400 < 918`) is already covered by
+    /// `scope_expansion_rebaseline_does_not_double_count_or_oscillate` above; this test is the
+    /// new-here half — a live session read actually SEES a mid-pass import.
+    #[test]
+    fn min_birthday_refresh_sees_a_mid_pass_import_with_an_older_birthday() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        const TIP: u64 = 700_000;
+        let mut s = wallet_with_account(&dir, TIP); // TEST_UFVK, birthday 663_150 (span 36_851)
+
+        let p = Progress::default();
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+
+        // Round 1: a fresh read of the single-account wallet.
+        let birthday = s.min_birthday().expect("min_birthday");
+        assert_eq!(
+            birthday,
+            Some(663_150),
+            "single-account wallet reads that account's birthday"
+        );
+        let rebaselined = update_pass_progress(&p, &mut scanned_so_far_in_pass, 3_000, birthday);
+        assert!(!rebaselined, "first round of a pass is never a re-baseline");
+        assert_eq!(p.pass_start_permille(), Some(918));
+
+        // Between rounds: a second, OLDER-birthday account lands — e.g. a Ledger import
+        // mid-pass. `db_mut().create_account` (not `ensure_account`, which no-ops once any
+        // account exists) mirrors production's real import path.
+        let birthday2 = zcash_client_backend::data_api::AccountBirthday::from_treestate(
+            zcash_client_backend::proto::service::TreeState {
+                network: "main".into(),
+                height: 599_999,
+                hash: "0".repeat(64),
+                time: 1,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("birthday2");
+        s.db_mut()
+            .create_account(
+                "h16-4 second account (older birthday)",
+                &secrecy::SecretVec::new([7u8; 32].to_vec()),
+                &birthday2,
+                None,
+            )
+            .expect("create_account");
+
+        // Round 2: the refresh under test. First, the counterfactual — a STALE read (the old
+        // once-per-pass value, still 663_150) would feed a remaining (60_000) that now
+        // exceeds the pre-import span (36_851), saturating the seed to 0.
+        assert_eq!(
+            global_floor_permille(TIP, Some(663_150), 60_000),
+            Some(0),
+            "the STALE birthday saturates the seed to 0 once remaining exceeds its span"
+        );
+        // Now the real fix: a FRESH read — not the round-1 value reused — sees the import.
+        let birthday = s.min_birthday().expect("min_birthday");
+        assert_eq!(
+            birthday,
+            Some(600_000),
+            "a fresh read after the mid-pass import returns the NEW minimum birthday"
+        );
+        let rebaselined = update_pass_progress(&p, &mut scanned_so_far_in_pass, 60_000, birthday);
+        assert!(
+            rebaselined,
+            "400 is >50‰ below the 918 floor ⇒ scope expansion"
+        );
+        assert_eq!(
+            p.pass_start_permille(),
+            Some(400),
+            "the re-baseline stretches from the TRUE global position (400), not 0"
         );
     }
 
