@@ -123,18 +123,28 @@ pub(crate) fn update_pass_progress(
     // the whole re-scan at ~100% (the host used to bypass every floor with
     // `forceCounterProgressUntilDone`; the blessed permille now reads the
     // genuine climb by itself).
-    let rebaselined = p.rebaseline_floor_if_scope_expanded(seed);
-    if rebaselined {
-        info!(
-            seed,
-            birthday = wallet_birthday,
-            "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
-        );
-        // [h10] The pass start follows the re-baseline: the scope grew UNDER
-        // this running pass, so the pass's own progress must stretch from the
-        // re-baselined position too, or it would still stretch from the stale
-        // pre-expansion start and under-report the re-scan's climb.
-        p.set_pass_start_permille(seed);
+    //
+    // [h17-1] Decide with the PURE read (`Progress::scope_expanded`) first, and when it says
+    // the scope expanded, publish the whole re-baselined pass — baseline, total, then start
+    // — and only THEN lower the floor, last. `derive_snapshot` can run on another thread at
+    // any instant while this function is mid-flight, and it folds whatever it reads into the
+    // floor with `fetch_max`, so every intermediate combination of fields it can observe here
+    // must compute a raw value AT MOST the floor the OLD scope already published, or that
+    // stale-but-too-high reading gets latched permanently (fetch_max never lowers):
+    //   - before `set_pass_start_permille` below: a poll reads the OLD start together with
+    //     the NEW baseline/total — a ZERO pass-local count — so raw is the old start alone,
+    //     which the floor already holds (that start was itself seeded through the floor
+    //     earlier).
+    //   - after it, before the floor call: a poll reads the NEW (lower) seed as the start,
+    //     still with a zero pass-local count — raw is the new seed alone, below the floor
+    //     the OLD scope holds (that gap below the floor is exactly what "expanded" means).
+    // Neither window can produce a raw value above the old floor, so nothing above it gets
+    // latched. Lowering the floor first, or moving the start before the baseline/total (the
+    // two orders this replaces), each open a window where a poll mixes a low/new field with
+    // high/old ones and computes a raw value ABOVE the floor at that instant — that mixed,
+    // double-counted read is the bug fixed here (confirmed against this exact seed/credit
+    // combination in scheduler::tests::rebaseline_old_order_used_to_latch_a_double_counted_697).
+    if p.scope_expanded(seed) {
         // [h16-1] The new start already includes everything credited so far: fold the
         // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
         // counters, so the next blend reads 0 pass-local progress against the fresh
@@ -143,14 +153,37 @@ pub(crate) fn update_pass_progress(
         *scanned_so_far_in_pass = 0;
         p.set_pass_baseline(p.fetched(), p.scanned());
         p.set_pass_total(sum_remaining);
+        // [h10] The pass start follows the re-baseline: the scope grew UNDER
+        // this running pass, so the pass's own progress must stretch from the
+        // re-baselined position too, or it would still stretch from the stale
+        // pre-expansion start and under-report the re-scan's climb.
+        p.set_pass_start_permille(seed);
+        // [h17-1] Lower the floor LAST, now that the rest of the re-baselined pass is fully
+        // published (see above). `scope_expanded` and this call share exactly one condition
+        // (it calls that method) and the floor only ever RISES in between — and, per the
+        // invariant above, nothing a concurrent poll can fetch_max it with in this window
+        // exceeds the floor this call is about to compare `seed` against — so this re-check
+        // is guaranteed to still see the expansion.
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed);
+        debug_assert!(
+            rebaselined,
+            "scope_expanded just reported an expansion and nothing between here and there \
+             can raise the floor above what it already held, so the re-check cannot flip"
+        );
+        info!(
+            seed,
+            birthday = wallet_birthday,
+            "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
+        );
+        rebaselined
     } else {
         // [h10] First suggest round of the pass latches the start; later rounds
         // of the same pass keep it — the pass's reported progress is measured
         // from where the GLOBAL position stood when the pass began.
         p.set_pass_start_permille_if_unset(seed);
+        let _ = p.permille_floor(seed);
+        false
     }
-    let _ = p.permille_floor(seed);
-    rebaselined
 }
 
 /// [h16-2] How much of an aborted range's work survives a `ScanContinuity` truncate: the
@@ -911,6 +944,125 @@ mod tests {
         assert_eq!(
             snap.progress_permille, 1000,
             "the pass reaches 1000 only once the remaining 1.1M are fetched AND scanned"
+        );
+    }
+
+    /// [h17-1] A real concurrent poll can't be made to land inside `update_pass_progress` at
+    /// an exact instant deterministically — but every store its re-baseline branch makes is a
+    /// plain `Progress` method, so replaying them by hand with a `derive_snapshot` poll spliced
+    /// between each one reads exactly what a poll on another thread could see at that instant.
+    /// This does NOT exercise `update_pass_progress` itself (its own branch is verified by
+    /// reading it against this same sequence) — it exercises the ORDER the brief specifies, to
+    /// confirm that order is safe. Same round-2 setup as
+    /// `scope_expansion_rebaseline_does_not_double_count_or_oscillate` (TIP 3,000,000; 900,000
+    /// credited and polled, latching the floor at 900; seed 450 for the import).
+    #[test]
+    fn rebaseline_new_order_never_reads_above_the_old_floor_mid_publish() {
+        let p = Progress::default();
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1;
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        p.add_fetched(900_000);
+        p.add_scanned(900_000);
+        // (round 1 credited nothing to `scanned_so_far_in_pass`: the non-expanded branch
+        // never touches it. Round 2 below is replayed by hand, not via another
+        // `update_pass_progress` call, so — unlike the counterfactual test below, which reads
+        // it back — this test has no further use for the local accumulator.)
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        // Round 2, replayed by hand in the NEW order: baseline, then total, then start, then
+        // (last) the floor call — polling after each step.
+        const SEED: u64 = 450; // global_floor_permille(3_000_000, Some(B0), 1_100_000)
+
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(1_100_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900,
+            "zero pass-local count under the OLD (round-1) start ⇒ raw ≪ 900, floor unmoved"
+        );
+
+        p.set_pass_start_permille(SEED);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900,
+            "zero pass-local count under the NEW seed ⇒ raw = 450 ≤ 900, floor still unmoved"
+        );
+
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED);
+        assert!(rebaselined, "the re-check must still see the expansion");
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            450,
+            "only once the floor call runs does the reading drop to the true post-rebaseline value"
+        );
+    }
+
+    /// [h17-1] Counterfactual: replays the PRE-fix order (floor lowered first, start moved
+    /// second, baseline/total published last — the exact order `update_pass_progress` used
+    /// before this fix) against the identical round-2 state, to reproduce what the reviewer's
+    /// report describes — a poll between the start moving and the baseline/total catching up
+    /// reads a DOUBLE-COUNTED value: the new 450 start stretched by a pass-local ratio still
+    /// measured against the pass's PRE-refresh baseline/total (900,000 fetched+scanned over a
+    /// 2,000,000 total, i.e. the scheduler's unconditional top-of-function snapshot for THIS
+    /// round, not round 1's). `fetch_max` latches that 697 and the true 450 can never surface
+    /// for the rest of the pass. This sequence is no longer reachable from
+    /// `update_pass_progress` (see its new order, and
+    /// `rebaseline_new_order_never_reads_above_the_old_floor_mid_publish` above) — this test
+    /// documents why the old order was wrong; it does not exercise production code.
+    #[test]
+    fn rebaseline_old_order_used_to_latch_a_double_counted_697() {
+        let p = Progress::default();
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1;
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        p.add_fetched(900_000);
+        p.add_scanned(900_000);
+        scanned_so_far_in_pass += 900_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        const SEED: u64 = 450;
+
+        // The unconditional top-of-function step `update_pass_progress` always runs before
+        // deciding expansion (unchanged by this fix): baseline from this round's zeroed-so-far
+        // accounting, total from `scanned_so_far_in_pass` + the NEW `sum_remaining`.
+        p.set_pass_baseline(
+            p.fetched().saturating_sub(scanned_so_far_in_pass),
+            p.scanned().saturating_sub(scanned_so_far_in_pass),
+        );
+        p.set_pass_total(scanned_so_far_in_pass + 1_100_000);
+
+        // OLD step 1: lower the floor FIRST.
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED));
+
+        // OLD step 2: move the start SECOND, still ahead of the baseline/total refresh.
+        p.set_pass_start_permille(SEED);
+
+        // The poll the reviewer's report describes: new start, stale pre-refresh baseline/total.
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            697,
+            "the new 450 start stretched by a pass-local ratio still measured against the \
+             stale pre-refresh baseline/total — the double-counted value fetch_max then latches"
+        );
+
+        // OLD step 3 (too late): the baseline/total refresh can no longer help — 697 is latched.
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(1_100_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            697,
+            "fetch_max never lowers: the true 450 can no longer surface for this pass"
         );
     }
 

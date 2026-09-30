@@ -612,6 +612,20 @@ impl Progress {
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
+    /// [h17-1] Pure read of the scope-expansion condition: true when `seed` lands materially
+    /// BELOW the current session floor (see [`Self::rebaseline_floor_if_scope_expanded`]'s doc
+    /// for what that means and why). Stores nothing — [`Self::rebaseline_floor_if_scope_expanded`]
+    /// checks exactly this same condition (it calls this method) before it stores. Lets a
+    /// caller decide which branch to take, and publish every field a re-baseline touches in a
+    /// safe order, before the floor itself moves — see `update_pass_progress`
+    /// (`core/src/scheduler.rs`), which calls this first and calls
+    /// [`Self::rebaseline_floor_if_scope_expanded`] last for exactly that reason.
+    #[inline]
+    pub fn scope_expanded(&self, seed: u64) -> bool {
+        let current = self.progress_permille_floor.load(Ordering::Relaxed);
+        seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
+    }
+
     /// [API v2.1 E-5] When a suggest round's GLOBAL seed lands materially BELOW the current
     /// session floor, the scan SCOPE EXPANDED under the floor's feet — an imported account
     /// with an older birthday, or a rewind re-growing the queue — and the old floor (folded
@@ -622,8 +636,7 @@ impl Progress {
     /// epsilon is 50× above that noise and far below any real expansion (an import drops
     /// the seed by hundreds of permille). Returns whether a re-baseline happened.
     pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64) -> bool {
-        let current = self.progress_permille_floor.load(Ordering::Relaxed);
-        if seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current {
+        if self.scope_expanded(seed) {
             self.progress_permille_floor
                 .store(seed.min(1000), Ordering::Relaxed);
             return true;
@@ -1179,6 +1192,53 @@ mod tests {
         );
         // …and climbs monotonically again within the new scope.
         assert_eq!(p.permille_floor(300), 300);
+    }
+
+    /// [h17-1] `scope_expanded` answers exactly like its mutating sibling
+    /// `rebaseline_floor_if_scope_expanded` on the same inputs, but never writes: the floor
+    /// must hold across both a within-scope "false" reading and a genuine-expansion "true"
+    /// one, and only the mutating call may then move it.
+    #[test]
+    fn scope_expanded_reads_true_and_false_without_mutating_the_floor() {
+        let p = Progress::default();
+        assert_eq!(p.permille_floor(900), 900);
+
+        // Within-scope noise reads false, and a pure read must not move the floor.
+        assert!(
+            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE),
+            "exactly-epsilon dip is still within scope"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "a pure read must not lower the floor"
+        );
+
+        // A material drop reads true — and is STILL just a read: the floor holds until a
+        // caller separately chooses to act on it.
+        assert!(
+            p.scope_expanded(450),
+            "450 is >50‰ below the 900 floor ⇒ scope expansion"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "scope_expanded alone must never lower (or raise) the floor"
+        );
+
+        // Agrees with the mutating sibling on both the false and the true case.
+        assert!(!p.rebaseline_floor_if_scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE));
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "still not expanded ⇒ still untouched"
+        );
+        assert!(p.rebaseline_floor_if_scope_expanded(450));
+        assert_eq!(
+            p.permille_floor(0),
+            450,
+            "the mutating sibling now re-baselines"
+        );
     }
 
     /// [h10] The pass start records the FIRST suggest round's seed and holds through later
