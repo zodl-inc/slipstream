@@ -132,10 +132,8 @@ pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
             Some("https://testnet-relay.example.invalid/relay")
         }
         "ohttp-gateway.example" => {
-            // TODO(COR-1830): Switch to mainnet-relay.example.invalid/relay once
-            // Fastly prod relay serves /ohttp-configs (currently 501; only POST /relay works).
-            // Mainnet clients fetch signed key config via the relay.
-            Some("https://simulator-relay.example.invalid/relay")
+            // Fastly prod relay (serves /ohttp-configs + /relay)
+            Some("https://mainnet-relay.example.invalid/relay")
         }
         _ => None,
     }
@@ -1538,7 +1536,7 @@ mod tests {
         }
     }
 
-    /// Verify signed-config with REAL live fixtures from relay-simulator endpoints (P1/P2/P3 fix).
+    /// Verify signed-config with REAL live fixtures from Fastly relay endpoints (P1/P2/P3 fix).
     /// Tests both mainnet and testnet with valid envelopes, tampered signatures, wrong network.
     #[tokio::test]
     #[ignore = "network"]
@@ -1569,7 +1567,7 @@ mod tests {
         );
 
         // Mainnet signed config via relay-simulator
-        let mainnet_url = "https://simulator-relay.example.invalid/ohttp-configs/signed";
+        let mainnet_url = "https://mainnet-relay.example.invalid/ohttp-configs/signed";
         let mainnet_resp = reqwest::get(mainnet_url)
             .await
             .expect("fetch mainnet signed config")
