@@ -1566,8 +1566,9 @@ mod tests {
             testnet_result
         );
 
-        // Mainnet signed config via relay-simulator
-        let mainnet_url = "https://mainnet-relay.example.invalid/ohttp-configs/signed";
+        // Mainnet signed config via the Fastly prod relay
+        let mainnet_url =
+            "https://mainnet-relay.example.invalid/ohttp-configs/signed";
         let mainnet_resp = reqwest::get(mainnet_url)
             .await
             .expect("fetch mainnet signed config")
