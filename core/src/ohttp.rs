@@ -18,12 +18,16 @@
 //! and every caller in this crate stay unchanged. Server-streaming RPCs are buffered by the
 //! gateway and delivered as one body containing all the length-prefixed messages.
 //!
-//! Wire format is RFC 9458 §4.3/§4.4 with the suite DHKEM(X25519, HKDF-SHA256) / HKDF-SHA256 /
-//! AES-128-GCM; the gateway folds the gRPC trailers into the Binary HTTP header section and this
-//! module moves them back into HTTP/2 trailers.
+//! The protocol itself (RFC 9458 §4.3/§4.4 with the suite DHKEM(X25519, HKDF-SHA256) /
+//! HKDF-SHA256 / AES-128-GCM, Binary HTTP, signed key-configuration verification, key selection,
+//! outer-status classification and size limits) is the shared sans-IO `zodl-ohttp-client` crate,
+//! driven with its `ClientProfile::SLIPSTREAM` (gRPC) and `ClientProfile::SLIPSTREAM_HTTP`
+//! ([`http_round_trip`]) profiles. This module keeps the I/O: the dialer, the pooled h2 sender,
+//! the relay table, timeouts and the mapping to gRPC. The gateway folds the gRPC trailers into
+//! the Binary HTTP header section and this module moves them back into HTTP/2 trailers.
 //!
-//! **Tor.** The TCP leg to the relay (and the one-off `/ohttp-configs` key fetch from the gateway)
-//! is opened through a [`Dialer`]: [`Dialer::Direct`] uses the device's own connection,
+//! **Tor.** The TCP leg to the relay (and the one-off `/ohttp-configs/signed` key fetch) is
+//! opened through a [`Dialer`]: [`Dialer::Direct`] uses the device's own connection,
 //! [`Dialer::Tor`] opens an arti stream so the relay only ever sees a Tor exit IP. Everything
 //! above TCP (TLS to the relay, HPKE to the gateway) is identical in both cases.
 
@@ -31,7 +35,6 @@ use std::{
     collections::HashMap,
     convert::Infallible,
     future::Future,
-    io::Cursor,
     pin::Pin,
     sync::Arc,
     sync::OnceLock,
@@ -39,19 +42,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde::Deserialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use aes_gcm::{
-    Aes128Gcm, KeyInit, Nonce,
-    aead::{Aead, Payload},
-};
 use bytes::Bytes;
-use hkdf::Hkdf;
-use hpke::{
-    Deserializable, Kem, OpModeS, Serializable, aead::AesGcm128, kdf::HkdfSha256,
-    kem::X25519HkdfSha256,
-};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
 };
@@ -60,46 +53,14 @@ use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
 use hyper_util::rt::{TokioExecutor, TokioIo};
-use rand_core::{OsRng, TryRngCore};
-use sha2::Sha256;
 use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
-
-type OhttpKem = X25519HkdfSha256;
-type OhttpKdf = HkdfSha256;
-type OhttpAead = AesGcm128;
-
-const KEM_ID: u16 = 0x0020;
-const KDF_ID: u16 = 0x0001;
-const AEAD_ID: u16 = 0x0001;
-const N_K: usize = 16; // AES-128-GCM key
-const N_N: usize = 12; // AES-GCM nonce
-const N_T: usize = 16; // AES-GCM tag
-const N_ENC: usize = 32; // X25519 encapsulated key
-const REQUEST_LABEL: &[u8] = b"message/bhttp request";
-const RESPONSE_LABEL: &[u8] = b"message/bhttp response";
-
-/// Embedded Ed25519 public keys for signed OHTTP config verification (C-01 fix).
-/// Mainnet key: matches zodl-inc/zcash-android-wallet-sdk OhttpSignedConfig.kt
-const ED25519_PUBKEY_MAINNET: &str =
-    "REDACTED-SIGNING-PUBKEY-MAINNET";
-/// Testnet key: matches zodl-inc/zcash-android-wallet-sdk OhttpSignedConfig.kt
-const ED25519_PUBKEY_TESTNET: &str =
-    "REDACTED-SIGNING-PUBKEY-TESTNET";
-
-/// Signed OHTTP config envelope (JSON, fetched from `/ohttp-configs/signed` via relay).
-#[derive(Debug, Deserialize)]
-struct SignedOhttpConfig {
-    v: u8,
-    network: String,
-    configs: String, // base64-encoded application/ohttp-keys document
-    not_before: u64, // Unix timestamp
-    not_after: u64,  // Unix timestamp
-    key_id: String,
-    #[serde(rename = "sig")]
-    signature: String, // base64-encoded Ed25519 signature
-}
+use zodl_ohttp_client::{
+    BhttpRequest, BhttpResponse, ClientProfile, ClientTrace, Completed, Error as CoreError,
+    KeyConfig, SizeGuard, complete_exchange_in_place, encapsulate_request, signed_config_url,
+    verify_signed_config,
+};
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
 const DUPLEX_BUF: usize = 4 << 20;
@@ -107,7 +68,6 @@ const DUPLEX_BUF: usize = 4 << 20;
 /// `UNARY_TIMEOUT` (30 s) bounds the wait for response headers, so this only matters for large
 /// buffered streams; the gateway itself gives lightwalletd 80 s.
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
-const USER_AGENT: &str = "zodl-slipstream-ohttp/0.1";
 
 /// Hostname prefix that marks an endpoint as an OHTTP gateway (mirrors the Kotlin SDK).
 pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
@@ -293,6 +253,7 @@ impl OhttpConnector {
                 relay_url,
                 dialer,
                 client_trace_prefix.or_else(get_default_client_trace_prefix),
+                ClientProfile::SLIPSTREAM,
             )?),
         })
     }
@@ -338,314 +299,42 @@ impl Service<Uri> for OhttpConnector {
     }
 }
 
-/// One HPKE key configuration from an `application/ohttp-keys` document (RFC 9458 §3.1).
-#[derive(Clone, Debug)]
-struct KeyConfig {
-    key_id: u8,
-    public_key: [u8; 32],
-    /// Unix timestamp when this config expires (from signed envelope's not_after).
+/// The gateway key in use and the end of the signed configuration it came from.
+#[derive(Clone, Copy, Debug)]
+struct CachedKey {
+    config: KeyConfig,
+    /// Unix time (seconds) at which the signed envelope stops being valid.
     not_after: u64,
 }
 
-impl KeyConfig {
-    /// `hdr = key_id || kem_id || kdf_id || aead_id`
-    fn header(&self) -> [u8; 7] {
-        let [k0, k1] = KEM_ID.to_be_bytes();
-        let [d0, d1] = KDF_ID.to_be_bytes();
-        let [a0, a1] = AEAD_ID.to_be_bytes();
-        [self.key_id, k0, k1, d0, d1, a0, a1]
-    }
-
-    /// First key config in the document that offers our suite.
-    fn parse_supported(doc: &[u8], not_after: u64) -> Result<Self, String> {
-        let mut pos = 0usize;
-        let rd_u8 = |pos: &mut usize| -> Result<u8, String> {
-            let b = *doc.get(*pos).ok_or("truncated key config")?;
-            *pos += 1;
-            Ok(b)
-        };
-        let rd_u16 = |pos: &mut usize| -> Result<u16, String> {
-            let hi = *doc.get(*pos).ok_or("truncated key config")?;
-            let lo = *doc.get(*pos + 1).ok_or("truncated key config")?;
-            *pos += 2;
-            Ok(u16::from_be_bytes([hi, lo]))
-        };
-        while pos + 2 <= doc.len() {
-            let len = rd_u16(&mut pos)? as usize;
-            let end = pos + len;
-            if end > doc.len() {
-                return Err("truncated key config entry".into());
-            }
-            let key_id = rd_u8(&mut pos)?;
-            let kem_id = rd_u16(&mut pos)?;
-            if kem_id != KEM_ID {
-                pos = end;
-                continue;
-            }
-            let pk_end = pos + N_ENC;
-            if pk_end > end {
-                return Err("truncated public key".into());
-            }
-            let mut public_key = [0u8; 32];
-            public_key.copy_from_slice(&doc[pos..pk_end]);
-            pos = pk_end;
-            let suites_len = rd_u16(&mut pos)? as usize;
-            let suites_end = pos + suites_len;
-            if suites_end > end {
-                return Err("truncated symmetric suites".into());
-            }
-            while pos + 4 <= suites_end {
-                let kdf = rd_u16(&mut pos)?;
-                let aead = rd_u16(&mut pos)?;
-                if kdf == KDF_ID && aead == AEAD_ID {
-                    return Ok(Self {
-                        key_id,
-                        public_key,
-                        not_after,
-                    });
-                }
-            }
-            pos = end;
-        }
-        Err("no supported HPKE suite in OHTTP key configuration".into())
-    }
-}
-
-/// P6: Check for duplicate JSON keys (strict parse per ZIP rule 1).
-fn check_no_duplicate_json_keys(json_bytes: &[u8]) -> Result<(), String> {
-    use std::collections::HashSet;
-    let value: serde_json::Value = serde_json::from_slice(json_bytes)
-        .map_err(|e| format!("JSON parse for dup-key check: {e}"))?;
-    if let serde_json::Value::Object(map) = value {
-        let mut seen = HashSet::new();
-        for key in map.keys() {
-            if !seen.insert(key) {
-                return Err(format!("duplicate JSON key: {}", key));
-            }
-        }
-    }
-    // Note: serde_json::Map already deduplicates, so this won't catch duplicates.
-    // A proper fix would require a streaming parser. This is a best-effort check.
-    Ok(())
-}
-
-/// C-01 fix: Verify signed OHTTP config envelope and return the parsed KeyConfig.
-/// Fetches through the relay, verifies Ed25519 signature, checks validity window.
-fn verify_signed_config(json_bytes: &[u8], gateway_host: &str) -> Result<KeyConfig, String> {
-    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-
-    // P6: Reject duplicate JSON keys (strict parse per ZIP rule 1)
-    check_no_duplicate_json_keys(json_bytes)?;
-
-    let envelope: SignedOhttpConfig =
-        serde_json::from_slice(json_bytes).map_err(|e| format!("signed config JSON parse: {e}"))?;
-
-    if envelope.v != 1 {
-        return Err(format!("unsupported signed config version: {}", envelope.v));
-    }
-
-    // Derive expected network from gateway_host (not from the envelope's own network field)
-    let expected_network = if gateway_host.contains("testnet") {
-        "testnet"
-    } else {
-        "mainnet"
-    };
-
-    // Require envelope network matches configured network
-    if envelope.network != expected_network {
-        return Err(format!(
-            "network mismatch: gateway={}, envelope={}",
-            expected_network, envelope.network
-        ));
-    }
-
-    // Require not_before < not_after (P5)
-    if envelope.not_before >= envelope.not_after {
-        return Err(format!(
-            "invalid validity window: not_before={} >= not_after={}",
-            envelope.not_before, envelope.not_after
-        ));
-    }
-
-    // Select the correct public key based on configured network
-    let (pubkey_hex, expected_key_id) = match expected_network {
-        "mainnet" => (ED25519_PUBKEY_MAINNET, "ba8a2dbd"),
-        "testnet" => (ED25519_PUBKEY_TESTNET, "a3620fb6"),
-        other => return Err(format!("unknown network: {other}")),
-    };
-    // Check key_id matches expected value (sha256(pk)[..4] as hex)
-    if envelope.key_id != expected_key_id {
-        return Err(format!(
-            "key_id mismatch: expected {}, got {}",
-            expected_key_id, envelope.key_id
-        ));
-    }
-
-    let pubkey_bytes =
-        hex::decode(pubkey_hex).map_err(|e| format!("decode embedded pubkey: {e}"))?;
-    let verifying_key = VerifyingKey::from_bytes(
-        pubkey_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| "invalid pubkey length")?,
-    )
-    .map_err(|e| format!("invalid Ed25519 pubkey: {e}"))?;
-
-    // Decode base64 fields
-    use base64::prelude::*;
-    let configs_bytes = BASE64_STANDARD
-        .decode(&envelope.configs)
-        .map_err(|e| format!("decode configs base64: {e}"))?;
-
-    // Enforce 4096-byte limit on decoded configs (P4)
-    const MAX_CONFIGS_SIZE: usize = 4096;
-    if configs_bytes.len() > MAX_CONFIGS_SIZE {
-        return Err(format!(
-            "decoded configs too large: {} bytes (max {})",
-            configs_bytes.len(),
-            MAX_CONFIGS_SIZE
-        ));
-    }
-
-    // Check validity window with ±60s tolerance (BEFORE signature verification - fail fast)
-    let now = SystemTime::now()
+fn unix_now() -> Result<u64, String> {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|e| format!("system time: {e}"))?
-        .as_secs();
-    const TOLERANCE_SECS: u64 = 60;
-    if now + TOLERANCE_SECS < envelope.not_before {
-        return Err(format!(
-            "signed config not yet valid (not_before={}, now={})",
-            envelope.not_before, now
-        ));
-    }
-    if now > envelope.not_after + TOLERANCE_SECS {
-        return Err(format!(
-            "signed config expired (not_after={}, now={})",
-            envelope.not_after, now
-        ));
-    }
-
-    // Enforce ≤24h validity window (BEFORE signature verification - fail fast)
-    let validity_duration = envelope.not_after.saturating_sub(envelope.not_before);
-    const MAX_VALIDITY_SECS: u64 = 24 * 60 * 60;
-    if validity_duration > MAX_VALIDITY_SECS {
-        return Err(format!(
-            "signed config validity window too long: {}s (max {}s)",
-            validity_duration, MAX_VALIDITY_SECS
-        ));
-    }
-
-    // NOW verify signature (after cheap temporal checks pass)
-    let signature_bytes = BASE64_STANDARD
-        .decode(&envelope.signature)
-        .map_err(|e| format!("decode signature base64: {e}"))?;
-    let signature = Signature::from_bytes(
-        signature_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| "invalid signature length")?,
-    );
-
-    // Build the message to verify: "zodl-ohttp-configs-v1" || 0x00 || network || 0x00 ||
-    // u64be(not_before) || u64be(not_after) || configs
-    let mut message = Vec::with_capacity(
-        b"zodl-ohttp-configs-v1".len()
-            + 1
-            + envelope.network.len()
-            + 1
-            + 8
-            + 8
-            + configs_bytes.len(),
-    );
-    message.extend_from_slice(b"zodl-ohttp-configs-v1");
-    message.push(0x00);
-    message.extend_from_slice(envelope.network.as_bytes());
-    message.push(0x00);
-    message.extend_from_slice(&envelope.not_before.to_be_bytes());
-    message.extend_from_slice(&envelope.not_after.to_be_bytes());
-    message.extend_from_slice(&configs_bytes);
-
-    // Verify signature (fail closed)
-    verifying_key
-        .verify(&message, &signature)
-        .map_err(|_| "Ed25519 signature verification failed")?;
-
-    tracing::info!(
-        gateway = %gateway_host,
-        network = %envelope.network,
-        not_before = envelope.not_before,
-        not_after = envelope.not_after,
-        "ohttp: signed config verified"
-    );
-
-    // Parse the configs document and return KeyConfig with not_after for cache TTL
-    KeyConfig::parse_supported(&configs_bytes, envelope.not_after)
+        .map(|d| d.as_secs())
+        .map_err(|e| format!("system time: {e}"))
 }
 
-/// Client-side state needed to decrypt one response (RFC 9458 §4.4).
-struct ResponseContext {
-    enc: Vec<u8>,
-    secret: [u8; N_K],
-}
-
-impl ResponseContext {
-    fn decapsulate(&self, enc_response: &[u8]) -> Result<Vec<u8>, String> {
-        let nonce_len = N_N.max(N_K);
-        if enc_response.len() < nonce_len + N_T {
-            return Err(format!(
-                "OHTTP response too short ({} bytes)",
-                enc_response.len()
-            ));
-        }
-        let (response_nonce, ct) = enc_response.split_at(nonce_len);
-        let mut salt = self.enc.clone();
-        salt.extend_from_slice(response_nonce);
-        let hk = Hkdf::<Sha256>::new(Some(&salt), &self.secret);
-        let mut key = [0u8; N_K];
-        hk.expand(b"key", &mut key).map_err(|_| "hkdf expand key")?;
-        let mut nonce = [0u8; N_N];
-        hk.expand(b"nonce", &mut nonce)
-            .map_err(|_| "hkdf expand nonce")?;
-        Aes128Gcm::new_from_slice(&key)
-            .map_err(|_| "aead key")?
-            .decrypt(Nonce::from_slice(&nonce), Payload { msg: ct, aad: b"" })
-            .map_err(|_| "OHTTP response authentication failed".to_string())
-    }
-}
-
-/// RFC 9458 §4.3 — encapsulate a Binary HTTP request. Returns `hdr || enc || ct` and the
-/// context for the matching response.
-fn encapsulate(key: &KeyConfig, plaintext: &[u8]) -> Result<(Vec<u8>, ResponseContext), String> {
-    let hdr = key.header();
-    let mut info = Vec::with_capacity(REQUEST_LABEL.len() + 1 + hdr.len());
-    info.extend_from_slice(REQUEST_LABEL);
-    info.push(0x00);
-    info.extend_from_slice(&hdr);
-
-    let pk = <OhttpKem as Kem>::PublicKey::from_bytes(&key.public_key)
-        .map_err(|e| format!("invalid gateway public key: {e:?}"))?;
-    let mut rng = OsRng.unwrap_err();
-    let (encapped, mut ctx) = hpke::setup_sender::<OhttpAead, OhttpKdf, OhttpKem, _>(
-        &OpModeS::Base,
-        &pk,
-        &info,
-        &mut rng,
-    )
-    .map_err(|e| format!("hpke setup_sender: {e:?}"))?;
-    let ct = ctx
-        .seal(plaintext, b"")
-        .map_err(|e| format!("hpke seal: {e:?}"))?;
-    let mut secret = [0u8; N_K];
-    ctx.export(RESPONSE_LABEL, &mut secret)
-        .map_err(|e| format!("hpke export: {e:?}"))?;
-
-    let enc = encapped.to_bytes().to_vec();
-    let mut out = Vec::with_capacity(hdr.len() + enc.len() + ct.len());
-    out.extend_from_slice(&hdr);
-    out.extend_from_slice(&enc);
-    out.extend_from_slice(&ct);
-    Ok((out, ResponseContext { enc, secret }))
+/// Verify a signed key-configuration envelope for `gateway_host` under `profile` (network from
+/// the host, pinned signing key, validity window at `now`, signature) and pick the key out of it.
+/// Pure: the fetch and the cache are the caller's.
+fn open_signed_keys(
+    profile: &ClientProfile,
+    json: &[u8],
+    gateway_host: &str,
+    now: u64,
+) -> Result<CachedKey, String> {
+    let network = profile
+        .network_rule
+        .network_for(gateway_host)
+        .map_err(|e| e.to_string())?;
+    let keys = verify_signed_config(json, network, now, &profile.signed_config)
+        .map_err(|e| e.to_string())?;
+    let config = KeyConfig::select_with(&keys.document, &profile.key_selection)
+        .map_err(|e| e.to_string())?;
+    Ok(CachedKey {
+        config,
+        not_after: keys.not_after,
+    })
 }
 
 struct HttpsTarget {
@@ -669,10 +358,123 @@ fn parse_https(url: &str) -> Result<HttpsTarget, String> {
     })
 }
 
+/// The outer answer of one HTTPS exchange, body read in full (within the size cap).
+struct RelayAnswer {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: Vec<u8>,
+}
+
+/// Why one HTTPS exchange failed.
+#[derive(Debug)]
+enum HttpsError {
+    /// The pooled h2 connection was not ready or refused the request: nothing reached the far
+    /// end, so the caller may try again (a relay POST is sealed afresh first).
+    PreSend(String),
+    /// Anything else (connect, TLS, read, size cap): not retried.
+    Other(String),
+}
+
+impl HttpsError {
+    fn into_message(self) -> String {
+        match self {
+            HttpsError::PreSend(m) | HttpsError::Other(m) => m,
+        }
+    }
+}
+
+/// Why a whole OHTTP round trip failed; the gRPC bridge maps the two differently.
+#[derive(Debug)]
+enum RoundTripError {
+    /// Key fetch, relay, gateway or decryption failed (gRPC `UNAVAILABLE`).
+    Transport(String),
+    /// The decrypted answer is not a Binary HTTP response (gRPC `INTERNAL`).
+    Decode(String),
+}
+
+/// The relay POST loop, free of I/O: `post` sends one sealed body to the relay and `refetch`
+/// fetches the key configuration again. **Every post is sealed afresh** (a new ephemeral key,
+/// so new ciphertext): the gateway answers a repeated ciphertext with 409, and the opener of
+/// one sealing opens that sealing's answer only. A pre-send transport failure is retried once;
+/// an outer 400 or 422 refetches the key and retries once (both classified by the shared core).
+async fn run_exchange<P, PF, R, RF>(
+    profile: &ClientProfile,
+    mut key: KeyConfig,
+    request: &BhttpRequest,
+    mut post: P,
+    mut refetch: R,
+) -> Result<BhttpResponse, RoundTripError>
+where
+    P: FnMut(Vec<u8>) -> PF,
+    PF: Future<Output = Result<RelayAnswer, HttpsError>>,
+    R: FnMut() -> RF,
+    RF: Future<Output = Result<KeyConfig, String>>,
+{
+    let mut attempt = 0u32;
+    loop {
+        let mut resent = false;
+        let (opener, mut answer) = loop {
+            let sealed = encapsulate_request(&key, request, &profile.encode, &profile.limits)
+                .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+            match post(sealed.body).await {
+                Ok(answer) => break (sealed.opener, answer),
+                Err(HttpsError::PreSend(e)) if !resent => {
+                    resent = true;
+                    tracing::debug!(err = %e, "ohttp: relay post failed before send; sealing again");
+                }
+                Err(e) => return Err(RoundTripError::Transport(e.into_message())),
+            }
+        };
+        let status = answer.status.as_u16();
+        match complete_exchange_in_place(
+            profile,
+            opener,
+            status,
+            answer.content_type.as_deref(),
+            &mut answer.body,
+            attempt,
+        ) {
+            Ok(Completed::Response(response)) => return Ok(response),
+            Ok(Completed::RefetchKeyConfig) => {
+                if attempt > 0 {
+                    return Err(RoundTripError::Transport(
+                        "ohttp: gateway rejected request after key refresh".into(),
+                    ));
+                }
+                tracing::warn!(
+                    status,
+                    "ohttp: gateway rejected request; refreshing key config"
+                );
+                key = refetch().await.map_err(RoundTripError::Transport)?;
+                attempt += 1;
+            }
+            Ok(Completed::Refused { status, detail }) => {
+                let code = StatusCode::from_u16(status)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|_| status.to_string());
+                let shown: String = detail.chars().take(160).collect();
+                return Err(RoundTripError::Transport(format!(
+                    "relay/gateway HTTP {code}: {shown}"
+                )));
+            }
+            Ok(Completed::WrongMediaType { content_type }) => {
+                return Err(RoundTripError::Transport(format!(
+                    "relay answered {content_type:?}, not message/ohttp-res"
+                )));
+            }
+            Err(e @ (CoreError::BhttpFormat(_) | CoreError::NotAResponse)) => {
+                return Err(RoundTripError::Decode(e.to_string()));
+            }
+            Err(e) => return Err(RoundTripError::Transport(e.to_string())),
+        }
+    }
+}
+
 struct OhttpClient {
     gateway_host: String,
+    relay_url: String,
     relay: HttpsTarget,
-    key_config: Mutex<Option<KeyConfig>>,
+    key_config: Mutex<Option<CachedKey>>,
     tls: Arc<rustls::ClientConfig>,
     dialer: Dialer,
     /// One multiplexed HTTP/2 connection per `host:port`, shared by all concurrent RPCs. Opening a
@@ -681,7 +483,10 @@ struct OhttpClient {
     /// more: every new connection would be a new circuit build.
     h2_pool: Mutex<HashMap<String, http2::SendRequest<Full<Bytes>>>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
-    client_trace: Option<client_trace::ClientTrace>,
+    client_trace: Option<ClientTrace>,
+    /// The shared core's options for this client (`SLIPSTREAM` for gRPC, `SLIPSTREAM_HTTP` for
+    /// [`http_round_trip`]).
+    profile: ClientProfile,
 }
 
 fn forward_header(name: &HeaderName) -> bool {
@@ -695,6 +500,7 @@ impl OhttpClient {
         relay_url: &str,
         dialer: Dialer,
         client_trace_prefix: Option<String>,
+        profile: ClientProfile,
     ) -> Result<Self, String> {
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -708,12 +514,14 @@ impl OhttpClient {
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
         Ok(Self {
             gateway_host: gateway_host.to_string(),
+            relay_url: relay_url.to_string(),
             relay: parse_https(relay_url)?,
             key_config: Mutex::new(None),
             tls: Arc::new(tls),
             dialer,
             h2_pool: Mutex::new(HashMap::new()),
-            client_trace: client_trace_prefix.map(|p| client_trace::ClientTrace::new(&p)),
+            client_trace: client_trace_prefix.map(|p| ClientTrace::new(&p, &profile.trace)),
+            profile,
         })
     }
 
@@ -772,208 +580,204 @@ impl OhttpClient {
         &self,
         target: &HttpsTarget,
         method: Method,
-        content_type: Option<&str>,
-        accept: &str,
+        headers: &[(&'static str, String)],
         body: Vec<u8>,
     ) -> Result<Request<Full<Bytes>>, String> {
         let uri = format!("https://{}:{}{}", target.host, target.port, target.path);
         let mut req = Request::builder()
             .method(method)
             .uri(uri)
-            .header(header::HOST, &target.host)
-            .header(header::USER_AGENT, USER_AGENT)
-            .header(header::ACCEPT, accept)
-            .header(header::ACCEPT_ENCODING, "identity");
-        if let Some(ct) = content_type {
-            req = req.header(header::CONTENT_TYPE, ct);
-        }
-        // Add client trace ID to relay POSTs only (not key config fetches)
-        if content_type == Some("message/ohttp-req")
-            && let Some(ref trace) = self.client_trace
-        {
-            req = req.header("X-Client-Trace-Id", trace.next());
+            .header(header::HOST, &target.host);
+        for (name, value) in headers {
+            req = req.header(*name, value.as_str());
         }
         req.body(Full::new(Bytes::from(body)))
             .map_err(|e| format!("build request: {e}"))
     }
 
-    /// One HTTPS exchange: multiplexed over the pooled h2 connection when available, otherwise a
-    /// fresh HTTP/1.1 connection. Pre-send connection errors (ready/TLS/connect) are always
-    /// retried once (F-12 fix). The response itself is returned without retry.
-    async fn https(
+    /// One HTTPS exchange, sent once: multiplexed over the pooled h2 connection when available,
+    /// otherwise a fresh HTTP/1.1 connection. A failure before anything was sent on a pooled h2
+    /// connection is [`HttpsError::PreSend`] (and drops that connection from the pool); it is
+    /// never retried here, because resending a relay POST's body would repeat its ciphertext.
+    /// The caller decides, and seals afresh. The body is read through `guard`, which aborts the
+    /// read at the first byte past the size cap.
+    async fn https_once(
         &self,
         target: &HttpsTarget,
         method: Method,
-        content_type: Option<&str>,
-        accept: &str,
+        headers: &[(&'static str, String)],
         body: Vec<u8>,
-        _allow_retry: bool, // No longer used; pre-send errors always retry, responses never do
-    ) -> Result<(StatusCode, Bytes), String> {
-        // Always allow at least 2 attempts for pre-send connection errors
-        let max_attempts = 2;
-        for attempt in 0..(max_attempts) {
-            let req =
-                self.build_request(target, method.clone(), content_type, accept, body.clone())?;
-            let resp = match self.h2_sender(target).await? {
-                Some(mut sender) => {
-                    if let Err(e) = sender.ready().await {
-                        self.h2_pool
-                            .lock()
-                            .await
-                            .remove(&format!("{}:{}", target.host, target.port));
-                        if attempt == 0 {
-                            tracing::debug!(err = %e, "ohttp: pooled h2 not ready; reconnecting");
-                            continue;
-                        }
-                        return Err(format!("h2 ready {}: {e}", target.host));
-                    }
-                    match sender.send_request(req).await {
-                        Ok(r) => r.map(|b| b.boxed()),
-                        Err(e) => {
-                            self.h2_pool
-                                .lock()
-                                .await
-                                .remove(&format!("{}:{}", target.host, target.port));
-                            if attempt == 0 {
-                                tracing::debug!(err = %e, "ohttp: h2 send failed; reconnecting");
-                                continue;
-                            }
-                            return Err(format!("h2 send {}: {e}", target.host));
-                        }
+        mut guard: SizeGuard,
+    ) -> Result<RelayAnswer, HttpsError> {
+        let req = self
+            .build_request(target, method, headers, body)
+            .map_err(HttpsError::Other)?;
+        let pool_key = format!("{}:{}", target.host, target.port);
+        let resp = match self.h2_sender(target).await.map_err(HttpsError::Other)? {
+            Some(mut sender) => {
+                if let Err(e) = sender.ready().await {
+                    self.h2_pool.lock().await.remove(&pool_key);
+                    return Err(HttpsError::PreSend(format!(
+                        "h2 ready {}: {e}",
+                        target.host
+                    )));
+                }
+                match sender.send_request(req).await {
+                    Ok(r) => r.map(|b| b.boxed()),
+                    Err(e) => {
+                        self.h2_pool.lock().await.remove(&pool_key);
+                        return Err(HttpsError::PreSend(format!("h2 send {}: {e}", target.host)));
                     }
                 }
-                None => {
-                    let (tls, _) = self.tls_connect(target).await?;
-                    let (mut sender, conn) =
-                        hyper::client::conn::http1::handshake(TokioIo::new(tls))
-                            .await
-                            .map_err(|e| format!("http1 handshake: {e}"))?;
-                    tokio::spawn(async move {
-                        let _ = conn.await;
-                    });
-                    sender
-                        .send_request(req)
-                        .await
-                        .map_err(|e| format!("send {}: {e}", target.host))?
-                        .map(|b| b.boxed())
-                }
-            };
-            let status = resp.status();
-            let bytes = resp
-                .into_body()
-                .collect()
-                .await
-                .map_err(|e| format!("read {}: {e}", target.host))?
-                .to_bytes();
-            return Ok((status, bytes));
+            }
+            None => {
+                let (tls, _) = self.tls_connect(target).await.map_err(HttpsError::Other)?;
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+                    .await
+                    .map_err(|e| HttpsError::Other(format!("http1 handshake: {e}")))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| HttpsError::Other(format!("send {}: {e}", target.host)))?
+                    .map(|b| b.boxed())
+            }
+        };
+        let (parts, mut body) = resp.into_parts();
+        if let Some(declared) = parts
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+        {
+            guard
+                .check_declared(declared)
+                .map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
         }
-        Err(format!("https {}: retries exhausted", target.host))
+        let mut bytes = Vec::new();
+        while let Some(frame) = body.frame().await {
+            let frame =
+                frame.map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
+            if let Ok(data) = frame.into_data() {
+                guard
+                    .push(data.len())
+                    .map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
+                bytes.extend_from_slice(&data);
+            }
+        }
+        Ok(RelayAnswer {
+            status: parts.status,
+            content_type: parts
+                .headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            body: bytes,
+        })
+    }
+
+    /// POST one sealed request body to the relay.
+    async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
+        let trace = self.client_trace.as_ref().map(|t| t.next());
+        let headers = self.profile.headers.relay_post(trace.as_deref());
+        self.https_once(
+            &self.relay,
+            Method::POST,
+            &headers,
+            body,
+            self.profile.limits.response_guard(),
+        )
+        .await
     }
 
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
         // C-01 fix: Check cache expiry based on not_after timestamp
-        if !refresh && let Some(k) = self.key_config.lock().await.as_ref() {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|e| format!("system time: {e}"))?
-                .as_secs();
-            // Refresh 60s before expiry to avoid races
-            if now + 60 < k.not_after {
-                return Ok(k.clone());
+        {
+            let mut cached = self.key_config.lock().await;
+            if !refresh && let Some(k) = cached.as_ref() {
+                let now = unix_now()?;
+                if self.profile.cache.is_fresh(Some(k.not_after), now) {
+                    return Ok(k.config);
+                }
+                tracing::info!(
+                    gateway = %self.gateway_host,
+                    not_after = k.not_after,
+                    now,
+                    "ohttp: cached key config expired, refreshing"
+                );
             }
-            tracing::info!(
-                gateway = %self.gateway_host,
-                not_after = k.not_after,
-                now,
-                "ohttp: cached key config expired, refreshing"
-            );
+            // The kept key is discarded before the fetch that replaces it, so a failed fetch
+            // leaves none to be used next.
+            if self.profile.cache.drop_before_refetch {
+                *cached = None;
+            }
         }
 
         // C-01 fix: Fetch signed config through relay host at /ohttp-configs/signed
         // Construct target from relay host (not gateway) to avoid direct gateway access
-        let signed_config_target = HttpsTarget {
-            host: self.relay.host.clone(),
-            port: self.relay.port,
-            path: "/ohttp-configs/signed".to_string(),
-        };
+        let signed_config_target = parse_https(
+            &signed_config_url(&self.relay_url, self.profile.signed_config_url)
+                .map_err(|e| e.to_string())?,
+        )?;
+        let headers = self.profile.headers.key_fetch(None);
 
-        let (status, json_bytes) = self
-            .https(
-                &signed_config_target,
-                Method::GET,
-                None,
-                "application/json",
-                Vec::new(),
-                true, // allow_retry: key config GET can safely retry on connection errors
-            )
-            .await?;
-        if status != StatusCode::OK {
-            return Err(format!("signed config fetch: HTTP {status}"));
+        // A key config GET is idempotent: a failure before anything was sent is tried once more.
+        let mut resent = false;
+        let answer = loop {
+            match self
+                .https_once(
+                    &signed_config_target,
+                    Method::GET,
+                    &headers,
+                    Vec::new(),
+                    self.profile.limits.key_config_guard(),
+                )
+                .await
+            {
+                Ok(answer) => break answer,
+                Err(HttpsError::PreSend(e)) if !resent => {
+                    resent = true;
+                    tracing::debug!(err = %e, "ohttp: key config fetch failed before send; retrying");
+                }
+                Err(e) => return Err(e.into_message()),
+            }
+        };
+        if !self.profile.outer.success.accepts(answer.status.as_u16()) {
+            return Err(format!("signed config fetch: HTTP {}", answer.status));
         }
 
         // C-01 fix: Verify signature and parse config
-        let cfg = verify_signed_config(&json_bytes, &self.gateway_host)?;
+        let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, unix_now()?)?;
         tracing::info!(
             gateway = %self.gateway_host,
-            key_id = cfg.key_id,
+            key_id = cfg.config.key_id(),
             not_after = cfg.not_after,
             via_tor = self.dialer.is_tor(),
             "ohttp: signed key config loaded and verified"
         );
-        *self.key_config.lock().await = Some(cfg.clone());
-        Ok(cfg)
+        *self.key_config.lock().await = Some(cfg);
+        Ok(cfg.config)
     }
 
-    /// Encapsulate + relay + decapsulate. Retries once with a fresh key config when the gateway
-    /// rejects the request (HTTP 400), which is what key rotation looks like from here.
-    async fn round_trip(&self, bhttp_request: &[u8]) -> Result<Vec<u8>, String> {
-        let mut key = self.key_config(false).await?;
-        for attempt in 0..2 {
-            let (enc_req, ctx) = encapsulate(&key, bhttp_request)?;
-            let (status, body) = self
-                .https(
-                    &self.relay,
-                    Method::POST,
-                    Some("message/ohttp-req"),
-                    "message/ohttp-res",
-                    enc_req,
-                    false, // C-08: never retry OHTTP relay POST — ciphertext must be sent exactly once
-                )
-                .await?;
-            match status {
-                StatusCode::OK => return ctx.decapsulate(&body),
-                StatusCode::BAD_REQUEST if attempt == 0 => {
-                    tracing::warn!(
-                        detail = %String::from_utf8_lossy(&body[..body.len().min(160)]),
-                        "ohttp: gateway rejected request (400); refreshing key config"
-                    );
-                    key = self.key_config(true).await?;
-                }
-                StatusCode::UNPROCESSABLE_ENTITY if attempt == 0 => {
-                    // 422 with problem type ohttp-key: drop cached config and refetch
-                    let body_str = String::from_utf8_lossy(&body);
-                    if body_str.contains("ohttp-key") || body_str.contains("HPKE") {
-                        tracing::warn!(
-                            detail = %body_str.chars().take(160).collect::<String>(),
-                            "ohttp: gateway 422 ohttp-key error; invalidating cache"
-                        );
-                        key = self.key_config(true).await?;
-                    } else {
-                        return Err(format!(
-                            "relay/gateway HTTP 422: {}",
-                            &body_str[..body_str.len().min(160)]
-                        ));
-                    }
-                }
-                other => {
-                    return Err(format!(
-                        "relay/gateway HTTP {other}: {}",
-                        String::from_utf8_lossy(&body[..body.len().min(160)])
-                    ));
-                }
-            }
-        }
-        Err("ohttp: gateway rejected request after key refresh".into())
+    /// Encapsulate + relay + decapsulate (see [`run_exchange`]). The key configuration is
+    /// fetched again, and the request sealed again, when the gateway rejects the request (outer
+    /// 400 or 422), which is what key rotation looks like from here.
+    async fn round_trip(&self, request: &BhttpRequest) -> Result<BhttpResponse, RoundTripError> {
+        let key = self
+            .key_config(false)
+            .await
+            .map_err(RoundTripError::Transport)?;
+        let this = self;
+        run_exchange(
+            &self.profile,
+            key,
+            request,
+            move |body| this.post_sealed(body),
+            move || this.key_config(true),
+        )
+        .await
     }
 
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.
@@ -989,28 +793,22 @@ impl OhttpClient {
             Err(e) => return grpc_error(GRPC_INTERNAL, &format!("read request body: {e}")),
         };
 
-        let mut msg = bhttp::Message::request(
-            parts.method.as_str().as_bytes().to_vec(),
-            b"https".to_vec(),
-            self.gateway_host.as_bytes().to_vec(),
-            path.as_bytes().to_vec(),
+        let request = grpc_request(
+            &self.gateway_host,
+            parts.method.as_str(),
+            &path,
+            &parts.headers,
+            &body,
         );
-        for (name, value) in &parts.headers {
-            if forward_header(name) {
-                msg.put_header(name.as_str().as_bytes().to_vec(), value.as_bytes().to_vec());
-            }
-        }
-        msg.write_content(&body);
-        let mut plaintext = Vec::with_capacity(body.len() + 256);
-        if let Err(e) = msg.write_bhttp(bhttp::Mode::KnownLength, &mut plaintext) {
-            return grpc_error(GRPC_INTERNAL, &format!("bhttp encode: {e:?}"));
-        }
 
         let started = std::time::Instant::now();
         let response =
-            match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip(&plaintext)).await {
+            match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip(&request)).await {
                 Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+                Ok(Err(RoundTripError::Decode(e))) => {
+                    return grpc_error(GRPC_INTERNAL, &format!("bhttp decode: {e}"));
+                }
+                Ok(Err(RoundTripError::Transport(e))) => {
                     tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
                     return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
                 }
@@ -1020,50 +818,17 @@ impl OhttpClient {
                 }
             };
 
-        let msg = match bhttp::Message::read_bhttp::<_, Cursor<Vec<u8>>>(&mut Cursor::new(response))
-        {
-            Ok(m) => m,
-            Err(e) => return grpc_error(GRPC_INTERNAL, &format!("bhttp decode: {e:?}")),
-        };
-        let http_status = msg.control().status().map(|s| s.code()).unwrap_or(200);
-        let mut headers = HeaderMap::new();
-        let mut trailers = HeaderMap::new();
-        for field in msg.header().iter() {
-            let (Ok(name), Ok(value)) = (
-                HeaderName::from_bytes(field.name()),
-                HeaderValue::from_bytes(field.value()),
-            ) else {
-                continue;
-            };
-            if name.as_str().starts_with("grpc-") {
-                trailers.insert(name, value);
-            } else if name == header::CONTENT_TYPE || name == header::DATE {
-                headers.insert(name, value);
-            }
-        }
-        if !trailers.contains_key("grpc-status") {
-            trailers.insert("grpc-status", HeaderValue::from_static("13"));
-            trailers.insert(
-                "grpc-message",
-                HeaderValue::from_static("ohttp: gateway response without grpc-status"),
-            );
-        }
-        if !headers.contains_key(header::CONTENT_TYPE) {
-            headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            );
-        }
+        let (http_status, headers, trailers) = grpc_parts(&response);
         tracing::debug!(
             path = %path,
             http_status,
             grpc_status = ?trailers.get("grpc-status"),
-            bytes = msg.content().len(),
+            bytes = response.body.len(),
             ms = started.elapsed().as_millis() as u64,
             "ohttp: rpc complete"
         );
 
-        let content = Bytes::copy_from_slice(msg.content());
+        let content = Bytes::from(response.body);
         let mut frames: Vec<Result<Frame<Bytes>, Infallible>> = Vec::with_capacity(2);
         if !content.is_empty() {
             frames.push(Ok(Frame::data(content)));
@@ -1076,6 +841,81 @@ impl OhttpClient {
         *resp.headers_mut() = headers;
         resp
     }
+}
+
+/// The Binary HTTP request for one gRPC call: method and path as received, `:authority` the
+/// gateway host, `:scheme` https, only the headers [`forward_header`] lets through (names
+/// lower-cased by the `SLIPSTREAM` profile's encoding).
+fn grpc_request(
+    gateway_host: &str,
+    method: &str,
+    path: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+) -> BhttpRequest {
+    let mut request = BhttpRequest::new(method, gateway_host, path).body(body);
+    for (name, value) in headers {
+        if forward_header(name) {
+            request = request.header(name.as_str(), value.as_bytes());
+        }
+    }
+    request
+}
+
+/// The gRPC view of a decoded gateway response: HTTP status, HTTP/2 headers (`content-type` and
+/// `date` only) and trailers (the `grpc-*` fields the gateway folded into the header section;
+/// the Binary HTTP trailer section is not read). A missing `grpc-status` becomes INTERNAL.
+fn grpc_parts(response: &BhttpResponse) -> (u16, HeaderMap, HeaderMap) {
+    let mut headers = HeaderMap::new();
+    let mut trailers = HeaderMap::new();
+    for (field_name, field_value) in &response.headers {
+        let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(field_name),
+            HeaderValue::from_bytes(field_value),
+        ) else {
+            continue;
+        };
+        if name.as_str().starts_with("grpc-") {
+            trailers.insert(name, value);
+        } else if name == header::CONTENT_TYPE || name == header::DATE {
+            headers.insert(name, value);
+        }
+    }
+    if !trailers.contains_key("grpc-status") {
+        trailers.insert("grpc-status", HeaderValue::from_static("13"));
+        trailers.insert(
+            "grpc-message",
+            HeaderValue::from_static("ohttp: gateway response without grpc-status"),
+        );
+    }
+    if !headers.contains_key(header::CONTENT_TYPE) {
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/grpc"),
+        );
+    }
+    (response.status, headers, trailers)
+}
+
+/// Where `http_round_trip` sends its request, as the gateway will see it.
+struct HttpTarget {
+    scheme: String,
+    host: String,
+    path: String,
+}
+
+fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
+    let uri = url
+        .parse::<http::Uri>()
+        .map_err(|e| format!("invalid URL: {e}"))?;
+    let host = uri.host().ok_or("URL has no host")?.to_string();
+    let path = uri
+        .path_and_query()
+        .map(|p| p.as_str())
+        .unwrap_or("/")
+        .to_string();
+    let scheme = uri.scheme_str().unwrap_or("https").to_string();
+    Ok(HttpTarget { scheme, host, path })
 }
 
 /// Sends an HTTP request through OHTTP (RFC 9458): HPKE-encapsulates the request,
@@ -1102,8 +942,8 @@ impl OhttpClient {
 /// with automatic key rotation retry on gateway 400/422.
 ///
 /// # Response size cap
-/// Enforces the same 64 MiB cap as the gRPC path (expandable to 256 MiB via
-/// `MAX_UPSTREAM_RESPONSE_BYTES`). Larger responses are truncated.
+/// A sealed response larger than the gateway's own 256 MiB cap (plus 64 KiB of framing) is
+/// rejected while it is being read, before it is buffered or decrypted.
 pub async fn http_round_trip(
     gateway_host: &str,
     dialer: Dialer,
@@ -1113,60 +953,61 @@ pub async fn http_round_trip(
     body: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
     // Parse URL to extract scheme, host, path for BHTTP encoding
-    let uri = url
-        .parse::<http::Uri>()
-        .map_err(|e| format!("invalid URL: {e}"))?;
-    let host = uri.host().ok_or("URL has no host")?.to_string();
-    let path = uri
-        .path_and_query()
-        .map(|p| p.as_str())
-        .unwrap_or("/")
-        .to_string();
-    let scheme = uri.scheme_str().unwrap_or("https");
+    let target = parse_http_target(url)?;
 
     // Get relay URL for this gateway
     let relay_url = relay_for(gateway_host)
         .ok_or_else(|| format!("no relay configured for gateway {}", gateway_host))?;
 
+    http_round_trip_via(
+        relay_url,
+        gateway_host,
+        dialer,
+        method,
+        target,
+        headers,
+        body,
+    )
+    .await
+}
+
+/// [`http_round_trip`] against an explicit relay URL (the body of the public function, so a
+/// test can point it at a local relay without touching the process-wide relay table).
+async fn http_round_trip_via(
+    relay_url: &str,
+    gateway_host: &str,
+    dialer: Dialer,
+    method: &str,
+    target: HttpTarget,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
     // Create OHTTP client
     let client = OhttpClient::new(
         gateway_host,
         relay_url,
         dialer,
         get_default_client_trace_prefix(),
+        ClientProfile::SLIPSTREAM_HTTP,
     )?;
 
-    // Encode HTTP request as Binary HTTP (RFC 9292)
-    let mut msg = bhttp::Message::request(
-        method.as_bytes().to_vec(),
-        scheme.as_bytes().to_vec(),
-        host.as_bytes().to_vec(),
-        path.as_bytes().to_vec(),
-    );
+    // HTTP request as Binary HTTP (RFC 9292): the URL's scheme, header names as given
+    let mut request = BhttpRequest::new(method, target.host, target.path)
+        .scheme(target.scheme)
+        .body(body);
     for (name, value) in headers {
-        msg.put_header(name.as_bytes().to_vec(), value.as_bytes().to_vec());
+        request = request.header(name.as_str(), value.as_str());
     }
-    msg.write_content(body);
-    let mut bhttp_request = Vec::with_capacity(body.len() + 256);
-    msg.write_bhttp(bhttp::Mode::KnownLength, &mut bhttp_request)
-        .map_err(|e| format!("bhttp encode: {e:?}"))?;
 
     // Send through OHTTP relay (encapsulate, POST, decapsulate)
-    let bhttp_response = client.round_trip(&bhttp_request).await?;
+    let response = client.round_trip(&request).await.map_err(|e| match e {
+        RoundTripError::Transport(e) => e,
+        RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
+    })?;
 
-    // Decode Binary HTTP response
-    let msg = bhttp::Message::read_bhttp::<_, Cursor<Vec<u8>>>(&mut Cursor::new(bhttp_response))
-        .map_err(|e| format!("bhttp decode: {e:?}"))?;
-    let status = msg.control().status().map(|s| s.code()).unwrap_or(200);
-    let mut response_headers = Vec::new();
-    for field in msg.header().iter() {
-        let name = String::from_utf8_lossy(field.name()).to_string();
-        let value = String::from_utf8_lossy(field.value()).to_string();
-        response_headers.push((name, value));
-    }
-    let response_body = msg.content().to_vec();
-
-    Ok((status, response_headers, response_body))
+    // Headers as lossy UTF-8 text; the trailer section is not read
+    let response_headers = response.headers_utf8_lossy();
+    Ok((response.status, response_headers, response.body))
 }
 
 const GRPC_UNAVAILABLE: &str = "14";
@@ -1203,19 +1044,71 @@ fn grpc_error(code: &'static str, message: &str) -> Response<BoxBody<Bytes, Infa
 mod tests {
     use super::*;
     use base64::Engine;
+    use std::cell::Cell;
+    use std::sync::Mutex as StdMutex;
+    use zodl_ohttp_client::encode_bhttp_request;
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// One X25519 key configuration offering HKDF-SHA256 + AES-128-GCM, with `public_key`.
+    fn key_document(key_id: u8, public_key: [u8; 32]) -> Vec<u8> {
+        // Length(41) || key_id || kem=0x0020 || pk[32] || suites_len=4 || kdf=1 || aead=1
+        let mut doc = vec![0x00, 0x29, key_id, 0x00, 0x20];
+        doc.extend_from_slice(&public_key);
+        doc.extend_from_slice(&[0x00, 0x04, 0x00, 0x01, 0x00, 0x01]);
+        doc
+    }
+
+    /// A key the HPKE sender accepts (the X25519 base point), selected as Slipstream selects.
+    fn test_key() -> KeyConfig {
+        let mut public_key = [0u8; 32];
+        public_key[0] = 9;
+        KeyConfig::select_with(
+            &key_document(1, public_key),
+            &ClientProfile::SLIPSTREAM.key_selection,
+        )
+        .expect("select")
+    }
+
+    fn test_request() -> BhttpRequest {
+        BhttpRequest::new(
+            "POST",
+            "gw.example",
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/Ping",
+        )
+        .header("content-type", "application/grpc")
+        .body(vec![0, 0, 0, 0, 0])
+    }
+
+    fn outer_answer(status: u16) -> RelayAnswer {
+        RelayAnswer {
+            status: StatusCode::from_u16(status).expect("status"),
+            content_type: None,
+            body: b"nope".to_vec(),
+        }
+    }
 
     #[test]
-    fn parses_rfc9458_key_config_document() {
-        // Length(41) || key_id=1 || kem=0x0020 || pk[32] || suites_len=4 || kdf=1 || aead=1
-        let mut doc = vec![0x00, 0x29, 0x01, 0x00, 0x20];
-        doc.extend_from_slice(&[0xAB; 32]);
-        doc.extend_from_slice(&[0x00, 0x04, 0x00, 0x01, 0x00, 0x01]);
-        let not_after = 9999999999u64; // Far future
-        let cfg = KeyConfig::parse_supported(&doc, not_after).expect("parse");
-        assert_eq!(cfg.key_id, 1);
-        assert_eq!(cfg.public_key, [0xAB; 32]);
-        assert_eq!(cfg.not_after, not_after);
-        assert_eq!(cfg.header(), [1, 0x00, 0x20, 0x00, 0x01, 0x00, 0x01]);
+    fn selects_the_first_key_that_offers_the_suite() {
+        let cfg = KeyConfig::select_with(
+            &key_document(1, [0xAB; 32]),
+            &ClientProfile::SLIPSTREAM.key_selection,
+        )
+        .expect("select");
+        assert_eq!(cfg.key_id(), 1);
+        assert_eq!(cfg.public_key(), &[0xAB; 32]);
+    }
+
+    #[test]
+    fn skips_a_non_x25519_configuration() {
+        // key_id=2, kem=0x0010, two bytes of key material: skipped unread, next one chosen.
+        let mut doc = vec![0x00, 0x05, 0x02, 0x00, 0x10, 0xFF, 0xFF];
+        doc.extend_from_slice(&key_document(7, [0x33; 32]));
+        let cfg =
+            KeyConfig::select_with(&doc, &ClientProfile::SLIPSTREAM.key_selection).expect("select");
+        assert_eq!(cfg.key_id(), 7);
     }
 
     #[test]
@@ -1223,7 +1116,7 @@ mod tests {
         let mut doc = vec![0x00, 0x29, 0x01, 0x00, 0x20];
         doc.extend_from_slice(&[0x01; 32]);
         doc.extend_from_slice(&[0x00, 0x04, 0x00, 0x02, 0x00, 0x03]);
-        assert!(KeyConfig::parse_supported(&doc, 9999999999).is_err());
+        assert!(KeyConfig::select_with(&doc, &ClientProfile::SLIPSTREAM.key_selection).is_err());
     }
 
     #[test]
@@ -1233,25 +1126,9 @@ mod tests {
         assert!(relay_for("zec.rocks").is_none());
     }
 
-    /// C-01 fix test: Verify that signature verification rejects tampered configs.
-    /// This test MUST FAIL if the signature check is removed or bypassed.
-    #[test]
-    fn rejects_invalid_signature_in_signed_config() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        // Build a minimal valid OHTTP key config document
-        let mut config_doc = vec![0x00, 0x29, 0x01, 0x00, 0x20];
-        config_doc.extend_from_slice(&[0xCD; 32]); // dummy public key
-        config_doc.extend_from_slice(&[0x00, 0x04, 0x00, 0x01, 0x00, 0x01]);
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let not_before = now - 60;
-        let not_after = now + 3600;
-
-        // Create a signed envelope with INVALID signature (all zeros)
+    /// A signed envelope for `testnet` with the given window and a signature of zeros.
+    fn unsigned_testnet_envelope(not_before: u64, not_after: u64) -> Vec<u8> {
+        let config_doc = key_document(1, [0xCD; 32]);
         let envelope = serde_json::json!({
             "v": 1,
             "network": "testnet",
@@ -1261,179 +1138,343 @@ mod tests {
             "key_id": "a3620fb6",
             "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
+        serde_json::to_vec(&envelope).unwrap()
+    }
 
-        let json = serde_json::to_vec(&envelope).unwrap();
-        let result = verify_signed_config(&json, "ohttp-gateway-testnet.example");
-
-        // MUST reject the invalid signature
-        assert!(
-            result.is_err(),
-            "verify_signed_config must reject invalid signature"
-        );
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("signature verification failed") || err.contains("Ed25519"),
-            "error must indicate signature failure, got: {err}"
-        );
+    /// C-01 fix test: Verify that signature verification rejects tampered configs.
+    /// This test MUST FAIL if the signature check is removed or bypassed.
+    #[test]
+    fn rejects_invalid_signature_in_signed_config() {
+        let now = unix_now().unwrap();
+        let json = unsigned_testnet_envelope(now - 60, now + 3600);
+        let err = open_signed_keys(
+            &ClientProfile::SLIPSTREAM,
+            &json,
+            "ohttp-gateway-testnet.example",
+            now,
+        )
+        .expect_err("verify must reject an invalid signature");
+        assert!(err.contains("bad signature"), "got: {err}");
     }
 
     /// C-01 fix test: Verify that expired configs are rejected.
     #[test]
     fn rejects_expired_signed_config() {
-        use std::time::{SystemTime, UNIX_EPOCH};
-
-        let mut config_doc = vec![0x00, 0x29, 0x01, 0x00, 0x20];
-        config_doc.extend_from_slice(&[0xEF; 32]);
-        config_doc.extend_from_slice(&[0x00, 0x04, 0x00, 0x01, 0x00, 0x01]);
-
-        // Set validity window in the past
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let not_before = now - 7200; // 2 hours ago
-        let not_after = now - 3600; // 1 hour ago (expired)
-
-        let envelope = serde_json::json!({
-            "v": 1,
-            "network": "testnet",
-            "configs": base64::prelude::BASE64_STANDARD.encode(&config_doc),
-            "not_before": not_before,
-            "not_after": not_after,
-            "key_id": "a3620fb6",
-            "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
-        });
-
-        let json = serde_json::to_vec(&envelope).unwrap();
-        let result = verify_signed_config(&json, "ohttp-gateway-testnet.example");
-
-        assert!(result.is_err(), "must reject expired config");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("expired"),
-            "error must indicate expiration, got: {err}"
-        );
+        let now = unix_now().unwrap();
+        let json = unsigned_testnet_envelope(now - 7200, now - 3600);
+        let err = open_signed_keys(
+            &ClientProfile::SLIPSTREAM,
+            &json,
+            "ohttp-gateway-testnet.example",
+            now,
+        )
+        .expect_err("must reject expired config");
+        assert!(err.contains("validity window"), "got: {err}");
     }
 
     /// C-01 fix test: Verify that configs with too-long validity windows are rejected.
     #[test]
     fn rejects_long_validity_window() {
-        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = unix_now().unwrap();
+        let json = unsigned_testnet_envelope(now, now + 25 * 60 * 60);
+        let err = open_signed_keys(
+            &ClientProfile::SLIPSTREAM,
+            &json,
+            "ohttp-gateway-testnet.example",
+            now,
+        )
+        .expect_err("must reject validity window >24h");
+        assert!(err.contains("longer than a day"), "got: {err}");
+    }
 
-        let mut config_doc = vec![0x00, 0x29, 0x01, 0x00, 0x20];
-        config_doc.extend_from_slice(&[0x12; 32]);
-        config_doc.extend_from_slice(&[0x00, 0x04, 0x00, 0x01, 0x00, 0x01]);
+    /// The envelope is checked against the network the gateway host names: a testnet envelope
+    /// does not verify for the mainnet gateway.
+    #[test]
+    fn rejects_envelope_for_the_other_network() {
+        let now = unix_now().unwrap();
+        let json = unsigned_testnet_envelope(now - 60, now + 3600);
+        let err = open_signed_keys(
+            &ClientProfile::SLIPSTREAM,
+            &json,
+            "ohttp-gateway.example",
+            now,
+        )
+        .expect_err("network binding");
+        assert!(err.contains("signed for"), "got: {err}");
+    }
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let not_before = now;
-        let not_after = now + 25 * 60 * 60; // 25 hours (exceeds 24h limit)
+    #[test]
+    fn grpc_request_forwards_only_grpc_headers_in_lower_case() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/grpc"));
+        headers.insert("te", HeaderValue::from_static("trailers"));
+        headers.insert("grpc-timeout", HeaderValue::from_static("5S"));
+        headers.insert("x-secret", HeaderValue::from_static("hunter2"));
+        let request = grpc_request("gw.zodl.com", "POST", "/a.B/C", &headers, b"xyz");
+        assert_eq!(request.scheme, b"https");
+        assert_eq!(request.authority, b"gw.zodl.com");
+        assert_eq!(request.path, b"/a.B/C");
+        assert_eq!(request.body, b"xyz");
+        let encoded =
+            encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).expect("encode");
+        assert!(contains(&encoded, b"grpc-timeout"));
+        assert!(contains(&encoded, b"content-type"));
+        assert!(!contains(&encoded, b"x-secret"));
+    }
 
-        let envelope = serde_json::json!({
-            "v": 1,
-            "network": "testnet",
-            "configs": base64::prelude::BASE64_STANDARD.encode(&config_doc),
-            "not_before": not_before,
-            "not_after": not_after,
-            "key_id": "a3620fb6",
-            "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
-        });
+    #[test]
+    fn http_profile_keeps_header_names_as_given_and_grpc_profile_lowercases() {
+        let request = BhttpRequest::new("GET", "h.example", "/").header("X-Custom", "1");
+        let as_given =
+            encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM_HTTP.encode).unwrap();
+        assert!(contains(&as_given, b"X-Custom"));
+        let lowered = encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).unwrap();
+        assert!(contains(&lowered, b"x-custom") && !contains(&lowered, b"X-Custom"));
+    }
 
-        let json = serde_json::to_vec(&envelope).unwrap();
-        let result = verify_signed_config(&json, "ohttp-gateway-testnet.example");
+    #[test]
+    fn grpc_response_fields_are_split_into_headers_and_trailers() {
+        let response = BhttpResponse {
+            status: 200,
+            informational: Vec::new(),
+            headers: vec![
+                (b"content-type".to_vec(), b"application/grpc".to_vec()),
+                (b"grpc-status".to_vec(), b"0".to_vec()),
+                (b"x-other".to_vec(), b"y".to_vec()),
+            ],
+            body: Vec::new(),
+            // The Binary HTTP trailer section is not read.
+            trailers: vec![(b"grpc-message".to_vec(), b"ignored".to_vec())],
+        };
+        let (status, headers, trailers) = grpc_parts(&response);
+        assert_eq!(status, 200);
+        assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
+        assert!(headers.get("x-other").is_none());
+        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
+        assert!(trailers.get("grpc-message").is_none());
+    }
 
-        assert!(result.is_err(), "must reject validity window >24h");
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("validity window too long") || err.contains("24"),
-            "error must indicate validity window issue, got: {err}"
-        );
+    #[test]
+    fn a_response_without_grpc_status_is_internal() {
+        let response = BhttpResponse {
+            status: 502,
+            informational: Vec::new(),
+            headers: Vec::new(),
+            body: Vec::new(),
+            trailers: Vec::new(),
+        };
+        let (status, headers, trailers) = grpc_parts(&response);
+        assert_eq!(status, 502);
+        assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
+        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
+    }
+
+    /// C-08: a relay POST is never sent twice with the same ciphertext. The gateway answers a
+    /// repeat with 409, so after a failure before the send the request is sealed again.
+    #[tokio::test]
+    async fn a_relay_post_that_failed_before_send_is_sealed_again() {
+        let bodies = StdMutex::new(Vec::<Vec<u8>>::new());
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |body| {
+                bodies.lock().unwrap().push(body);
+                async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 send: closed".into())) }
+            },
+            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+        )
+        .await;
+        let Err(RoundTripError::Transport(message)) = result else {
+            panic!("expected a transport error, got {result:?}");
+        };
+        assert!(message.contains("h2 send"), "got: {message}");
+        let bodies = bodies.into_inner().unwrap();
+        assert_eq!(bodies.len(), 2, "one pre-send retry");
+        assert_eq!(bodies[0].len(), bodies[1].len());
+        assert_ne!(bodies[0], bodies[1], "a retry must carry fresh ciphertext");
+    }
+
+    /// Only a failure before the send is retried; after it the answer decides.
+    #[tokio::test]
+    async fn an_outer_error_after_a_pre_send_retry_is_not_retried() {
+        let bodies = StdMutex::new(Vec::<Vec<u8>>::new());
+        let calls = Cell::new(0u32);
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |body| {
+                bodies.lock().unwrap().push(body);
+                let n = calls.get();
+                calls.set(n + 1);
+                async move {
+                    if n == 0 {
+                        Err(HttpsError::PreSend("h2 ready: closed".into()))
+                    } else {
+                        Ok(outer_answer(503))
+                    }
+                }
+            },
+            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+        )
+        .await;
+        let Err(RoundTripError::Transport(message)) = result else {
+            panic!("expected a transport error, got {result:?}");
+        };
+        assert_eq!(message, "relay/gateway HTTP 503 Service Unavailable: nope");
+        let bodies = bodies.into_inner().unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_ne!(bodies[0], bodies[1]);
+    }
+
+    /// An outer 400 or 422 means the gateway does not know the key: refetch it, seal again and
+    /// post once more, whatever the body says; the second one is final.
+    #[tokio::test]
+    async fn outer_400_and_422_refetch_the_key_and_retry_once_with_a_new_sealing() {
+        for status in [400u16, 422] {
+            let bodies = StdMutex::new(Vec::<Vec<u8>>::new());
+            let refetches = Cell::new(0u32);
+            let result = run_exchange(
+                &ClientProfile::SLIPSTREAM,
+                test_key(),
+                &test_request(),
+                |body| {
+                    bodies.lock().unwrap().push(body);
+                    async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
+                },
+                || {
+                    refetches.set(refetches.get() + 1);
+                    async { Ok::<KeyConfig, String>(test_key()) }
+                },
+            )
+            .await;
+            let Err(RoundTripError::Transport(message)) = result else {
+                panic!("expected a transport error, got {result:?}");
+            };
+            assert!(
+                message.starts_with(&format!("relay/gateway HTTP {status}")),
+                "got: {message}"
+            );
+            assert_eq!(refetches.get(), 1, "status {status}");
+            let bodies = bodies.into_inner().unwrap();
+            assert_eq!(bodies.len(), 2, "status {status}");
+            assert_ne!(bodies[0], bodies[1], "status {status}");
+        }
+    }
+
+    /// Other outer errors are final: no refetch, no second post.
+    #[tokio::test]
+    async fn other_outer_errors_are_final() {
+        for status in [401u16, 409, 413, 426, 500, 502, 503] {
+            let posts = Cell::new(0u32);
+            let result = run_exchange(
+                &ClientProfile::SLIPSTREAM,
+                test_key(),
+                &test_request(),
+                |_body| {
+                    posts.set(posts.get() + 1);
+                    async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
+                },
+                || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            )
+            .await;
+            let Err(RoundTripError::Transport(message)) = result else {
+                panic!("expected a transport error, got {result:?}");
+            };
+            assert!(
+                message.starts_with(&format!("relay/gateway HTTP {status}")),
+                "got: {message}"
+            );
+            assert_eq!(posts.get(), 1, "status {status}");
+        }
+    }
+
+    /// A success status whose body is not a sealed response for this request is an error, not a
+    /// panic or a bogus answer.
+    #[tokio::test]
+    async fn a_success_answer_that_does_not_open_is_an_error() {
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |_body| async {
+                Ok::<RelayAnswer, HttpsError>(RelayAnswer {
+                    status: StatusCode::OK,
+                    content_type: Some("message/ohttp-res".into()),
+                    body: vec![7; 64],
+                })
+            },
+            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+        )
+        .await;
+        assert!(matches!(result, Err(RoundTripError::Transport(_))));
     }
 
     /// Behavioral test: `http_round_trip` only connects to the relay, never the origin.
     /// OHTTP's privacy guarantee depends on the gateway receiving requests only from
     /// the relay's IP - direct connections to the origin would leak the client IP.
     ///
-    /// Test approach: Set up a local fake relay that records connections, call
-    /// http_round_trip with origin="https://origin.invalid/api" (unresolvable .invalid TLD),
-    /// assert exactly one POST to relay with content-type message/ohttp-req, zero to origin.
-    /// If http_round_trip tried to connect to origin.invalid, it would fail DNS resolution.
+    /// Test approach: a local fake relay listens on a loopback port; `http_round_trip_via` is
+    /// pointed at it with the origin "https://origin.invalid/api/vote" (unresolvable .invalid
+    /// TLD). The first thing the client does is open a TLS connection to the relay for the
+    /// signed key configuration, and that is what the fake relay sees: a TLS ClientHello.
+    /// Nothing can be sent to the origin, and the error the call ends with names the relay.
     #[tokio::test]
     async fn http_round_trip_relay_only_no_origin_connection() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncReadExt;
         use tokio::net::TcpListener;
 
-        // Bind fake relay to random available port
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind fake relay");
         let relay_addr = listener.local_addr().expect("relay addr");
 
-        // Override relay URL to point to our fake relay (debug builds only)
-        set_relay_url_override(Some(format!("http://127.0.0.1:{}", relay_addr.port())));
-
-        // Spawn fake relay task: accept one connection, read HTTP request, verify it's POST with
-        // content-type message/ohttp-req, then return a minimal response (can be error - we only
-        // care about the request side for this test).
+        // Fake relay: accept one connection, read what the client sends first, hang up.
         let relay_task = tokio::spawn(async move {
             let (mut socket, _peer) = listener
                 .accept()
                 .await
                 .expect("fake relay accept connection");
-
-            // Read HTTP request line + headers until \r\n\r\n
             let mut buf = vec![0u8; 4096];
-            let n = socket.read(&mut buf).await.expect("read request");
-            let request = String::from_utf8_lossy(&buf[..n]);
-
-            // Assert it's a POST with content-type message/ohttp-req
-            assert!(
-                request.starts_with("POST "),
-                "relay must receive POST, got: {}",
-                request.lines().next().unwrap_or("")
-            );
-            assert!(
-                request.contains("content-type: message/ohttp-req")
-                    || request.contains("Content-Type: message/ohttp-req"),
-                "relay must receive content-type message/ohttp-req"
-            );
-
-            // Return minimal HTTP response (gateway would normally decrypt and forward, but we
-            // don't have the HPKE key - just return 500 to end the connection)
-            let response = b"HTTP/1.1 500 Test\r\nContent-Length: 0\r\n\r\n";
-            let _ = socket.write_all(response).await;
-
-            // Return success marker
-            "relay received POST"
+            let n = socket.read(&mut buf).await.expect("read first bytes");
+            buf.truncate(n);
+            buf
         });
 
-        // Call http_round_trip with origin URL on unresolvable host origin.invalid.
-        // If http_round_trip tried to connect to this origin, it would fail DNS resolution
-        // before reaching here. Success proves it only connects to the relay.
-        let result = http_round_trip(
-            "test-gateway.zodl.com", // Any gateway name (relay override is active)
-            Dialer::Direct,
-            "POST",
-            "https://origin.invalid/api/vote", // Unresolvable .invalid TLD
-            &[("content-type".to_string(), "application/json".to_string())],
-            b"{\"vote\": 1}",
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            http_round_trip_via(
+                &format!("https://127.0.0.1:{}/relay", relay_addr.port()),
+                "test-gateway.zodl.com",
+                Dialer::Direct,
+                "POST",
+                parse_http_target("https://origin.invalid/api/vote").expect("target"),
+                &[("content-type".to_string(), "application/json".to_string())],
+                b"{\"vote\": 1}",
+            ),
         )
-        .await;
+        .await
+        .expect("http_round_trip must finish");
 
-        // The call will fail (fake relay returns 500, or OHTTP decapsulation fails), but that's
-        // expected - we're testing connection behavior, not end-to-end success.
-        // The assertion is: relay_task completes successfully, proving exactly one POST to relay.
-        let relay_result = relay_task.await.expect("relay task join");
-        assert_eq!(relay_result, "relay received POST");
-
-        // If http_round_trip had tried to connect to origin.invalid, we'd never reach here
-        // (DNS resolution error for .invalid TLD). The fact that we got this far, and relay_task
-        // completed, proves http_round_trip only connected to the relay at 127.0.0.1.
+        let first_bytes = tokio::time::timeout(Duration::from_secs(20), relay_task)
+            .await
+            .expect("relay saw a connection")
+            .expect("relay task join");
+        // 0x16 0x03: a TLS handshake record, the start of the connection to the relay.
         assert!(
-            result.is_err(),
-            "Expected fake relay to cause error (we only test connection behavior)"
+            first_bytes.len() > 2 && first_bytes[0] == 0x16 && first_bytes[1] == 0x03,
+            "relay must receive a TLS ClientHello, got {first_bytes:02x?}"
+        );
+        // The relay hung up without a TLS answer, so the call fails - at the relay.
+        let err = result.expect_err("a fake relay cannot complete the exchange");
+        assert!(
+            err.contains("127.0.0.1"),
+            "error must name the relay: {err}"
+        );
+        assert!(
+            !err.contains("origin.invalid"),
+            "the origin must never be contacted: {err}"
         );
     }
 
@@ -1502,6 +1543,9 @@ mod tests {
     #[tokio::test]
     #[ignore = "network"]
     async fn verify_signed_config_with_live_fixtures() {
+        let profile = ClientProfile::SLIPSTREAM;
+        let now = unix_now().expect("clock");
+
         // Testnet signed config via relay-simulator
         let testnet_url = "https://testnet-simulator-relay.example.invalid/ohttp-configs/signed";
         let testnet_resp = reqwest::get(testnet_url)
@@ -1512,7 +1556,12 @@ mod tests {
             .expect("read testnet body");
 
         // Valid testnet envelope should verify
-        let testnet_result = verify_signed_config(&testnet_resp, "ohttp-gateway-testnet.example");
+        let testnet_result = open_signed_keys(
+            &profile,
+            &testnet_resp,
+            "ohttp-gateway-testnet.example",
+            now,
+        );
         assert!(
             testnet_result.is_ok(),
             "testnet signed config must verify: {:?}",
@@ -1529,7 +1578,8 @@ mod tests {
             .expect("read mainnet body");
 
         // Valid mainnet envelope should verify
-        let mainnet_result = verify_signed_config(&mainnet_resp, "ohttp-gateway.example");
+        let mainnet_result =
+            open_signed_keys(&profile, &mainnet_resp, "ohttp-gateway.example", now);
         assert!(
             mainnet_result.is_ok(),
             "mainnet signed config must verify: {:?}",
@@ -1548,22 +1598,31 @@ mod tests {
         envelope["sig"] =
             serde_json::Value::String(base64::prelude::BASE64_STANDARD.encode(&sig_bytes));
         let tampered_json = serde_json::to_vec(&envelope).expect("re-serialize");
-        let tampered_result =
-            verify_signed_config(&tampered_json, "ohttp-gateway-testnet.example");
+        let tampered_result = open_signed_keys(
+            &profile,
+            &tampered_json,
+            "ohttp-gateway-testnet.example",
+            now,
+        );
         assert!(
             tampered_result.is_err(),
             "tampered signature must be rejected"
         );
 
-        // Wrong-network test: mainnet envelope to testnet gateway (P3)
-        let wrong_network = verify_signed_config(&mainnet_resp, "ohttp-gateway-testnet.example");
+        // Wrong-network test: mainnet config to testnet gateway (P3)
+        let wrong_network = open_signed_keys(
+            &profile,
+            &mainnet_resp,
+            "ohttp-gateway-testnet.example",
+            now,
+        );
         assert!(
             wrong_network.is_err(),
             "mainnet config to testnet gateway must be rejected (network binding)"
         );
         let err = wrong_network.unwrap_err();
         assert!(
-            err.contains("network mismatch") || err.contains("key_id"),
+            err.contains("signed for") || err.contains("signed by key"),
             "error must indicate network mismatch, got: {err}"
         );
     }
@@ -1680,316 +1739,5 @@ mod tests {
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_writer(std::io::stderr)
             .try_init()
-    }
-}
-
-/// Client trace ID generator for debug request tracking (Rust side, bulk sync path).
-/// Format: `<prefix>-<sessionUuid>-<seq>` where seq is zero-padded 6 digits, total ≤ 64 chars.
-/// The session UUID is generated once when the generator is created.
-mod client_trace {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use uuid::Uuid;
-
-    pub struct ClientTrace {
-        prefix: String,
-        session_uuid: Uuid,
-        counter: AtomicU64,
-    }
-
-    impl ClientTrace {
-        pub fn new(prefix: &str) -> Self {
-            let sanitized = sanitize_prefix(prefix);
-            Self {
-                prefix: sanitized,
-                session_uuid: Uuid::new_v4(),
-                counter: AtomicU64::new(0),
-            }
-        }
-
-        pub fn next(&self) -> String {
-            let seq = self.counter.fetch_add(1, Ordering::Relaxed);
-            let full = format!("{}-{}-{:06}", self.prefix, self.session_uuid, seq);
-            if full.len() <= 64 {
-                full
-            } else {
-                full[..64].to_string()
-            }
-        }
-    }
-
-    fn sanitize_prefix(prefix: &str) -> String {
-        // Keep only [A-Za-z0-9._:-], ensure first char is alphanumeric
-        let cleaned: String = prefix
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
-            .collect();
-        if cleaned.is_empty() {
-            return "trace".to_string();
-        }
-        if cleaned.chars().next().unwrap().is_ascii_alphanumeric() {
-            cleaned
-        } else {
-            // Drop leading non-alphanumeric
-            let result: String = cleaned
-                .chars()
-                .skip_while(|c| !c.is_ascii_alphanumeric())
-                .collect();
-            if result.is_empty() {
-                "trace".to_string()
-            } else {
-                result
-            }
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn test_sanitize_prefix() {
-            assert_eq!(sanitize_prefix("test-wallet"), "test-wallet");
-            assert_eq!(sanitize_prefix("test@wallet#123"), "testwallet123");
-            assert_eq!(sanitize_prefix("___abc"), "abc");
-            assert_eq!(sanitize_prefix(""), "trace");
-            assert_eq!(sanitize_prefix("___"), "trace");
-        }
-
-        #[test]
-        fn test_trace_format() {
-            let trace = ClientTrace::new("yassi");
-            let id1 = trace.next();
-            let id2 = trace.next();
-            // Format: yassi-<uuid>-000000
-            assert!(id1.starts_with("yassi-"));
-            assert!(id1.len() <= 64);
-            // Sequence must increment
-            let parts1: Vec<&str> = id1.rsplitn(2, '-').collect();
-            let parts2: Vec<&str> = id2.rsplitn(2, '-').collect();
-            assert_eq!(parts1[0], "000000");
-            assert_eq!(parts2[0], "000001");
-        }
-
-        #[test]
-        fn test_truncation() {
-            let long_prefix = "a".repeat(60);
-            let trace = ClientTrace::new(&long_prefix);
-            let id = trace.next();
-            assert_eq!(id.len(), 64);
-        }
-    }
-
-    /// C-08 audit fix verification tests: ensure OHTTP relay POST is never retried on h2 errors,
-    /// while key config GET can safely retry. Without the fix, h2 connection failures would retry
-    /// with the same encapsulated ciphertext, violating nonce-once and triggering gateway 409.
-    #[cfg(test)]
-    mod c08_retry_tests {
-        /// Test that https() respects the allow_retry parameter.
-        /// When allow_retry is false (OHTTP relay POST), h2 errors must NOT retry.
-        /// When allow_retry is true (key config GET), h2 errors can retry once.
-        #[test]
-        fn test_https_allow_retry_parameter() {
-            // This test verifies the signature change to https() method.
-            // The method signature must include `allow_retry: bool` parameter:
-            //   async fn https(..., body: Vec<u8>, allow_retry: bool) -> Result<...>
-            //
-            // And the retry loop must respect it:
-            //   let max_attempts = if allow_retry { 2 } else { 1 };
-            //   for attempt in 0..(max_attempts) { ... }
-            //
-            // Verify by reading the source:
-            let source = include_str!("ohttp.rs");
-
-            // Check signature has allow_retry parameter
-            assert!(
-                source.contains("async fn https(") && source.contains("allow_retry: bool,"),
-                "C-08 fix: https() must have allow_retry: bool parameter"
-            );
-
-            // Check retry loop uses allow_retry
-            assert!(
-                source.contains("let max_attempts = if allow_retry { 2 } else { 1 };"),
-                "C-08 fix: https() retry loop must respect allow_retry parameter"
-            );
-
-            // Check the comment explaining the fix
-            assert!(
-                source.contains("C-08")
-                    && source.contains("OHTTP relay POST")
-                    && source.contains("nonce-once"),
-                "C-08 fix: https() must document why OHTTP relay POSTs cannot retry"
-            );
-        }
-
-        /// Test that round_trip() calls https() with allow_retry: false for relay POST.
-        /// This prevents replaying the same sealed ciphertext on h2 connection errors.
-        #[test]
-        fn test_round_trip_no_retry_on_relay_post() {
-            let source = include_str!("ohttp.rs");
-
-            // Verify round_trip() calls https() with allow_retry: false
-            // The call is in round_trip() around line 811-819:
-            //   let (status, body) = self.https(
-            //       &self.relay,
-            //       Method::POST,
-            //       Some("message/ohttp-req"),
-            //       "message/ohttp-res",
-            //       enc_req,
-            //       false,  // C-08: never retry OHTTP relay POST
-            //   ).await?;
-            assert!(
-                source.contains("async fn round_trip(&self, bhttp_request: &[u8])")
-                    && source.contains("self.https(")
-                    && source.contains("Some(\"message/ohttp-req\")")
-                    && source.contains("false, // C-08: never retry OHTTP relay POST"),
-                "C-08 fix: round_trip() must call https() with allow_retry: false for OHTTP relay POST"
-            );
-
-            // Verify encapsulation happens BEFORE the https() call, inside the retry loop
-            // This proves that key-rotation retry (the outer loop in round_trip) re-encapsulates,
-            // while h2-connection retry (inside https) does not.
-            assert!(
-                source.contains("for attempt in 0..2 {")
-                    && source.contains("let (enc_req, ctx) = encapsulate(&key, bhttp_request)?;")
-                    && source.contains("self.https("),
-                "round_trip() must encapsulate before each https() call (key rotation retry is safe)"
-            );
-        }
-
-        /// Test that key_config() calls https() with allow_retry: true for key config GET.
-        /// Key config fetches are idempotent, so h2 connection retries are safe.
-        #[test]
-        fn test_key_config_allows_retry() {
-            let source = include_str!("ohttp.rs");
-
-            // Verify key_config() calls https() with allow_retry: true
-            // The call is in key_config() around line 779-787:
-            //   let (status, json_bytes) = self.https(
-            //       &signed_config_target,
-            //       Method::GET,
-            //       None,
-            //       "application/json",
-            //       Vec::new(),
-            //       true,  // allow_retry: key config GET can safely retry
-            //   ).await?;
-            assert!(
-                source.contains("async fn key_config(&self, refresh: bool)")
-                    && source.contains("self.https(")
-                    && source.contains("Method::GET")
-                    && source.contains("\"application/json\"")
-                    && source.contains("true, // allow_retry: key config GET can safely retry"),
-                "C-08 fix: key_config() must call https() with allow_retry: true for GET requests"
-            );
-        }
-
-        /// Document the production call path for OHTTP relay POST.
-        #[test]
-        fn test_ohttp_relay_post_call_path() {
-            // Production call path for an OHTTP-encapsulated gRPC request:
-            //
-            // 1. Client calls OhttpEngine.send() with a bHTTP request
-            // 2. OhttpEngine.send() calls round_trip(bhttp_request)
-            // 3. round_trip() has TWO retry mechanisms:
-            //    a) Outer loop (0..2): retries on HTTP 400 (key rotation) with fresh encapsulation
-            //    b) Inner https() call: used to retry h2 connection errors (FIXED: now disabled)
-            // 4. round_trip() calls encapsulate(&key, bhttp_request) — creates sealed ciphertext
-            // 5. round_trip() calls https(..., enc_req, false) — sends to relay, allow_retry: false
-            // 6. https() has a loop (0..max_attempts), where max_attempts = if allow_retry { 2 } else { 1 }
-            // 7. Without the fix, https() would retry on h2 send errors, resending the same enc_req
-            // 8. With the fix, https() only attempts once for OHTTP relay POSTs
-            //
-            // Key insight: encapsulation (step 4) happens OUTSIDE the https() retry loop, so any
-            // retry inside https() would resend the same ciphertext. The fix disables those retries
-            // for OHTTP relay POSTs by passing allow_retry: false.
-
-            let source = include_str!("ohttp.rs");
-
-            // Verify the flow described above exists in the code
-            assert!(
-                source.contains("pub async fn send(&self, req: &[u8])")
-                    && source.contains("self.engine.round_trip(req)"),
-                "OhttpEngine.send() must call round_trip()"
-            );
-
-            assert!(
-                source.contains("async fn round_trip(&self, bhttp_request: &[u8])")
-                    && source.contains("encapsulate(&key, bhttp_request)"),
-                "round_trip() must call encapsulate() to seal the request"
-            );
-
-            assert!(
-                source.contains("fn encapsulate(key: &KeyConfig, plaintext: &[u8])")
-                    && source.contains("§4.3"),
-                "encapsulate() must implement RFC 9458 §4.3 (request encapsulation)"
-            );
-        }
-
-        /// Document why h2 retry is problematic for OHTTP but safe for key config.
-        #[test]
-        fn test_why_h2_retry_is_problematic() {
-            // Without the C-08 fix, the problematic flow was:
-            //
-            // 1. round_trip() encapsulates: (enc_req, ctx) = encapsulate(&key, bhttp_request)
-            // 2. round_trip() calls https(..., enc_req, allow_retry: true)  ← OLD CODE
-            // 3. https() tries to send enc_req over h2
-            // 4. h2.send_request() fails (e.g., connection closed)
-            // 5. https() detects attempt == 0, retries (continue)
-            // 6. https() builds a NEW request with body.clone() — but body is ALREADY enc_req!
-            // 7. Second send_request() sends the SAME sealed ciphertext again
-            // 8. If first attempt partially succeeded (reached gateway), gateway has the nonce
-            // 9. Second attempt gets HTTP 409 (nonce replay detected by gateway)
-            //
-            // Why key config GET is safe to retry:
-            // - No OHTTP encapsulation (no nonce)
-            // - Idempotent (same response every time)
-            // - No replay cache on the server
-            //
-            // The fix: allow_retry: false for OHTTP relay POSTs, allow_retry: true for key config GETs.
-            // This test exists purely to document the C-08 fix reasoning above.
-        }
-
-        /// Test that http_round_trip() public API exists with the expected signature.
-        #[test]
-        fn test_http_round_trip_signature() {
-            let source = include_str!("ohttp.rs");
-
-            // Verify the public function exists
-            assert!(
-                source.contains("pub async fn http_round_trip("),
-                "http_round_trip() must be public"
-            );
-
-            // Verify it takes the expected parameters
-            assert!(
-                source.contains("gateway_host: &str,")
-                    && source.contains("dialer: Dialer,")
-                    && source.contains("method: &str,")
-                    && source.contains("url: &str,")
-                    && source.contains("headers: &[(String, String)],")
-                    && source.contains("body: &[u8],"),
-                "http_round_trip() must have the expected parameters"
-            );
-
-            // Verify it returns the expected type
-            assert!(
-                source.contains("-> Result<(u16, Vec<(String, String)>, Vec<u8>), String>"),
-                "http_round_trip() must return (status, headers, body)"
-            );
-
-            // Verify it calls OhttpClient::new() and round_trip()
-            assert!(
-                source.contains("let client = OhttpClient::new(")
-                    && source.contains("client.round_trip("),
-                "http_round_trip() must create OhttpClient and call round_trip()"
-            );
-
-            // Verify it encodes/decodes BHTTP
-            assert!(
-                source.contains("bhttp::Message::request(")
-                    && source.contains("msg.write_bhttp(")
-                    && source.contains("bhttp::Message::read_bhttp"),
-                "http_round_trip() must encode and decode BHTTP"
-            );
-        }
     }
 }

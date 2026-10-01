@@ -474,15 +474,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bhttp"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2bc657efe5aa3821f1cacfb47665c32849e09820844bff9f5066227312829fa3"
-dependencies = [
- "thiserror 1.0.69",
-]
-
-[[package]]
 name = "bincode"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8347,22 +8338,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
-name = "zodl-slipstream"
-version = "0.3.0-alpha.1"
+name = "zodl-ohttp-client"
+version = "0.1.0"
+source = "git+https://github.com/zodl-inc/ohttp.git?rev=18ef6f31f81d8245ede04599f4bfbe3fb9bb7d9d#18ef6f31f81d8245ede04599f4bfbe3fb9bb7d9d"
 dependencies = [
  "aes-gcm",
- "arti-client",
  "base64 0.22.1",
- "bhttp",
- "bls12_381",
- "bytes",
  "ed25519-dalek",
- "ff",
- "futures-util",
- "group",
  "hex",
  "hkdf",
  "hpke",
+ "rand_core 0.9.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
+name = "zodl-slipstream"
+version = "0.3.0-alpha.1"
+dependencies = [
+ "arti-client",
+ "base64 0.22.1",
+ "bls12_381",
+ "bytes",
+ "ff",
+ "futures-util",
+ "group",
  "http",
  "http-body",
  "http-body-util",
@@ -8374,7 +8378,6 @@ dependencies = [
  "pasta_curves",
  "prost",
  "rand 0.8.8",
- "rand_core 0.9.5",
  "rayon",
  "reqwest",
  "rusqlite",
@@ -8383,9 +8386,7 @@ dependencies = [
  "schemerz",
  "schemerz-rusqlite",
  "secrecy",
- "serde",
  "serde_json",
- "sha2 0.10.9",
  "shardtree",
  "sinsemilla",
  "tempfile",
@@ -8410,6 +8411,7 @@ dependencies = [
  "zcash_script",
  "zcash_transparent",
  "zip32",
+ "zodl-ohttp-client",
  "zodl-slipstream-gpuhash",
 ]
 

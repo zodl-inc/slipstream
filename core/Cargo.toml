@@ -57,28 +57,21 @@ futures-util = { workspace = true }
 # Tor and OHTTP transport dependencies
 arti-client = { version = "0.35", default-features = false, features = ["compression", "rustls", "tokio", "onion-service-client"] }
 tor-rtcompat = "0.35"
-aes-gcm = "0.10"
-bhttp = "0.5"
 bytes = "1"
-hkdf = "0.12"
-hpke = { version = "0.13", default-features = false, features = ["std", "x25519", "alloc"] }
 http = "1"
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
-rand_core = { version = "0.9", features = ["os_rng"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-sha2 = "0.10"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tower-service = "0.3"
 webpki-roots = "0.26"
-# C-01 fix: Ed25519 signature verification for signed OHTTP configs
-ed25519-dalek = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
-hex = "0.4"
+# Shared sans-IO OHTTP core (HPKE encapsulation, Binary HTTP, signed-config verification, key
+# selection, outer-status classification, size limits). `default-features = false`: the `client`
+# feature would pull reqwest, and Slipstream does its own I/O.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "18ef6f31f81d8245ede04599f4bfbe3fb9bb7d9d", default-features = false }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # T10b spend-proof: the sapling stub prover's trait signatures name these types
@@ -90,8 +83,10 @@ bls12_381 = { workspace = true }
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = "0.3"
-# For live signed-config verification tests
+# For live signed-config verification tests and the hand-built envelopes of the ohttp tests
 reqwest = "0.12"
+serde_json = "1"
+base64 = "0.22"
 
 [features]
 default = ["zcash_client_sqlite"]
