@@ -1439,6 +1439,7 @@ mod tests {
                 async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 send: closed".into())) }
             },
             || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || {},
         )
         .await;
         let Err(RoundTripError::Transport(message)) = result else {
@@ -1473,6 +1474,7 @@ mod tests {
                 }
             },
             || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || {},
         )
         .await;
         let Err(RoundTripError::Transport(message)) = result else {
@@ -1503,6 +1505,7 @@ mod tests {
                     refetches.set(refetches.get() + 1);
                     async { Ok::<KeyConfig, String>(test_key()) }
                 },
+                || {},
             )
             .await;
             let Err(RoundTripError::Transport(message)) = result else {
@@ -1533,6 +1536,7 @@ mod tests {
                     async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
                 },
                 || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+                || {},
             )
             .await;
             let Err(RoundTripError::Transport(message)) = result else {
@@ -1562,6 +1566,7 @@ mod tests {
                 })
             },
             || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || {},
         )
         .await;
         assert!(matches!(result, Err(RoundTripError::Transport(_))));
@@ -1903,7 +1908,7 @@ mod tests {
     /// the key config again (Direct dialer only).
     #[tokio::test]
     async fn cached_client_reuses_key_config() {
-        let fetches = StdMutex::new(0u32);
+        let _fetches = StdMutex::new(0u32);
         let client1 = get_or_create_client(
             "test-gateway-cache.zodl.com",
             "https://relay.example/relay",
