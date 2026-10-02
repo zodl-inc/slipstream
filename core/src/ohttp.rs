@@ -1509,7 +1509,7 @@ mod tests {
         let profile = ClientProfile::SLIPSTREAM;
         let now = unix_now().expect("clock");
 
-        // Testnet signed config via relay-simulator
+        // Testnet signed config: direct fetch for testing (relay URLs come from zodl-ohttp-client)
         let testnet_url = "https://testnet-simulator-relay.example.invalid/ohttp-configs/signed";
         let testnet_resp = reqwest::get(testnet_url)
             .await
@@ -1531,7 +1531,7 @@ mod tests {
             testnet_result
         );
 
-        // Mainnet signed config via the Fastly prod relay
+        // Mainnet signed config: direct fetch for testing (relay URLs come from zodl-ohttp-client)
         let mainnet_url =
             "https://mainnet-relay.example.invalid/ohttp-configs/signed";
         let mainnet_resp = reqwest::get(mainnet_url)
