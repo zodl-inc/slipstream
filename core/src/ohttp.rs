@@ -1121,6 +1121,7 @@ where
 /// [`http_round_trip`] against an explicit relay URL (the body of the public function, so a
 /// test can point it at a local relay without touching the process-wide relay table).
 /// `on_dispatch` is called right before the sealed request is posted to the relay.
+#[allow(clippy::too_many_arguments)] // one seam over the limit; bundling would hide the borrows
 async fn http_round_trip_via<D>(
     relay_url: &str,
     gateway_host: &str,
@@ -2212,7 +2213,7 @@ mod tests {
     async fn dispatch_fires_before_pre_send_retry() {
         let events = StdMutex::new(Vec::<&str>::new());
         let post_attempt = Cell::new(0u32);
-        let result = run_exchange(
+        let _result = run_exchange(
             &ClientProfile::SLIPSTREAM,
             test_key(),
             &test_request(),
