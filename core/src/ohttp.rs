@@ -85,10 +85,9 @@ static CLIENT_CACHE: OnceLock<Mutex<HashMap<ClientCacheKey, Arc<OhttpClient>>>> 
 struct ClientCacheKey {
     gateway_host: String,
     relay_url: String,
-    /// Empty string if None; distinguishes presence/absence and the prefix value.
-    trace_prefix: String,
+    trace_prefix: Option<String>,
     /// Profile identified by which const it equals (1=ANDROID, 2=IOS, 3=SLIPSTREAM,
-    /// 4=SLIPSTREAM_HTTP, 5=LIBRARY, 0=other).
+    /// 4=SLIPSTREAM_HTTP, 5=LIBRARY). Any other profile has no key and is never cached.
     profile_id: u8,
 }
 
@@ -98,7 +97,7 @@ impl ClientCacheKey {
         relay_url: &str,
         trace_prefix: Option<String>,
         profile: ClientProfile,
-    ) -> Self {
+    ) -> Option<Self> {
         let profile_id = if profile == ClientProfile::ANDROID {
             1
         } else if profile == ClientProfile::IOS {
@@ -110,15 +109,15 @@ impl ClientCacheKey {
         } else if profile == ClientProfile::LIBRARY {
             5
         } else {
-            0
+            return None;
         };
 
-        Self {
+        Some(Self {
             gateway_host: gateway_host.to_string(),
             relay_url: relay_url.to_string(),
-            trace_prefix: trace_prefix.unwrap_or_default(),
+            trace_prefix,
             profile_id,
-        }
+        })
     }
 }
 
@@ -151,8 +150,19 @@ async fn get_or_create_client(
     client_trace_prefix: Option<String>,
     profile: ClientProfile,
 ) -> Result<Arc<OhttpClient>, String> {
-    // Tor clients are never cached: each call gets a fresh client with fresh connections
-    if dialer.is_tor() {
+    // Tor clients are never cached: each call gets a fresh client with fresh connections.
+    // Neither is a profile outside the known presets, which has no distinguishing cache key.
+    let key = if dialer.is_tor() {
+        None
+    } else {
+        ClientCacheKey::new(
+            gateway_host,
+            relay_url,
+            client_trace_prefix.clone(),
+            profile,
+        )
+    };
+    let Some(key) = key else {
         return Ok(Arc::new(OhttpClient::new(
             gateway_host,
             relay_url,
@@ -160,16 +170,10 @@ async fn get_or_create_client(
             client_trace_prefix,
             profile,
         )?));
-    }
+    };
 
     // Direct clients are cached per (gateway_host, relay_url, trace_prefix, profile)
     let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = ClientCacheKey::new(
-        gateway_host,
-        relay_url,
-        client_trace_prefix.clone(),
-        profile,
-    );
     let mut map = cache.lock().await;
 
     if let Some(client) = map.get(&key) {
