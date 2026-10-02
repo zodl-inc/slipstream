@@ -78,8 +78,49 @@ static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 /// Process-wide cache of OHTTP clients for Direct-dialer connections only. Each cached client
 /// pools HTTP/2 connections and verified key configs per gateway. Tor-dialer clients are never
 /// cached (fresh client per call) to avoid linking requests across isolated circuits.
-/// Cache key: (gateway_host, relay_url).
-static CLIENT_CACHE: OnceLock<Mutex<HashMap<(String, String), Arc<OhttpClient>>>> = OnceLock::new();
+static CLIENT_CACHE: OnceLock<Mutex<HashMap<ClientCacheKey, Arc<OhttpClient>>>> = OnceLock::new();
+
+/// Cache key for OHTTP clients: gateway host, relay URL, trace prefix, and profile.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ClientCacheKey {
+    gateway_host: String,
+    relay_url: String,
+    /// Empty string if None; distinguishes presence/absence and the prefix value.
+    trace_prefix: String,
+    /// Profile identified by which const it equals (1=ANDROID, 2=IOS, 3=SLIPSTREAM,
+    /// 4=SLIPSTREAM_HTTP, 5=LIBRARY, 0=other).
+    profile_id: u8,
+}
+
+impl ClientCacheKey {
+    fn new(
+        gateway_host: &str,
+        relay_url: &str,
+        trace_prefix: Option<String>,
+        profile: ClientProfile,
+    ) -> Self {
+        let profile_id = if profile == ClientProfile::ANDROID {
+            1
+        } else if profile == ClientProfile::IOS {
+            2
+        } else if profile == ClientProfile::SLIPSTREAM {
+            3
+        } else if profile == ClientProfile::SLIPSTREAM_HTTP {
+            4
+        } else if profile == ClientProfile::LIBRARY {
+            5
+        } else {
+            0
+        };
+
+        Self {
+            gateway_host: gateway_host.to_string(),
+            relay_url: relay_url.to_string(),
+            trace_prefix: trace_prefix.unwrap_or_default(),
+            profile_id,
+        }
+    }
+}
 
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
 /// Called from JNI/FFI when the engine or TorRuntime is created.
@@ -100,9 +141,9 @@ fn get_default_client_trace_prefix() -> Option<String> {
 }
 
 /// Get or create a cached OHTTP client for the given parameters. **Privacy:** only
-/// `Dialer::Direct` clients are cached (keyed by gateway_host + relay_url); `Dialer::Tor`
-/// always creates a fresh client to avoid linking requests across isolated circuits or leaking
-/// the device IP when the caller asked for Tor.
+/// `Dialer::Direct` clients are cached (keyed by gateway_host + relay_url + trace_prefix +
+/// profile); `Dialer::Tor` always creates a fresh client to avoid linking requests across
+/// isolated circuits or leaking the device IP when the caller asked for Tor.
 async fn get_or_create_client(
     gateway_host: &str,
     relay_url: &str,
@@ -121,9 +162,14 @@ async fn get_or_create_client(
         )?));
     }
 
-    // Direct clients are cached per (gateway_host, relay_url)
+    // Direct clients are cached per (gateway_host, relay_url, trace_prefix, profile)
     let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let key = (gateway_host.to_string(), relay_url.to_string());
+    let key = ClientCacheKey::new(
+        gateway_host,
+        relay_url,
+        client_trace_prefix.clone(),
+        profile,
+    );
     let mut map = cache.lock().await;
 
     if let Some(client) = map.get(&key) {
@@ -1974,6 +2020,78 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&tor_client, &tor_client2),
             "consecutive Tor calls must get distinct clients (no caching)"
+        );
+    }
+
+    /// Different profiles or trace prefixes result in distinct cached clients.
+    #[tokio::test]
+    async fn cache_keys_include_profile_and_trace_prefix() {
+        // Same gateway+relay, different profiles → different clients
+        let client_slipstream = get_or_create_client(
+            "test-gateway-profile.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .await
+        .expect("create SLIPSTREAM client");
+
+        let client_slipstream_http = get_or_create_client(
+            "test-gateway-profile.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create SLIPSTREAM_HTTP client");
+
+        assert!(
+            !Arc::ptr_eq(&client_slipstream, &client_slipstream_http),
+            "different profiles must yield distinct cached clients"
+        );
+
+        // Same gateway+relay+profile, different trace prefixes → different clients
+        let client_no_trace = get_or_create_client(
+            "test-gateway-trace.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create client without trace prefix");
+
+        let client_with_trace = get_or_create_client(
+            "test-gateway-trace.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            Some("test-prefix".to_string()),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create client with trace prefix");
+
+        assert!(
+            !Arc::ptr_eq(&client_no_trace, &client_with_trace),
+            "different trace prefixes must yield distinct cached clients"
+        );
+
+        // Same params → same client (cache hit)
+        let client_same = get_or_create_client(
+            "test-gateway-trace.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            Some("test-prefix".to_string()),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("get cached client");
+
+        assert!(
+            Arc::ptr_eq(&client_with_trace, &client_same),
+            "identical params must yield the same cached client"
         );
     }
 
