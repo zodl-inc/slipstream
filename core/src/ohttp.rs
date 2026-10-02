@@ -75,9 +75,6 @@ pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
 /// Process-wide default client trace prefix for OHTTP connections (set once from JNI).
 static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 
-/// Process-wide relay URL override for testing (debug builds only).
-static RELAY_URL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
-
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
 /// Called from JNI/FFI when the engine or TorRuntime is created.
 ///
@@ -87,19 +84,6 @@ static RELAY_URL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 /// release profile, which silently dropped the prefix in debug app builds too.
 pub fn set_default_client_trace_prefix(prefix: Option<String>) {
     let _ = DEFAULT_CLIENT_TRACE_PREFIX.set(prefix);
-}
-
-/// Override relay URL for testing (e.g., relay-simulator). Only allowed in debug builds.
-pub fn set_relay_url_override(url: Option<String>) {
-    #[cfg(debug_assertions)]
-    {
-        let _ = RELAY_URL_OVERRIDE.set(url);
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = (url, &RELAY_URL_OVERRIDE);
-        tracing::warn!("set_relay_url_override called in release build (ignored)");
-    }
 }
 
 /// Get the default client trace prefix.
@@ -113,30 +97,11 @@ fn get_default_client_trace_prefix() -> Option<String> {
 /// different HPKE keys, and an RFC 9458 relay has a single fixed gateway target.
 ///
 /// Uses Fastly-hosted relays in production (temporary hostnames; final hostnames will be
-/// set in COR-1830). Debug builds can override via [`set_relay_url_override`] for local testing.
+/// set in COR-1830). Relay URLs can be overridden at build time via environment variables
+/// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET` (see `zodl-ohttp-client`
+/// documentation).
 pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
-    // Debug builds: check for override first
-    #[cfg(debug_assertions)]
-    {
-        if let Some(Some(override_url)) = RELAY_URL_OVERRIDE.get() {
-            // SAFETY: We leak the string to get a 'static lifetime. This is acceptable because
-            // the override is set once at startup in debug builds only.
-            return Some(Box::leak(override_url.clone().into_boxed_str()));
-        }
-    }
-
-    // Production relay URLs
-    match gateway_host {
-        "ohttp-gateway-testnet.example" => {
-            // Fastly dev relay (serves /ohttp-configs + /relay)
-            Some("https://testnet-relay.example.invalid/relay")
-        }
-        "ohttp-gateway.example" => {
-            // Fastly prod relay (serves /ohttp-configs + /relay)
-            Some("https://mainnet-relay.example.invalid/relay")
-        }
-        _ => None,
-    }
+    zodl_ohttp_client::relay_for(gateway_host)
 }
 
 /// Object-safe alias for the byte stream underneath TLS (a plain TCP socket or an arti Tor
