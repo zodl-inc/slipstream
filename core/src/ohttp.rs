@@ -75,10 +75,11 @@ pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
 /// Process-wide default client trace prefix for OHTTP connections (set once from JNI).
 static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 
-/// Process-wide cache of OHTTP clients per gateway host. Each client caches the verified key
-/// config and pools HTTP/2 connections to its relay, avoiding repeated key fetches and TLS
-/// handshakes.
-static CLIENT_CACHE: OnceLock<Mutex<HashMap<String, Arc<OhttpClient>>>> = OnceLock::new();
+/// Process-wide cache of OHTTP clients for Direct-dialer connections only. Each cached client
+/// pools HTTP/2 connections and verified key configs per gateway. Tor-dialer clients are never
+/// cached (fresh client per call) to avoid linking requests across isolated circuits.
+/// Cache key: (gateway_host, relay_url).
+static CLIENT_CACHE: OnceLock<Mutex<HashMap<(String, String), Arc<OhttpClient>>>> = OnceLock::new();
 
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
 /// Called from JNI/FFI when the engine or TorRuntime is created.
@@ -98,8 +99,10 @@ fn get_default_client_trace_prefix() -> Option<String> {
         .and_then(|opt| opt.clone())
 }
 
-/// Get or create a cached OHTTP client for the given parameters. Clients are cached by gateway
-/// host; if the relay URL or dialer changes for the same gateway, the old client is replaced.
+/// Get or create a cached OHTTP client for the given parameters. **Privacy:** only
+/// `Dialer::Direct` clients are cached (keyed by gateway_host + relay_url); `Dialer::Tor`
+/// always creates a fresh client to avoid linking requests across isolated circuits or leaking
+/// the device IP when the caller asked for Tor.
 async fn get_or_create_client(
     gateway_host: &str,
     relay_url: &str,
@@ -107,18 +110,27 @@ async fn get_or_create_client(
     client_trace_prefix: Option<String>,
     profile: ClientProfile,
 ) -> Result<Arc<OhttpClient>, String> {
-    let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().await;
-
-    // Check if we have a cached client for this gateway
-    if let Some(client) = map.get(gateway_host) {
-        // Verify it's still valid (same relay URL)
-        if client.relay_url == relay_url {
-            return Ok(Arc::clone(client));
-        }
+    // Tor clients are never cached: each call gets a fresh client with fresh connections
+    if dialer.is_tor() {
+        return Ok(Arc::new(OhttpClient::new(
+            gateway_host,
+            relay_url,
+            dialer,
+            client_trace_prefix,
+            profile,
+        )?));
     }
 
-    // Create a new client
+    // Direct clients are cached per (gateway_host, relay_url)
+    let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = (gateway_host.to_string(), relay_url.to_string());
+    let mut map = cache.lock().await;
+
+    if let Some(client) = map.get(&key) {
+        return Ok(Arc::clone(client));
+    }
+
+    // Create and cache a new Direct-dialer client
     let client = Arc::new(OhttpClient::new(
         gateway_host,
         relay_url,
@@ -126,7 +138,7 @@ async fn get_or_create_client(
         client_trace_prefix,
         profile,
     )?);
-    map.insert(gateway_host.to_string(), Arc::clone(&client));
+    map.insert(key, Arc::clone(&client));
     Ok(client)
 }
 
@@ -1842,7 +1854,7 @@ mod tests {
     }
 
     /// Cache hit: a second call to the same gateway reuses the cached client and does not fetch
-    /// the key config again.
+    /// the key config again (Direct dialer only).
     #[tokio::test]
     async fn cached_client_reuses_key_config() {
         let fetches = StdMutex::new(0u32);
@@ -1887,6 +1899,81 @@ mod tests {
             cached.as_ref().unwrap().config.key_id(),
             original_key_id,
             "cached key must be the same"
+        );
+    }
+
+    /// Privacy: Tor-dialer clients are NEVER cached. A cached Direct client must not be returned
+    /// to a Tor call (would leak device IP when caller asked for Tor), and Tor clients must not
+    /// be cached (would link requests across isolated circuits).
+    #[tokio::test]
+    async fn tor_clients_never_cached_never_receive_direct_cache() {
+        // Create and cache a Direct client
+        let direct_client = get_or_create_client(
+            "test-gateway-tor-privacy.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create direct client");
+
+        // Mark it with a fake Tor client to detect if it's reused
+        let now = unix_now().expect("time");
+        *direct_client.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: now + 3600,
+        });
+
+        // A Tor call must get a fresh client, not the cached Direct one
+        let tor_client = get_or_create_client(
+            "test-gateway-tor-privacy.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Tor(Box::new(
+                arti_client::TorClient::builder()
+                    .create_unbootstrapped()
+                    .expect("unbootstrapped tor client"),
+            )),
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create tor client");
+
+        assert!(
+            !Arc::ptr_eq(&direct_client, &tor_client),
+            "Tor call must NOT receive the cached Direct client"
+        );
+        assert!(
+            tor_client.dialer.is_tor(),
+            "returned client must have Tor dialer"
+        );
+
+        // The Tor client's key cache should be empty (fresh client)
+        let tor_key_cache = tor_client.key_config.lock().await;
+        assert!(
+            tor_key_cache.is_none(),
+            "Tor client must start with empty key cache (fresh)"
+        );
+
+        // A second Tor call must also get a fresh client (no caching of Tor clients)
+        let tor_client2 = get_or_create_client(
+            "test-gateway-tor-privacy.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Tor(Box::new(
+                arti_client::TorClient::builder()
+                    .create_unbootstrapped()
+                    .expect("unbootstrapped tor client"),
+            )),
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create second tor client");
+
+        assert!(
+            !Arc::ptr_eq(&tor_client, &tor_client2),
+            "consecutive Tor calls must get distinct clients (no caching)"
         );
     }
 
