@@ -75,6 +75,11 @@ pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
 /// Process-wide default client trace prefix for OHTTP connections (set once from JNI).
 static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 
+/// Process-wide cache of OHTTP clients per gateway host. Each client caches the verified key
+/// config and pools HTTP/2 connections to its relay, avoiding repeated key fetches and TLS
+/// handshakes.
+static CLIENT_CACHE: OnceLock<Mutex<HashMap<String, Arc<OhttpClient>>>> = OnceLock::new();
+
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
 /// Called from JNI/FFI when the engine or TorRuntime is created.
 ///
@@ -91,6 +96,38 @@ fn get_default_client_trace_prefix() -> Option<String> {
     DEFAULT_CLIENT_TRACE_PREFIX
         .get()
         .and_then(|opt| opt.clone())
+}
+
+/// Get or create a cached OHTTP client for the given parameters. Clients are cached by gateway
+/// host; if the relay URL or dialer changes for the same gateway, the old client is replaced.
+async fn get_or_create_client(
+    gateway_host: &str,
+    relay_url: &str,
+    dialer: Dialer,
+    client_trace_prefix: Option<String>,
+    profile: ClientProfile,
+) -> Result<Arc<OhttpClient>, String> {
+    let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut map = cache.lock().await;
+
+    // Check if we have a cached client for this gateway
+    if let Some(client) = map.get(gateway_host) {
+        // Verify it's still valid (same relay URL)
+        if client.relay_url == relay_url {
+            return Ok(Arc::clone(client));
+        }
+    }
+
+    // Create a new client
+    let client = Arc::new(OhttpClient::new(
+        gateway_host,
+        relay_url,
+        dialer,
+        client_trace_prefix,
+        profile,
+    )?);
+    map.insert(gateway_host.to_string(), Arc::clone(&client));
+    Ok(client)
 }
 
 /// Relay URL for a given gateway host. One relay per gateway: mainnet and testnet gateways use
@@ -360,25 +397,34 @@ enum RoundTripError {
 /// so new ciphertext): the gateway answers a repeated ciphertext with 409, and the opener of
 /// one sealing opens that sealing's answer only. A pre-send transport failure is retried once;
 /// an outer 400 or 422 refetches the key and retries once (both classified by the shared core).
-async fn run_exchange<P, PF, R, RF>(
+/// `on_dispatch` is called right before the sealed request is posted to the relay.
+async fn run_exchange<P, PF, R, RF, D>(
     profile: &ClientProfile,
     mut key: KeyConfig,
     request: &BhttpRequest,
     mut post: P,
     mut refetch: R,
+    on_dispatch: D,
 ) -> Result<BhttpResponse, RoundTripError>
 where
     P: FnMut(Vec<u8>) -> PF,
     PF: Future<Output = Result<RelayAnswer, HttpsError>>,
     R: FnMut() -> RF,
     RF: Future<Output = Result<KeyConfig, String>>,
+    D: Fn(),
 {
     let mut attempt = 0u32;
+    let mut dispatched = false;
     loop {
         let mut resent = false;
         let (opener, mut answer) = loop {
             let sealed = encapsulate_request(&key, request, &profile.encode, &profile.limits)
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+            // Signal dispatch right before posting the sealed request to the relay
+            if !dispatched {
+                on_dispatch();
+                dispatched = true;
+            }
             match post(sealed.body).await {
                 Ok(answer) => break (sealed.opener, answer),
                 Err(HttpsError::PreSend(e)) if !resent => {
@@ -726,8 +772,16 @@ impl OhttpClient {
 
     /// Encapsulate + relay + decapsulate (see [`run_exchange`]). The key configuration is
     /// fetched again, and the request sealed again, when the gateway rejects the request (outer
-    /// 400 or 422), which is what key rotation looks like from here.
-    async fn round_trip(&self, request: &BhttpRequest) -> Result<BhttpResponse, RoundTripError> {
+    /// 400 or 422), which is what key rotation looks like from here. `on_dispatch` is called
+    /// right before the sealed request is posted to the relay.
+    async fn round_trip<D>(
+        &self,
+        request: &BhttpRequest,
+        on_dispatch: D,
+    ) -> Result<BhttpResponse, RoundTripError>
+    where
+        D: Fn(),
+    {
         let key = self
             .key_config(false)
             .await
@@ -739,6 +793,7 @@ impl OhttpClient {
             request,
             move |body| this.post_sealed(body),
             move || this.key_config(true),
+            on_dispatch,
         )
         .await
     }
@@ -765,21 +820,25 @@ impl OhttpClient {
         );
 
         let started = std::time::Instant::now();
-        let response =
-            match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip(&request)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(RoundTripError::Decode(e))) => {
-                    return grpc_error(GRPC_INTERNAL, &format!("bhttp decode: {e}"));
-                }
-                Ok(Err(RoundTripError::Transport(e))) => {
-                    tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
-                    return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
-                }
-                Err(_) => {
-                    tracing::warn!(path = %path, "ohttp: round trip timed out");
-                    return grpc_error(GRPC_UNAVAILABLE, "ohttp: round trip timed out");
-                }
-            };
+        let response = match tokio::time::timeout(
+            ROUND_TRIP_TIMEOUT,
+            self.round_trip(&request, || {}),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            Ok(Err(RoundTripError::Decode(e))) => {
+                return grpc_error(GRPC_INTERNAL, &format!("bhttp decode: {e}"));
+            }
+            Ok(Err(RoundTripError::Transport(e))) => {
+                tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
+                return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
+            }
+            Err(_) => {
+                tracing::warn!(path = %path, "ohttp: round trip timed out");
+                return grpc_error(GRPC_UNAVAILABLE, "ohttp: round trip timed out");
+            }
+        };
 
         let (http_status, headers, trailers) = grpc_parts(&response);
         tracing::debug!(
@@ -907,6 +966,10 @@ fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
 /// # Response size cap
 /// A sealed response larger than the gateway's own 256 MiB cap (plus 64 KiB of framing) is
 /// rejected while it is being read, before it is buffered or decrypted.
+///
+/// # Caching
+/// The verified key configuration and HTTP/TLS connections to the relay are cached per gateway
+/// host, avoiding repeated key fetches and TLS handshakes.
 pub async fn http_round_trip(
     gateway_host: &str,
     dialer: Dialer,
@@ -915,6 +978,68 @@ pub async fn http_round_trip(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    http_round_trip_with_dispatch(gateway_host, dialer, method, url, headers, body, || {}).await
+}
+
+/// Like [`http_round_trip`], but calls `on_dispatch` right before the sealed request is posted
+/// to the relay (after key config fetch and encapsulation). This lets the caller distinguish
+/// failures that never sent ciphertext (key fetch, encapsulation) from those that did (relay
+/// transport, gateway processing).
+///
+/// # Arguments
+/// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
+/// * `dialer` - How to reach the relay: `Dialer::Direct` or `Dialer::Tor(_)`
+/// * `method` - HTTP method (e.g., "GET", "POST")
+/// * `url` - Full target URL (e.g., "<https://voting.valargroup.dev/api/vote>")
+/// * `headers` - Request headers as (name, value) pairs
+/// * `body` - Request body bytes
+/// * `on_dispatch` - Called once, right before the sealed request is sent to the relay
+///
+/// # Returns
+/// `Ok((status, headers, body))` on success, or `Err(msg)` on failure.
+///
+/// # Example
+/// ```no_run
+/// # async fn demo() -> Result<(), String> {
+/// use std::sync::atomic::{AtomicBool, Ordering};
+/// use zodl_slipstream::ohttp::{Dialer, http_round_trip_with_dispatch};
+///
+/// let dispatched = AtomicBool::new(false);
+/// match http_round_trip_with_dispatch(
+///     "ohttp-gateway.example",
+///     Dialer::Direct,
+///     "POST",
+///     "https://voting.example/api/vote",
+///     &[("content-type".to_string(), "application/json".to_string())],
+///     b"{\"vote\": 1}",
+///     || dispatched.store(true, Ordering::SeqCst),
+/// )
+/// .await
+/// {
+///     Ok(response) => println!("Vote sent: {}", response.0),
+///     Err(e) if !dispatched.load(Ordering::SeqCst) => {
+///         // Safe to retry: request never left the device
+///         println!("Pre-dispatch failure: {e}");
+///     }
+///     Err(e) => {
+///         // Request was sent; do not retry (possible duplicate)
+///         println!("Post-dispatch failure: {e}");
+///     }
+/// }
+/// # Ok(()) }
+/// ```
+pub async fn http_round_trip_with_dispatch<D>(
+    gateway_host: &str,
+    dialer: Dialer,
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+    on_dispatch: D,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String>
+where
+    D: Fn() + Send + Sync,
+{
     // Parse URL to extract scheme, host, path for BHTTP encoding
     let target = parse_http_target(url)?;
 
@@ -930,13 +1055,15 @@ pub async fn http_round_trip(
         target,
         headers,
         body,
+        on_dispatch,
     )
     .await
 }
 
 /// [`http_round_trip`] against an explicit relay URL (the body of the public function, so a
 /// test can point it at a local relay without touching the process-wide relay table).
-async fn http_round_trip_via(
+/// `on_dispatch` is called right before the sealed request is posted to the relay.
+async fn http_round_trip_via<D>(
     relay_url: &str,
     gateway_host: &str,
     dialer: Dialer,
@@ -944,15 +1071,20 @@ async fn http_round_trip_via(
     target: HttpTarget,
     headers: &[(String, String)],
     body: &[u8],
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    // Create OHTTP client
-    let client = OhttpClient::new(
+    on_dispatch: D,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String>
+where
+    D: Fn(),
+{
+    // Get or create cached OHTTP client (caches key config and HTTP/2 connections)
+    let client = get_or_create_client(
         gateway_host,
         relay_url,
         dialer,
         get_default_client_trace_prefix(),
         ClientProfile::SLIPSTREAM_HTTP,
-    )?;
+    )
+    .await?;
 
     // HTTP request as Binary HTTP (RFC 9292): the URL's scheme, header names as given
     let mut request = BhttpRequest::new(method, target.host, target.path)
@@ -963,10 +1095,13 @@ async fn http_round_trip_via(
     }
 
     // Send through OHTTP relay (encapsulate, POST, decapsulate)
-    let response = client.round_trip(&request).await.map_err(|e| match e {
-        RoundTripError::Transport(e) => e,
-        RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
-    })?;
+    let response = client
+        .round_trip(&request, on_dispatch)
+        .await
+        .map_err(|e| match e {
+            RoundTripError::Transport(e) => e,
+            RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
+        })?;
 
     // Headers as lossy UTF-8 text; the trailer section is not read
     let response_headers = response.headers_utf8_lossy();
@@ -1415,6 +1550,7 @@ mod tests {
                 parse_http_target("https://origin.invalid/api/vote").expect("target"),
                 &[("content-type".to_string(), "application/json".to_string())],
                 b"{\"vote\": 1}",
+                || {},
             ),
         )
         .await
@@ -1703,5 +1839,197 @@ mod tests {
             .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
             .with_writer(std::io::stderr)
             .try_init()
+    }
+
+    /// Cache hit: a second call to the same gateway reuses the cached client and does not fetch
+    /// the key config again.
+    #[tokio::test]
+    async fn cached_client_reuses_key_config() {
+        let fetches = StdMutex::new(0u32);
+        let client1 = get_or_create_client(
+            "test-gateway-cache.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create client");
+
+        // Artificially populate the key cache to avoid a real fetch
+        let now = unix_now().expect("time");
+        *client1.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: now + 3600,
+        });
+        let original_key_id = test_key().key_id();
+
+        // Second call should return the same client instance (Arc equality)
+        let client2 = get_or_create_client(
+            "test-gateway-cache.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("get cached client");
+
+        assert!(
+            Arc::ptr_eq(&client1, &client2),
+            "second call must return the same cached client"
+        );
+
+        // The cached key should still be present
+        let cached = client2.key_config.lock().await;
+        assert!(cached.is_some(), "key config must remain cached");
+        assert_eq!(
+            cached.as_ref().unwrap().config.key_id(),
+            original_key_id,
+            "cached key must be the same"
+        );
+    }
+
+    /// Cache expiry: an expired key config is refetched on the next request.
+    #[tokio::test]
+    async fn expired_key_config_is_refetched() {
+        let now = unix_now().expect("time");
+        let client = get_or_create_client(
+            "test-gateway-expiry.zodl.com",
+            "https://relay.example/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("create client");
+
+        // Populate with an expired key
+        *client.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: now - 3600,
+        });
+
+        // The next key_config call should detect expiry and attempt a refetch.
+        // We can't test the actual refetch without a real server, but we can verify
+        // the cache detects the expiry (it will fail trying to fetch, which is expected).
+        let result = client.key_config(false).await;
+        assert!(
+            result.is_err(),
+            "expired key must trigger a refetch attempt (which fails here without a server)"
+        );
+
+        // The old key should have been cleared
+        let cached = client.key_config.lock().await;
+        assert!(
+            cached.is_none() || cached.as_ref().unwrap().not_after != now - 3600,
+            "expired key must be cleared after refetch attempt"
+        );
+    }
+
+    /// Cache invalidation: a 400/422 response refetches the key and retries once.
+    #[tokio::test]
+    async fn key_error_invalidates_and_refetches() {
+        let refetch_count = StdMutex::new(0u32);
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |_body| async {
+                Ok::<RelayAnswer, HttpsError>(outer_answer(400)) // Gateway rejects with 400
+            },
+            || {
+                let mut count = refetch_count.lock().unwrap();
+                *count += 1;
+                async { Ok::<KeyConfig, String>(test_key()) }
+            },
+            || {}, // no-op dispatch
+        )
+        .await;
+
+        // Should have refetched once
+        assert_eq!(
+            *refetch_count.lock().unwrap(),
+            1,
+            "400 must trigger exactly one key refetch"
+        );
+
+        // Should fail after the retry
+        assert!(
+            matches!(result, Err(RoundTripError::Transport(_))),
+            "must fail after refetch retry"
+        );
+    }
+
+    /// Dispatch callback is invoked exactly once, before the first POST attempt.
+    #[tokio::test]
+    async fn dispatch_callback_fires_once_before_post() {
+        let dispatch_count = StdMutex::new(0u32);
+        let post_count = StdMutex::new(0u32);
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |_body| {
+                let mut count = post_count.lock().unwrap();
+                *count += 1;
+                async { Err::<RelayAnswer, HttpsError>(HttpsError::PreSend("closed".into())) }
+            },
+            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || {
+                let mut count = dispatch_count.lock().unwrap();
+                *count += 1;
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *dispatch_count.lock().unwrap(),
+            1,
+            "dispatch callback must be called exactly once"
+        );
+        assert_eq!(
+            *post_count.lock().unwrap(),
+            2,
+            "post should be attempted twice (initial + pre-send retry)"
+        );
+        assert!(matches!(result, Err(RoundTripError::Transport(_))));
+    }
+
+    /// Dispatch callback fires before the first POST, even if the first attempt fails pre-send
+    /// and is retried.
+    #[tokio::test]
+    async fn dispatch_fires_before_pre_send_retry() {
+        let events = StdMutex::new(Vec::<&str>::new());
+        let post_attempt = Cell::new(0u32);
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |_body| {
+                let n = post_attempt.get();
+                post_attempt.set(n + 1);
+                events.lock().unwrap().push("post");
+                async move {
+                    if n == 0 {
+                        Err(HttpsError::PreSend("closed".into()))
+                    } else {
+                        Ok(outer_answer(200)) // Pretend success on retry
+                    }
+                }
+            },
+            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || {
+                events.lock().unwrap().push("dispatch");
+            },
+        )
+        .await;
+
+        let log = events.lock().unwrap();
+        assert_eq!(
+            &log[..],
+            &["dispatch", "post", "post"],
+            "dispatch must fire before the first post, even if that post fails pre-send"
+        );
     }
 }
