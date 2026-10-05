@@ -195,8 +195,8 @@ async fn get_or_create_client(
 /// Relay URL for a given gateway host. One relay per gateway: mainnet and testnet gateways use
 /// different HPKE keys, and an RFC 9458 relay has a single fixed gateway target.
 ///
-/// Uses Fastly-hosted relays in production (temporary hostnames; final hostnames will be
-/// set in COR-1830). Relay URLs can be overridden at build time via environment variables
+/// Uses Fastly-hosted relays in production (`relay.example.invalid`).
+/// Relay URLs can be overridden at build time via environment variables
 /// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET` (see `zodl-ohttp-client`
 /// documentation).
 pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
