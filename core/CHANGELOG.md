@@ -10,6 +10,17 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- Migrated to `zcash_address 0.14.0-pre.1`, `zcash_client_backend 0.25.0-pre.1`,
+  `zcash_client_sqlite 0.23.0-pre.1`, `zcash_keys 0.17.0-pre.1`,
+  `zcash_primitives 0.31.0-pre.1`, and `zcash_transparent 0.11.0-pre.1`.
+- Unified addresses and unified full viewing keys are encoded at ZIP 316
+  Revision 0 when Revision 0 can represent them: an address as `u…` and a UFVK
+  as `uview…`; on testnet, as `utest…` and `uviewtest…`. An address whose only
+  receiver is transparent, and a key or address carrying expiry metadata, are
+  still encoded at Revision 2. Encodings stored by a host may differ from those
+  this crate now produces; both revisions decode.
+
 ## [0.4.0-pre.0] - 2026-10-05
 
 ### Added

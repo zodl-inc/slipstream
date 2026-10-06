@@ -1515,7 +1515,9 @@ mod tests {
         // production's rule-2 invariant (the ChainTip range never grafts, so the
         // retained checkpoints always live in built territory).
         let blocks = super::testkit::synth_blocks_orchard(760, 100, Some((65_600, &owned)));
-        let ufvk_str = ufvk.encode(&zcash_protocol::consensus::MAIN_NETWORK);
+        let ufvk_str = ufvk
+            .encode(&zcash_protocol::consensus::MAIN_NETWORK)
+            .expect("a derived UFVK has an encoding");
         (blocks, ufvk_str, seed)
     }
 

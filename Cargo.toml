@@ -30,15 +30,15 @@ futures-util = "0.3"
 thiserror = "2"
 tracing = "0.1"
 zcash_protocol = "=0.11.0-pre.0"
-zcash_client_backend = { version = "=0.25.0-pre.0", features = [
+zcash_client_backend = { version = "=0.25.0-pre.1", features = [
     "lightwalletd-tonic-tls-webpki-roots",
     "orchard",
     "tor",
     "transparent-inputs",
     "unstable",
 ] }
-zcash_client_sqlite = { version = "=0.23.0-pre.0", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
-zcash_keys = { version = "=0.17.0-pre.0", features = ["orchard"] }
+zcash_client_sqlite = { version = "=0.23.0-pre.1", features = ["orchard", "transparent-inputs", "unstable", "serde"] }
+zcash_keys = { version = "=0.17.0-pre.1", features = ["orchard"] }
 rusqlite = "0.37"
 # Issue #4: slipstream's own `ext_slipstream_*` schema rides the wallet DB's
 # schemerz migrator (WalletMigrator::with_external_migrations) — versions match
@@ -50,8 +50,8 @@ secrecy = "0.8"
 rand = "0.10"
 sapling = { package = "sapling-crypto", version = "0.9", default-features = false }
 orchard = "0.16"
-zcash_primitives = "=0.31.0-pre.0"
-transparent = { package = "zcash_transparent", version = "=0.11.0-pre.0", default-features = false }
+zcash_primitives = "=0.31.0-pre.1"
+transparent = { package = "zcash_transparent", version = "=0.11.0-pre.1", default-features = false }
 zcash_script = "0.6"
 tempfile = "3"          # dev-only usage; listed here for version unity
 incrementalmerkletree = { version = "0.9", default-features = false }
@@ -59,7 +59,7 @@ shardtree = "0.8"
 rayon = "1.7"
 zip32 = "0.3"
 zcash_note_encryption = "0.5.1"
-zcash_address = "=0.14.0-pre.0"
+zcash_address = "=0.14.0-pre.1"
 # T10b spend-proof stub prover signatures only (already in the graph via sapling).
 jubjub = "0.11"
 bls12_381 = "0.9"
