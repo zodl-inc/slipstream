@@ -424,7 +424,14 @@ fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: zodl_slipstream::Netwo
             eprintln!("error: derivation failed: {e:?}");
             std::process::exit(2);
         });
-    println!("{}", usk.to_unified_full_viewing_key().encode(&network));
+    let encoded = usk
+        .to_unified_full_viewing_key()
+        .encode(&network)
+        .unwrap_or_else(|e| {
+            eprintln!("error: cannot encode the UFVK: {e}");
+            std::process::exit(2);
+        });
+    println!("{encoded}");
     eprintln!(
         "hint: slipstream sync --network {} --server <lwd-url> --wallet-dir <dir> --ufvk '<above>' --birthday <height>",
         match network {
@@ -1338,10 +1345,10 @@ fn cmd_send(
             .get_account(wallet_account)
             .expect("get account")
             .expect("account exists");
-        let wallet_ufvk = acct.ufvk().expect("wallet has a UFVK").encode(&network);
-        assert_eq!(
-            wallet_ufvk,
-            ufvk.encode(&network),
+        assert!(
+            acct.ufvk()
+                .expect("wallet has a UFVK")
+                .is_equivalent_to(&ufvk),
             "mnemonic/account does not match the wallet's UFVK"
         );
     }
@@ -1775,11 +1782,13 @@ mod tests {
         .expect("derives");
         let encoded = usk
             .to_unified_full_viewing_key()
-            .encode(&zodl_slipstream::Network::TestNetwork);
-        // librustzcash main encodes every UFVK as ZIP 316 Revision 2 ("uvf…"); decoding still accepts the R0 "uview…" form.
+            .encode(&zodl_slipstream::Network::TestNetwork)
+            .expect("a derived UFVK has an encoding");
+        // A UFVK that ZIP 316 Revision 0 can represent is encoded at Revision 0
+        // ("uview…"); decoding accepts both revisions.
         assert!(
-            encoded.starts_with("uvftest1"),
-            "testnet UFVK must carry the uvftest HRP, got {encoded}"
+            encoded.starts_with("uviewtest1"),
+            "testnet UFVK must carry the uviewtest HRP, got {encoded}"
         );
     }
 
