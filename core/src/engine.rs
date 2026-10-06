@@ -57,7 +57,7 @@ use crate::{
 /// hand cannot be relied on — and this is the evidence that it cannot — it should be
 /// derived from something that moves on its own (git describe at build time) rather
 /// than maintained.
-pub const ENGINE_BUILD: &str = "2026-10-05.v0.13-nu7-pre-release-crates";
+pub const ENGINE_BUILD: &str = "2026-10-06.v0.14-pre-1-crates";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick

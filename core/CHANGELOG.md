@@ -10,6 +10,8 @@ workspace.
 
 ## [Unreleased]
 
+## [0.4.0-pre.1] - 2026-10-06
+
 ### Changed
 - Migrated to `zcash_address 0.14.0-pre.1`, `zcash_client_backend 0.25.0-pre.1`,
   `zcash_client_sqlite 0.23.0-pre.1`, `zcash_keys 0.17.0-pre.1`,
@@ -20,6 +22,7 @@ workspace.
   receiver is transparent, and a key or address carrying expiry metadata, are
   still encoded at Revision 2. Encodings stored by a host may differ from those
   this crate now produces; both revisions decode.
+- `engine::ENGINE_BUILD` is `2026-10-06.v0.14-pre-1-crates`.
 
 ## [0.4.0-pre.0] - 2026-10-05
 
