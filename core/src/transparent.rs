@@ -22,7 +22,7 @@
 //! - Error type: upstream `Error::MisbehavingServer` → `SlipstreamError::MisbehavingServer`;
 //!   upstream `Error::Wallet(...)` → `SlipstreamError::Wallet(format!(...))`.
 //! - gRPC: upstream calls `client.get_address_utxos_stream(request)` directly; we call
-//!   `grpc::get_address_utxos(client, addresses, start_height)` which wraps the same
+//!   `grpc::get_address_utxos(client, addresses, start_height, progress)` which wraps the same
 //!   streaming call (T3.1 wrapper from grpc.rs).
 //! - Network/params: upstream takes a generic `params: &P`; we use `session.network`
 //!   (the same `Network` type from `zcash_protocol::consensus`).
@@ -46,6 +46,7 @@ use zcash_script::script;
 
 use crate::{
     error::SlipstreamError,
+    events::Progress,
     grpc::{self, LwdClient},
     wallet_session::WalletSession,
 };
@@ -73,9 +74,14 @@ pub struct TransparentStats {
 /// 3. `grpc::get_address_utxos` — fetch UTXOs from lightwalletd.
 /// 4. For each reply: `WalletTransparentOutput::from_parts(OutPoint::new(...), TxOut::new(...), Some(height))`
 ///    then `db.put_received_transparent_utxo(&output)` (sync.rs:511-535).
+///
+/// `progress` is stamped for every UTXO received and again after each account's answer (an
+/// account with no UTXOs answers with an empty stream), so a wallet with many accounts on a
+/// slow link does not read as stalled while it refreshes.
 pub async fn refresh_utxos(
     session: &mut WalletSession,
     client: &mut LwdClient,
+    progress: Option<&Progress>,
 ) -> Result<TransparentStats, SlipstreamError> {
     let mut stats = TransparentStats::default();
 
@@ -119,7 +125,13 @@ pub async fn refresh_utxos(
 
         // Fetch all UTXOs for these addresses from start_height.
         // sync.rs:498: start_height.into() converts BlockHeight → u64.
-        let replies = grpc::get_address_utxos(client, addresses, start_height.into()).await?;
+        let replies =
+            grpc::get_address_utxos(client, addresses, start_height.into(), progress).await?;
+        // Liveness: each account's answer is progress, even one with no UTXOs (its stream ends
+        // without a message, so the per-message stamps cannot cover it).
+        if let Some(p) = progress {
+            p.touch();
+        }
 
         // sync.rs:511-537: construct WalletTransparentOutput and store each reply.
         for reply in replies {

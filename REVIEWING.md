@@ -2,9 +2,8 @@
 
 > For Zcash protocol / cryptographic engineers. This is a **map** — where to look and why — not a
 > tutorial.
-> The engine consumes **canonical** librustzcash — crates.io releases where published; the
-> Ironwood-era family rides `[patch.crates-io]` onto `zcash/librustzcash` main at a pinned rev
-> (see `Cargo.toml`), never a third-party fork. It adds *scheduling,
+> The engine consumes **canonical** librustzcash from crates.io, currently the NU7 pre-releases
+> pinned with `=` requirements (see `Cargo.toml`), never a third-party fork. It adds *scheduling,
 > persistence shape, and transport policy* — **not cryptography**.
 
 ## TL;DR

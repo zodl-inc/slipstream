@@ -53,7 +53,10 @@ pub struct FfiSlipstreamSnapshot {
     // ── T5.5 counter-based progress fields (appended at END for padding stability) ──
     /// Total blocks in the current pass. Set (not accumulated) by the scheduler each time
     /// suggest_scan_ranges returns: value = scanned_so_far + sum(all returned ranges).
-    /// Denominator for counter-based progress: scanned_blocks / pass_total_blocks.
+    /// Denominator for the blessed progress (`progress_permille`): `fetched_blocks` and
+    /// `scanned_blocks`, each first measured from the per-round baseline the scheduler
+    /// snapshots at the same time (so blocks a re-baselined pass already credited are not
+    /// counted a second time), then clamped to this total, weighed half each.
     pub pass_total_blocks: u64,
     /// Spendable hint: 0 = not yet spendable; 1 = a ChainTip-priority range has completed
     /// scanning (≈ SBS funds-spendable semantics). Latches to 1; never resets within a pass.
@@ -70,9 +73,20 @@ pub struct FfiSlipstreamSnapshot {
     pub is_recovering: u8,
     /// Blessed progress value, 0..=1000, session-monotonic (never regresses while the
     /// handle lives). Done forces 1000. Replaces host-side % math.
+    ///
+    /// Computed as a two-stage blend: the pass's own progress is `fetched_blocks` and
+    /// `scanned_blocks`, each relative to the pass's per-round baseline and clamped to
+    /// `pass_total_blocks`, weighed half each (see `pass_total_blocks`); that pass-local
+    /// fraction is then stretched from the pass's own starting position — its GLOBAL
+    /// position when the pass began, or wherever the scan scope last expanded under it —
+    /// up to 1000, so a resync's reading climbs from where the wallet already stood instead
+    /// of restarting at 0. The stretched result is folded into the session-monotonic floor,
+    /// which only ever rises — the reason this field never regresses.
     pub progress_permille: u16,
-    /// Seconds since the last forward progress while state == Syncing; 0 otherwise.
-    /// The host keeps the policy (log vs restart); the engine supplies the fact.
+    /// Seconds without forward progress while state == Syncing; 0 otherwise — the longer of the
+    /// time since the last progress and the time the block download has kept failing at the
+    /// same block (see HOSTING.md §5.3). The host keeps the policy (log vs restart); the engine
+    /// supplies the fact.
     pub stalled_seconds: u32,
     // ── API v2.1 E-4 (appended at END for padding stability) ──
     /// Monotonic version of the wallet's stored transaction set (see
@@ -256,14 +270,59 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             SyncState::Done => 3,
         };
         // ── API v2 derived fields (ENGINE_API_V2.md §4.4) ──
-        // Blessed progress: raw pass ratio folded into the session-monotonic floor (reported
+        // Blessed progress: the pass blend folded into the session-monotonic floor (reported
         // progress never regresses while the handle lives). Done folds 1000 into the floor so
         // a later catch-up pass can't display below a completed pass's 100%.
-        let raw_permille = p
+        //
+        // [h10] The pass-local ratio weighs downloaded and scanned blocks half each — a
+        // resync's downloaded-but-not-yet-scanned blocks now move the reading instead of
+        // being invisible until scanning alone crosses the pass's global start position.
+        // Each term clamps to `pass_total` independently: a same-pass retry (e.g. a
+        // ScanContinuity truncate-and-re-suggest, scheduler.rs) can re-fetch and re-count
+        // blocks an earlier attempt in the SAME pass already counted, so `fetched` (and
+        // `scanned`) can exceed `pass_total` within one pass — the clamp keeps such a
+        // retry's over-count from giving its term more than its intended half-weight share.
+        //
+        // [h16-1] Each term is measured from the pass-local BASELINE the scheduler
+        // snapshots every suggest round (`Progress::set_pass_baseline`), not from the raw
+        // counter: the raw `fetched_blocks`/`scanned_blocks` counters are shared with other
+        // readers (this snapshot's own `fetched_blocks`/`scanned_blocks` fields below, and
+        // the CLI ticker) and so are never zeroed mid-pass, but a scope-expansion
+        // re-baseline (`rebaseline_floor_if_scope_expanded`) folds already-credited work
+        // into the new `pass_start_permille` — without subtracting the baseline here, that
+        // same work would ALSO inflate this pass-local ratio and double-count it.
+        let pass_total = p.pass_total();
+        let fetched_capped = p
+            .fetched()
+            .saturating_sub(p.pass_base_fetched())
+            .min(pass_total);
+        let scanned_capped = p
             .scanned()
+            .saturating_sub(p.pass_base_scanned())
+            .min(pass_total);
+        let pass_permille = fetched_capped
+            .saturating_add(scanned_capped)
             .saturating_mul(1000)
-            .checked_div(p.pass_total())
+            .checked_div(pass_total.saturating_mul(2))
             .unwrap_or(0);
+        // The pass's own progress is stretched between where the wallet's GLOBAL position
+        // stood when the pass began (`pass_start_permille`, latched by the scheduler's first
+        // suggest round of this pass) and 1000 — so a resync inherits the position the
+        // wallet already proved instead of restarting the pass-local ratio at 0. Before any
+        // suggest round has run (the pass-open E-3 seed only raises the FLOOR, not this
+        // pass's own start), the raw reading is the pass-local ratio alone.
+        let raw_permille = match p.pass_start_permille() {
+            Some(start) => {
+                let start = start.min(1000);
+                let climb = 1000u64
+                    .saturating_sub(start)
+                    .saturating_mul(pass_permille)
+                    .checked_div(1000)
+                    .unwrap_or(0);
+                start.saturating_add(climb)
+            }
+            None => pass_permille,
+        };
         let progress_permille = match state {
             SyncState::Done => p.permille_floor(1000) as u16,
             _ => p.permille_floor(raw_permille) as u16,
@@ -274,20 +333,12 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             SyncState::Done | SyncState::Error(_) => 0u8,
             _ => u8::from(p.recovering()),
         };
-        // Stall clock: only meaningful while actively syncing; 0 when idle/terminal or before
-        // the first progress stamp.
+        // Stall fact: only meaningful while actively syncing; 0 when idle/terminal. The longer
+        // of the time since the last progress stamp and a repeatedly failing download's span
+        // (`Progress::stall_secs`).
         let stalled_seconds = match state {
             SyncState::Syncing => {
-                let last = p.last_progress_unix_secs();
-                if last == 0 {
-                    0
-                } else {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    u32::try_from(now.saturating_sub(last)).unwrap_or(u32::MAX)
-                }
+                u32::try_from(p.stall_secs(crate::events::unix_now_secs())).unwrap_or(u32::MAX)
             }
             _ => 0u32,
         };
@@ -408,45 +459,52 @@ mod tests {
         assert_eq!(p.permille_floor(0), 1000, "floor persists at max");
     }
 
+    /// A handle around `progress` in `state`, for snapshot tests (no task, no network).
+    fn handle_in(
+        state: SyncState,
+        progress: std::sync::Arc<crate::events::Progress>,
+    ) -> SlipstreamHandle {
+        SlipstreamHandle {
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .expect("tokio runtime"),
+            progress,
+            state: std::sync::Arc::new(Mutex::new(state)),
+            events: std::sync::Arc::new(Mutex::new(Vec::new())),
+            task: None,
+            pass_lock: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint: Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+            wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
+            network: zcash_protocol::consensus::Network::TestNetwork,
+            total_memory_bytes: 0,
+        }
+    }
+
     /// [API v2 §4.4] Terminal states force is_recovering = 0 (the fail-safe latch), and Done
     /// forces progress to 1000 — a dead or finished pass can never wedge a "Restoring" UI or
     /// show partial progress.
     #[test]
     fn snapshot_terminal_states_apply_v2_latches() {
-        let mk = |state: SyncState, progress: std::sync::Arc<crate::events::Progress>| {
-            SlipstreamHandle {
-                runtime: tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .expect("tokio runtime"),
-                progress,
-                state: std::sync::Arc::new(Mutex::new(state)),
-                events: std::sync::Arc::new(Mutex::new(Vec::new())),
-                task: None,
-                pass_lock: Arc::new(tokio::sync::Mutex::new(())),
-                endpoint: Endpoint {
-                    host: "localhost".into(),
-                    port: 9067,
-                    tls: false,
-                },
-                wallet_db_path: std::path::PathBuf::from("/tmp/test.db"),
-                network: zcash_protocol::consensus::Network::TestNetwork,
-                total_memory_bytes: 0,
-            }
-        };
-
-        // Syncing + recovering flag set → surfaces as recovering, permille from counters.
+        // Syncing + recovering flag set → surfaces as recovering, permille from the pass
+        // blend. No pass start recorded (fresh Progress) ⇒ raw = pass_permille =
+        // (0 fetched + 250 scanned)/(2×1000) = 125 — the new half-weighted formula (was
+        // 250 under the old scanned/pass_total ratio; [h10]).
         let p1 = std::sync::Arc::new(crate::events::Progress::default());
         p1.set_recovering(true);
         p1.set_pass_total(1000);
         p1.add_scanned(250);
-        let snap = mk(SyncState::Syncing, p1.clone()).snapshot();
+        let snap = handle_in(SyncState::Syncing, p1.clone()).snapshot();
         assert_eq!(snap.is_recovering, 1);
-        assert_eq!(snap.progress_permille, 250);
+        assert_eq!(snap.progress_permille, 125);
 
         // Error → latch forces NOT recovering even though the live flag is still true.
-        let snap = mk(SyncState::Error(2), p1.clone()).snapshot();
+        let snap = handle_in(SyncState::Error(2), p1.clone()).snapshot();
         assert_eq!(
             snap.is_recovering, 0,
             "Error must release the recovery gate"
@@ -457,11 +515,110 @@ mod tests {
         );
 
         // Done → recovery off AND progress forced to (and floored at) 1000.
-        let snap = mk(SyncState::Done, p1).snapshot();
+        let snap = handle_in(SyncState::Done, p1).snapshot();
         assert_eq!(snap.is_recovering, 0, "Done must clear recovering");
         assert_eq!(
             snap.progress_permille, 1000,
             "Done must complete the progress"
+        );
+    }
+
+    /// [h10] A fresh pass has no recorded start (no suggest round has run yet — see
+    /// `Progress::pass_start_permille`): the snapshot reads the pass blend alone, with
+    /// fetched and scanned blocks weighed half each. Half the pass fetched and nothing
+    /// scanned must move the reading off 0 — downloaded-but-unscanned blocks now count
+    /// toward progress instead of being invisible until 93.6% of the pass is scanned.
+    #[test]
+    fn snapshot_fresh_pass_with_no_start_reads_the_pass_blend_alone() {
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.set_pass_total(10_000);
+        p.add_fetched(5_000); // half the pass fetched
+        // scanned stays 0; pass_start_permille is unset on a fresh Progress.
+        let snap = handle_in(SyncState::Syncing, p).snapshot();
+        assert_eq!(
+            snap.progress_permille, 250,
+            "no pass start ⇒ raw = pass_permille = (5_000 fetched + 0 scanned)/(2×10_000) = 250"
+        );
+    }
+
+    /// [h10] A pass that starts at a known GLOBAL position (936‰, matching the brief's
+    /// worked example of a wallet that was 51k blocks in with three accounts scanning): the
+    /// blend stretches from 936 to 1000 as the pass-local ratio climbs, weighing fetched and
+    /// scanned blocks half each — a resync's downloaded blocks move the reading well before
+    /// 93.6% of the pass is SCANNED. The session floor holds even if the counters are
+    /// replayed lower (e.g. a stray reset).
+    #[test]
+    fn snapshot_pass_blend_climbs_from_known_pass_start_and_never_regresses() {
+        let pass_total = 51_271u64;
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.set_pass_total(pass_total);
+        p.set_pass_start_permille(936);
+
+        let snap = handle_in(SyncState::Syncing, p.clone()).snapshot();
+        assert_eq!(
+            snap.progress_permille, 936,
+            "nothing fetched or scanned yet: raw = start"
+        );
+
+        p.add_fetched(pass_total);
+        let snap = handle_in(SyncState::Syncing, p.clone()).snapshot();
+        assert_eq!(
+            snap.progress_permille, 968,
+            "everything fetched, nothing scanned: half-weighted climb off the start"
+        );
+
+        p.add_scanned(pass_total);
+        let snap = handle_in(SyncState::Syncing, p.clone()).snapshot();
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "everything fetched and scanned: the pass is done"
+        );
+
+        // Replay the counters lower (e.g. a stray reset) — the session floor must hold.
+        p.fetched_blocks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        p.scanned_blocks
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let snap = handle_in(SyncState::Syncing, p).snapshot();
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "reported progress never regresses while the handle lives"
+        );
+    }
+
+    /// [h16-2 pin] A same-pass retry (e.g. a ScanContinuity truncate-and-re-suggest) can
+    /// re-fetch and re-count blocks an earlier attempt in the SAME pass already counted, so
+    /// `fetched`/`scanned` can exceed `pass_total` within one pass — each term must clamp to
+    /// `pass_total` independently instead of overflowing the blend past its intended
+    /// half-weight share. Unaffected by the h16-1 baseline (default 0), so this already held
+    /// before h16-2; pinned here as regression coverage for the reviewer's round.
+    #[test]
+    fn fetched_exceeding_pass_total_stays_clamped() {
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.set_pass_total(100);
+        p.add_fetched(150); // exceeds pass_total
+        p.add_scanned(150); // exceeds pass_total
+        let snap = handle_in(SyncState::Syncing, p).snapshot();
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "fetched/scanned beyond pass_total must clamp to it, not overflow the blend"
+        );
+    }
+
+    /// [h16-2 pin] `pass_total == 0` (no suggest round has run yet, or a degenerate empty
+    /// pass) must read the pass start alone, not divide-by-zero into 0 and mask a known
+    /// GLOBAL position. Unaffected by the h16-1 baseline (both clamp to a 0 pass_total
+    /// regardless of the baseline), so this already held before h16-2; pinned here as
+    /// regression coverage for the reviewer's round.
+    #[test]
+    fn pass_total_zero_with_start_set_reads_the_start() {
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.set_pass_start_permille(620);
+        // pass_total left at 0 (default).
+        let snap = handle_in(SyncState::Syncing, p).snapshot();
+        assert_eq!(
+            snap.progress_permille, 620,
+            "pass_total == 0 must read the pass start, not divide by zero into 0"
         );
     }
 
@@ -768,5 +925,25 @@ mod tests {
         // Ring must be empty after drain.
         let ring = handle.events.lock().unwrap();
         assert!(ring.is_empty());
+    }
+
+    /// While Syncing, `stalled_seconds` reports a block download that keeps failing at the same
+    /// block even though the retried passes keep stamping progress; in any other state it
+    /// stays 0.
+    #[test]
+    fn snapshot_reports_a_repeatedly_failing_download_while_syncing() {
+        let now = crate::events::unix_now_secs();
+        let p = std::sync::Arc::new(crate::events::Progress::default());
+        p.note_download_gave_up_at(500, now - 300);
+        p.note_download_gave_up_at(500, now - 200);
+        p.touch(); // a retried pass's fresh sign of life
+        let syncing = handle_in(SyncState::Syncing, p.clone()).snapshot();
+        assert!(
+            syncing.stalled_seconds >= 300,
+            "counted from the first give-up, got {}",
+            syncing.stalled_seconds
+        );
+        let done = handle_in(SyncState::Done, p).snapshot();
+        assert_eq!(done.stalled_seconds, 0, "only Syncing reports a stall");
     }
 }

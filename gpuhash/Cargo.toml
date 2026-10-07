@@ -1,7 +1,7 @@
 [package]
 name = "zodl-slipstream-gpuhash"
 description = "GPU-accelerated Orchard Sinsemilla MerkleCRH"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 rust-version.workspace = true
 repository.workspace = true
