@@ -43,7 +43,7 @@ pub(crate) type Db = WalletDb<
     Connection,
     SlipstreamNetwork,
     zcash_client_sqlite::util::SystemClock,
-    rand::rngs::OsRng,
+    rand::rand_core::UnwrapErr<rand::rngs::SysRng>,
 >;
 
 pub struct WalletSession {
@@ -106,7 +106,7 @@ impl WalletSession {
             wallet_conn,
             network,
             zcash_client_sqlite::util::SystemClock,
-            rand::rngs::OsRng,
+            rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         );
         // Issue #4: the engine's own `ext_slipstream_*` schema (graft buffer,
         // reconciliation views — see `migrations.rs`) rides the wallet's
@@ -264,6 +264,9 @@ impl WalletSession {
         self.db
             .put_orchard_subtree_roots(0, &roots.orchard)
             .map_err(|e| wallet_err("put_orchard_subtree_roots", e))?;
+        self.db
+            .put_ironwood_subtree_roots(0, &roots.ironwood)
+            .map_err(|e| wallet_err("put_ironwood_subtree_roots", e))?;
         Ok(())
     }
 

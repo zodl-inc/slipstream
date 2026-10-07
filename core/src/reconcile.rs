@@ -63,7 +63,7 @@ pub const RECONCILE_VIEW_NAME: &str = "ext_slipstream_v_tx_reconciled";
 /// parties' spends), but only our txs have a row in `transactions`, so a
 /// non-wallet `tl.txid` simply has no `t` to match. The test is "is the note
 /// received yet", NOT "is the nullifier still tracked", so it is robust to
-/// `prune_tracked_nullifiers` timing.
+/// `prune_tracked_spends` timing.
 ///
 /// KNOWN INVARIANT — the view is APPROXIMATE mid-restore and MUST stay
 /// recovery-scoped on the read side ([audit P0-B, verified against a field

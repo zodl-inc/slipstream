@@ -85,6 +85,124 @@ pub(crate) fn global_floor_permille(
     Some(scanned.saturating_mul(1000) / span)
 }
 
+/// [h16-1] One suggest round's progress bookkeeping: set the pass total and seed/re-baseline
+/// the session floor + pass start from the GLOBAL seed. Extracted from the `run_to_completion`
+/// loop body (behaviour unchanged by the extraction itself) so it can be driven directly in
+/// tests without a live fetch/scan pass — everything here is pure atomic bookkeeping over an
+/// already-known range-length sum, no network I/O. Reads `p.chain_tip()` live, like the inline
+/// block it replaces. Returns whether this round re-baselined the session floor (test hook;
+/// `run_to_completion` ignores it).
+pub(crate) fn update_pass_progress(
+    p: &Progress,
+    scanned_so_far_in_pass: &mut u64,
+    sum_remaining: u64,
+    wallet_birthday: Option<u64>,
+) -> bool {
+    // [h16-1] Snapshot the pass-local blend baseline BEFORE the pass total is set: from
+    // this moment, `derive_snapshot` reads `fetched()`/`scanned()` relative to this
+    // baseline instead of raw, so blocks already credited to `scanned_so_far_in_pass`
+    // (this pass's completed-range tally) are not counted a second time against the new
+    // total. At this instant the pass-local counters equal the work the pass has credited.
+    p.set_pass_baseline(
+        p.fetched().saturating_sub(*scanned_so_far_in_pass),
+        p.scanned().saturating_sub(*scanned_so_far_in_pass),
+    );
+    p.set_pass_total(*scanned_so_far_in_pass + sum_remaining);
+    // [API v2 §4.4 / Phase E] Seed the session-monotonic floor with the GLOBAL position.
+    // fetch_max semantics: the seed can only RAISE the floor, and re-seeding every suggest
+    // round tracks global progress as ranges complete. Two behaviours fall out for free:
+    // a cold-launch catch-up starts at ~99.9% instead of flashing 0% (the old Swift
+    // summary floor), and a relaunched restore RESUMES near its true position instead of
+    // 0% (the old Swift monotonic floor could not survive a relaunch).
+    let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining) else {
+        return false;
+    };
+    // [API v2.1 E-5] Scope-expansion re-baseline: an imported account with an
+    // older birthday (or a rewind) grows the span under the session floor —
+    // without this, the ~1000 floor from the previous scope's Done would mask
+    // the whole re-scan at ~100% (the host used to bypass every floor with
+    // `forceCounterProgressUntilDone`; the blessed permille now reads the
+    // genuine climb by itself).
+    //
+    // [h17-1] Decide with the PURE read (`Progress::scope_expanded`) first, and when it says
+    // the scope expanded, publish the whole re-baselined pass — baseline, total, then start
+    // — and only THEN lower the floor, last. `derive_snapshot` can run on another thread at
+    // any instant while this function is mid-flight, and it folds whatever it reads into the
+    // floor with `fetch_max`, so every intermediate combination of fields it can observe here
+    // must compute a raw value AT MOST the floor the OLD scope already published, or that
+    // stale-but-too-high reading gets latched permanently (fetch_max never lowers):
+    //   - before `set_pass_start_permille` below: a poll reads the OLD start together with
+    //     the NEW baseline/total — a ZERO pass-local count — so raw is the old start alone,
+    //     which the floor already holds (that start was itself seeded through the floor
+    //     earlier).
+    //   - after it, before the floor call: a poll reads the NEW (lower) seed as the start,
+    //     still with a zero pass-local count — raw is the new seed alone, below the floor
+    //     the OLD scope holds (that gap below the floor is exactly what "expanded" means).
+    // Neither window can produce a raw value above the old floor, so nothing above it gets
+    // latched. Lowering the floor first, or moving the start before the baseline/total (the
+    // two orders this replaces), each open a window where a poll mixes a low/new field with
+    // high/old ones and computes a raw value ABOVE the floor at that instant — that mixed,
+    // double-counted read is the bug fixed here (confirmed against this exact seed/credit
+    // combination in scheduler::tests::rebaseline_old_order_used_to_latch_a_double_counted_697).
+    if p.scope_expanded(seed) {
+        // [h16-1] The new start already includes everything credited so far: fold the
+        // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
+        // counters, so the next blend reads 0 pass-local progress against the fresh
+        // `sum_remaining`-only total below, instead of replaying the pre-expansion
+        // credit a second time against the new (smaller, re-baselined) denominator.
+        *scanned_so_far_in_pass = 0;
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(sum_remaining);
+        // [h10] The pass start follows the re-baseline: the scope grew UNDER
+        // this running pass, so the pass's own progress must stretch from the
+        // re-baselined position too, or it would still stretch from the stale
+        // pre-expansion start and under-report the re-scan's climb.
+        p.set_pass_start_permille(seed);
+        // [h17-1] Lower the floor LAST, now that the rest of the re-baselined pass is fully
+        // published (see above). `scope_expanded` and this call share exactly one condition
+        // (it calls that method) and the floor only ever RISES in between — and, per the
+        // invariant above, nothing a concurrent poll can fetch_max it with in this window
+        // exceeds the floor this call is about to compare `seed` against — so this re-check
+        // is guaranteed to still see the expansion.
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed);
+        debug_assert!(
+            rebaselined,
+            "scope_expanded just reported an expansion and nothing between here and there \
+             can raise the floor above what it already held, so the re-check cannot flip"
+        );
+        info!(
+            seed,
+            birthday = wallet_birthday,
+            "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
+        );
+        rebaselined
+    } else {
+        // [h10] First suggest round of the pass latches the start; later rounds
+        // of the same pass keep it — the pass's reported progress is measured
+        // from where the GLOBAL position stood when the pass began.
+        p.set_pass_start_permille_if_unset(seed);
+        let _ = p.permille_floor(seed);
+        false
+    }
+}
+
+/// [h16-2] How much of an aborted range's work survives a `ScanContinuity` truncate: the
+/// span below `rewind_height` (clamped to the aborted range's own bounds), which the
+/// truncate does NOT discard. The ScanContinuity branch (`run_to_completion`) credits this
+/// to `scanned_so_far_in_pass` right after the truncate, so the next suggest round's
+/// baseline snapshot (h16-1) folds it in — without this, `pass_total` would cover only the
+/// small repair range while `fetched`/`scanned` still held the whole aborted range, so the
+/// blend would read the still-in-flight repair as already done.
+pub(crate) fn scan_continuity_repair_credit(
+    start: u64,
+    end_exclusive: u64,
+    rewind_height: u64,
+) -> u64 {
+    rewind_height
+        .saturating_sub(start)
+        .min(end_exclusive.saturating_sub(start))
+}
+
 /// [API v2.1 E-3] Seed the snapshot atomics from PERSISTED wallet state, so the snapshot is
 /// truthful from `open()` — before the first suggest round — and hosts never compensate for
 /// a pre-pass snapshot that "lies" (the ENGINE_API_V2.md §0 known gap: `is_recovering` read
@@ -218,6 +336,41 @@ pub struct ScanStatsTotals {
     pub orchard_received: u64,
 }
 
+/// Requests an abort of the wrapped task when dropped, instead of leaving it to keep running
+/// detached.
+///
+/// A plain `JoinHandle` that is only awaited on the normal path is not enough: an early `?`
+/// return, or the enclosing future being dropped outright (a host restart aborts the SESSION
+/// task, not this one), skips the `.await` and leaves the spawned task running orphaned. For
+/// the per-range fetch task below, an orphan keeps fetching after its scanner is gone — its
+/// worker eventually exhausts its retries and records a download give-up into whatever
+/// `Progress` it still holds, corrupting a session that has already started fresh (see
+/// `Progress::begin_session`).
+///
+/// The guarantee is limited: dropping the wrapper requests the abort, and the task stops at
+/// its next `.await`. `abort()` does not wait for that. A fetch task spends its life at
+/// awaits, so an aborted pass's fetch practically cannot record into a later session, but
+/// nothing here waits until it is gone. Aborting an already-finished task is a no-op, so the
+/// normal path (`.await` to a result) is unaffected.
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+impl<T> std::future::Future for AbortOnDrop<T> {
+    type Output = Result<T, tokio::task::JoinError>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll(cx)
+    }
+}
+
 /// Process every suggested range until none remain. The caller has already
 /// run update_chain_tip + put_subtree_roots (engine.rs).
 ///
@@ -244,11 +397,6 @@ pub async fn run_to_completion(
     // backfill window). A read failure degrades to "not recovering" rather than failing the
     // pass — the flag is presentation state, never correctness state.
     let recover_until: Option<u64> = session.max_recover_until().unwrap_or_default();
-    // [API v2 §4.4 / Phase E] The wallet's oldest birthday, read once per pass alongside the
-    // recovery ceiling: with the chain tip and the remaining queue it seeds the global permille
-    // floor each suggest round (below). A read failure degrades to "no seed" — presentation
-    // state, never correctness state.
-    let wallet_birthday: Option<u64> = session.min_birthday().unwrap_or_default();
     // [API v2.1 E-4] Pass-start baseline for the boundary tx-set signature check (see the
     // range-boundary block at the bottom of the loop). `None` (read failure) = the first
     // successful boundary read becomes the baseline without bumping.
@@ -286,30 +434,20 @@ pub async fn run_to_completion(
                     e.saturating_sub(s)
                 })
                 .sum();
-            p.set_pass_total(scanned_so_far_in_pass + sum_remaining);
-            // [API v2 §4.4 / Phase E] Seed the session-monotonic floor with the GLOBAL position.
-            // fetch_max semantics: the seed can only RAISE the floor, and re-seeding every suggest
-            // round tracks global progress as ranges complete. Two behaviours fall out for free:
-            // a cold-launch catch-up starts at ~99.9% instead of flashing 0% (the old Swift
-            // summary floor), and a relaunched restore RESUMES near its true position instead of
-            // 0% (the old Swift monotonic floor could not survive a relaunch).
-            if let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining)
-            {
-                // [API v2.1 E-5] Scope-expansion re-baseline: an imported account with an
-                // older birthday (or a rewind) grows the span under the session floor —
-                // without this, the ~1000 floor from the previous scope's Done would mask
-                // the whole re-scan at ~100% (the host used to bypass every floor with
-                // `forceCounterProgressUntilDone`; the blessed permille now reads the
-                // genuine climb by itself).
-                if p.rebaseline_floor_if_scope_expanded(seed) {
-                    info!(
-                        seed,
-                        birthday = wallet_birthday,
-                        "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
-                    );
-                }
-                let _ = p.permille_floor(seed);
-            }
+            // [h16-4] Read every suggest round, not once per pass: an account imported
+            // BETWEEN two rounds of the same pass, with an older birthday, widens the span
+            // above (sum_remaining grows) while a pass-level read would still hold the
+            // stale, newer birthday — once sum_remaining exceeds that stale span,
+            // global_floor_permille saturates to 0 and the re-baseline below stretches from
+            // 0 instead of the true global position. A read failure degrades to `None`,
+            // exactly as before.
+            let wallet_birthday: Option<u64> = session.min_birthday().unwrap_or_default();
+            update_pass_progress(
+                p,
+                &mut scanned_so_far_in_pass,
+                sum_remaining,
+                wallet_birthday,
+            );
         }
 
         // block_range() returns a Range<BlockHeight> where .end is END-EXCLUSIVE
@@ -344,15 +482,18 @@ pub async fn run_to_completion(
         {
             let ep = config.endpoint.clone();
             let tor_owned = tor.cloned();
+            let boundary_progress = progress.clone();
             tx.set_boundary_fetcher(std::sync::Arc::new(move |end_height| {
                 let ep = ep.clone();
                 let tor_owned = tor_owned.clone();
+                let progress = boundary_progress.clone();
                 tokio::spawn(async move {
                     crate::grpc::retry_get_tree_state(
                         &ep,
                         end_height,
                         "boundary prefetch (fetch-side)",
                         tor_owned.as_ref(),
+                        progress,
                     )
                     .await
                 })
@@ -374,8 +515,12 @@ pub async fn run_to_completion(
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
-        let fetch_task =
-            tokio::spawn(async move { run_fetch(&endpoint, plan, tx, fetch_progress).await });
+        // Wrapped in AbortOnDrop: if `connect_via` below fails (`?` returns early) or this
+        // whole future is dropped (a host restart aborts the session, not this task), the
+        // fetch task is aborted instead of orphaned (see `AbortOnDrop`'s doc).
+        let fetch_task = AbortOnDrop(tokio::spawn(async move {
+            run_fetch(&endpoint, plan, tx, fetch_progress).await
+        }));
 
         // scan_chunks runs in the current task using a SEPARATE grpc client so it
         // does not contend with the fetch workers' connections.
@@ -455,6 +600,14 @@ pub async fn run_to_completion(
                 .db_mut()
                 .truncate_to_height(BlockHeight::from(rewind_height))
                 .map_err(|e| SlipstreamError::Wallet(format!("truncate_to_height: {e}")))?;
+
+            // [h16-2] The truncate discards blocks above rewind_height, but the blocks
+            // BELOW it (the surviving prefix of the aborted range) are still done — credit
+            // them now so the next suggest round's baseline snapshot (h16-1) folds them
+            // into scanned_so_far_in_pass instead of leaving pass_total cover only the
+            // small repair range while fetched/scanned still hold the whole aborted range.
+            scanned_so_far_in_pass +=
+                scan_continuity_repair_credit(start, end_exclusive, u64::from(rewind_height));
 
             report.reorgs_recovered += 1;
             if let Some(ref p) = progress {
@@ -635,6 +788,7 @@ pub async fn run_to_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ffi_handle::{SyncState, derive_snapshot};
 
     #[test]
     fn sync_report_default_is_zero() {
@@ -707,6 +861,362 @@ mod tests {
         );
         // Remaining exceeding the span clamps to 0 rather than underflowing.
         assert_eq!(global_floor_permille(1_100, Some(1_000), 5_000), Some(0));
+    }
+
+    /// [h16-1] Reviewer's example on 10c9f633 (PR #14 review round): an older-birthday
+    /// account import expands the scan scope mid-pass. Drives the real suggest-round
+    /// accounting (`update_pass_progress`) across three rounds, polling the FFI snapshot
+    /// between them the way a host would — the poll matters because `derive_snapshot`
+    /// itself latches the session floor (`Progress::permille_floor`), and the pre-fix bug's
+    /// inflated reading re-latches a floor high enough to wrongly trigger ANOTHER
+    /// re-baseline on the very next round (the reviewer's "fires again on every round").
+    #[test]
+    fn scope_expansion_rebaseline_does_not_double_count_or_oscillate() {
+        let p = Progress::default();
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1; // pre-import birthday: span 1,000,000
+        const B0: u64 = TIP - 2_000_000 + 1; // post-import (older) birthday: span 2,000,000
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+
+        // Round 1: the pass's first suggest round, no expansion yet — a 1,000,000-block
+        // span with everything still remaining, so the seed (and the latched start) is 0.
+        let rebaselined =
+            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        assert!(!rebaselined, "first round of a pass is never a re-baseline");
+        assert_eq!(p.pass_start_permille(), Some(0));
+
+        // This pass scans 900k of its original 1M-block span before anything changes.
+        p.add_fetched(900_000);
+        p.add_scanned(900_000);
+        scanned_so_far_in_pass += 900_000;
+
+        // A host poll between suggest rounds (polling is continuous in practice) latches
+        // the session floor at 900 before the import lands.
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 900,
+            "900k/1M fetched+scanned, no start stretch yet (start=0) ⇒ 900"
+        );
+
+        // Round 2: an older-birthday account is imported — the scope expands to a
+        // 2,000,000-block span with 1,100,000 remaining (the reviewer's own example).
+        // seed = (2,000,000 − 1,100,000) × 1000 / 2,000,000 = 450, far enough below the
+        // 900 floor to read as scope expansion, not noise.
+        let rebaselined =
+            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_100_000, Some(B0));
+        assert!(
+            rebaselined,
+            "450 is >50‰ below the 900 floor ⇒ scope expansion"
+        );
+        assert_eq!(p.pass_start_permille(), Some(450));
+
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 450,
+            "right after the re-baseline the reading must be the new start alone (450), \
+             not the pre-expansion 900k/900k double-counted against the new 1.1M total"
+        );
+
+        // Round 3: the very next suggest round, nothing scanned since round 2 — the seed
+        // is still 450, which must NOT read as a further expansion against the now-correct
+        // 450 floor (pre-fix, the round-2 poll above re-inflates the floor and this round
+        // wrongly re-baselines again).
+        let rebaselined_again =
+            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_100_000, Some(B0));
+        assert!(
+            !rebaselined_again,
+            "the next suggest round must not re-baseline again"
+        );
+
+        // The repair climbs from 450 to 1000 as the remaining 1.1M blocks are fetched and
+        // scanned — not instantly, and not before both are done.
+        p.add_fetched(1_100_000);
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 725,
+            "everything fetched, nothing scanned since the re-baseline: half-weighted climb \
+             off the 450 start"
+        );
+
+        p.add_scanned(1_100_000);
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "the pass reaches 1000 only once the remaining 1.1M are fetched AND scanned"
+        );
+    }
+
+    /// [h17-1] A real concurrent poll can't be made to land inside `update_pass_progress` at
+    /// an exact instant deterministically — but every store its re-baseline branch makes is a
+    /// plain `Progress` method, so replaying them by hand with a `derive_snapshot` poll spliced
+    /// between each one reads exactly what a poll on another thread could see at that instant.
+    /// This does NOT exercise `update_pass_progress` itself (its own branch is verified by
+    /// reading it against this same sequence) — it exercises the ORDER the brief specifies, to
+    /// confirm that order is safe. Same round-2 setup as
+    /// `scope_expansion_rebaseline_does_not_double_count_or_oscillate` (TIP 3,000,000; 900,000
+    /// credited and polled, latching the floor at 900; seed 450 for the import).
+    #[test]
+    fn rebaseline_new_order_never_reads_above_the_old_floor_mid_publish() {
+        let p = Progress::default();
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1;
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        p.add_fetched(900_000);
+        p.add_scanned(900_000);
+        // (round 1 credited nothing to `scanned_so_far_in_pass`: the non-expanded branch
+        // never touches it. Round 2 below is replayed by hand, not via another
+        // `update_pass_progress` call, so — unlike the counterfactual test below, which reads
+        // it back — this test has no further use for the local accumulator.)
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        // Round 2, replayed by hand in the NEW order: baseline, then total, then start, then
+        // (last) the floor call — polling after each step.
+        const SEED: u64 = 450; // global_floor_permille(3_000_000, Some(B0), 1_100_000)
+
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(1_100_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900,
+            "zero pass-local count under the OLD (round-1) start ⇒ raw ≪ 900, floor unmoved"
+        );
+
+        p.set_pass_start_permille(SEED);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900,
+            "zero pass-local count under the NEW seed ⇒ raw = 450 ≤ 900, floor still unmoved"
+        );
+
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED);
+        assert!(rebaselined, "the re-check must still see the expansion");
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            450,
+            "only once the floor call runs does the reading drop to the true post-rebaseline value"
+        );
+    }
+
+    /// [h17-1] Counterfactual: replays the PRE-fix order (floor lowered first, start moved
+    /// second, baseline/total published last — the exact order `update_pass_progress` used
+    /// before this fix) against the identical round-2 state, to reproduce what the reviewer's
+    /// report describes — a poll between the start moving and the baseline/total catching up
+    /// reads a DOUBLE-COUNTED value: the new 450 start stretched by a pass-local ratio still
+    /// measured against the pass's PRE-refresh baseline/total (900,000 fetched+scanned over a
+    /// 2,000,000 total, i.e. the scheduler's unconditional top-of-function snapshot for THIS
+    /// round, not round 1's). `fetch_max` latches that 697 and the true 450 can never surface
+    /// for the rest of the pass. This sequence is no longer reachable from
+    /// `update_pass_progress` (see its new order, and
+    /// `rebaseline_new_order_never_reads_above_the_old_floor_mid_publish` above) — this test
+    /// documents why the old order was wrong; it does not exercise production code.
+    #[test]
+    fn rebaseline_old_order_used_to_latch_a_double_counted_697() {
+        let p = Progress::default();
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1;
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        p.add_fetched(900_000);
+        p.add_scanned(900_000);
+        scanned_so_far_in_pass += 900_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        const SEED: u64 = 450;
+
+        // The unconditional top-of-function step `update_pass_progress` always runs before
+        // deciding expansion (unchanged by this fix): baseline from this round's zeroed-so-far
+        // accounting, total from `scanned_so_far_in_pass` + the NEW `sum_remaining`.
+        p.set_pass_baseline(
+            p.fetched().saturating_sub(scanned_so_far_in_pass),
+            p.scanned().saturating_sub(scanned_so_far_in_pass),
+        );
+        p.set_pass_total(scanned_so_far_in_pass + 1_100_000);
+
+        // OLD step 1: lower the floor FIRST.
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED));
+
+        // OLD step 2: move the start SECOND, still ahead of the baseline/total refresh.
+        p.set_pass_start_permille(SEED);
+
+        // The poll the reviewer's report describes: new start, stale pre-refresh baseline/total.
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            697,
+            "the new 450 start stretched by a pass-local ratio still measured against the \
+             stale pre-refresh baseline/total — the double-counted value fetch_max then latches"
+        );
+
+        // OLD step 3 (too late): the baseline/total refresh can no longer help — 697 is latched.
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(1_100_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            697,
+            "fetch_max never lowers: the true 450 can no longer surface for this pass"
+        );
+    }
+
+    /// [h16-4] The fix under test: `run_to_completion` now reads `session.min_birthday()`
+    /// fresh every suggest round instead of once per pass. Drives two rounds against a REAL
+    /// `WalletSession` (not the hardcoded `Some(B1)`/`Some(B0)` literals the sibling test
+    /// above uses): round 1 sees the single TEST_UFVK account (birthday 663_150, tip
+    /// 700_000, via `wallet_with_account`); between rounds a second, older-birthday account
+    /// lands via a real `create_account` import — the same synthetic `[7u8; 32]` filler seed
+    /// `oracle.rs`'s `t10b_fixture`/`t10b_prepare` already uses to create a spending account
+    /// in these unit tests, never a real wallet's key material — before round 2's read.
+    ///
+    /// Contrasts the STALE seed a once-per-pass read would still feed in (birthday still
+    /// 663_150: remaining 60_000 now exceeds that pre-import 36_851 span, so
+    /// `global_floor_permille` saturates to 0 — the exact bug from the brief) against the
+    /// FRESH seed a per-round read reaches (birthday 600_000: seed 400) — `pass_start_permille`
+    /// must land on 400, the true global position, not 0. The re-baseline MATH itself (this is
+    /// a `rebaseline_floor_if_scope_expanded` case, `50 + 400 < 918`) is already covered by
+    /// `scope_expansion_rebaseline_does_not_double_count_or_oscillate` above; this test is the
+    /// new-here half — a live session read actually SEES a mid-pass import.
+    #[test]
+    fn min_birthday_refresh_sees_a_mid_pass_import_with_an_older_birthday() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        const TIP: u64 = 700_000;
+        let mut s = wallet_with_account(&dir, TIP); // TEST_UFVK, birthday 663_150 (span 36_851)
+
+        let p = Progress::default();
+        p.set_chain_tip(TIP);
+        let mut scanned_so_far_in_pass = 0u64;
+
+        // Round 1: a fresh read of the single-account wallet.
+        let birthday = s.min_birthday().expect("min_birthday");
+        assert_eq!(
+            birthday,
+            Some(663_150),
+            "single-account wallet reads that account's birthday"
+        );
+        let rebaselined = update_pass_progress(&p, &mut scanned_so_far_in_pass, 3_000, birthday);
+        assert!(!rebaselined, "first round of a pass is never a re-baseline");
+        assert_eq!(p.pass_start_permille(), Some(918));
+
+        // Between rounds: a second, OLDER-birthday account lands — e.g. a Ledger import
+        // mid-pass. `db_mut().create_account` (not `ensure_account`, which no-ops once any
+        // account exists) mirrors production's real import path.
+        let birthday2 = zcash_client_backend::data_api::AccountBirthday::from_treestate(
+            zcash_client_backend::proto::service::TreeState {
+                network: "main".into(),
+                height: 599_999,
+                hash: "0".repeat(64),
+                time: 1,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("birthday2");
+        s.db_mut()
+            .create_account(
+                "h16-4 second account (older birthday)",
+                &secrecy::SecretVec::new([7u8; 32].to_vec()),
+                &birthday2,
+                None,
+            )
+            .expect("create_account");
+
+        // Round 2: the refresh under test. First, the counterfactual — a STALE read (the old
+        // once-per-pass value, still 663_150) would feed a remaining (60_000) that now
+        // exceeds the pre-import span (36_851), saturating the seed to 0.
+        assert_eq!(
+            global_floor_permille(TIP, Some(663_150), 60_000),
+            Some(0),
+            "the STALE birthday saturates the seed to 0 once remaining exceeds its span"
+        );
+        // Now the real fix: a FRESH read — not the round-1 value reused — sees the import.
+        let birthday = s.min_birthday().expect("min_birthday");
+        assert_eq!(
+            birthday,
+            Some(600_000),
+            "a fresh read after the mid-pass import returns the NEW minimum birthday"
+        );
+        let rebaselined = update_pass_progress(&p, &mut scanned_so_far_in_pass, 60_000, birthday);
+        assert!(
+            rebaselined,
+            "400 is >50‰ below the 918 floor ⇒ scope expansion"
+        );
+        assert_eq!(
+            p.pass_start_permille(),
+            Some(400),
+            "the re-baseline stretches from the TRUE global position (400), not 0"
+        );
+    }
+
+    /// [h16-2] Reviewer's example on 10c9f633 (PR #14 review round): a 10k-block range
+    /// breaks continuity at height 9,000 (rewind to 8,990, matching upstream's
+    /// `at.saturating_sub(10)`). The blocks below 8,990 stay done after the truncate — this
+    /// test credits them to `scanned_so_far_in_pass` the same way the real ScanContinuity
+    /// branch does (via `scan_continuity_repair_credit`, the exact formula that branch
+    /// calls; driving a live ScanContinuity error needs a full darkside scan failure, so the
+    /// branch's OWN wiring is verified by reading, not by this test — see the report). No
+    /// birthday is seeded (`global_floor_permille` returns `None` on `None`, per
+    /// `global_floor_degenerate_inputs_yield_none`), isolating the fetched/scanned/pass_total
+    /// interaction from h16-1's separate `pass_start_permille` stretch.
+    #[test]
+    fn continuity_repair_credits_the_surviving_prefix_not_the_whole_range() {
+        let p = Progress::default();
+        let mut scanned_so_far_in_pass = 0u64;
+
+        // Round 1: the range about to break is [0, 10_000) — "a 10k-block range".
+        let (start, end_exclusive) = (0u64, 10_000u64);
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, end_exclusive - start, None);
+        assert_eq!(p.pass_total(), 10_000);
+
+        // The break: fetch ran ahead to the whole range (f=10,000); scan got to 9,000
+        // (s=9,000) before the continuity error at height 9,000.
+        p.add_fetched(10_000);
+        p.add_scanned(9_000);
+
+        // ScanContinuity { at: 9_000 } -> rewind_height = 9_000 - 10 = 8_990 (at is u32,
+        // matching error.rs's ScanContinuity::at and the branch's own rewind_height).
+        let at: u32 = 9_000;
+        let rewind_height = at.saturating_sub(10);
+        assert_eq!(rewind_height, 8_990);
+
+        // The fix under test: credit the surviving prefix right after the truncate, via the
+        // SAME formula (`scan_continuity_repair_credit`) the production branch calls.
+        scanned_so_far_in_pass +=
+            scan_continuity_repair_credit(start, end_exclusive, u64::from(rewind_height));
+        assert_eq!(scanned_so_far_in_pass, 8_990);
+
+        // Next suggest round: the repair range is [8_990, 10_000) -> 1_010 remaining
+        // ("T ≈ 1,010" in the reviewer's own notation for the UNCREDITED pre-fix total —
+        // post-fix, T is the credited 8_990 plus this 1_010 repair range).
+        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_010, None);
+        assert_eq!(
+            p.pass_total(),
+            10_000,
+            "T = the credited 8_990 + the 1_010 repair range"
+        );
+
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 899,
+            "right after the rewind the reading must be ~900, not 1000 mid-repair \
+             (no pass start is seeded here, so this is the pass-local ratio alone: \
+             fetched (10,000−1,010=8,990) + scanned (9,000−10=8,990) over 2×10,000)"
+        );
+
+        // The repair completes: the remaining 1_010 blocks are fetched and scanned.
+        p.add_fetched(1_010);
+        p.add_scanned(1_010);
+        let snap = derive_snapshot(&p, SyncState::Syncing);
+        assert_eq!(
+            snap.progress_permille, 1000,
+            "reaches 1000 only once the repair completes"
+        );
     }
 
     // ── [API v2.1 E-3] truthful-from-open seed ─────────────────────────────────
@@ -914,5 +1424,27 @@ mod tests {
             "statuses_set must sum across ranges"
         );
         assert_eq!(report.enhance.skipped, 1, "skipped must sum across ranges");
+    }
+
+    // ── AbortOnDrop: an orphaned fetch task must not keep running ──────────────
+
+    /// Dropped before it is ever awaited, the wrapper must stop the wrapped task instead of
+    /// leaving it to run detached — the exact shape of the bug where an orphaned fetch task
+    /// kept running after its session was abandoned and recorded a give-up into the NEXT
+    /// session's fresh `Progress` count.
+    #[tokio::test(start_paused = true)]
+    async fn abort_on_drop_stops_the_task_before_it_sets_its_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_in_task = flag.clone();
+        let task = AbortOnDrop(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            flag_in_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        drop(task);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert!(
+            !flag.load(std::sync::atomic::Ordering::SeqCst),
+            "the aborted task must never set the flag"
+        );
     }
 }

@@ -424,7 +424,14 @@ fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: zodl_slipstream::Netwo
             eprintln!("error: derivation failed: {e:?}");
             std::process::exit(2);
         });
-    println!("{}", usk.to_unified_full_viewing_key().encode(&network));
+    let encoded = usk
+        .to_unified_full_viewing_key()
+        .encode(&network)
+        .unwrap_or_else(|e| {
+            eprintln!("error: cannot encode the UFVK: {e}");
+            std::process::exit(2);
+        });
+    println!("{encoded}");
     eprintln!(
         "hint: slipstream sync --network {} --server <lwd-url> --wallet-dir <dir> --ufvk '<above>' --birthday <height>",
         match network {
@@ -711,7 +718,7 @@ fn cmd_watch(
                     &db_path,
                     network,
                     zcash_client_sqlite::util::SystemClock,
-                    rand::rngs::OsRng,
+                    rand::rand_core::UnwrapErr(rand::rngs::SysRng),
                 ) {
                     Ok(db) => match db.get_wallet_summary(
                         zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
@@ -1338,10 +1345,10 @@ fn cmd_send(
             .get_account(wallet_account)
             .expect("get account")
             .expect("account exists");
-        let wallet_ufvk = acct.ufvk().expect("wallet has a UFVK").encode(&network);
-        assert_eq!(
-            wallet_ufvk,
-            ufvk.encode(&network),
+        assert!(
+            acct.ufvk()
+                .expect("wallet has a UFVK")
+                .is_equivalent_to(&ufvk),
             "mnemonic/account does not match the wallet's UFVK"
         );
     }
@@ -1420,11 +1427,7 @@ fn cmd_send(
         ) -> Option<sapling::circuit::Spend> {
             unreachable!("orchard/ironwood-only tx must not prepare sapling spends")
         }
-        fn create_proof<R: rand::RngCore>(
-            &self,
-            _: sapling::circuit::Spend,
-            _: &mut R,
-        ) -> Self::Proof {
+        fn create_proof<R: rand::Rng>(&self, _: sapling::circuit::Spend, _: &mut R) -> Self::Proof {
             unreachable!("orchard/ironwood-only tx must not prove sapling spends")
         }
         fn encode_proof(_: Self::Proof) -> sapling::bundle::GrothProofBytes {
@@ -1442,7 +1445,7 @@ fn cmd_send(
         ) -> sapling::circuit::Output {
             unreachable!("orchard/ironwood-only tx must not prepare sapling outputs")
         }
-        fn create_proof<R: rand::RngCore>(
+        fn create_proof<R: rand::Rng>(
             &self,
             _: sapling::circuit::Output,
             _: &mut R,
@@ -1465,6 +1468,8 @@ fn cmd_send(
     >(
         db,
         &network,
+        &zcash_client_sqlite::util::SystemClock,
+        &mut rand::rand_core::UnwrapErr(rand::rngs::SysRng),
         &NoSapling,
         &NoSapling,
         &SpendingKeys::from_unified_spending_key(usk),
@@ -1777,7 +1782,10 @@ mod tests {
         .expect("derives");
         let encoded = usk
             .to_unified_full_viewing_key()
-            .encode(&zodl_slipstream::Network::TestNetwork);
+            .encode(&zodl_slipstream::Network::TestNetwork)
+            .expect("a derived UFVK has an encoding");
+        // A UFVK that ZIP 316 Revision 0 can represent is encoded at Revision 0
+        // ("uview…"); decoding accepts both revisions.
         assert!(
             encoded.starts_with("uviewtest1"),
             "testnet UFVK must carry the uviewtest HRP, got {encoded}"

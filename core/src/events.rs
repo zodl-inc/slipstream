@@ -20,8 +20,55 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
+
+/// Current wall-clock time in whole Unix seconds (0 if the clock reads before the epoch).
+pub(crate) fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// A block download that has given up this many times at the same block, each give-up within
+/// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] of the one before, counts toward `stalled_seconds` from its
+/// first give-up (see [`Progress::download_failure_secs`]). Two: the engine's own retry gets one
+/// chance first.
+pub const DOWNLOAD_FAILURE_STALL_STREAK: u32 = 2;
+
+/// Give-ups at the same block more than this many seconds apart are separate runs. The time in
+/// between was not spent failing that download: for example, a synced wallet sitting idle between
+/// catch-up passes, or the engine busy downloading other ranges. It sits well above the few
+/// minutes between consecutive give-ups when a server keeps failing a range. A run also stops
+/// counting toward `stalled_seconds` once its latest give-up is older than this: see
+/// [`Progress::download_failure_secs`].
+pub const DOWNLOAD_FAILURE_RUN_GAP_SECS: u64 = 600;
+
+/// A safety bound on how many runs [`Progress`] keeps. Runs normally hold only the one or two
+/// blocks the download is stuck on, because a later release removes each run.
+const MAX_DOWNLOAD_FAILURE_RUNS: usize = 8;
+
+/// A run of block-download give-ups at one block (see [`Progress::note_download_gave_up`]).
+///
+/// There is one run per block. A run ends in one of four ways: a later release of its block to
+/// the scanner ([`Progress::note_blocks_released`]), a completed pass
+/// ([`Progress::note_pass_completed`]), a sync attempt that failed without its download giving up
+/// ([`Progress::note_attempt_failed`]), or a new session ([`Progress::begin_session`]). A give-up
+/// at its block more than [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] after the previous one starts it
+/// over, and until then it counts only while live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadFailure {
+    /// Give-ups at `at_height` in this run.
+    pub streak: u32,
+    /// The block the download could not deliver: the lowest block not yet handed to the scanner
+    /// when it gave up. Give-ups at any other block belong to that block's own run.
+    pub at_height: u64,
+    /// Unix seconds of the run's first give-up.
+    pub since_unix: u64,
+    /// Unix seconds of the run's latest give-up.
+    pub last_unix: u64,
+}
 
 /// Shared engine progress for poll-based consumers (decision D8).
 ///
@@ -32,7 +79,7 @@ use std::sync::{
 ///
 /// Wrap in `Arc<Progress>` and pass `Some(arc)` to `engine::sync_once` to
 /// receive live updates. `None` disables all progress tracking with zero overhead.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Progress {
     /// Current chain tip height as reported by the server.
     pub chain_tip: AtomicU64,
@@ -69,15 +116,49 @@ pub struct Progress {
     /// states (Done / Error) — the fail-safe latch that previously lived in the Swift
     /// SDK ("a dead pass can never wedge Restoring") now holds for every host.
     pub recovering: AtomicU64,
-    /// Unix seconds of the last forward progress (any counter bump / pass start).
-    /// The snapshot derives `stalled_seconds = now − this` while Syncing.
+    /// Unix seconds of the last forward progress: any counter bump, a pass start,
+    /// data arriving from the server during a pass (every streamed block and
+    /// every metadata message, direct or over Tor), or a unit of
+    /// local work completing (a persisted chunk, the range-end tree build). The
+    /// snapshot's `stalled_seconds` (while Syncing) is the longer of `now − this` and the
+    /// time the block download has kept failing at the same block — see [`Self::stall_secs`].
     pub last_progress_unix: AtomicU64,
     /// Session-monotonic progress floor in permille (0..=1000). The snapshot fetch-maxes
-    /// the raw `scanned / pass_total` ratio into this and reports the floor, so reported
-    /// progress NEVER regresses while the handle lives (subsumes the SDK's
-    /// monotonicRecoveryProgress floor and its warm-start seeding: a follow-up catch-up
-    /// pass holds the prior high-water mark instead of flashing back to 0%).
+    /// the pass's BLENDED progress into this and reports the floor, so reported progress
+    /// NEVER regresses while the handle lives (subsumes the SDK's monotonicRecoveryProgress
+    /// floor and its warm-start seeding: a follow-up catch-up pass holds the prior
+    /// high-water mark instead of flashing back to 0%). The blend stretches the pass-local
+    /// ratio of fetched+scanned blocks between the pass's starting GLOBAL position (see
+    /// [`Progress::pass_start_permille`]) and 1000, instead of the raw `scanned / pass_total`
+    /// ratio this field used to be fed directly.
     pub progress_permille_floor: AtomicU64,
+    /// The pass's starting GLOBAL position in permille — the `global_floor_permille` seed
+    /// recorded by the FIRST suggest round of the current pass (see
+    /// [`Self::set_pass_start_permille_if_unset`]), or overwritten mid-pass when the scan
+    /// scope expands under it (see [`Self::set_pass_start_permille`] and
+    /// [`Self::rebaseline_floor_if_scope_expanded`]). `u64::MAX` means unset — no suggest
+    /// round has recorded one yet this pass (see [`Self::begin_pass`], which resets it).
+    /// The FFI snapshot stretches the pass-local fetched+scanned ratio between this value
+    /// and 1000 (`raw = start + (1000 − start) × pass_permille / 1000`), so a resync's
+    /// reading climbs from where the wallet's GLOBAL position already stood instead of
+    /// restarting at 0 and staying invisible until the pass-local ratio alone crosses that
+    /// same global position. Read with [`Self::pass_start_permille`].
+    pass_start_permille: AtomicU64,
+    /// [h16-1] `fetched_blocks`/`scanned_blocks` value (respectively) that the pass-local
+    /// blend's numerators are measured FROM, snapshotted by the scheduler every suggest
+    /// round (see [`Self::set_pass_baseline`]) just before it sets `pass_total_blocks`. The
+    /// FFI snapshot's `pass_permille` term uses `fetched() − pass_base_fetched()` (clamped
+    /// to `pass_total`) in place of the raw counter, so blocks this pass already credited to
+    /// `scanned_so_far_in_pass` before the snapshot — e.g. the ones folded into a scope
+    /// expansion's re-baselined `pass_start_permille` — are not counted a SECOND time
+    /// against the new total. `fetched_blocks`/`scanned_blocks` themselves are never zeroed
+    /// mid-pass (other readers need the raw counters: the FFI snapshot's own
+    /// `fetched_blocks`/`scanned_blocks` fields, and the CLI ticker), so this baseline is
+    /// the offset, not a reset. Reset to 0 by [`Self::begin_pass`]. Read with
+    /// [`Self::pass_base_fetched`] / [`Self::pass_base_scanned`].
+    pass_base_fetched: AtomicU64,
+    /// [h16-1] See [`Self::pass_base_fetched`] — the `scanned_blocks` counterpart.
+    pass_base_scanned: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -107,6 +188,49 @@ pub struct Progress {
     /// Deliberately NOT reset by [`Self::begin_pass`] — an orphan outlives its pass by
     /// definition.
     pub wallet_writers: AtomicUsize,
+    /// The runs of block-download give-ups, one per block, keyed by `at_height` (see
+    /// [`Self::note_download_gave_up`]). Deliberately NOT reset by [`Self::begin_pass`]: a run
+    /// spans the retried passes it is about. A run ends when a later release covers its block
+    /// ([`Self::note_blocks_released`]); every run ends when a pass completes
+    /// ([`Self::note_pass_completed`]), a sync attempt fails without its download giving up
+    /// ([`Self::note_attempt_failed`]), or a new session begins ([`Self::begin_session`]).
+    download_failures: std::sync::Mutex<std::collections::BTreeMap<u64, DownloadFailure>>,
+    /// Whether the block download gave up since the last sync attempt ended: set by every
+    /// give-up, spent by [`Self::note_attempt_failed`], and cleared by
+    /// [`Self::note_pass_completed`] and [`Self::begin_session`].
+    download_gave_up_this_attempt: AtomicBool,
+}
+
+impl Default for Progress {
+    /// Every counter starts at 0 — the natural "nothing has happened yet" value — except
+    /// `pass_start_permille`: 0 there is a legitimate pass-start position (a fresh-birthday
+    /// restore has a GLOBAL position of 0‰), so it cannot double as the "unset" sentinel and
+    /// starts at `u64::MAX` instead (see the field's own doc and
+    /// [`Progress::pass_start_permille`]).
+    fn default() -> Self {
+        Self {
+            chain_tip: AtomicU64::new(0),
+            fetched_blocks: AtomicU64::new(0),
+            scanned_blocks: AtomicU64::new(0),
+            enhanced_txs: AtomicU64::new(0),
+            current_range_end: AtomicU64::new(0),
+            reorgs_recovered: AtomicU64::new(0),
+            pass_total_blocks: AtomicU64::new(0),
+            spendable_hint: AtomicU64::new(0),
+            ranges_completed: AtomicU64::new(0),
+            recovering: AtomicU64::new(0),
+            last_progress_unix: AtomicU64::new(0),
+            progress_permille_floor: AtomicU64::new(0),
+            pass_start_permille: AtomicU64::new(u64::MAX),
+            pass_base_fetched: AtomicU64::new(0),
+            pass_base_scanned: AtomicU64::new(0),
+            tip_refreshes: AtomicU64::new(0),
+            tx_set_version: AtomicU64::new(0),
+            wallet_writers: AtomicUsize::new(0),
+            download_failures: std::sync::Mutex::new(std::collections::BTreeMap::new()),
+            download_gave_up_this_attempt: AtomicBool::new(false),
+        }
+    }
 }
 
 /// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
@@ -239,14 +363,223 @@ impl Progress {
     // ── API v2 (ENGINE_API_V2.md §4.4) ──
 
     /// Stamp `last_progress_unix` with the current wall-clock second. Called by every
-    /// counter bump and at pass start; the snapshot derives stalledness from it.
+    /// counter bump, at pass start, whenever server data arrives during a pass, and when a
+    /// unit of local work completes (a persisted chunk, the range-end tree build); the
+    /// snapshot derives stalledness from it.
     #[inline]
     pub fn touch(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+        let now = unix_now_secs();
         self.last_progress_unix.store(now, Ordering::Relaxed);
+    }
+
+    /// Record that the block download gave up: a fetch worker failed (or panicked) and failed
+    /// the fetch while `at_height` was the lowest block not yet released to the scanner.
+    ///
+    /// A failed pass is retried, and its retries show signs of life — a pass start, metadata
+    /// answers, scans of new blocks near the tip — so a server that can never deliver a block
+    /// range would otherwise keep the stall clock fresh forever, and the host's stall recovery
+    /// would never see it.
+    ///
+    /// There is one run per block. A give-up at `at_height` no more than
+    /// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] after that block's previous one continues its run; a
+    /// later one starts the run over. A give-up at any other block starts or continues that
+    /// block's own run and never touches this one: scan ranges are not downloaded in height
+    /// order (ChainTip, FoundNote and Verify ranges come before Historic ones, and truncation
+    /// rewinds), so a give-up at one block says nothing about another. Each run ends when a
+    /// later release covers its block ([`Self::note_blocks_released`]), a pass completes
+    /// ([`Self::note_pass_completed`]), a sync attempt fails without its download giving up
+    /// ([`Self::note_attempt_failed`]), or a new session begins ([`Self::begin_session`]).
+    /// Should more than a handful of blocks have runs at once, the one that failed least
+    /// recently is dropped.
+    pub fn note_download_gave_up(&self, at_height: u64) {
+        self.note_download_gave_up_at(at_height, unix_now_secs());
+    }
+
+    /// [`Self::note_download_gave_up`] with an explicit clock (tests).
+    pub(crate) fn note_download_gave_up_at(&self, at_height: u64, now_unix: u64) {
+        let (run, evicted) = {
+            let mut runs = self
+                .download_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let run = match runs.get(&at_height) {
+                Some(run)
+                    if now_unix.saturating_sub(run.last_unix) <= DOWNLOAD_FAILURE_RUN_GAP_SECS =>
+                {
+                    DownloadFailure {
+                        streak: run.streak.saturating_add(1),
+                        last_unix: now_unix,
+                        ..*run
+                    }
+                }
+                _ => DownloadFailure {
+                    streak: 1,
+                    at_height,
+                    since_unix: now_unix,
+                    last_unix: now_unix,
+                },
+            };
+            runs.insert(at_height, run);
+            let evicted = if runs.len() > MAX_DOWNLOAD_FAILURE_RUNS {
+                // The run that failed least recently — never the one just recorded.
+                let least_recent = runs
+                    .values()
+                    .filter(|other| other.at_height != at_height)
+                    .min_by_key(|other| other.last_unix)
+                    .map(|other| other.at_height);
+                least_recent.and_then(|height| runs.remove(&height))
+            } else {
+                None
+            };
+            (run, evicted)
+        };
+        self.download_gave_up_this_attempt
+            .store(true, Ordering::SeqCst);
+        if run.streak == DOWNLOAD_FAILURE_STALL_STREAK {
+            tracing::warn!(
+                at_height = run.at_height,
+                since_unix = run.since_unix,
+                "block download keeps giving up at the same height — stall time counts from its first give-up"
+            );
+        }
+        if let Some(evicted) = evicted {
+            tracing::info!(
+                streak = evicted.streak,
+                at_height = evicted.at_height,
+                reason = "least recently failed of too many runs",
+                "block download failure run cleared"
+            );
+        }
+    }
+
+    /// A pass completed: the download got past whatever it failed on before, so every run ends.
+    pub fn note_pass_completed(&self) {
+        self.download_gave_up_this_attempt
+            .store(false, Ordering::SeqCst);
+        self.clear_download_failures("pass completed");
+    }
+
+    /// A new sync session starts (a host start or restart). It gets a fresh count: every run
+    /// ends, so the session's first give-up at any block starts a new run instead of extending
+    /// one from before the restart.
+    pub fn begin_session(&self) {
+        self.download_gave_up_this_attempt
+            .store(false, Ordering::SeqCst);
+        self.clear_download_failures("new session");
+    }
+
+    /// A sync attempt failed: a pass, or the tip check between passes. If the block download
+    /// gave up during that attempt, the failure is the download's and every run stays.
+    /// Otherwise the attempt failed for another reason — typically it could not reach the
+    /// server at all, as when the device is offline — so nothing shows the download is still
+    /// failing, and every run ends. Without this, a run from before the device went offline
+    /// would keep reporting its growing span through every pass that fails before its download
+    /// starts.
+    pub fn note_attempt_failed(&self) {
+        if !self
+            .download_gave_up_this_attempt
+            .swap(false, Ordering::SeqCst)
+        {
+            self.clear_download_failures("sync attempt failed without its download giving up");
+        }
+    }
+
+    /// A fetch handed `first_height..=last_height` to the scanner: every run whose block falls
+    /// in that span ends, because the download got past the block it had stopped at. Runs at
+    /// other blocks are untouched.
+    ///
+    /// Without this, a run started in one scan range (say ChainTip) would last through the
+    /// hours-long Historic download that follows it in the same pass, and keep counting as a
+    /// stall long after its block was delivered. Does nothing when no run's block is in the
+    /// span.
+    pub fn note_blocks_released(&self, first_height: u64, last_height: u64) {
+        if first_height > last_height {
+            return;
+        }
+        let ended: Vec<DownloadFailure> = {
+            let mut runs = self
+                .download_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let covered: Vec<u64> = runs
+                .range(first_height..=last_height)
+                .map(|(&height, _)| height)
+                .collect();
+            covered
+                .into_iter()
+                .filter_map(|height| runs.remove(&height))
+                .collect()
+        };
+        for run in ended {
+            tracing::info!(
+                streak = run.streak,
+                at_height = run.at_height,
+                reason = "download got past it",
+                "block download failure run cleared"
+            );
+        }
+    }
+
+    /// Ends every run (see [`Self::note_pass_completed`], [`Self::begin_session`] and
+    /// [`Self::note_attempt_failed`]).
+    fn clear_download_failures(&self, reason: &str) {
+        let cleared = {
+            let mut runs = self
+                .download_failures
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let cleared = runs.len();
+            runs.clear();
+            cleared
+        };
+        if cleared > 0 {
+            tracing::info!(
+                runs = cleared,
+                reason,
+                "block download failure runs cleared"
+            );
+        }
+    }
+
+    /// The current runs of block-download give-ups, one per block, in ascending block order.
+    pub fn download_failures(&self) -> Vec<DownloadFailure> {
+        self.download_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .copied()
+            .collect()
+    }
+
+    /// Seconds the block download has kept failing at the same block, as of `now_unix`: the
+    /// longest time since a run's first give-up, over the live runs — latest give-up at most
+    /// [`DOWNLOAD_FAILURE_RUN_GAP_SECS`] old — with at least
+    /// [`DOWNLOAD_FAILURE_STALL_STREAK`] give-ups; 0 when no run qualifies. A run that has gone
+    /// quiet for longer than the gap no longer counts: the download is not shown to be failing
+    /// any more, and its next give-up starts the run over.
+    pub fn download_failure_secs(&self, now_unix: u64) -> u64 {
+        self.download_failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .filter(|run| run.streak >= DOWNLOAD_FAILURE_STALL_STREAK)
+            .filter(|run| now_unix.saturating_sub(run.last_unix) <= DOWNLOAD_FAILURE_RUN_GAP_SECS)
+            .map(|run| now_unix.saturating_sub(run.since_unix))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The stall fact as of `now_unix`: the longer of the time since the last progress stamp
+    /// (0 before the first stamp) and [`Self::download_failure_secs`]. The FFI snapshot
+    /// reports it as `stalled_seconds` while Syncing, and 0 otherwise.
+    pub fn stall_secs(&self, now_unix: u64) -> u64 {
+        let last = self.last_progress_unix_secs();
+        let since_progress = if last == 0 {
+            0
+        } else {
+            now_unix.saturating_sub(last)
+        };
+        since_progress.max(self.download_failure_secs(now_unix))
     }
 
     /// Scheduler: set whether the pass is still inside the recovery (restore backfill)
@@ -279,6 +612,20 @@ impl Progress {
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
+    /// [h17-1] Pure read of the scope-expansion condition: true when `seed` lands materially
+    /// BELOW the current session floor (see [`Self::rebaseline_floor_if_scope_expanded`]'s doc
+    /// for what that means and why). Stores nothing — [`Self::rebaseline_floor_if_scope_expanded`]
+    /// checks exactly this same condition (it calls this method) before it stores. Lets a
+    /// caller decide which branch to take, and publish every field a re-baseline touches in a
+    /// safe order, before the floor itself moves — see `update_pass_progress`
+    /// (`core/src/scheduler.rs`), which calls this first and calls
+    /// [`Self::rebaseline_floor_if_scope_expanded`] last for exactly that reason.
+    #[inline]
+    pub fn scope_expanded(&self, seed: u64) -> bool {
+        let current = self.progress_permille_floor.load(Ordering::Relaxed);
+        seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
+    }
+
     /// [API v2.1 E-5] When a suggest round's GLOBAL seed lands materially BELOW the current
     /// session floor, the scan SCOPE EXPANDED under the floor's feet — an imported account
     /// with an older birthday, or a rewind re-growing the queue — and the old floor (folded
@@ -289,8 +636,7 @@ impl Progress {
     /// epsilon is 50× above that noise and far below any real expansion (an import drops
     /// the seed by hundreds of permille). Returns whether a re-baseline happened.
     pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64) -> bool {
-        let current = self.progress_permille_floor.load(Ordering::Relaxed);
-        if seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current {
+        if self.scope_expanded(seed) {
             self.progress_permille_floor
                 .store(seed.min(1000), Ordering::Relaxed);
             return true;
@@ -298,17 +644,84 @@ impl Progress {
         false
     }
 
+    /// The pass's starting GLOBAL position in permille, as recorded by
+    /// [`Self::set_pass_start_permille_if_unset`] or [`Self::set_pass_start_permille`].
+    /// `None` before any suggest round of the current pass has recorded one — `begin_pass`
+    /// leaves it this way. See the `pass_start_permille` field doc for how the FFI snapshot
+    /// uses it.
+    #[inline]
+    pub fn pass_start_permille(&self) -> Option<u64> {
+        let v = self.pass_start_permille.load(Ordering::Relaxed);
+        if v == u64::MAX { None } else { Some(v) }
+    }
+
+    /// Record `seed` as the pass start IF no suggest round of the current pass has recorded
+    /// one yet (compare-exchange against the unset sentinel). Called on every suggest round;
+    /// only the FIRST round of a pass has any effect — later rounds of the SAME pass keep the
+    /// value the first round saw, so the pass's reported progress is always measured from
+    /// where the wallet's global position stood when the pass began, not wherever a later
+    /// round's seed has since drifted to. Clamps to 1000, matching [`Self::permille_floor`]'s
+    /// own clamp (`u64::MAX` is reserved for "unset" and can never be recorded as a value).
+    #[inline]
+    pub fn set_pass_start_permille_if_unset(&self, seed: u64) {
+        let seed = seed.min(1000);
+        let _ = self.pass_start_permille.compare_exchange(
+            u64::MAX,
+            seed,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Overwrite the pass start with `seed` unconditionally. Called instead of
+    /// [`Self::set_pass_start_permille_if_unset`] when
+    /// [`Self::rebaseline_floor_if_scope_expanded`] reports that the scan scope grew under
+    /// the running pass (an imported account with an older birthday, or a rewind): the
+    /// pass's own progress must stretch from the RE-BASELINED position, or the blend would
+    /// still stretch from the stale pre-expansion start and under-report the re-scan's climb.
+    /// Clamps to 1000, matching [`Self::permille_floor`]'s own clamp.
+    #[inline]
+    pub fn set_pass_start_permille(&self, seed: u64) {
+        self.pass_start_permille
+            .store(seed.min(1000), Ordering::Relaxed);
+    }
+
+    /// [h16-1] Snapshot the pass-local blend baseline: `fetched`/`scanned` reads that the
+    /// FFI snapshot's `pass_permille` term measures FROM (see the `pass_base_fetched` field
+    /// doc). Called by the scheduler on every suggest round, and again — to different
+    /// values — when a scope expansion re-baselines the session floor.
+    #[inline]
+    pub fn set_pass_baseline(&self, fetched: u64, scanned: u64) {
+        self.pass_base_fetched.store(fetched, Ordering::Relaxed);
+        self.pass_base_scanned.store(scanned, Ordering::Relaxed);
+    }
+
+    /// Read the pass-local fetched baseline (see [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn pass_base_fetched(&self) -> u64 {
+        self.pass_base_fetched.load(Ordering::Relaxed)
+    }
+
+    /// Read the pass-local scanned baseline (see [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn pass_base_scanned(&self) -> u64 {
+        self.pass_base_scanned.load(Ordering::Relaxed)
+    }
+
     /// Reset the per-pass RATIO counters at the start of a sync pass.
     ///
     /// The FFI handle outlives individual sync passes (Swift `prepare()` opens it once;
     /// `stop()`/`start()` reuse it across app background/foreground cycles), so without
-    /// this reset a resumed pass would compute `scanned / pass_total` with a stale
-    /// numerator from the previous pass — e.g. 100k stale scanned / 169k remaining
-    /// = 59% at pass start, climbing past 100% (clamped) long before the pass is done.
+    /// this reset a resumed pass would compute its progress blend with a stale numerator
+    /// from the previous pass — e.g. 100k stale scanned / 169k remaining = 59% at pass
+    /// start, climbing past 100% (clamped) long before the pass is done.
     ///
     /// Resets: `scanned_blocks`, `fetched_blocks`, `pass_total_blocks`,
-    /// `current_range_end`, and the `spendable_hint` latch (the new pass's ChainTip
-    /// range re-latches it within seconds, mirroring old-SDK per-sync semantics).
+    /// `current_range_end`, the `spendable_hint` latch (the new pass's ChainTip
+    /// range re-latches it within seconds, mirroring old-SDK per-sync semantics),
+    /// `pass_start_permille` (back to unset — the new pass has not had a suggest round
+    /// yet; see [`Self::pass_start_permille`]), and the `pass_base_fetched`/
+    /// `pass_base_scanned` blend baseline (back to 0 — see [`Self::set_pass_baseline`]).
     ///
     /// Deliberately NOT reset (monotonic per handle — Swift consumes these as deltas
     /// via strict-greater/last-seen comparisons): `enhanced_txs`, `ranges_completed`,
@@ -319,6 +732,9 @@ impl Progress {
         self.pass_total_blocks.store(0, Ordering::Relaxed);
         self.current_range_end.store(0, Ordering::Relaxed);
         self.spendable_hint.store(0, Ordering::Relaxed);
+        self.pass_start_permille.store(u64::MAX, Ordering::Relaxed);
+        self.pass_base_fetched.store(0, Ordering::Relaxed);
+        self.pass_base_scanned.store(0, Ordering::Relaxed);
         // v2: a new pass starts the stall clock fresh. `recovering` and the permille
         // floor are deliberately NOT reset — recovering is recomputed on the first
         // suggest round, and the floor is session-monotonic by contract (§4.4).
@@ -718,6 +1134,36 @@ mod tests {
         );
     }
 
+    /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
+    /// and — like the other per-pass ratio state — resets to 0 on `begin_pass()`.
+    #[test]
+    fn pass_baseline_defaults_to_zero_and_resets_on_begin_pass() {
+        let p = Progress::default();
+        assert_eq!(p.pass_base_fetched(), 0, "unset on a fresh handle");
+        assert_eq!(p.pass_base_scanned(), 0, "unset on a fresh handle");
+
+        p.set_pass_baseline(12_345, 6_789);
+        assert_eq!(p.pass_base_fetched(), 12_345);
+        assert_eq!(p.pass_base_scanned(), 6_789);
+
+        // A later suggest round re-snapshots to different values (store, not add).
+        p.set_pass_baseline(1, 2);
+        assert_eq!(
+            p.pass_base_fetched(),
+            1,
+            "set_pass_baseline overwrites, not adds"
+        );
+        assert_eq!(
+            p.pass_base_scanned(),
+            2,
+            "set_pass_baseline overwrites, not adds"
+        );
+
+        p.begin_pass();
+        assert_eq!(p.pass_base_fetched(), 0, "begin_pass resets the baseline");
+        assert_eq!(p.pass_base_scanned(), 0, "begin_pass resets the baseline");
+    }
+
     /// [API v2.1 E-5] The floor re-baselines when the scope EXPANDS (seed materially below
     /// the floor — import/rewind) and stays monotone against within-scope noise.
     #[test]
@@ -746,5 +1192,450 @@ mod tests {
         );
         // …and climbs monotonically again within the new scope.
         assert_eq!(p.permille_floor(300), 300);
+    }
+
+    /// [h17-1] `scope_expanded` answers exactly like its mutating sibling
+    /// `rebaseline_floor_if_scope_expanded` on the same inputs, but never writes: the floor
+    /// must hold across both a within-scope "false" reading and a genuine-expansion "true"
+    /// one, and only the mutating call may then move it.
+    #[test]
+    fn scope_expanded_reads_true_and_false_without_mutating_the_floor() {
+        let p = Progress::default();
+        assert_eq!(p.permille_floor(900), 900);
+
+        // Within-scope noise reads false, and a pure read must not move the floor.
+        assert!(
+            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE),
+            "exactly-epsilon dip is still within scope"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "a pure read must not lower the floor"
+        );
+
+        // A material drop reads true — and is STILL just a read: the floor holds until a
+        // caller separately chooses to act on it.
+        assert!(
+            p.scope_expanded(450),
+            "450 is >50‰ below the 900 floor ⇒ scope expansion"
+        );
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "scope_expanded alone must never lower (or raise) the floor"
+        );
+
+        // Agrees with the mutating sibling on both the false and the true case.
+        assert!(!p.rebaseline_floor_if_scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE));
+        assert_eq!(
+            p.permille_floor(0),
+            900,
+            "still not expanded ⇒ still untouched"
+        );
+        assert!(p.rebaseline_floor_if_scope_expanded(450));
+        assert_eq!(
+            p.permille_floor(0),
+            450,
+            "the mutating sibling now re-baselines"
+        );
+    }
+
+    /// [h10] The pass start records the FIRST suggest round's seed and holds through later
+    /// rounds of the same pass; `begin_pass()` unsets it for the next pass; a scope-expansion
+    /// re-baseline (import/rewind) overwrites it instead of holding the stale pre-expansion
+    /// value. Mirrors exactly the branch the scheduler's suggest-round loop takes.
+    #[test]
+    fn pass_start_permille_records_once_then_rebaselines_on_scope_expansion() {
+        let p = Progress::default();
+        assert_eq!(
+            p.pass_start_permille(),
+            None,
+            "unset on a fresh handle (default sentinel)"
+        );
+
+        // First suggest round of the pass: ordinary progress, no scope expansion.
+        assert!(!p.rebaseline_floor_if_scope_expanded(300));
+        p.set_pass_start_permille_if_unset(300);
+        let _ = p.permille_floor(300);
+        assert_eq!(p.pass_start_permille(), Some(300));
+
+        // A later round of the SAME pass, still no expansion — the start must hold.
+        assert!(!p.rebaseline_floor_if_scope_expanded(340));
+        p.set_pass_start_permille_if_unset(340);
+        let _ = p.permille_floor(340);
+        assert_eq!(
+            p.pass_start_permille(),
+            Some(300),
+            "later rounds of the same pass keep the first value"
+        );
+
+        // A round where the scope EXPANDS under the pass (an import with an older
+        // birthday, or a rewind): the pass start must follow the re-baseline.
+        assert!(p.rebaseline_floor_if_scope_expanded(50));
+        p.set_pass_start_permille(50);
+        assert_eq!(
+            p.pass_start_permille(),
+            Some(50),
+            "scope expansion overwrites the pass start"
+        );
+
+        // begin_pass() (the next pass) unsets it again.
+        p.begin_pass();
+        assert_eq!(p.pass_start_permille(), None, "begin_pass unsets the start");
+
+        // The new pass's first round records fresh.
+        p.set_pass_start_permille_if_unset(10);
+        assert_eq!(p.pass_start_permille(), Some(10));
+    }
+
+    /// [h10] Both setters clamp to 1000, matching `permille_floor`'s own clamp — a seed can
+    /// never express more than "fully caught up".
+    #[test]
+    fn pass_start_permille_setters_clamp_to_1000() {
+        let p = Progress::default();
+        p.set_pass_start_permille(5_000);
+        assert_eq!(p.pass_start_permille(), Some(1000));
+
+        let p2 = Progress::default();
+        p2.set_pass_start_permille_if_unset(5_000);
+        assert_eq!(p2.pass_start_permille(), Some(1000));
+    }
+
+    // ── download-failure runs (the repeated-give-up stall span) ──────────────────
+
+    /// A run as [`Progress::download_failures`] reports it.
+    fn run(streak: u32, at_height: u64, since_unix: u64, last_unix: u64) -> DownloadFailure {
+        DownloadFailure {
+            streak,
+            at_height,
+            since_unix,
+            last_unix,
+        }
+    }
+
+    #[test]
+    fn a_give_up_at_the_same_block_within_the_gap_continues_its_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(100, 1_020);
+        assert_eq!(
+            p.download_failures(),
+            vec![run(3, 100, 1_000, 1_020)],
+            "the streak goes up; the run keeps its block and its first give-up"
+        );
+    }
+
+    #[test]
+    fn a_give_up_at_a_different_block_starts_its_own_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(150, 1_500);
+        p.note_download_gave_up_at(90, 1_600);
+        assert_eq!(
+            p.download_failures(),
+            vec![
+                run(1, 90, 1_600, 1_600),
+                run(2, 100, 1_000, 1_010),
+                run(1, 150, 1_500, 1_500),
+            ],
+            "a block above and a block below each start their own run; block 100's is untouched"
+        );
+    }
+
+    /// Scan ranges are not downloaded in height order, so the retried passes can also give up
+    /// at other blocks in between: a block stuck at H keeps its run through them, and the span
+    /// counts from H's first give-up.
+    #[test]
+    fn a_stuck_block_keeps_its_run_while_give_ups_elsewhere_interleave() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(500, 1_000); // H
+        p.note_download_gave_up_at(900, 1_100); // T
+        p.note_download_gave_up_at(500, 1_200); // H
+        p.note_download_gave_up_at(900, 1_300); // T
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 500, 1_000, 1_200), run(2, 900, 1_100, 1_300)]
+        );
+        assert_eq!(
+            p.download_failure_secs(1_400),
+            400,
+            "counted from H's first give-up"
+        );
+    }
+
+    /// Same-block give-ups far apart are separate runs: in between, the download was not failing
+    /// there (for example, a synced wallet sitting idle between catch-up passes, or the engine
+    /// busy downloading other ranges).
+    #[test]
+    fn a_same_block_give_up_after_the_gap_starts_the_run_over() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(100, 1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1);
+        assert_eq!(p.download_failures(), vec![run(1, 100, 1_611, 1_611)]);
+        assert_eq!(
+            p.download_failure_secs(2_000),
+            0,
+            "a run that starts over needs its second give-up again"
+        );
+    }
+
+    #[test]
+    fn a_same_block_give_up_exactly_the_gap_later_continues_the_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_000 + DOWNLOAD_FAILURE_RUN_GAP_SECS);
+        assert_eq!(p.download_failures(), vec![run(2, 100, 1_000, 1_600)]);
+    }
+
+    #[test]
+    fn download_failure_counts_only_from_the_second_give_up() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        assert_eq!(
+            p.download_failure_secs(1_300),
+            0,
+            "one give-up: the engine's own retry gets its chance"
+        );
+        p.note_download_gave_up_at(100, 1_050);
+        assert_eq!(
+            p.download_failure_secs(1_300),
+            300,
+            "counted from the FIRST give-up of the run"
+        );
+    }
+
+    #[test]
+    fn download_failure_secs_is_the_longest_of_the_qualifying_runs() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(300, 900); // the oldest run, but a single give-up
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(200, 1_200);
+        p.note_download_gave_up_at(100, 1_500); // still live at 2_000: within the gap
+        p.note_download_gave_up_at(200, 1_600); // still live at 2_000: within the gap
+        assert_eq!(
+            p.download_failure_secs(2_000),
+            1_000,
+            "block 100's run is the longest of those with two give-ups"
+        );
+    }
+
+    #[test]
+    fn a_completed_pass_or_a_new_session_clears_every_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.note_download_gave_up_at(200, 1_020);
+        p.note_pass_completed();
+        assert_eq!(p.download_failures(), vec![]);
+        assert_eq!(p.download_failure_secs(2_000), 0);
+
+        p.note_download_gave_up_at(100, 3_000);
+        p.note_download_gave_up_at(100, 3_010);
+        p.note_download_gave_up_at(200, 3_020);
+        p.begin_session();
+        assert_eq!(p.download_failures(), vec![]);
+        assert_eq!(p.download_failure_secs(4_000), 0);
+    }
+
+    #[test]
+    fn pass_starts_touches_and_counters_leave_the_runs_alone() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        p.begin_pass();
+        p.touch();
+        p.add_scanned(5);
+        p.add_ranges_completed();
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 100, 1_000, 1_010)],
+            "a pass start, a stamp or a counter never ends a run"
+        );
+    }
+
+    #[test]
+    fn stall_secs_is_the_longer_of_the_two_spans() {
+        let p = Progress::default();
+        assert_eq!(
+            p.stall_secs(5_000),
+            0,
+            "no stamp and no run: nothing to report"
+        );
+        p.last_progress_unix.store(1_000, Ordering::Relaxed);
+        assert_eq!(
+            p.stall_secs(1_100),
+            100,
+            "no run: the time since the last stamp"
+        );
+        p.note_download_gave_up_at(100, 900);
+        p.note_download_gave_up_at(100, 950);
+        p.last_progress_unix.store(1_090, Ordering::Relaxed);
+        assert_eq!(
+            p.stall_secs(1_100),
+            200,
+            "a fresh stamp must not hide a download that keeps failing"
+        );
+    }
+
+    /// Runs normally hold only the block or two the download is stuck on, but they are bounded:
+    /// a ninth block evicts the run that failed least recently, whatever its height.
+    #[test]
+    fn a_ninth_block_evicts_the_least_recently_failed_run() {
+        let p = Progress::default();
+        for (i, height) in (100..=800).step_by(100).enumerate() {
+            p.note_download_gave_up_at(height, 1_000 + 10 * i as u64);
+        }
+        // Block 100 fails again, so block 200 (last failed at 1_010) is now the least recent.
+        p.note_download_gave_up_at(100, 1_080);
+        p.note_download_gave_up_at(900, 1_090);
+        let runs = p.download_failures();
+        assert_eq!(
+            runs.iter().map(|run| run.at_height).collect::<Vec<_>>(),
+            vec![100, 300, 400, 500, 600, 700, 800, 900],
+            "block 200's run is the one evicted"
+        );
+        assert_eq!(
+            runs[0],
+            run(2, 100, 1_000, 1_080),
+            "the survivors keep their runs"
+        );
+    }
+
+    // ── note_blocks_released: a run also ends when a release covers its block ──
+
+    #[test]
+    fn a_release_ends_only_the_run_whose_block_it_covers() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(300, 1_000);
+        p.note_download_gave_up_at(300, 1_010);
+        p.note_download_gave_up_at(105, 1_020);
+        p.note_download_gave_up_at(105, 1_030);
+        p.note_blocks_released(100, 110);
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 300, 1_000, 1_010)],
+            "the release got past block 105, not block 300"
+        );
+    }
+
+    #[test]
+    fn a_release_covering_several_runs_ends_them_all() {
+        let p = Progress::default();
+        for height in [99, 100, 107, 110, 111] {
+            p.note_download_gave_up_at(height, 1_000);
+        }
+        p.note_blocks_released(100, 110);
+        assert_eq!(
+            p.download_failures()
+                .iter()
+                .map(|run| run.at_height)
+                .collect::<Vec<_>>(),
+            vec![99, 111],
+            "every run from block 100 through block 110 ends; blocks 99 and 111 were not released"
+        );
+    }
+
+    #[test]
+    fn a_release_that_does_not_cover_a_runs_block_keeps_it() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(105, 1_000);
+        p.note_download_gave_up_at(105, 1_010);
+        p.note_blocks_released(50, 99);
+        p.note_blocks_released(110, 100); // a reversed span covers nothing
+        assert_eq!(
+            p.download_failures(),
+            vec![run(2, 105, 1_000, 1_010)],
+            "a release that never reaches the run's block must not end it"
+        );
+    }
+
+    /// A give-up in the ChainTip range starts a run, and the retried pass re-fetches that range
+    /// successfully, so the run ends right there instead of lingering through the Historic
+    /// download that follows. A later give-up at a lower block (Historic ranges lie behind
+    /// ChainTip) is a different problem and starts a fresh run of its own.
+    #[test]
+    fn a_give_up_after_the_run_ended_starts_a_fresh_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(1_003, 1_000);
+        p.note_blocks_released(1_000, 1_010);
+        p.note_download_gave_up_at(900, 5_000);
+        assert_eq!(
+            p.download_failures(),
+            vec![run(1, 900, 5_000, 5_000)],
+            "the ended run must not linger beside the new one"
+        );
+    }
+
+    // ── live runs and failed sync attempts ───────────────────────────────────
+
+    #[test]
+    fn a_run_stops_counting_once_its_latest_give_up_is_older_than_the_gap() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        assert_eq!(
+            p.download_failure_secs(1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS),
+            10 + DOWNLOAD_FAILURE_RUN_GAP_SECS,
+            "still live at exactly the gap"
+        );
+        assert_eq!(
+            p.download_failure_secs(1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1),
+            0,
+            "no give-up for longer than the gap: the run no longer counts"
+        );
+    }
+
+    /// Two give-ups, then nothing more for longer than the gap while the engine keeps showing
+    /// signs of life: the stall fact is only the time since the latest progress stamp, however
+    /// old the run's first give-up is.
+    #[test]
+    fn an_inactive_run_does_not_hide_a_fresh_progress_stamp() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(100, 1_010);
+        let now = 1_010 + DOWNLOAD_FAILURE_RUN_GAP_SECS + 1;
+        p.last_progress_unix.store(now - 5, Ordering::Relaxed);
+        assert_eq!(p.stall_secs(now), 5);
+    }
+
+    #[test]
+    fn an_attempt_that_failed_without_a_give_up_ends_every_run() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_download_gave_up_at(200, 1_005);
+        p.note_attempt_failed(); // the attempt that gave up
+        assert_eq!(
+            p.download_failures().len(),
+            2,
+            "an attempt that failed because the download gave up keeps every run"
+        );
+        p.note_attempt_failed(); // an attempt that failed without giving up
+        assert!(
+            p.download_failures().is_empty(),
+            "an attempt that failed without its download giving up ends every run"
+        );
+    }
+
+    #[test]
+    fn each_attempt_that_gave_up_keeps_the_run_going() {
+        let p = Progress::default();
+        p.note_download_gave_up_at(100, 1_000);
+        p.note_attempt_failed();
+        p.note_download_gave_up_at(100, 1_020);
+        p.note_attempt_failed();
+        assert_eq!(
+            p.download_failures().first().map(|run| run.streak),
+            Some(2),
+            "every failed attempt gave up at the block: the run continues"
+        );
+        p.note_attempt_failed();
+        assert!(
+            p.download_failures().is_empty(),
+            "the give-up was spent by the attempt before; this one failed without one"
+        );
     }
 }

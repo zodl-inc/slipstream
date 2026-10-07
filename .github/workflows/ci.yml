@@ -1,7 +1,7 @@
 name: CI
 
 # Adapted from the librustzcash CI breakdown, pared down to what applies to this
-# workspace. Slipstream is a std, tokio/sqlite/gRPC sync engine consuming git-patched
+# workspace. Slipstream is a std, tokio/sqlite/gRPC sync engine consuming published
 # librustzcash crates, so the librustzcash-specific jobs are intentionally omitted:
 #   - cross-target builds (wasm32 / thumbv7 no_std)      — not a target here
 #   - the pool/consensus feature matrix (Orchard/NU7/…)  — not features here
