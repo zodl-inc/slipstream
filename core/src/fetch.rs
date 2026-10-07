@@ -616,6 +616,7 @@ async fn open_and_pump(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn worker(
     worker_id: usize,
     endpoint: Endpoint,

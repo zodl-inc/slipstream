@@ -94,17 +94,54 @@ default = ["zcash_client_sqlite"]
 # half of the crate — WalletSession, the sparse persistence lanes, the
 # ext_slipstream_* schema/migrations, and the engine loop that is (today)
 # hard-wired to them. Without it the crate compiles the storage-independent
-# half: FfiHandle, Session, raw networking, scheduling-policy primitives and the
-# connector trait, and the `#[cfg(gpuhash)]` GPU batch-commit.
+# transport/planning layer only; a future non-sqlite backend slots in beside
+# this gate.
 zcash_client_sqlite = [
-  "dep:zcash_client_sqlite",
-  "dep:rusqlite",
-  "dep:schemerz",
-  "dep:schemerz-rusqlite",
-  "dep:uuid",
+    "dep:zcash_client_sqlite",
+    "dep:rusqlite",
+    "dep:schemerz",
+    "dep:schemerz-rusqlite",
+    "dep:uuid",
 ]
 
-# GPU-accelerated Sapling batch commitment, using OpenCL. iOS devices, the
-# Android emulator, and certain desktop/laptop graphics cards lack OpenCL
-# runtimes, so this is never a default.
+# Hermetic integration tests against a local darkside lightwalletd (see CONVENTIONS).
+# The darkside harness drives WalletSession, so it requires the sqlite backend.
+darkside = ["zcash_client_sqlite"]
+
+# GPU-accelerated Orchard subtree-build (B0). Pulls slipstream-gpuhash + wgpu.
+# OFF by default → the default libzcashlc build never compiles wgpu. The GPU
+# lane exists solely for the sqlite persistence path, so it requires that
+# backend.
 gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
+
+# Integration-test binaries that require the sqlite backend are declared with
+# `required-features`, so `cargo test --no-default-features` SKIPS them instead
+# of failing to build — a non-sqlite backend must keep a runnable test suite
+# (issue #4). The darkside binaries additionally self-gate on `#![cfg]`.
+[[test]]
+name = "census_scan"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
+name = "stress_sparse_join"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
+name = "darkside_follow"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_oracle"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_reorg"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_sync"
+required-features = ["darkside"]
+
+[[test]]
+name = "darkside_transport"
+required-features = ["darkside"]
