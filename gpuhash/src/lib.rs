@@ -238,12 +238,8 @@ fn generators_u32() -> &'static [u32] {
             bytes.extend_from_slice(&x.to_repr());
             bytes.extend_from_slice(&y.to_repr());
         }
-        bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| u32::from_le_bytes(*c))
-            .collect()
+        let (words, _) = bytes.as_chunks::<4>();
+        words.iter().copied().map(u32::from_le_bytes).collect()
     })
 }
 
@@ -298,7 +294,7 @@ mod tests {
     use super::*;
     use incrementalmerkletree::{Hashable, Level};
     use orchard::tree::MerkleHashOrchard;
-    use rand::{RngCore, SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     /// Whether a wgpu adapter can be acquired. The GPU test skips (rather than
     /// panicking in `Gpu::new`) where there is none — e.g. a GPU-less CI runner.

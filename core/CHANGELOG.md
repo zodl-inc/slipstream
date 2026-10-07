@@ -16,6 +16,108 @@ workspace.
 
 ## [Unreleased]
 
+## [0.4.0-pre.1] - 2026-10-06
+
+### Changed
+- Migrated to `zcash_address 0.14.0-pre.1`, `zcash_client_backend 0.25.0-pre.1`,
+  `zcash_client_sqlite 0.23.0-pre.1`, `zcash_keys 0.17.0-pre.1`,
+  `zcash_primitives 0.31.0-pre.1`, and `zcash_transparent 0.11.0-pre.1`.
+- Unified addresses and unified full viewing keys are encoded at ZIP 316
+  Revision 0 when Revision 0 can represent them: an address as `u…` and a UFVK
+  as `uview…`; on testnet, as `utest…` and `uviewtest…`. An address whose only
+  receiver is transparent, and a key or address carrying expiry metadata, are
+  still encoded at Revision 2. Encodings stored by a host may differ from those
+  this crate now produces; both revisions decode.
+- `engine::ENGINE_BUILD` is `2026-10-06.v0.14-pre-1-crates`.
+
+## [0.4.0-pre.0] - 2026-10-05
+
+### Added
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::queue_rescan`, which `zcash_client_backend` 0.25 adds.
+
+### Changed
+- Migrated to `incrementalmerkletree 0.9`, `orchard 0.16`, `rand 0.10`,
+  `sapling-crypto 0.9`, `shardtree 0.8`, `zcash_address 0.14.0-pre.0`,
+  `zcash_client_backend 0.25.0-pre.0`, `zcash_client_sqlite 0.23.0-pre.0`,
+  `zcash_keys 0.17.0-pre.0`, `zcash_primitives 0.31.0-pre.0`,
+  `zcash_protocol 0.11.0-pre.0`, `zcash_transparent 0.11.0-pre.0`, and
+  `zip32 0.3`.
+- The `gpu` feature requires `zodl-slipstream-gpuhash` 0.1.2, which is built on
+  the same curve generation.
+- Unified addresses and unified full viewing keys are encoded as ZIP 316
+  Revision 2: an address as `zu…` when it has no transparent receiver and as
+  `tu…` when it has one (its receivers come from the host's
+  `UnifiedAddressRequest`), and a UFVK as `uvf…`; on testnet, as `zutest…`,
+  `tutest…` and `uvftest…`. Encodings stored by a host differ from those this
+  crate now produces.
+- `engine::ENGINE_BUILD` is `2026-10-05.v0.13-nu7-pre-release-crates`.
+
+## [0.3.0] - 2026-10-01
+
+### Added
+- `events`: `DownloadFailure`, `DOWNLOAD_FAILURE_STALL_STREAK`, `DOWNLOAD_FAILURE_RUN_GAP_SECS`,
+  and the `Progress` methods `note_download_gave_up`, `note_blocks_released`,
+  `note_pass_completed`, `begin_session`, `note_attempt_failed`, `download_failures`,
+  `download_failure_secs` and `stall_secs`. They track, per block, a block download that keeps
+  giving up, and derive from it the stall fact the snapshot reports as `stalled_seconds`.
+- `grpc::SubtreeRoots::ironwood`, the server's Ironwood subtree roots, alongside `sapling` and
+  `orchard`.
+- `events`: the `Progress` methods `pass_start_permille`, `set_pass_start_permille`,
+  `set_pass_start_permille_if_unset`, `scope_expanded`, `set_pass_baseline`, `pass_base_fetched`
+  and `pass_base_scanned`. They record where a pass started, and the blocks it had fetched and
+  scanned when the current suggest round began, which `progress_permille` measures from.
+
+### Changed
+- `stalled_seconds` (and `Progress::last_progress_unix`) now also move whenever data arrives from
+  the server during a pass — every streamed block and every metadata message (a subtree root, an
+  address-history transaction, a UTXO), direct or over Tor — not only when a counter moves. A slow
+  but working pass no longer reads as stalled, so hosts that restart stalled passes stop
+  restarting healthy ones.
+- Completing a write-behind persist unit and building the range-end tree now also count as
+  forward progress for `stalled_seconds`, so a long local-only tail (a slow device finishing a
+  range) no longer reads as stalled.
+- `stalled_seconds` also counts a block download that keeps failing at the same block: once the
+  download has given up twice at one block, with no more than ten minutes between give-ups, it
+  reports the time since the first of them whenever that is longer, for as long as that block's
+  latest give-up is at most ten minutes old. The count ends when a later download hands that
+  block to the scanner, a pass completes, a new session starts, or a sync attempt — a pass, or
+  the tip check between passes — fails without its download giving up, for example with no
+  network. Give-ups are tracked per block, so failures at other blocks neither extend nor hide a
+  run. A server that cannot deliver a block range therefore still reads as stalled even though
+  every failed pass is retried, while a device that goes offline does not. A server whose passes
+  only sometimes reach the download is reported later, or not at all, since each pass that fails
+  before its download ends the count. A fetch that failed after delivering every block does not
+  count.
+- `grpc::get_subtree_roots`, `grpc::get_taddress_txids`, `grpc::get_address_utxos` and
+  `transparent::refresh_utxos` take a new `progress: Option<&Progress>` argument, stamped for
+  every message received.
+- `grpc::SubtreeRoots` is `#[non_exhaustive]`, so a field for a future pool is not a breaking
+  change.
+- `progress_permille` climbs through a pass instead of holding at the session floor until the
+  pass is nearly scanned. It maps the pass's downloaded and scanned blocks, at half weight each,
+  into the gap between the position the pass started from and done. A scan-scope expansion (an
+  import with an older birthday) re-bases it, a continuity repair counts only the blocks below
+  its rewind height, and the wallet birthday is read again every suggest round. The session
+  floor and `Done` reading 1000 are unchanged.
+- `engine::ENGINE_BUILD` is `2026-09-24.v0.12-download-failure-stall`.
+
+### Fixed
+- A fetch whose plan chunk exhausts its retry budget now fails the pass immediately, so the
+  pass-level retry takes over (or, when wire failover is armed, the engine fails over to an
+  alternate endpoint at once). Previously the other workers kept running and could wait behind
+  the missing chunk indefinitely, leaving the pass in `Syncing` with no progress.
+- A slow block stream no longer fails its attempt and re-downloads its sub-chunk when
+  `chunk_timeout` elapses: the blocks received so far are handed on as a shorter sub-chunk and
+  the stream continues. When a stream errors, goes silent, or ends early, the blocks it already
+  delivered are handed on before the attempt is retried, so the retry resumes after them instead
+  of downloading them again.
+- Ironwood subtree roots are fetched from the server every pass and grafted like Sapling's and
+  Orchard's, so Ironwood's shard indices stay a complete range. Previously they were only
+  seeded locally: when one account's Ironwood tree was seeded near the tip before another
+  account's older-birthday scan crossed Ironwood activation, the scan failed with
+  `SubtreeDiscontinuity` and the sync retried forever.
+
 ## [0.2.0] - 2026-08-19
 
 ### Changed

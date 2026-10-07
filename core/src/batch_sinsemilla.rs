@@ -243,7 +243,7 @@ fn scalar_combine(layer: u8, left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{RngCore, SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng, rngs::StdRng};
 
     fn pool(n: usize) -> Vec<MerkleHashOrchard> {
         let mut out = Vec::with_capacity(n);

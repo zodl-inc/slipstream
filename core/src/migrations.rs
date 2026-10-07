@@ -369,7 +369,7 @@ mod tests {
                 conn,
                 crate::network::SlipstreamNetwork::from(Network::MainNetwork),
                 zcash_client_sqlite::util::SystemClock,
-                rand::rngs::OsRng,
+                rand::rand_core::UnwrapErr(rand::rngs::SysRng),
             );
             zcash_client_sqlite::wallet::init::WalletMigrator::new()
                 .init_or_migrate(&mut db)

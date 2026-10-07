@@ -10,6 +10,12 @@ workspace.
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-10-05
+
+### Changed
+- Moved to `ff 0.14`, `group 0.14`, `pasta_curves 0.6` and `sinsemilla 0.2`,
+  the curve generation `orchard 0.16` uses. The public API is unchanged.
+
 ## [0.1.1] - 2026-08-07
 
 Initial public release of the `zodl-slipstream-gpuhash` crate. This crate
