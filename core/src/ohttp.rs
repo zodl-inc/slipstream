@@ -962,7 +962,11 @@ impl OhttpClient {
         (
             u16,
             HeaderMap,
-            Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>,
+            Pin<
+                Box<
+                    dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + Sync,
+                >,
+            >,
         ),
         RoundTripError,
     >
