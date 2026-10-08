@@ -57,9 +57,9 @@ use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
 use zodl_ohttp_client::{
-    BhttpRequest, BhttpResponse, ClientProfile, ClientTrace, Completed, Error as CoreError,
-    KeyConfig, SizeGuard, complete_exchange_in_place, encapsulate_request, signed_config_url,
-    verify_signed_config,
+    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
+    ChunkedResponseDecoder, ClientProfile, ClientTrace, Error as CoreError, KeyConfig,
+    ResponseEvent, SizeGuard, encapsulate_chunked_request, signed_config_url, verify_signed_config,
 };
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
@@ -454,20 +454,17 @@ enum RoundTripError {
     Decode(String),
 }
 
-/// The relay POST loop, free of I/O: `post` sends one sealed body to the relay and `refetch`
-/// fetches the key configuration again. **Every post is sealed afresh** (a new ephemeral key,
-/// so new ciphertext): the gateway answers a repeated ciphertext with 409, and the opener of
-/// one sealing opens that sealing's answer only. A pre-send transport failure is retried once;
-/// an outer 400 or 422 refetches the key and retries once (both classified by the shared core).
-/// `on_dispatch` is called right before the sealed request is posted to the relay.
-async fn run_exchange<P, PF, R, RF, D>(
-    profile: &ClientProfile,
+/// The relay POST loop for chunked OHTTP. Returns the decoder and the buffered response body.
+/// **Every post is sealed afresh** (a new ephemeral key, so new ciphertext): the gateway answers
+/// a repeated ciphertext with 409. A pre-send transport failure is retried once; an outer 400 or
+/// 422 refetches the key and retries once.
+async fn run_exchange_chunked<P, PF, R, RF, D>(
     mut key: KeyConfig,
     request: &BhttpRequest,
     mut post: P,
     mut refetch: R,
     on_dispatch: D,
-) -> Result<BhttpResponse, RoundTripError>
+) -> Result<(ChunkedResponseDecoder, Vec<u8>), RoundTripError>
 where
     P: FnMut(Vec<u8>) -> PF,
     PF: Future<Output = Result<RelayAnswer, HttpsError>>,
@@ -479,16 +476,19 @@ where
     let mut dispatched = false;
     loop {
         let mut resent = false;
-        let (opener, mut answer) = loop {
-            let sealed = encapsulate_request(&key, request, &profile.encode, &profile.limits)
+        let (opener, answer) = loop {
+            let encoded =
+                zodl_ohttp_client::encode_bhttp_request(request, &ClientProfile::SLIPSTREAM.encode)
+                    .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+            let (sealed, opener) = encapsulate_chunked_request(&key, &encoded)
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
             // Signal dispatch right before posting the sealed request to the relay
             if !dispatched {
                 on_dispatch();
                 dispatched = true;
             }
-            match post(sealed.body).await {
-                Ok(answer) => break (sealed.opener, answer),
+            match post(sealed).await {
+                Ok(answer) => break (opener, answer),
                 Err(HttpsError::PreSend(e)) if !resent => {
                     resent = true;
                     tracing::debug!(err = %e, "ohttp: relay post failed before send; sealing again");
@@ -497,47 +497,43 @@ where
             }
         };
         let status = answer.status.as_u16();
-        match complete_exchange_in_place(
-            profile,
-            opener,
-            status,
-            answer.content_type.as_deref(),
-            &mut answer.body,
-            attempt,
-        ) {
-            Ok(Completed::Response(response)) => return Ok(response),
-            Ok(Completed::RefetchKeyConfig) => {
-                if attempt > 0 {
-                    return Err(RoundTripError::Transport(
-                        "ohttp: gateway rejected request after key refresh".into(),
-                    ));
-                }
-                tracing::warn!(
-                    status,
-                    "ohttp: gateway rejected request; refreshing key config"
-                );
-                key = refetch().await.map_err(RoundTripError::Transport)?;
-                attempt += 1;
-            }
-            Ok(Completed::Refused { status, detail }) => {
-                let code = StatusCode::from_u16(status)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|_| status.to_string());
-                let shown: String = detail.chars().take(160).collect();
-                return Err(RoundTripError::Transport(format!(
-                    "relay/gateway HTTP {code}: {shown}"
-                )));
-            }
-            Ok(Completed::WrongMediaType { content_type }) => {
-                return Err(RoundTripError::Transport(format!(
-                    "relay answered {content_type:?}, not message/ohttp-res"
-                )));
-            }
-            Err(e @ (CoreError::BhttpFormat(_) | CoreError::NotAResponse)) => {
-                return Err(RoundTripError::Decode(e.to_string()));
-            }
-            Err(e) => return Err(RoundTripError::Transport(e.to_string())),
+
+        // Check outer response - 400/422 triggers key refetch
+        if matches!(status, 400 | 422) && attempt == 0 {
+            tracing::warn!(
+                status,
+                "ohttp: gateway rejected request; refreshing key config"
+            );
+            key = refetch().await.map_err(RoundTripError::Transport)?;
+            attempt += 1;
+            continue;
         }
+
+        if !StatusCode::from_u16(status)
+            .map(|s| s.is_success())
+            .unwrap_or(false)
+        {
+            let code = StatusCode::from_u16(status)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|_| status.to_string());
+            let detail = String::from_utf8_lossy(&answer.body);
+            let shown: String = detail.chars().take(160).collect();
+            return Err(RoundTripError::Transport(format!(
+                "relay/gateway HTTP {code}: {shown}"
+            )));
+        }
+
+        // Check content-type
+        let media_type = answer.content_type.as_deref().unwrap_or("");
+        let essence = media_type.split(';').next().unwrap_or_default().trim();
+        if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
+            return Err(RoundTripError::Transport(format!(
+                "relay answered {media_type:?}, not {CONTENT_TYPE_CHUNKED_RES}"
+            )));
+        }
+
+        // Return decoder and buffered body for streaming decryption
+        return Ok((opener.decoder(), answer.body));
     }
 }
 
@@ -749,10 +745,13 @@ impl OhttpClient {
         })
     }
 
-    /// POST one sealed request body to the relay.
+    /// POST one sealed chunked request body to the relay.
     async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
-        let headers = self.profile.headers.relay_post(trace.as_deref());
+        let mut headers = vec![("content-type", CONTENT_TYPE_CHUNKED_REQ.to_string())];
+        if let Some(trace_id) = trace {
+            headers.push(("x-client-trace-id", trace_id));
+        }
         self.https_once(
             &self.relay,
             Method::POST,
@@ -832,10 +831,9 @@ impl OhttpClient {
         Ok(cfg.config)
     }
 
-    /// Encapsulate + relay + decapsulate (see [`run_exchange`]). The key configuration is
+    /// Encapsulate + relay + decapsulate with chunked OHTTP. The key configuration is
     /// fetched again, and the request sealed again, when the gateway rejects the request (outer
-    /// 400 or 422), which is what key rotation looks like from here. `on_dispatch` is called
-    /// right before the sealed request is posted to the relay.
+    /// 400 or 422). Decodes the chunked response and returns the inner message.
     async fn round_trip<D>(
         &self,
         request: &BhttpRequest,
@@ -849,15 +847,28 @@ impl OhttpClient {
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        run_exchange(
-            &self.profile,
+        let (mut decoder, body) = run_exchange_chunked(
             key,
             request,
             move |body| this.post_sealed(body),
             move || this.key_config(true),
             on_dispatch,
         )
-        .await
+        .await?;
+
+        // Decode the buffered response body through the chunked decoder
+        let mut events = decoder
+            .push(&body)
+            .map_err(|e| RoundTripError::Decode(e.to_string()))?;
+        events.extend(
+            decoder
+                .finish()
+                .map_err(|e| RoundTripError::Decode(e.to_string()))?,
+        );
+
+        // Collect events into a BhttpResponse
+        zodl_ohttp_client::collect_response(events)
+            .map_err(|e| RoundTripError::Decode(e.to_string()))
     }
 
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.

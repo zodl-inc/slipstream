@@ -16,6 +16,13 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+- OHTTP connector migrated to Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08).
+  Requests are sent as `message/ohttp-chunked-req` and responses are decoded
+  incrementally as `message/ohttp-chunked-res`. The gateway can now stream
+  GetBlockRange responses as blocks arrive from lightwalletd, improving
+  time-to-first-block for long-range syncs.
+
 ## [0.4.0-pre.1] - 2026-10-06
 
 ### Changed

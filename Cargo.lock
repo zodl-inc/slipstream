@@ -4265,7 +4265,7 @@ dependencies = [
  "derive-deftly",
  "libc",
  "paste",
- "thiserror 2.0.21",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -8429,7 +8429,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 [[package]]
 name = "zodl-ohttp-client"
 version = "0.1.0"
-source = "git+https://github.com/zodl-inc/ohttp.git?rev=f0d88a5d960578b0e34c01881912baca0198de3a#f0d88a5d960578b0e34c01881912baca0198de3a"
+source = "git+https://github.com/zodl-inc/ohttp.git?rev=e3ab773d92a49d3ad9c8a2b0627cd915772e5a56#e3ab773d92a49d3ad9c8a2b0627cd915772e5a56"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
