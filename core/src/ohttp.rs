@@ -15,16 +15,19 @@
 //! `zcash_client_backend`. It hands tonic an in-memory duplex stream whose other end is an
 //! in-process HTTP/2 server. That server turns each gRPC request into one OHTTP round trip and
 //! replies with a normal gRPC response (headers + body + trailers), so `CompactTxStreamerClient<Channel>`
-//! and every caller in this crate stay unchanged. Server-streaming RPCs are buffered by the
-//! gateway and delivered as one body containing all the length-prefixed messages.
+//! and every caller in this crate stay unchanged. Responses are Chunked OHTTP: the gateway seals
+//! them chunk by chunk as lightwalletd streams, and this module decodes them the same way, so a
+//! server-streaming RPC delivers its first message before the response has ended.
 //!
 //! The protocol itself (RFC 9458 §4.3/§4.4 with the suite DHKEM(X25519, HKDF-SHA256) /
 //! HKDF-SHA256 / AES-128-GCM, Binary HTTP, signed key-configuration verification, key selection,
 //! outer-status classification and size limits) is the shared sans-IO `zodl-ohttp-client` crate,
 //! driven with its `ClientProfile::SLIPSTREAM` (gRPC) and `ClientProfile::SLIPSTREAM_HTTP`
 //! ([`http_round_trip`]) profiles. This module keeps the I/O: the dialer, the pooled h2 sender,
-//! the relay table, timeouts and the mapping to gRPC. The gateway folds the gRPC trailers into
-//! the Binary HTTP header section and this module moves them back into HTTP/2 trailers.
+//! the relay table, timeouts and the mapping to gRPC. The gateway carries the gRPC status in the
+//! Binary HTTP trailer section when lightwalletd streamed it, and in the header section when the
+//! answer was trailers-only or collected first (a cache hit); this module puts it into the HTTP/2
+//! trailers either way, where tonic reads it.
 //!
 //! **Tor.** The TCP leg to the relay (and the one-off `/ohttp-configs/signed` key fetch) is
 //! opened through a [`Dialer`]: [`Dialer::Direct`] uses the device's own connection,
@@ -431,6 +434,51 @@ struct RelayAnswer {
     body: Vec<u8>,
 }
 
+/// The outer answer of one HTTPS exchange with the body left unread, to be decoded chunk by
+/// chunk as it arrives.
+struct RelayStream {
+    status: StatusCode,
+    content_type: Option<String>,
+    body: BoxBody<Bytes, hyper::Error>,
+}
+
+/// What [`run_exchange_chunked`] needs from the relay's answer to one sealed POST, whatever
+/// became of its body. Keeps one exchange loop (re-sealing, key refetch, outer-status and
+/// content-type checks) for the buffered and the streamed paths.
+trait OuterAnswer {
+    fn status(&self) -> StatusCode;
+    fn content_type(&self) -> Option<&str>;
+    /// The start of the body, for the error message of a non-success outer status.
+    fn detail(&self) -> String;
+}
+
+impl OuterAnswer for RelayAnswer {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+    fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+    fn detail(&self) -> String {
+        String::from_utf8_lossy(&self.body)
+            .chars()
+            .take(160)
+            .collect()
+    }
+}
+
+impl OuterAnswer for RelayStream {
+    fn status(&self) -> StatusCode {
+        self.status
+    }
+    fn content_type(&self) -> Option<&str> {
+        self.content_type.as_deref()
+    }
+    fn detail(&self) -> String {
+        String::new()
+    }
+}
+
 /// Why one HTTPS exchange failed.
 #[derive(Debug)]
 enum HttpsError {
@@ -458,20 +506,21 @@ enum RoundTripError {
     Decode(String),
 }
 
-/// The relay POST loop for chunked OHTTP. Returns the decoder and the buffered response body.
-/// **Every post is sealed afresh** (a new ephemeral key, so new ciphertext): the gateway answers
-/// a repeated ciphertext with 409. A pre-send transport failure is retried once; an outer 400 or
-/// 422 refetches the key and retries once.
-async fn run_exchange_chunked<P, PF, R, RF, D>(
+/// The relay POST loop for chunked OHTTP. Returns the decoder and the relay's answer (buffered
+/// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
+/// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
+/// is retried once; an outer 400 or 422 refetches the key and retries once.
+async fn run_exchange_chunked<A, P, PF, R, RF, D>(
     mut key: KeyConfig,
     request: &BhttpRequest,
     mut post: P,
     mut refetch: R,
     on_dispatch: D,
-) -> Result<(ChunkedResponseDecoder, Vec<u8>), RoundTripError>
+) -> Result<(ChunkedResponseDecoder, A), RoundTripError>
 where
+    A: OuterAnswer,
     P: FnMut(Vec<u8>) -> PF,
-    PF: Future<Output = Result<RelayAnswer, HttpsError>>,
+    PF: Future<Output = Result<A, HttpsError>>,
     R: FnMut() -> RF,
     RF: Future<Output = Result<KeyConfig, String>>,
     D: Fn(),
@@ -500,12 +549,12 @@ where
                 Err(e) => return Err(RoundTripError::Transport(e.into_message())),
             }
         };
-        let status = answer.status.as_u16();
+        let status = answer.status();
 
         // Check outer response - 400/422 triggers key refetch
-        if matches!(status, 400 | 422) && attempt == 0 {
+        if matches!(status.as_u16(), 400 | 422) && attempt == 0 {
             tracing::warn!(
-                status,
+                status = status.as_u16(),
                 "ohttp: gateway rejected request; refreshing key config"
             );
             key = refetch().await.map_err(RoundTripError::Transport)?;
@@ -513,22 +562,15 @@ where
             continue;
         }
 
-        if !StatusCode::from_u16(status)
-            .map(|s| s.is_success())
-            .unwrap_or(false)
-        {
-            let code = StatusCode::from_u16(status)
-                .map(|s| s.to_string())
-                .unwrap_or_else(|_| status.to_string());
-            let detail = String::from_utf8_lossy(&answer.body);
-            let shown: String = detail.chars().take(160).collect();
+        if !status.is_success() {
             return Err(RoundTripError::Transport(format!(
-                "relay/gateway HTTP {code}: {shown}"
+                "relay/gateway HTTP {status}: {}",
+                answer.detail()
             )));
         }
 
         // Check content-type
-        let media_type = answer.content_type.as_deref().unwrap_or("");
+        let media_type = answer.content_type().unwrap_or("");
         let essence = media_type.split(';').next().unwrap_or_default().trim();
         if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
             return Err(RoundTripError::Transport(format!(
@@ -536,10 +578,89 @@ where
             )));
         }
 
-        // Return decoder and buffered body for streaming decryption
-        return Ok((opener.decoder(), answer.body));
+        return Ok((opener.decoder(), answer));
     }
 }
+
+/// The decoded events of one chunked response after its head, as the gRPC body frames tonic
+/// reads from the in-process pipe.
+///
+/// The gateway may carry the gRPC status in the Binary HTTP *header* section: lightwalletd's
+/// own trailers-only answers (an error, or an empty server stream), and every response the
+/// gateway collected before sending (a cache hit, a backend error) have `grpc-status` there
+/// and an empty trailer section. tonic requires a `grpc-status` trailer on every stream that
+/// was not trailers-only, so those fields are moved into the one trailers frame this emits.
+/// A response without a status anywhere ends with `INTERNAL`; a decode failure with
+/// `UNAVAILABLE`. Nothing follows the trailers frame.
+struct GrpcFrames {
+    /// The `grpc-*` fields taken out of the response headers.
+    header_fields: HeaderMap,
+    trailers_sent: bool,
+}
+
+impl GrpcFrames {
+    fn new(header_fields: HeaderMap) -> Self {
+        Self {
+            header_fields,
+            trailers_sent: false,
+        }
+    }
+
+    fn frame(&mut self, event: Result<ResponseEvent, String>) -> Option<Frame<Bytes>> {
+        if self.trailers_sent {
+            return None;
+        }
+        match event {
+            Ok(ResponseEvent::Data(bytes)) => Some(Frame::data(Bytes::from(bytes))),
+            Ok(ResponseEvent::Trailers(fields)) => {
+                let mut trailers = HeaderMap::new();
+                for (k, v) in fields {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_bytes(v.as_bytes()),
+                    ) {
+                        trailers.insert(name, value);
+                    }
+                }
+                if !trailers.contains_key("grpc-status") {
+                    let mut name = None;
+                    for (n, value) in self.header_fields.drain() {
+                        if n.is_some() {
+                            name = n;
+                        }
+                        if let Some(n) = name.clone() {
+                            trailers.append(n, value);
+                        }
+                    }
+                }
+                if !trailers.contains_key("grpc-status") {
+                    trailers.insert("grpc-status", HeaderValue::from_static("13"));
+                    trailers.insert(
+                        "grpc-message",
+                        HeaderValue::from_static("ohttp: gateway response without grpc-status"),
+                    );
+                }
+                self.trailers_sent = true;
+                Some(Frame::trailers(trailers))
+            }
+            // The head was taken before this; `End` only confirms the final chunk opened.
+            Ok(ResponseEvent::Head { .. }) | Ok(ResponseEvent::End) => None,
+            Err(e) => {
+                let mut trailers = HeaderMap::new();
+                trailers.insert("grpc-status", HeaderValue::from_static("14"));
+                if let Ok(msg) = HeaderValue::from_str(&format!("ohttp decode: {e}")) {
+                    trailers.insert("grpc-message", msg);
+                }
+                self.trailers_sent = true;
+                Some(Frame::trailers(trailers))
+            }
+        }
+    }
+}
+
+/// The decoded events of one response after its head.
+type EventStream =
+    Pin<Box<dyn futures_util::Stream<Item = Result<ResponseEvent, String>> + Send + Sync>>;
 
 struct OhttpClient {
     gateway_host: String,
@@ -766,11 +887,9 @@ impl OhttpClient {
         .await
     }
 
-    /// POST one sealed chunked request body to the relay. Returns response stream.
-    async fn post_sealed_stream(
-        &self,
-        body: Vec<u8>,
-    ) -> Result<(StatusCode, Option<String>, BoxBody<Bytes, hyper::Error>), HttpsError> {
+    /// POST one sealed chunked request body to the relay. Returns the response with its body
+    /// unread.
+    async fn post_sealed_stream(&self, body: Vec<u8>) -> Result<RelayStream, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let mut headers = vec![("content-type", CONTENT_TYPE_CHUNKED_REQ.to_string())];
         if let Some(trace_id) = trace {
@@ -787,7 +906,7 @@ impl OhttpClient {
         method: Method,
         headers: &[(&'static str, String)],
         body: Vec<u8>,
-    ) -> Result<(StatusCode, Option<String>, BoxBody<Bytes, hyper::Error>), HttpsError> {
+    ) -> Result<RelayStream, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
             .map_err(HttpsError::Other)?;
@@ -830,7 +949,11 @@ impl OhttpClient {
             .get(header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
-        Ok((parts.status, content_type, body))
+        Ok(RelayStream {
+            status: parts.status,
+            content_type,
+            body,
+        })
     }
 
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
@@ -918,7 +1041,7 @@ impl OhttpClient {
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        let (mut decoder, body) = run_exchange_chunked(
+        let (mut decoder, answer) = run_exchange_chunked(
             key,
             request,
             move |body| this.post_sealed(body),
@@ -929,7 +1052,7 @@ impl OhttpClient {
 
         // Decode the buffered response body through the chunked decoder
         let mut events = decoder
-            .push(&body)
+            .push(&answer.body)
             .map_err(|e| RoundTripError::Decode(e.to_string()))?;
         events.extend(
             decoder
@@ -955,25 +1078,16 @@ impl OhttpClient {
         })
     }
 
-    /// Encapsulate + relay + stream-decode with chunked OHTTP. Returns status, headers, and a
-    /// stream of gRPC frames (data + trailers). The response body is decoded chunk-by-chunk as it
-    /// arrives; the first gRPC message frame is emitted before the full response has been received.
+    /// Encapsulate + relay + stream-decode with chunked OHTTP. Returns the inner status and
+    /// headers once the head has been decoded, and the remaining events (body, trailers, end)
+    /// as they are decoded chunk by chunk: the first gRPC message is available before the
+    /// response has been received in full. Same exchange loop as [`Self::round_trip`]: every
+    /// post is sealed afresh, an outer 400 or 422 refetches the key and retries once.
     async fn round_trip_stream<D>(
         &self,
         request: BhttpRequest,
         on_dispatch: D,
-    ) -> Result<
-        (
-            u16,
-            HeaderMap,
-            Pin<
-                Box<
-                    dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send + Sync,
-                >,
-            >,
-        ),
-        RoundTripError,
-    >
+    ) -> Result<(u16, HeaderMap, EventStream), RoundTripError>
     where
         D: Fn(),
     {
@@ -984,61 +1098,21 @@ impl OhttpClient {
             .key_config(false)
             .await
             .map_err(RoundTripError::Transport)?;
-
-        // Seal the request
-        let encoded =
-            zodl_ohttp_client::encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode)
-                .map_err(|e| RoundTripError::Transport(e.to_string()))?;
-        let (sealed, opener) = encapsulate_chunked_request(&key, &encoded)
-            .map_err(|e| RoundTripError::Transport(e.to_string()))?;
-
-        // Post and get stream, with key refetch on 400/422
-        let mut attempt = 0u32;
-        let (_status, _content_type, body_stream) = loop {
-            on_dispatch();
-            let (status, content_type, body_stream) = self
-                .post_sealed_stream(sealed.clone())
-                .await
-                .map_err(|e| RoundTripError::Transport(e.into_message()))?;
-
-            let status_u16 = status.as_u16();
-            if matches!(status_u16, 400 | 422) && attempt == 0 {
-                tracing::warn!(
-                    status_u16,
-                    "ohttp: gateway rejected request; refreshing key config"
-                );
-                let _key = self
-                    .key_config(true)
-                    .await
-                    .map_err(RoundTripError::Transport)?;
-                attempt += 1;
-                continue;
-            }
-
-            if !status.is_success() {
-                let code = status.to_string();
-                return Err(RoundTripError::Transport(format!(
-                    "relay/gateway HTTP {code}"
-                )));
-            }
-
-            let media_type = content_type.as_deref().unwrap_or("");
-            let essence = media_type.split(';').next().unwrap_or_default().trim();
-            if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
-                return Err(RoundTripError::Transport(format!(
-                    "relay answered {media_type:?}, not {CONTENT_TYPE_CHUNKED_RES}"
-                )));
-            }
-
-            break (status_u16, content_type, body_stream);
-        };
+        let this = self;
+        let (mut decoder, answer) = run_exchange_chunked(
+            key,
+            &request,
+            move |body| this.post_sealed_stream(body),
+            move || this.key_config(true),
+            on_dispatch,
+        )
+        .await?;
 
         // Spawn task to decode chunks and forward events with idle timeout
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, String>>(16);
-        let mut decoder = opener.decoder();
 
         tokio::spawn(async move {
-            let mut body_stream = body_stream;
+            let mut body_stream = answer.body;
             loop {
                 match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()).await {
                     Ok(Some(Ok(frame))) => {
@@ -1118,44 +1192,15 @@ impl OhttpClient {
             }
         };
 
-        // Stream remaining events as frames
-        let frame_stream = rx.map(move |event_result| match event_result {
-            Ok(ResponseEvent::Data(bytes)) => Ok(Frame::data(Bytes::from(bytes))),
-            Ok(ResponseEvent::Trailers(fields)) => {
-                let mut trailer_map = HeaderMap::new();
-                for (k, v) in fields {
-                    if let (Ok(name), Ok(value)) = (
-                        HeaderName::from_bytes(k.as_bytes()),
-                        HeaderValue::from_bytes(v.as_bytes()),
-                    ) {
-                        trailer_map.insert(name, value);
-                    }
-                }
-                Ok(Frame::trailers(trailer_map))
-            }
-            Ok(ResponseEvent::End) => Ok(Frame::data(Bytes::new())), // Empty frame to signal end
-            Ok(ResponseEvent::Head { .. }) => {
-                // Already consumed
-                Ok(Frame::data(Bytes::new()))
-            }
-            Err(e) => {
-                // Decode error → send UNAVAILABLE trailers
-                let mut trailer_map = HeaderMap::new();
-                trailer_map.insert("grpc-status", HeaderValue::from_static("14"));
-                if let Ok(msg) = HeaderValue::from_str(&format!("ohttp decode: {e}")) {
-                    trailer_map.insert("grpc-message", msg);
-                }
-                Ok(Frame::trailers(trailer_map))
-            }
-        });
-
-        Ok((http_status, headers, Box::pin(frame_stream)))
+        Ok((http_status, headers, Box::pin(rx)))
     }
 
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.
     /// Uses streaming decoding: the first gRPC message frame is returned before the full response
     /// has been received from the gateway.
     async fn handle(&self, req: Request<Incoming>) -> Response<BoxBody<Bytes, Infallible>> {
+        use futures_util::stream::StreamExt as _;
+
         let (parts, body) = req.into_parts();
         let path = parts
             .uri
@@ -1177,7 +1222,7 @@ impl OhttpClient {
 
         let started = std::time::Instant::now();
         // Timeout only for getting the Head (status + headers)
-        let (http_status, mut headers, frame_stream) =
+        let (http_status, mut headers, events) =
             match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip_stream(request, || {}))
                 .await
             {
@@ -1195,22 +1240,23 @@ impl OhttpClient {
                 }
             };
 
-        // Extract gRPC headers (content-type, date) and move grpc-* to be sent as trailers later
+        // Keep content-type and date as response headers; `grpc-*` fields found in the header
+        // section (a trailers-only or a collected answer) go out as HTTP/2 trailers, where tonic
+        // reads the status, see `GrpcFrames`.
         let mut response_headers = HeaderMap::new();
         let mut grpc_fields = HeaderMap::new();
+        let mut last_name: Option<HeaderName> = None;
         for (name, value) in headers.drain() {
-            if name
-                .as_ref()
-                .map(|n| n.as_str().starts_with("grpc-"))
-                .unwrap_or(false)
-            {
-                if let Some(n) = name {
-                    grpc_fields.insert(n, value);
-                }
-            } else if (name == Some(header::CONTENT_TYPE) || name == Some(header::DATE))
-                && let Some(n) = name
-            {
-                response_headers.insert(n, value);
+            if name.is_some() {
+                last_name = name;
+            }
+            let Some(name) = last_name.clone() else {
+                continue;
+            };
+            if name.as_str().starts_with("grpc-") {
+                grpc_fields.append(name, value);
+            } else if name == header::CONTENT_TYPE || name == header::DATE {
+                response_headers.append(name, value);
             }
         }
 
@@ -1222,24 +1268,23 @@ impl OhttpClient {
             );
         }
 
-        // Ensure grpc-status is set (default to INTERNAL if missing)
-        if !grpc_fields.contains_key("grpc-status") {
-            grpc_fields.insert("grpc-status", HeaderValue::from_static("13"));
-            grpc_fields.insert(
-                "grpc-message",
-                HeaderValue::from_static("ohttp: gateway response without grpc-status"),
-            );
-        }
-
         tracing::debug!(
             path = %path,
             http_status,
+            header_grpc_status = grpc_fields
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-"),
             ms = started.elapsed().as_millis() as u64,
             "ohttp: rpc streaming"
         );
 
-        // Stream body frames directly
-        let body = StreamBody::new(frame_stream).boxed();
+        // Body frames, then exactly one trailers frame carrying the gRPC status.
+        let mut frames = GrpcFrames::new(grpc_fields);
+        let body = StreamBody::new(events.filter_map(move |event| {
+            futures_util::future::ready(frames.frame(event).map(Ok::<_, Infallible>))
+        }))
+        .boxed();
 
         let mut resp = Response::new(body);
         *resp.status_mut() = StatusCode::from_u16(http_status).unwrap_or(StatusCode::OK);
@@ -1554,12 +1599,12 @@ mod tests {
         RF: Future<Output = Result<KeyConfig, String>>,
         D: Fn(),
     {
-        let (mut decoder, body) =
+        let (mut decoder, answer) =
             run_exchange_chunked(key, request, post, refetch, on_dispatch).await?;
 
         // Decode the buffered response
         let mut events = decoder
-            .push(&body)
+            .push(&answer.body)
             .map_err(|e| RoundTripError::Decode(e.to_string()))?;
         events.extend(
             decoder
@@ -1939,6 +1984,198 @@ mod tests {
             !err.contains("origin.invalid"),
             "the origin must never be contacted: {err}"
         );
+    }
+
+    // ── GrpcFrames: the gRPC status always reaches tonic as a trailer ──────────────────────
+
+    fn header_fields(fields: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (k, v) in fields {
+            map.append(
+                HeaderName::from_bytes(k.as_bytes()).expect("name"),
+                HeaderValue::from_str(v).expect("value"),
+            );
+        }
+        map
+    }
+
+    fn owned(fields: &[(&str, &str)]) -> Vec<(String, String)> {
+        fields
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// Runs the events through one `GrpcFrames` and returns `(data frames, trailers frames)`.
+    fn frames_of(
+        header_grpc: &[(&str, &str)],
+        events: Vec<Result<ResponseEvent, String>>,
+    ) -> (Vec<Vec<u8>>, Vec<HeaderMap>) {
+        let mut frames = GrpcFrames::new(header_fields(header_grpc));
+        let mut data = Vec::new();
+        let mut trailers = Vec::new();
+        for event in events {
+            if let Some(frame) = frames.frame(event) {
+                match frame.into_data() {
+                    Ok(d) => data.push(d.to_vec()),
+                    Err(frame) => trailers.push(frame.into_trailers().expect("trailers")),
+                }
+            }
+        }
+        (data, trailers)
+    }
+
+    fn grpc_status(trailers: &HeaderMap) -> Option<&str> {
+        trailers.get("grpc-status").and_then(|v| v.to_str().ok())
+    }
+
+    /// The field case (2026-10-08): a cache hit or a trailers-only lightwalletd answer carries
+    /// `grpc-status` in the header section and an EMPTY trailer section. tonic 0.14 fails the
+    /// stream with "missing grpc-status trailer" unless the status is sent as a trailer.
+    #[test]
+    fn header_carried_grpc_status_is_sent_as_the_trailers_frame() {
+        let (data, trailers) = frames_of(
+            &[("grpc-status", "0"), ("grpc-message", "ok")],
+            vec![
+                Ok(ResponseEvent::Data(vec![0, 0, 0, 0, 1, 7])),
+                Ok(ResponseEvent::Trailers(vec![])),
+                Ok(ResponseEvent::End),
+            ],
+        );
+        assert_eq!(data, vec![vec![0, 0, 0, 0, 1, 7]]);
+        assert_eq!(
+            trailers.len(),
+            1,
+            "exactly one trailers frame, nothing after it"
+        );
+        assert_eq!(grpc_status(&trailers[0]), Some("0"));
+        assert_eq!(
+            trailers[0].get("grpc-message").map(|v| v.as_bytes()),
+            Some(&b"ok"[..])
+        );
+    }
+
+    #[test]
+    fn trailers_only_error_reaches_tonic_as_an_error_trailer() {
+        let (data, trailers) = frames_of(
+            &[("grpc-status", "3"), ("grpc-message", "bad range")],
+            vec![Ok(ResponseEvent::Trailers(vec![])), Ok(ResponseEvent::End)],
+        );
+        assert!(data.is_empty());
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(grpc_status(&trailers[0]), Some("3"));
+    }
+
+    #[test]
+    fn a_streamed_status_in_the_trailer_section_is_kept_as_is() {
+        let (data, trailers) = frames_of(
+            &[],
+            vec![
+                Ok(ResponseEvent::Data(vec![1])),
+                Ok(ResponseEvent::Data(vec![2])),
+                Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "0")]))),
+                Ok(ResponseEvent::End),
+            ],
+        );
+        assert_eq!(data, vec![vec![1], vec![2]]);
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(grpc_status(&trailers[0]), Some("0"));
+    }
+
+    #[test]
+    fn the_trailer_section_wins_over_header_fields() {
+        let (_, trailers) = frames_of(
+            &[("grpc-status", "0")],
+            vec![Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "8")])))],
+        );
+        assert_eq!(grpc_status(&trailers[0]), Some("8"));
+    }
+
+    #[test]
+    fn no_status_anywhere_ends_the_stream_with_internal() {
+        let (_, trailers) = frames_of(&[], vec![Ok(ResponseEvent::Trailers(vec![]))]);
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(grpc_status(&trailers[0]), Some("13"));
+    }
+
+    #[test]
+    fn a_decode_error_ends_the_stream_with_unavailable_and_nothing_follows() {
+        let (data, trailers) = frames_of(
+            &[("grpc-status", "0")],
+            vec![
+                Ok(ResponseEvent::Data(vec![1])),
+                Err("truncated".into()),
+                Ok(ResponseEvent::Data(vec![2])),
+                Ok(ResponseEvent::Trailers(vec![])),
+            ],
+        );
+        assert_eq!(
+            data,
+            vec![vec![1]],
+            "nothing is forwarded after the trailers"
+        );
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(grpc_status(&trailers[0]), Some("14"));
+        assert!(
+            trailers[0]
+                .get("grpc-message")
+                .is_some_and(|v| v.as_bytes().starts_with(b"ohttp decode: truncated"))
+        );
+    }
+
+    /// The streamed answer goes through the same exchange loop as the buffered one: an outer
+    /// non-success status is final (and names the status), a wrong content-type is rejected.
+    #[tokio::test]
+    async fn streamed_outer_answers_use_the_shared_exchange_checks() {
+        fn stream_answer(status: u16, content_type: &str) -> RelayStream {
+            RelayStream {
+                status: StatusCode::from_u16(status).expect("status"),
+                content_type: Some(content_type.to_string()),
+                body: Full::new(Bytes::from_static(b"x"))
+                    .map_err(|never: Infallible| match never {})
+                    .boxed(),
+            }
+        }
+        let err = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async { Ok(stream_answer(503, CONTENT_TYPE_CHUNKED_RES)) },
+            || async { unreachable!("no refetch on 503") },
+            || {},
+        )
+        .await
+        .err()
+        .expect("503 is final");
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m.contains("503")),
+            "{err:?}"
+        );
+
+        let err = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async { Ok(stream_answer(200, "text/html")) },
+            || async { unreachable!("no refetch on 200") },
+            || {},
+        )
+        .await
+        .err()
+        .expect("wrong content-type is rejected");
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m.contains("text/html")),
+            "{err:?}"
+        );
+
+        let (_decoder, answer) = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async { Ok(stream_answer(200, CONTENT_TYPE_CHUNKED_RES)) },
+            || async { unreachable!("no refetch on 200") },
+            || {},
+        )
+        .await
+        .expect("a chunked 200 is handed back unread");
+        assert_eq!(answer.status, StatusCode::OK);
     }
 
     /// Chunked OHTTP streaming test: verify that the first gRPC message frame is received
