@@ -1281,10 +1281,9 @@ impl OhttpClient {
 
         // Body frames, then exactly one trailers frame carrying the gRPC status.
         let mut frames = GrpcFrames::new(grpc_fields);
-        let body = StreamBody::new(events.filter_map(move |event| {
+        let body = BodyExt::boxed(StreamBody::new(events.filter_map(move |event| {
             futures_util::future::ready(frames.frame(event).map(Ok::<_, Infallible>))
-        }))
-        .boxed();
+        })));
 
         let mut resp = Response::new(body);
         *resp.status_mut() = StatusCode::from_u16(http_status).unwrap_or(StatusCode::OK);
