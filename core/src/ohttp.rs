@@ -956,13 +956,13 @@ impl OhttpClient {
     /// arrives; the first gRPC message frame is emitted before the full response has been received.
     async fn round_trip_stream<D>(
         &self,
-        request: &BhttpRequest,
+        request: BhttpRequest,
         on_dispatch: D,
     ) -> Result<
         (
             u16,
             HeaderMap,
-            impl futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>>,
+            Pin<Box<dyn futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>> + Send>>,
         ),
         RoundTripError,
     >
@@ -979,14 +979,14 @@ impl OhttpClient {
 
         // Seal the request
         let encoded =
-            zodl_ohttp_client::encode_bhttp_request(request, &ClientProfile::SLIPSTREAM.encode)
+            zodl_ohttp_client::encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode)
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
         let (sealed, opener) = encapsulate_chunked_request(&key, &encoded)
             .map_err(|e| RoundTripError::Transport(e.to_string()))?;
 
         // Post and get stream, with key refetch on 400/422
         let mut attempt = 0u32;
-        let (status, content_type, body_stream) = loop {
+        let (_status, _content_type, body_stream) = loop {
             on_dispatch();
             let (status, content_type, body_stream) = self
                 .post_sealed_stream(sealed.clone())
@@ -1074,7 +1074,7 @@ impl OhttpClient {
 
         // Wait for first Head event
         let mut rx = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let (http_status, mut headers) = loop {
+        let (http_status, headers) = loop {
             match rx.next().await {
                 Some(Ok(ResponseEvent::Head { status, headers: h })) => {
                     let mut header_map = HeaderMap::new();
@@ -1133,7 +1133,7 @@ impl OhttpClient {
             }
         });
 
-        Ok((http_status, headers, frame_stream))
+        Ok((http_status, headers, Box::pin(frame_stream)))
     }
 
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.
@@ -1161,8 +1161,8 @@ impl OhttpClient {
 
         let started = std::time::Instant::now();
         // Timeout only for getting the Head (status + headers)
-        let (http_status, mut headers, frame_stream) =
-            match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip_stream(&request, || {}))
+        let (http_status, headers, frame_stream) =
+            match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip_stream(request, || {}))
                 .await
             {
                 Ok(Ok(result)) => result,
