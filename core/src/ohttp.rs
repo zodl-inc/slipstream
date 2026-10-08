@@ -1165,7 +1165,7 @@ impl OhttpClient {
 
         let started = std::time::Instant::now();
         // Timeout only for getting the Head (status + headers)
-        let (http_status, headers, frame_stream) =
+        let (http_status, mut headers, frame_stream) =
             match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip_stream(request, || {}))
                 .await
             {
