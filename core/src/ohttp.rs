@@ -69,6 +69,10 @@ const DUPLEX_BUF: usize = 4 << 20;
 /// buffered streams; the gateway itself gives lightwalletd 80 s.
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
 
+/// Idle timeout between chunks in a streaming OHTTP response. A healthy stream delivers chunks
+/// continuously; 30 s of silence means the connection is dead.
+const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Hostname prefix that marks an endpoint as an OHTTP gateway (mirrors the Kotlin SDK).
 pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
 
@@ -1029,15 +1033,15 @@ impl OhttpClient {
             break (status_u16, content_type, body_stream);
         };
 
-        // Spawn task to decode chunks and forward events
+        // Spawn task to decode chunks and forward events with idle timeout
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, String>>(16);
         let mut decoder = opener.decoder();
 
         tokio::spawn(async move {
             let mut body_stream = body_stream;
-            while let Some(frame_result) = body_stream.frame().await {
-                match frame_result {
-                    Ok(frame) => {
+            loop {
+                match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()).await {
+                    Ok(Some(Ok(frame))) => {
                         if let Ok(data) = frame.into_data() {
                             match decoder.push(&data) {
                                 Ok(events) => {
@@ -1054,8 +1058,18 @@ impl OhttpClient {
                             }
                         }
                     }
-                    Err(e) => {
+                    Ok(Some(Err(e))) => {
                         let _ = tx.send(Err(format!("read chunk: {e}"))).await;
+                        return;
+                    }
+                    Ok(None) => {
+                        // Stream ended normally
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err("idle timeout: no chunk received in 30s".into()))
+                            .await;
                         return;
                     }
                 }
@@ -1078,31 +1092,29 @@ impl OhttpClient {
 
         // Wait for first Head event
         let mut rx = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let (http_status, headers) = loop {
-            match rx.next().await {
-                Some(Ok(ResponseEvent::Head { status, headers: h })) => {
-                    let mut header_map = HeaderMap::new();
-                    for (k, v) in h {
-                        if let (Ok(name), Ok(value)) = (
-                            HeaderName::from_bytes(k.as_bytes()),
-                            HeaderValue::from_bytes(v.as_bytes()),
-                        ) {
-                            header_map.insert(name, value);
-                        }
+        let (http_status, headers) = match rx.next().await {
+            Some(Ok(ResponseEvent::Head { status, headers: h })) => {
+                let mut header_map = HeaderMap::new();
+                for (k, v) in h {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_bytes(v.as_bytes()),
+                    ) {
+                        header_map.insert(name, value);
                     }
-                    break (status, header_map);
                 }
-                Some(Err(e)) => {
-                    return Err(RoundTripError::Decode(e));
-                }
-                None => {
-                    return Err(RoundTripError::Decode("no Head event received".into()));
-                }
-                _ => {
-                    return Err(RoundTripError::Decode(
-                        "unexpected event before Head".into(),
-                    ));
-                }
+                (status, header_map)
+            }
+            Some(Err(e)) => {
+                return Err(RoundTripError::Decode(e));
+            }
+            None => {
+                return Err(RoundTripError::Decode("no Head event received".into()));
+            }
+            _ => {
+                return Err(RoundTripError::Decode(
+                    "unexpected event before Head".into(),
+                ));
             }
         };
 
@@ -1195,10 +1207,10 @@ impl OhttpClient {
                 if let Some(n) = name {
                     grpc_fields.insert(n, value);
                 }
-            } else if name == Some(header::CONTENT_TYPE) || name == Some(header::DATE) {
-                if let Some(n) = name {
-                    response_headers.insert(n, value);
-                }
+            } else if (name == Some(header::CONTENT_TYPE) || name == Some(header::DATE))
+                && let Some(n) = name
+            {
+                response_headers.insert(n, value);
             }
         }
 
@@ -2046,7 +2058,7 @@ mod tests {
 
         while let Some(chunk) = rx.recv().await {
             chunk_count += 1;
-            if first_data_received.is_none() && chunk.len() > 0 {
+            if first_data_received.is_none() && !chunk.is_empty() {
                 first_data_received = Some(std::time::Instant::now());
             }
         }
