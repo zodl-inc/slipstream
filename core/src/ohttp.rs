@@ -58,7 +58,7 @@ use tokio::sync::Mutex;
 use tower_service::Service;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseDecoder, ClientProfile, ClientTrace, KeyConfig, SizeGuard,
+    ChunkedResponseDecoder, ClientProfile, ClientTrace, KeyConfig, ResponseEvent, SizeGuard,
     encapsulate_chunked_request, signed_config_url, verify_signed_config,
 };
 
@@ -2002,7 +2002,6 @@ mod tests {
     /// a GetBlockRange response slowly (3 chunks with delays).
     #[tokio::test]
     async fn chunked_ohttp_streams_first_block_before_last_chunk() {
-        use futures_util::stream::StreamExt;
         use std::sync::{Arc, Mutex as StdMutex};
         use tokio::time::sleep;
 
