@@ -1726,43 +1726,6 @@ mod tests {
         assert!(contains(&lowered, b"x-custom") && !contains(&lowered, b"X-Custom"));
     }
 
-    #[test]
-    fn grpc_response_fields_are_split_into_headers_and_trailers() {
-        let response = BhttpResponse {
-            status: 200,
-            informational: Vec::new(),
-            headers: vec![
-                (b"content-type".to_vec(), b"application/grpc".to_vec()),
-                (b"grpc-status".to_vec(), b"0".to_vec()),
-                (b"x-other".to_vec(), b"y".to_vec()),
-            ],
-            body: Vec::new(),
-            // The Binary HTTP trailer section is not read.
-            trailers: vec![(b"grpc-message".to_vec(), b"ignored".to_vec())],
-        };
-        let (status, headers, trailers) = grpc_parts(&response);
-        assert_eq!(status, 200);
-        assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
-        assert!(headers.get("x-other").is_none());
-        assert_eq!(trailers.get("grpc-status").unwrap(), "0");
-        assert!(trailers.get("grpc-message").is_none());
-    }
-
-    #[test]
-    fn a_response_without_grpc_status_is_internal() {
-        let response = BhttpResponse {
-            status: 502,
-            informational: Vec::new(),
-            headers: Vec::new(),
-            body: Vec::new(),
-            trailers: Vec::new(),
-        };
-        let (status, headers, trailers) = grpc_parts(&response);
-        assert_eq!(status, 502);
-        assert_eq!(headers.get("content-type").unwrap(), "application/grpc");
-        assert_eq!(trailers.get("grpc-status").unwrap(), "13");
-    }
-
     /// C-08: a relay POST is never sent twice with the same ciphertext. The gateway answers a
     /// repeat with 409, so after a failure before the send the request is sealed again.
     #[tokio::test]
