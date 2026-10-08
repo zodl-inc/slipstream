@@ -58,8 +58,8 @@ use tokio::sync::Mutex;
 use tower_service::Service;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseDecoder, ClientProfile, ClientTrace, Error as CoreError, KeyConfig,
-    ResponseEvent, SizeGuard, encapsulate_chunked_request, signed_config_url, verify_signed_config,
+    ChunkedResponseDecoder, ClientProfile, ClientTrace, KeyConfig, SizeGuard,
+    encapsulate_chunked_request, signed_config_url, verify_signed_config,
 };
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
@@ -866,9 +866,22 @@ impl OhttpClient {
                 .map_err(|e| RoundTripError::Decode(e.to_string()))?,
         );
 
-        // Collect events into a BhttpResponse
-        zodl_ohttp_client::collect_response(events)
-            .map_err(|e| RoundTripError::Decode(e.to_string()))
+        // Collect events into a Response and convert to BhttpResponse
+        let response = zodl_ohttp_client::collect_response(events)
+            .map_err(|e| RoundTripError::Decode(e.to_string()))?;
+
+        // Convert Response to BhttpResponse (headers as bytes)
+        Ok(BhttpResponse {
+            status: response.status,
+            informational: Vec::new(),
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
+                .collect(),
+            body: response.body,
+            trailers: Vec::new(),
+        })
     }
 
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.
@@ -1257,9 +1270,56 @@ mod tests {
     fn outer_answer(status: u16) -> RelayAnswer {
         RelayAnswer {
             status: StatusCode::from_u16(status).expect("status"),
-            content_type: None,
+            content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
             body: b"nope".to_vec(),
         }
+    }
+
+    /// Test helper: wraps run_exchange_chunked for backward compatibility with existing tests.
+    /// Decodes the buffered response and returns a BhttpResponse.
+    async fn run_exchange<P, PF, R, RF, D>(
+        _profile: &ClientProfile,
+        key: KeyConfig,
+        request: &BhttpRequest,
+        mut post: P,
+        mut refetch: R,
+        on_dispatch: D,
+    ) -> Result<BhttpResponse, RoundTripError>
+    where
+        P: FnMut(Vec<u8>) -> PF,
+        PF: Future<Output = Result<RelayAnswer, HttpsError>>,
+        R: FnMut() -> RF,
+        RF: Future<Output = Result<KeyConfig, String>>,
+        D: Fn(),
+    {
+        let (mut decoder, body) =
+            run_exchange_chunked(key, request, |b| post(b), || refetch(), on_dispatch).await?;
+
+        // Decode the buffered response
+        let mut events = decoder
+            .push(&body)
+            .map_err(|e| RoundTripError::Decode(e.to_string()))?;
+        events.extend(
+            decoder
+                .finish()
+                .map_err(|e| RoundTripError::Decode(e.to_string()))?,
+        );
+
+        // Convert to BhttpResponse
+        let response = zodl_ohttp_client::collect_response(events)
+            .map_err(|e| RoundTripError::Decode(e.to_string()))?;
+
+        Ok(BhttpResponse {
+            status: response.status,
+            informational: Vec::new(),
+            headers: response
+                .headers
+                .into_iter()
+                .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
+                .collect(),
+            body: response.body,
+            trailers: Vec::new(),
+        })
     }
 
     #[test]
