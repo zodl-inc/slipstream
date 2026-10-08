@@ -1293,7 +1293,7 @@ mod tests {
         D: Fn(),
     {
         let (mut decoder, body) =
-            run_exchange_chunked(key, request, |b| post(b), || refetch(), on_dispatch).await?;
+            run_exchange_chunked(key, request, post, refetch, on_dispatch).await?;
 
         // Decode the buffered response
         let mut events = decoder
