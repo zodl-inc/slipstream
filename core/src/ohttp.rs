@@ -1281,8 +1281,8 @@ mod tests {
         _profile: &ClientProfile,
         key: KeyConfig,
         request: &BhttpRequest,
-        mut post: P,
-        mut refetch: R,
+        post: P,
+        refetch: R,
         on_dispatch: D,
     ) -> Result<BhttpResponse, RoundTripError>
     where
