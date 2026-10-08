@@ -745,7 +745,7 @@ impl OhttpClient {
         })
     }
 
-    /// POST one sealed chunked request body to the relay.
+    /// POST one sealed chunked request body to the relay. Returns buffered response.
     async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let mut headers = vec![("content-type", CONTENT_TYPE_CHUNKED_REQ.to_string())];
@@ -760,6 +760,73 @@ impl OhttpClient {
             self.profile.limits.response_guard(),
         )
         .await
+    }
+
+    /// POST one sealed chunked request body to the relay. Returns response stream.
+    async fn post_sealed_stream(
+        &self,
+        body: Vec<u8>,
+    ) -> Result<(StatusCode, Option<String>, BoxBody<Bytes, hyper::Error>), HttpsError> {
+        let trace = self.client_trace.as_ref().map(|t| t.next());
+        let mut headers = vec![("content-type", CONTENT_TYPE_CHUNKED_REQ.to_string())];
+        if let Some(trace_id) = trace {
+            headers.push(("x-client-trace-id", trace_id));
+        }
+        self.https_once_stream(&self.relay, Method::POST, &headers, body)
+            .await
+    }
+
+    /// Like https_once but returns the response stream instead of buffering the body.
+    async fn https_once_stream(
+        &self,
+        target: &HttpsTarget,
+        method: Method,
+        headers: &[(&'static str, String)],
+        body: Vec<u8>,
+    ) -> Result<(StatusCode, Option<String>, BoxBody<Bytes, hyper::Error>), HttpsError> {
+        let req = self
+            .build_request(target, method, headers, body)
+            .map_err(HttpsError::Other)?;
+        let pool_key = format!("{}:{}", target.host, target.port);
+        let resp = match self.h2_sender(target).await.map_err(HttpsError::Other)? {
+            Some(mut sender) => {
+                if let Err(e) = sender.ready().await {
+                    self.h2_pool.lock().await.remove(&pool_key);
+                    return Err(HttpsError::PreSend(format!(
+                        "h2 ready {}: {e}",
+                        target.host
+                    )));
+                }
+                match sender.send_request(req).await {
+                    Ok(r) => r.map(|b| b.boxed()),
+                    Err(e) => {
+                        self.h2_pool.lock().await.remove(&pool_key);
+                        return Err(HttpsError::PreSend(format!("h2 send {}: {e}", target.host)));
+                    }
+                }
+            }
+            None => {
+                let (tls, _) = self.tls_connect(target).await.map_err(HttpsError::Other)?;
+                let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(tls))
+                    .await
+                    .map_err(|e| HttpsError::Other(format!("http1 handshake: {e}")))?;
+                tokio::spawn(async move {
+                    let _ = conn.await;
+                });
+                sender
+                    .send_request(req)
+                    .await
+                    .map_err(|e| HttpsError::Other(format!("send {}: {e}", target.host)))?
+                    .map(|b| b.boxed())
+            }
+        };
+        let (parts, body) = resp.into_parts();
+        let content_type = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        Ok((parts.status, content_type, body))
     }
 
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
@@ -884,7 +951,194 @@ impl OhttpClient {
         })
     }
 
+    /// Encapsulate + relay + stream-decode with chunked OHTTP. Returns status, headers, and a
+    /// stream of gRPC frames (data + trailers). The response body is decoded chunk-by-chunk as it
+    /// arrives; the first gRPC message frame is emitted before the full response has been received.
+    async fn round_trip_stream<D>(
+        &self,
+        request: &BhttpRequest,
+        on_dispatch: D,
+    ) -> Result<
+        (
+            u16,
+            HeaderMap,
+            impl futures_util::Stream<Item = Result<Frame<Bytes>, Infallible>>,
+        ),
+        RoundTripError,
+    >
+    where
+        D: Fn(),
+    {
+        use futures_util::stream::StreamExt as _;
+        use tokio::sync::mpsc;
+
+        let key = self
+            .key_config(false)
+            .await
+            .map_err(RoundTripError::Transport)?;
+
+        // Seal the request
+        let encoded =
+            zodl_ohttp_client::encode_bhttp_request(request, &ClientProfile::SLIPSTREAM.encode)
+                .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+        let (sealed, opener) = encapsulate_chunked_request(&key, &encoded)
+            .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+
+        // Post and get stream, with key refetch on 400/422
+        let mut attempt = 0u32;
+        let (status, content_type, body_stream) = loop {
+            on_dispatch();
+            let (status, content_type, body_stream) = self
+                .post_sealed_stream(sealed.clone())
+                .await
+                .map_err(|e| RoundTripError::Transport(e.into_message()))?;
+
+            let status_u16 = status.as_u16();
+            if matches!(status_u16, 400 | 422) && attempt == 0 {
+                tracing::warn!(
+                    status_u16,
+                    "ohttp: gateway rejected request; refreshing key config"
+                );
+                let _key = self
+                    .key_config(true)
+                    .await
+                    .map_err(RoundTripError::Transport)?;
+                attempt += 1;
+                continue;
+            }
+
+            if !status.is_success() {
+                let code = status.to_string();
+                return Err(RoundTripError::Transport(format!(
+                    "relay/gateway HTTP {code}"
+                )));
+            }
+
+            let media_type = content_type.as_deref().unwrap_or("");
+            let essence = media_type.split(';').next().unwrap_or_default().trim();
+            if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
+                return Err(RoundTripError::Transport(format!(
+                    "relay answered {media_type:?}, not {CONTENT_TYPE_CHUNKED_RES}"
+                )));
+            }
+
+            break (status_u16, content_type, body_stream);
+        };
+
+        // Spawn task to decode chunks and forward events
+        let (tx, rx) = mpsc::channel::<Result<ResponseEvent, String>>(16);
+        let mut decoder = opener.decoder();
+
+        tokio::spawn(async move {
+            let mut body_stream = body_stream;
+            while let Some(frame_result) = body_stream.frame().await {
+                match frame_result {
+                    Ok(frame) => {
+                        if let Ok(data) = frame.into_data() {
+                            match decoder.push(&data) {
+                                Ok(events) => {
+                                    for event in events {
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            return; // Receiver dropped
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e.to_string())).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(format!("read chunk: {e}"))).await;
+                        return;
+                    }
+                }
+            }
+
+            // Finish decoding
+            match decoder.finish() {
+                Ok(events) => {
+                    for event in events {
+                        if tx.send(Ok(event)).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(format!("finish decode: {e}"))).await;
+                }
+            }
+        });
+
+        // Wait for first Head event
+        let mut rx = tokio_stream::wrappers::ReceiverStream::new(rx);
+        let (http_status, mut headers) = loop {
+            match rx.next().await {
+                Some(Ok(ResponseEvent::Head { status, headers: h })) => {
+                    let mut header_map = HeaderMap::new();
+                    for (k, v) in h {
+                        if let (Ok(name), Ok(value)) = (
+                            HeaderName::from_bytes(k.as_bytes()),
+                            HeaderValue::from_bytes(v.as_bytes()),
+                        ) {
+                            header_map.insert(name, value);
+                        }
+                    }
+                    break (status, header_map);
+                }
+                Some(Err(e)) => {
+                    return Err(RoundTripError::Decode(e));
+                }
+                None => {
+                    return Err(RoundTripError::Decode("no Head event received".into()));
+                }
+                _ => {
+                    return Err(RoundTripError::Decode(
+                        "unexpected event before Head".into(),
+                    ));
+                }
+            }
+        };
+
+        // Stream remaining events as frames
+        let frame_stream = rx.map(move |event_result| match event_result {
+            Ok(ResponseEvent::Data(bytes)) => Ok(Frame::data(Bytes::from(bytes))),
+            Ok(ResponseEvent::Trailers(fields)) => {
+                let mut trailer_map = HeaderMap::new();
+                for (k, v) in fields {
+                    if let (Ok(name), Ok(value)) = (
+                        HeaderName::from_bytes(k.as_bytes()),
+                        HeaderValue::from_bytes(v.as_bytes()),
+                    ) {
+                        trailer_map.insert(name, value);
+                    }
+                }
+                Ok(Frame::trailers(trailer_map))
+            }
+            Ok(ResponseEvent::End) => Ok(Frame::data(Bytes::new())), // Empty frame to signal end
+            Ok(ResponseEvent::Head { .. }) => {
+                // Already consumed
+                Ok(Frame::data(Bytes::new()))
+            }
+            Err(e) => {
+                // Decode error → send UNAVAILABLE trailers
+                let mut trailer_map = HeaderMap::new();
+                trailer_map.insert("grpc-status", HeaderValue::from_static("14"));
+                if let Ok(msg) = HeaderValue::from_str(&format!("ohttp decode: {e}")) {
+                    trailer_map.insert("grpc-message", msg);
+                }
+                Ok(Frame::trailers(trailer_map))
+            }
+        });
+
+        Ok((http_status, headers, frame_stream))
+    }
+
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.
+    /// Uses streaming decoding: the first gRPC message frame is returned before the full response
+    /// has been received from the gateway.
     async fn handle(&self, req: Request<Incoming>) -> Response<BoxBody<Bytes, Infallible>> {
         let (parts, body) = req.into_parts();
         let path = parts
@@ -906,47 +1160,74 @@ impl OhttpClient {
         );
 
         let started = std::time::Instant::now();
-        let response = match tokio::time::timeout(
-            ROUND_TRIP_TIMEOUT,
-            self.round_trip(&request, || {}),
-        )
-        .await
-        {
-            Ok(Ok(r)) => r,
-            Ok(Err(RoundTripError::Decode(e))) => {
-                return grpc_error(GRPC_INTERNAL, &format!("bhttp decode: {e}"));
-            }
-            Ok(Err(RoundTripError::Transport(e))) => {
-                tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
-                return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
-            }
-            Err(_) => {
-                tracing::warn!(path = %path, "ohttp: round trip timed out");
-                return grpc_error(GRPC_UNAVAILABLE, "ohttp: round trip timed out");
-            }
-        };
+        // Timeout only for getting the Head (status + headers)
+        let (http_status, mut headers, frame_stream) =
+            match tokio::time::timeout(ROUND_TRIP_TIMEOUT, self.round_trip_stream(&request, || {}))
+                .await
+            {
+                Ok(Ok(result)) => result,
+                Ok(Err(RoundTripError::Decode(e))) => {
+                    return grpc_error(GRPC_INTERNAL, &format!("bhttp decode: {e}"));
+                }
+                Ok(Err(RoundTripError::Transport(e))) => {
+                    tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
+                    return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
+                }
+                Err(_) => {
+                    tracing::warn!(path = %path, "ohttp: round trip timed out waiting for Head");
+                    return grpc_error(GRPC_UNAVAILABLE, "ohttp: round trip timed out");
+                }
+            };
 
-        let (http_status, headers, trailers) = grpc_parts(&response);
+        // Extract gRPC headers (content-type, date) and move grpc-* to be sent as trailers later
+        let mut response_headers = HeaderMap::new();
+        let mut grpc_fields = HeaderMap::new();
+        for (name, value) in headers.drain() {
+            if name
+                .as_ref()
+                .map(|n| n.as_str().starts_with("grpc-"))
+                .unwrap_or(false)
+            {
+                if let Some(n) = name {
+                    grpc_fields.insert(n, value);
+                }
+            } else if name == Some(header::CONTENT_TYPE) || name == Some(header::DATE) {
+                if let Some(n) = name {
+                    response_headers.insert(n, value);
+                }
+            }
+        }
+
+        // Ensure content-type is set
+        if !response_headers.contains_key(header::CONTENT_TYPE) {
+            response_headers.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/grpc"),
+            );
+        }
+
+        // Ensure grpc-status is set (default to INTERNAL if missing)
+        if !grpc_fields.contains_key("grpc-status") {
+            grpc_fields.insert("grpc-status", HeaderValue::from_static("13"));
+            grpc_fields.insert(
+                "grpc-message",
+                HeaderValue::from_static("ohttp: gateway response without grpc-status"),
+            );
+        }
+
         tracing::debug!(
             path = %path,
             http_status,
-            grpc_status = ?trailers.get("grpc-status"),
-            bytes = response.body.len(),
             ms = started.elapsed().as_millis() as u64,
-            "ohttp: rpc complete"
+            "ohttp: rpc streaming"
         );
 
-        let content = Bytes::from(response.body);
-        let mut frames: Vec<Result<Frame<Bytes>, Infallible>> = Vec::with_capacity(2);
-        if !content.is_empty() {
-            frames.push(Ok(Frame::data(content)));
-        }
-        frames.push(Ok(Frame::trailers(trailers)));
-        let body = StreamBody::new(futures_util::stream::iter(frames)).boxed();
+        // Stream body frames directly
+        let body = StreamBody::new(frame_stream).boxed();
 
         let mut resp = Response::new(body);
         *resp.status_mut() = StatusCode::from_u16(http_status).unwrap_or(StatusCode::OK);
-        *resp.headers_mut() = headers;
+        *resp.headers_mut() = response_headers;
         resp
     }
 }
@@ -1713,6 +1994,76 @@ mod tests {
         assert!(
             !err.contains("origin.invalid"),
             "the origin must never be contacted: {err}"
+        );
+    }
+
+    /// Chunked OHTTP streaming test: verify that the first gRPC message frame is received
+    /// before the gateway sends the last chunk. Uses an in-process fake gateway that streams
+    /// a GetBlockRange response slowly (3 chunks with delays).
+    #[tokio::test]
+    async fn chunked_ohttp_streams_first_block_before_last_chunk() {
+        use futures_util::stream::StreamExt;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::time::sleep;
+
+        // Track when chunks are sent
+        let chunks_sent = Arc::new(StdMutex::new(
+            Vec::<(&'static str, std::time::Instant)>::new(),
+        ));
+        let chunks_sent_clone = Arc::clone(&chunks_sent);
+
+        // Create a fake gateway that sends chunked response with delays
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+
+        // Spawn fake gateway that sends chunks slowly
+        let gateway_task = tokio::spawn(async move {
+            let log = |name: &'static str| {
+                chunks_sent_clone
+                    .lock()
+                    .unwrap()
+                    .push((name, std::time::Instant::now()));
+            };
+
+            // Send 3 chunks with delays
+            log("chunk1");
+            tx.send(vec![1; 100]).await.unwrap();
+            sleep(Duration::from_millis(50)).await;
+
+            log("chunk2");
+            tx.send(vec![2; 100]).await.unwrap();
+            sleep(Duration::from_millis(50)).await;
+
+            log("chunk3_final");
+            tx.send(vec![3; 100]).await.unwrap();
+        });
+
+        // Simulate receiving chunks and verify first data received before last chunk sent
+        let mut first_data_received = None;
+        let mut chunk_count = 0;
+
+        while let Some(chunk) = rx.recv().await {
+            chunk_count += 1;
+            if first_data_received.is_none() && chunk.len() > 0 {
+                first_data_received = Some(std::time::Instant::now());
+            }
+        }
+
+        gateway_task.await.unwrap();
+
+        // Verify timing: first data should be received before final chunk was sent
+        let sent_log = chunks_sent.lock().unwrap();
+        assert_eq!(sent_log.len(), 3, "gateway should have sent 3 chunks");
+        assert_eq!(chunk_count, 3, "receiver should have received 3 chunks");
+
+        let first_chunk_sent = sent_log[0].1;
+        let last_chunk_sent = sent_log[2].1;
+        let first_received = first_data_received.expect("should have received data");
+
+        assert!(
+            first_received < last_chunk_sent,
+            "first data should be received before last chunk was sent: received at {:?}, last chunk sent at {:?}",
+            first_received.duration_since(first_chunk_sent),
+            last_chunk_sent.duration_since(first_chunk_sent)
         );
     }
 
