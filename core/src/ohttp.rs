@@ -1267,41 +1267,6 @@ fn grpc_request(
     request
 }
 
-/// The gRPC view of a decoded gateway response: HTTP status, HTTP/2 headers (`content-type` and
-/// `date` only) and trailers (the `grpc-*` fields the gateway folded into the header section;
-/// the Binary HTTP trailer section is not read). A missing `grpc-status` becomes INTERNAL.
-fn grpc_parts(response: &BhttpResponse) -> (u16, HeaderMap, HeaderMap) {
-    let mut headers = HeaderMap::new();
-    let mut trailers = HeaderMap::new();
-    for (field_name, field_value) in &response.headers {
-        let (Ok(name), Ok(value)) = (
-            HeaderName::from_bytes(field_name),
-            HeaderValue::from_bytes(field_value),
-        ) else {
-            continue;
-        };
-        if name.as_str().starts_with("grpc-") {
-            trailers.insert(name, value);
-        } else if name == header::CONTENT_TYPE || name == header::DATE {
-            headers.insert(name, value);
-        }
-    }
-    if !trailers.contains_key("grpc-status") {
-        trailers.insert("grpc-status", HeaderValue::from_static("13"));
-        trailers.insert(
-            "grpc-message",
-            HeaderValue::from_static("ohttp: gateway response without grpc-status"),
-        );
-    }
-    if !headers.contains_key(header::CONTENT_TYPE) {
-        headers.insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/grpc"),
-        );
-    }
-    (response.status, headers, trailers)
-}
-
 /// Where `http_round_trip` sends its request, as the gateway will see it.
 struct HttpTarget {
     scheme: String,
