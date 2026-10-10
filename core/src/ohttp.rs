@@ -1914,7 +1914,8 @@ mod tests {
             || {},
         )
         .await;
-        assert!(matches!(result, Err(RoundTripError::Transport(_))));
+        // Labelled as a chunked response, so it reaches the decoder, which refuses to open it.
+        assert!(matches!(result, Err(RoundTripError::Decode(_))));
     }
 
     /// Behavioral test: `http_round_trip` only connects to the relay, never the origin.
