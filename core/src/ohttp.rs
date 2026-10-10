@@ -1906,7 +1906,7 @@ mod tests {
             |_body| async {
                 Ok::<RelayAnswer, HttpsError>(RelayAnswer {
                     status: StatusCode::OK,
-                    content_type: Some("message/ohttp-res".into()),
+                    content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
                     body: vec![7; 64],
                 })
             },
