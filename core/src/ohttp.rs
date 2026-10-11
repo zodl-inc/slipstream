@@ -506,6 +506,41 @@ enum RoundTripError {
     Decode(String),
 }
 
+/// Runs `attempt`, and once more when its answer is the gateway's freshness refusal (an inner
+/// 400 with `ohttp-freshness: rejected`). The refusal carried the gateway clock, which the
+/// decoder has already learned, so the second attempt (sealed afresh by `attempt`) is stamped
+/// right. At most one retry: a second refusal is returned as it is.
+async fn with_freshness_retry<T, F, Fut, J>(
+    mut attempt: F,
+    is_refusal: J,
+) -> Result<T, RoundTripError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, RoundTripError>>,
+    J: Fn(&T) -> bool,
+{
+    let first = attempt().await?;
+    if !is_refusal(&first) {
+        return Ok(first);
+    }
+    drop(first);
+    tracing::warn!(
+        offset_secs = zodl_ohttp_client::freshness::clock_offset_secs(),
+        "ohttp: gateway refused the request as stale; sending it again"
+    );
+    attempt().await
+}
+
+/// `on_dispatch` wrapped so that it runs at most once, across the attempts of one request.
+fn once_dispatch<D: Fn()>(on_dispatch: D) -> impl Fn() {
+    let done = std::sync::atomic::AtomicBool::new(false);
+    move || {
+        if !done.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            on_dispatch();
+        }
+    }
+}
+
 /// The relay POST loop for chunked OHTTP. Returns the decoder and the relay's answer (buffered
 /// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
 /// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
@@ -1025,10 +1060,31 @@ impl OhttpClient {
         Ok(cfg.config)
     }
 
+    /// [`Self::round_trip_once`], sent once more (sealed afresh) when the gateway refused it
+    /// as stale: an inner 400 with `ohttp-freshness: rejected` ("Request freshness" in the
+    /// ZIP). That response carries the gateway clock, which the decoder has already learned,
+    /// so the second attempt is stamped right even on a device whose clock is off. Never more
+    /// than one retry per request.
+    async fn round_trip<D>(
+        &self,
+        request: &BhttpRequest,
+        on_dispatch: D,
+    ) -> Result<BhttpResponse, RoundTripError>
+    where
+        D: Fn(),
+    {
+        let dispatch = once_dispatch(on_dispatch);
+        with_freshness_retry(
+            || self.round_trip_once(request, &dispatch),
+            |r: &BhttpResponse| zodl_ohttp_client::freshness::is_rejection(r.status, &r.headers),
+        )
+        .await
+    }
+
     /// Encapsulate + relay + decapsulate with chunked OHTTP. The key configuration is
     /// fetched again, and the request sealed again, when the gateway rejects the request (outer
     /// 400 or 422). Decodes the chunked response and returns the inner message.
-    async fn round_trip<D>(
+    async fn round_trip_once<D>(
         &self,
         request: &BhttpRequest,
         on_dispatch: D,
@@ -1078,12 +1134,38 @@ impl OhttpClient {
         })
     }
 
+    /// [`Self::round_trip_stream_once`] with the same single retry as [`Self::round_trip`] when
+    /// the gateway refused the request as stale. The refusal is known from the head alone, so
+    /// nothing of it reaches the caller.
+    async fn round_trip_stream<D>(
+        &self,
+        request: BhttpRequest,
+        on_dispatch: D,
+    ) -> Result<(u16, HeaderMap, EventStream), RoundTripError>
+    where
+        D: Fn(),
+    {
+        let dispatch = once_dispatch(on_dispatch);
+        // A refused first attempt is dropped (its decoding task ends with the receiver).
+        with_freshness_retry(
+            || self.round_trip_stream_once(request.clone(), &dispatch),
+            |(status, headers, _): &(u16, HeaderMap, EventStream)| {
+                let fields: Vec<(&[u8], &[u8])> = headers
+                    .iter()
+                    .map(|(k, v)| (k.as_str().as_bytes(), v.as_bytes()))
+                    .collect();
+                zodl_ohttp_client::freshness::is_rejection(*status, &fields)
+            },
+        )
+        .await
+    }
+
     /// Encapsulate + relay + stream-decode with chunked OHTTP. Returns the inner status and
     /// headers once the head has been decoded, and the remaining events (body, trailers, end)
     /// as they are decoded chunk by chunk: the first gRPC message is available before the
     /// response has been received in full. Same exchange loop as [`Self::round_trip`]: every
     /// post is sealed afresh, an outer 400 or 422 refetches the key and retries once.
-    async fn round_trip_stream<D>(
+    async fn round_trip_stream_once<D>(
         &self,
         request: BhttpRequest,
         on_dispatch: D,
@@ -2778,6 +2860,70 @@ mod tests {
     }
 
     /// Dispatch callback is invoked exactly once, before the first POST attempt.
+    #[tokio::test]
+    async fn a_freshness_refusal_is_sent_once_more_and_only_once() {
+        // Answers in order; `true` = the gateway's freshness refusal.
+        async fn run(answers: &[bool]) -> (Result<bool, RoundTripError>, usize) {
+            let calls = Cell::new(0usize);
+            let result = with_freshness_retry(
+                || {
+                    let i = calls.get();
+                    calls.set(i + 1);
+                    let answer = answers[i];
+                    async move { Ok::<bool, RoundTripError>(answer) }
+                },
+                |refused: &bool| *refused,
+            )
+            .await;
+            (result, calls.get())
+        }
+        let (r, n) = run(&[false]).await;
+        assert!(!r.expect("answer"), "an accepted request is returned");
+        assert_eq!(n, 1, "and not sent again");
+        let (r, n) = run(&[true, false]).await;
+        assert!(!r.expect("answer"), "the retry's answer is returned");
+        assert_eq!(n, 2, "a refusal is sent once more");
+        let (r, n) = run(&[true, true, false]).await;
+        assert!(r.expect("answer"), "a second refusal is returned as it is");
+        assert_eq!(n, 2, "never more than one retry");
+
+        let calls = Cell::new(0usize);
+        let err = with_freshness_retry(
+            || {
+                calls.set(calls.get() + 1);
+                async { Err::<bool, _>(RoundTripError::Transport("down".into())) }
+            },
+            |_: &bool| true,
+        )
+        .await;
+        assert!(err.is_err());
+        assert_eq!(calls.get(), 1, "a failed attempt is not a refusal");
+    }
+
+    #[test]
+    fn the_refusal_is_recognised_from_the_inner_head() {
+        let refused: Vec<(Vec<u8>, Vec<u8>)> = vec![
+            (b"content-type".to_vec(), b"text/plain".to_vec()),
+            (b"ohttp-freshness".to_vec(), b"rejected".to_vec()),
+            (b"ohttp-server-time".to_vec(), b"1800000000".to_vec()),
+        ];
+        assert!(zodl_ohttp_client::freshness::is_rejection(400, &refused));
+        assert!(!zodl_ohttp_client::freshness::is_rejection(
+            400,
+            &refused[..1]
+        ));
+        assert!(!zodl_ohttp_client::freshness::is_rejection(200, &refused));
+    }
+
+    #[test]
+    fn dispatch_runs_once_across_attempts() {
+        let n = Cell::new(0u32);
+        let dispatch = once_dispatch(|| n.set(n.get() + 1));
+        dispatch();
+        dispatch();
+        assert_eq!(n.get(), 1);
+    }
+
     #[tokio::test]
     async fn dispatch_callback_fires_once_before_post() {
         let dispatch_count = StdMutex::new(0u32);
