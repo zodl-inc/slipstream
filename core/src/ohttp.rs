@@ -3075,7 +3075,7 @@ mod tests {
         use std::sync::Arc;
 
         // Channel to send frames
-        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Result<Frame<hyper::body::Bytes>, std::io::Error>>(100);
+        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Result<Frame<hyper::body::Bytes>, std::io::Error>>(100);
 
         // Track whether the body was dropped
         let body_dropped = Arc::new(AtomicBool::new(false));
