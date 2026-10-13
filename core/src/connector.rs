@@ -581,6 +581,11 @@ mod tests {
     #[test]
     fn ohttp_over_tor_timeout_leaves_room_for_two_circuits() {
         assert!(TOR_OHTTP_CONNECT_TIMEOUT >= TOR_CONNECT_TIMEOUT);
+        // Every fresh-circuit dial attempt fits in the OHTTP connect budget, with room to spare.
+        assert!(
+            crate::ohttp::TOR_DIAL_TIMEOUT * crate::ohttp::TOR_DIAL_ATTEMPTS
+                < TOR_OHTTP_CONNECT_TIMEOUT
+        );
         assert!(TOR_OHTTP_CONNECT_TIMEOUT.as_secs() <= 60);
     }
 

@@ -218,10 +218,11 @@ type BoxedIo = Box<dyn AsyncIo>;
 
 /// Per-attempt bound on opening one Tor stream to the relay/gateway. A healthy circuit connects
 /// in a few seconds; a stuck one is cut here and retried on a FRESH isolated circuit.
-/// 10s x 3 attempts = 30s, fitting within TOR_OHTTP_CONNECT_TIMEOUT.
-const TOR_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+/// 8 s x 3 attempts = 24 s, inside the 30 s `TOR_OHTTP_CONNECT_TIMEOUT` with 6 s left for TLS and
+/// the request, so the third fresh circuit gets its full attempt.
+pub(crate) const TOR_DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 /// Fresh-circuit attempts per Tor dial before the error surfaces to the caller.
-const TOR_DIAL_ATTEMPTS: u32 = 3;
+pub(crate) const TOR_DIAL_ATTEMPTS: u32 = 3;
 
 /// How the TCP leg towards the relay / gateway is opened.
 #[allow(clippy::large_enum_variant)]
