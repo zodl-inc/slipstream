@@ -3070,27 +3070,55 @@ mod tests {
     /// reading frames after the RPC has been dropped.
     #[tokio::test]
     async fn streaming_decode_stops_on_receiver_drop() {
-        use futures_util::stream::{self, StreamExt};
         use http_body_util::StreamBody;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
 
-        // Body source that tracks whether it has been dropped
-        let dropped = Arc::new(AtomicBool::new(false));
-        let dropped_clone = dropped.clone();
+        // Channel to send frames
+        let (frame_tx, mut frame_rx) = tokio::sync::mpsc::channel::<Result<Frame<hyper::body::Bytes>, std::io::Error>>(100);
 
-        // Create a stream that yields frames with delays, tracking when it's dropped
-        let stream = stream::unfold((0u8, dropped_clone), |(count, dropped_flag)| async move {
-            if count >= 100 {
-                // Mark as dropped when the stream completes
-                drop(dropped_flag);
-                return None;
+        // Track whether the body was dropped
+        let body_dropped = Arc::new(AtomicBool::new(false));
+        let body_dropped_clone = body_dropped.clone();
+
+        // Spawn task to generate frames
+        tokio::spawn(async move {
+            for i in 0u8..100 {
+                let frame = Frame::data(hyper::body::Bytes::from(vec![i; 8]));
+                if frame_tx.send(Ok(frame)).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            // Add delay between frames to simulate network behavior
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            let frame = http::frame::Frame::data(hyper::body::Bytes::from(vec![count; 8]));
-            Some((Ok::<_, std::io::Error>(frame), (count + 1, dropped_flag)))
         });
+
+        // Create a stream that tracks when it's dropped
+        struct DroppableStream<R> {
+            receiver: R,
+            dropped: Arc<AtomicBool>,
+        }
+
+        impl<R> Drop for DroppableStream<R> {
+            fn drop(&mut self) {
+                self.dropped.store(true, Ordering::Relaxed);
+            }
+        }
+
+        impl futures_util::Stream for DroppableStream<tokio::sync::mpsc::Receiver<Result<Frame<hyper::body::Bytes>, std::io::Error>>> {
+            type Item = Result<Frame<hyper::body::Bytes>, std::io::Error>;
+
+            fn poll_next(
+                mut self: std::pin::Pin<&mut Self>,
+                cx: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Option<Self::Item>> {
+                self.receiver.poll_recv(cx).map(|opt| opt)
+            }
+        }
+
+        let stream = DroppableStream {
+            receiver: frame_rx,
+            dropped: body_dropped_clone,
+        };
 
         let body = StreamBody::new(stream);
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, String>>(16);
@@ -3142,7 +3170,7 @@ mod tests {
 
         // Verify the body was dropped (the stream's drop guard should have fired)
         assert!(
-            dropped.load(Ordering::Relaxed),
+            body_dropped.load(Ordering::Relaxed),
             "body stream should be dropped when receiver is dropped"
         );
     }
