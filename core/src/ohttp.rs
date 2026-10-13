@@ -2209,7 +2209,7 @@ mod tests {
     }
 
     #[test]
-    fn a_decode_error_ends_the_stream_with_unavailable_and_nothing_follows() {
+    fn a_decode_error_ends_the_stream_with_internal_and_nothing_follows() {
         let (data, trailers) = frames_of(
             &[("grpc-status", "0")],
             vec![
@@ -2225,11 +2225,12 @@ mod tests {
             "nothing is forwarded after the trailers"
         );
         assert_eq!(trailers.len(), 1);
-        assert_eq!(grpc_status(&trailers[0]), Some("14"));
+        // Decode errors mid-stream map to grpc-status 13 INTERNAL
+        assert_eq!(grpc_status(&trailers[0]), Some("13"));
         assert!(
             trailers[0]
                 .get("grpc-message")
-                .is_some_and(|v| v.as_bytes().starts_with(b"ohttp decode: truncated"))
+                .is_some_and(|v| v.as_bytes().starts_with(b"ohttp: truncated"))
         );
     }
 
