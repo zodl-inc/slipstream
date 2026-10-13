@@ -3071,11 +3071,12 @@ mod tests {
     #[tokio::test]
     async fn streaming_decode_stops_on_receiver_drop() {
         use http_body_util::StreamBody;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         // Channel to send frames
-        let (frame_tx, frame_rx) = tokio::sync::mpsc::channel::<Result<Frame<hyper::body::Bytes>, std::io::Error>>(100);
+        let (frame_tx, frame_rx) =
+            tokio::sync::mpsc::channel::<Result<Frame<hyper::body::Bytes>, std::io::Error>>(100);
 
         // Track whether the body was dropped
         let body_dropped = Arc::new(AtomicBool::new(false));
@@ -3104,7 +3105,11 @@ mod tests {
             }
         }
 
-        impl futures_util::Stream for DroppableStream<tokio::sync::mpsc::Receiver<Result<Frame<hyper::body::Bytes>, std::io::Error>>> {
+        impl futures_util::Stream
+            for DroppableStream<
+                tokio::sync::mpsc::Receiver<Result<Frame<hyper::body::Bytes>, std::io::Error>>,
+            >
+        {
             type Item = Result<Frame<hyper::body::Bytes>, std::io::Error>;
 
             fn poll_next(
