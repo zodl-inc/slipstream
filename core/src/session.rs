@@ -479,10 +479,7 @@ async fn follow_loop(
 
         // Fast-path probe: GetLatestBlock only (no subtree roots, no UTXO refresh).
         let observed = match probe_tip(&config.engine, tor_conn).await {
-            Ok(t) => {
-                consecutive_failures = 0;
-                t
-            }
+            Ok(t) => t,
             Err(err) if err.is_transient() => {
                 consecutive_failures += 1;
                 // The tip check could not reach the server, so no download is failing

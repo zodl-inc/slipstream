@@ -3027,33 +3027,17 @@ mod tests {
     /// to the decoder, preventing unbounded memory growth.
     #[test]
     fn streaming_decode_enforces_size_limit() {
-        use zodl_ohttp_client::{ChunkedResponseDecoder, ChunkedResponseOpener};
-
-        // Create a decoder (need an opener first)
-        let key = test_key();
-        let request = encode_bhttp_request(&test_request(), &ClientProfile::SLIPSTREAM.encode)
-            .expect("encode");
-        let (_sealed, opener) =
-            zodl_ohttp_client::encapsulate_chunked_request(&key, &request).expect("encapsulate");
-        let mut decoder = ChunkedResponseDecoder::from_opener(&opener);
-
         // Simulate streaming with a small size limit (100 bytes)
         let mut guard = SizeGuard::new(Some(100));
 
         // First chunk: 50 bytes, should succeed
-        let chunk1 = vec![0u8; 50];
-        assert!(guard.push(chunk1.len()).is_ok(), "first chunk within limit");
+        assert!(guard.push(50).is_ok(), "first chunk within limit");
 
         // Second chunk: 30 bytes, total 80 bytes, should succeed
-        let chunk2 = vec![0u8; 30];
-        assert!(
-            guard.push(chunk2.len()).is_ok(),
-            "second chunk within limit"
-        );
+        assert!(guard.push(30).is_ok(), "second chunk within limit");
 
         // Third chunk: 30 bytes, total 110 bytes, should fail
-        let chunk3 = vec![0u8; 30];
-        let result = guard.push(chunk3.len());
+        let result = guard.push(30);
         assert!(result.is_err(), "third chunk exceeds limit");
         match result {
             Err(zodl_ohttp_client::Error::TooLarge { max }) => {
@@ -3063,13 +3047,9 @@ mod tests {
         }
 
         // Verify that after failure, the guard continues to fail (no further data should be read)
-        let chunk4 = vec![0u8; 10];
         assert!(
-            guard.push(chunk4.len()).is_err(),
+            guard.push(10).is_err(),
             "guard stays failed after limit exceeded"
         );
-
-        // The decoder itself was never fed the oversized data, preventing unbounded growth
-        drop(decoder);
     }
 }
