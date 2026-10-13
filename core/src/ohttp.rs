@@ -444,6 +444,83 @@ struct RelayStream {
     body: BoxBody<Bytes, hyper::Error>,
 }
 
+/// Streaming half of [`OhttpClient::round_trip_stream_once`]: reads the relay body frame by
+/// frame, enforces the response size bound, feeds the chunked decoder and forwards its events.
+/// It stops as soon as the receiver is gone (the RPC was cancelled or timed out) and drops the
+/// body, even while an incomplete chunk produces no events, so a dropped call stops reading
+/// ciphertext from the relay.
+async fn pump_chunked_body(
+    mut body_stream: BoxBody<Bytes, hyper::Error>,
+    mut decoder: ChunkedResponseDecoder,
+    mut guard: SizeGuard,
+    tx: tokio::sync::mpsc::Sender<Result<ResponseEvent, String>>,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            () = tx.closed() => {
+                // Receiver dropped: stop reading and drop the body promptly
+                drop(body_stream);
+                return;
+            }
+            frame_result = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()) => {
+                match frame_result {
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(data) = frame.into_data() {
+                            // Enforce size limit before pushing to decoder
+                            if let Err(e) = guard.push(data.len()) {
+                                let _ = tx.send(Err(e.to_string())).await;
+                                return;
+                            }
+                            match decoder.push(&data) {
+                                Ok(events) => {
+                                    for event in events {
+                                        if tx.send(Ok(event)).await.is_err() {
+                                            return; // Receiver dropped
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    let _ = tx.send(Err(e.to_string())).await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    Ok(Some(Err(e))) => {
+                        let _ = tx.send(Err(format!("read chunk: {e}"))).await;
+                        return;
+                    }
+                    Ok(None) => {
+                        // Stream ended normally
+                        break;
+                    }
+                    Err(_) => {
+                        let _ = tx
+                            .send(Err("idle timeout: no chunk received in 30s".into()))
+                            .await;
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
+    // Finish decoding
+    match decoder.finish() {
+        Ok(events) => {
+            for event in events {
+                if tx.send(Ok(event)).await.is_err() {
+                    return;
+                }
+            }
+        }
+        Err(e) => {
+            let _ = tx.send(Err(format!("finish decode: {e}"))).await;
+        }
+    }
+}
+
 /// What [`run_exchange_chunked`] needs from the relay's answer to one sealed POST, whatever
 /// became of its body. Keeps one exchange loop (re-sealing, key refetch, outer-status and
 /// content-type checks) for the buffered and the streamed paths.
@@ -1204,7 +1281,7 @@ impl OhttpClient {
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        let (mut decoder, answer) = run_exchange_chunked(
+        let (decoder, answer) = run_exchange_chunked(
             key,
             &request,
             move |body| this.post_sealed_stream(body),
@@ -1215,75 +1292,9 @@ impl OhttpClient {
 
         // Spawn task to decode chunks and forward events with idle timeout
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, String>>(16);
-        let mut guard = this.profile.limits.response_guard();
+        let guard = this.profile.limits.response_guard();
 
-        tokio::spawn(async move {
-            let mut body_stream = answer.body;
-            loop {
-                tokio::select! {
-                    biased;
-                    () = tx.closed() => {
-                        // Receiver dropped: stop reading and drop the body promptly
-                        drop(body_stream);
-                        return;
-                    }
-                    frame_result = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()) => {
-                        match frame_result {
-                            Ok(Some(Ok(frame))) => {
-                                if let Ok(data) = frame.into_data() {
-                                    // Enforce size limit before pushing to decoder
-                                    if let Err(e) = guard.push(data.len()) {
-                                        let _ = tx.send(Err(e.to_string())).await;
-                                        return;
-                                    }
-                                    match decoder.push(&data) {
-                                        Ok(events) => {
-                                            for event in events {
-                                                if tx.send(Ok(event)).await.is_err() {
-                                                    return; // Receiver dropped
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            let _ = tx.send(Err(e.to_string())).await;
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                let _ = tx.send(Err(format!("read chunk: {e}"))).await;
-                                return;
-                            }
-                            Ok(None) => {
-                                // Stream ended normally
-                                break;
-                            }
-                            Err(_) => {
-                                let _ = tx
-                                    .send(Err("idle timeout: no chunk received in 30s".into()))
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Finish decoding
-            match decoder.finish() {
-                Ok(events) => {
-                    for event in events {
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = tx.send(Err(format!("finish decode: {e}"))).await;
-                }
-            }
-        });
+        tokio::spawn(pump_chunked_body(answer.body, decoder, guard, tx));
 
         // Wait for first Head event
         let mut rx = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -3065,118 +3076,65 @@ mod tests {
         );
     }
 
-    /// Streaming decoder task stops promptly when the receiver is dropped, even when the body
-    /// source has more frames pending. Regression test for finding 1: the task should not continue
-    /// reading frames after the RPC has been dropped.
+    /// A cancelled RPC drops the receiver while the relay is still sending an incomplete chunk
+    /// (no events yet): the production pump must notice at once, end, and drop the relay body,
+    /// instead of reading on until the 30 s idle timeout.
     #[tokio::test]
-    async fn streaming_decode_stops_on_receiver_drop() {
-        use http_body_util::StreamBody;
+    async fn pump_stops_and_drops_the_body_when_the_receiver_is_dropped() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
 
-        // Channel to send frames
-        let (frame_tx, frame_rx) =
-            tokio::sync::mpsc::channel::<Result<Frame<hyper::body::Bytes>, std::io::Error>>(100);
-
-        // Track whether the body was dropped
-        let body_dropped = Arc::new(AtomicBool::new(false));
-        let body_dropped_clone = body_dropped.clone();
-
-        // Spawn task to generate frames
-        tokio::spawn(async move {
-            for i in 0u8..100 {
-                let frame = Frame::data(hyper::body::Bytes::from(vec![i; 8]));
-                if frame_tx.send(Ok(frame)).await.is_err() {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        });
-
-        // Create a stream that tracks when it's dropped
-        struct DroppableStream<R> {
-            receiver: R,
-            dropped: Arc<AtomicBool>,
-        }
-
-        impl<R> Drop for DroppableStream<R> {
+        /// A relay body that never yields a frame and records when it is dropped.
+        struct PendingBody(Arc<AtomicBool>);
+        impl Drop for PendingBody {
             fn drop(&mut self) {
-                self.dropped.store(true, Ordering::Relaxed);
+                self.0.store(true, Ordering::SeqCst);
             }
         }
-
-        impl futures_util::Stream
-            for DroppableStream<
-                tokio::sync::mpsc::Receiver<Result<Frame<hyper::body::Bytes>, std::io::Error>>,
-            >
-        {
-            type Item = Result<Frame<hyper::body::Bytes>, std::io::Error>;
-
+        impl futures_util::Stream for PendingBody {
+            type Item = Result<Frame<Bytes>, hyper::Error>;
             fn poll_next(
-                mut self: std::pin::Pin<&mut Self>,
-                cx: &mut std::task::Context<'_>,
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Option<Self::Item>> {
-                self.receiver.poll_recv(cx).map(|opt| opt)
+                std::task::Poll::Pending
             }
         }
 
-        let stream = DroppableStream {
-            receiver: frame_rx,
-            dropped: body_dropped_clone,
-        };
+        let (decoder, _answer) = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async {
+                Ok(RelayStream {
+                    status: StatusCode::OK,
+                    content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
+                    body: Full::new(Bytes::new())
+                        .map_err(|never: Infallible| match never {})
+                        .boxed(),
+                })
+            },
+            || async { unreachable!("no refetch on 200") },
+            || {},
+        )
+        .await
+        .expect("a chunked 200 is handed back unread");
 
-        let body = StreamBody::new(stream);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let body = StreamBody::new(PendingBody(dropped.clone())).boxed();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, String>>(16);
+        let task = tokio::spawn(pump_chunked_body(body, decoder, SizeGuard::new(None), tx));
 
-        // Spawn the decoder task (simplified version of the production code)
-        let task = tokio::spawn(async move {
-            let mut body_stream = body;
-            loop {
-                tokio::select! {
-                    biased;
-                    () = tx.closed() => {
-                        // Receiver dropped: stop reading and drop the body promptly
-                        drop(body_stream);
-                        return;
-                    }
-                    frame_result = body_stream.frame() => {
-                        match frame_result {
-                            Some(Ok(_frame)) => {
-                                // In production, we would decode and send events here
-                                // For this test, we just continue the loop
-                            }
-                            Some(Err(_e)) => {
-                                return;
-                            }
-                            None => {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        // Let the task read a few frames
-        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-
-        // Drop the receiver (simulating a cancelled RPC or timeout)
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !task.is_finished(),
+            "the pump waits for the relay while the call is alive"
+        );
         drop(rx);
 
-        // The task should complete within a short timeout (not continue reading all 100 frames)
-        let result = tokio::time::timeout(std::time::Duration::from_millis(500), task).await;
-        assert!(
-            result.is_ok(),
-            "task should complete within timeout after receiver drop"
-        );
-
-        // Give a bit of time for the body to be dropped
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        // Verify the body was dropped (the stream's drop guard should have fired)
-        assert!(
-            body_dropped.load(Ordering::Relaxed),
-            "body stream should be dropped when receiver is dropped"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .expect("the pump ends promptly once the receiver is dropped")
+            .expect("the pump does not panic");
+        assert!(dropped.load(Ordering::SeqCst), "the relay body is dropped");
     }
 }
