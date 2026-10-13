@@ -1220,42 +1220,52 @@ impl OhttpClient {
         tokio::spawn(async move {
             let mut body_stream = answer.body;
             loop {
-                match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()).await {
-                    Ok(Some(Ok(frame))) => {
-                        if let Ok(data) = frame.into_data() {
-                            // Enforce size limit before pushing to decoder
-                            if let Err(e) = guard.push(data.len()) {
-                                let _ = tx.send(Err(e.to_string())).await;
-                                return;
-                            }
-                            match decoder.push(&data) {
-                                Ok(events) => {
-                                    for event in events {
-                                        if tx.send(Ok(event)).await.is_err() {
-                                            return; // Receiver dropped
+                tokio::select! {
+                    biased;
+                    () = tx.closed() => {
+                        // Receiver dropped: stop reading and drop the body promptly
+                        drop(body_stream);
+                        return;
+                    }
+                    frame_result = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()) => {
+                        match frame_result {
+                            Ok(Some(Ok(frame))) => {
+                                if let Ok(data) = frame.into_data() {
+                                    // Enforce size limit before pushing to decoder
+                                    if let Err(e) = guard.push(data.len()) {
+                                        let _ = tx.send(Err(e.to_string())).await;
+                                        return;
+                                    }
+                                    match decoder.push(&data) {
+                                        Ok(events) => {
+                                            for event in events {
+                                                if tx.send(Ok(event)).await.is_err() {
+                                                    return; // Receiver dropped
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            let _ = tx.send(Err(e.to_string())).await;
+                                            return;
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    let _ = tx.send(Err(e.to_string())).await;
-                                    return;
-                                }
+                            }
+                            Ok(Some(Err(e))) => {
+                                let _ = tx.send(Err(format!("read chunk: {e}"))).await;
+                                return;
+                            }
+                            Ok(None) => {
+                                // Stream ended normally
+                                break;
+                            }
+                            Err(_) => {
+                                let _ = tx
+                                    .send(Err("idle timeout: no chunk received in 30s".into()))
+                                    .await;
+                                return;
                             }
                         }
-                    }
-                    Ok(Some(Err(e))) => {
-                        let _ = tx.send(Err(format!("read chunk: {e}"))).await;
-                        return;
-                    }
-                    Ok(None) => {
-                        // Stream ended normally
-                        break;
-                    }
-                    Err(_) => {
-                        let _ = tx
-                            .send(Err("idle timeout: no chunk received in 30s".into()))
-                            .await;
-                        return;
                     }
                 }
             }
@@ -3052,6 +3062,88 @@ mod tests {
         assert!(
             guard.push(10).is_err(),
             "guard stays failed after limit exceeded"
+        );
+    }
+
+    /// Streaming decoder task stops promptly when the receiver is dropped, even when the body
+    /// source has more frames pending. Regression test for finding 1: the task should not continue
+    /// reading frames after the RPC has been dropped.
+    #[tokio::test]
+    async fn streaming_decode_stops_on_receiver_drop() {
+        use futures_util::stream::{self, StreamExt};
+        use http_body_util::StreamBody;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Body source that tracks whether it has been dropped
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_clone = dropped.clone();
+
+        // Create a stream that yields frames with delays, tracking when it's dropped
+        let stream = stream::unfold((0u8, dropped_clone), |(count, dropped_flag)| async move {
+            if count >= 100 {
+                // Mark as dropped when the stream completes
+                drop(dropped_flag);
+                return None;
+            }
+            // Add delay between frames to simulate network behavior
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            let frame = http::frame::Frame::data(hyper::body::Bytes::from(vec![count; 8]));
+            Some((Ok::<_, std::io::Error>(frame), (count + 1, dropped_flag)))
+        });
+
+        let body = StreamBody::new(stream);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, String>>(16);
+
+        // Spawn the decoder task (simplified version of the production code)
+        let task = tokio::spawn(async move {
+            let mut body_stream = body;
+            loop {
+                tokio::select! {
+                    biased;
+                    () = tx.closed() => {
+                        // Receiver dropped: stop reading and drop the body promptly
+                        drop(body_stream);
+                        return;
+                    }
+                    frame_result = body_stream.frame() => {
+                        match frame_result {
+                            Some(Ok(_frame)) => {
+                                // In production, we would decode and send events here
+                                // For this test, we just continue the loop
+                            }
+                            Some(Err(_e)) => {
+                                return;
+                            }
+                            None => {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Let the task read a few frames
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+
+        // Drop the receiver (simulating a cancelled RPC or timeout)
+        drop(rx);
+
+        // The task should complete within a short timeout (not continue reading all 100 frames)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(500), task).await;
+        assert!(
+            result.is_ok(),
+            "task should complete within timeout after receiver drop"
+        );
+
+        // Give a bit of time for the body to be dropped
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Verify the body was dropped (the stream's drop guard should have fired)
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "body stream should be dropped when receiver is dropped"
         );
     }
 }

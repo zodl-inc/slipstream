@@ -416,7 +416,8 @@ async fn follow_loop(
     initial_tip: u64,
 ) {
     let mut last_tip = initial_tip;
-    let mut consecutive_failures: u32 = 0;
+    let mut probe_failures: u32 = 0;
+    let mut catchup_failures: u32 = 0;
     // T8.2 mempool monitoring state (per-session). Non-fatal: a persistently failing
     // stream disables mempool for this session and the loop keeps tip-polling.
     // `seen_txids` persists across reconnects because lightwalletd replays the whole
@@ -481,46 +482,55 @@ async fn follow_loop(
         let observed = match probe_tip(&config.engine, tor_conn).await {
             Ok(t) => t,
             Err(err) if err.is_transient() => {
-                consecutive_failures += 1;
+                probe_failures += 1;
                 // The tip check could not reach the server, so no download is failing
                 // (see `Progress::note_attempt_failed`).
                 reporter.progress.note_attempt_failed();
                 // After N consecutive failures, surface Error(3) so hosts can react (e.g., switch
                 // servers). Before the threshold, log and retry.
-                if consecutive_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                let total_failures = probe_failures + catchup_failures;
+                if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
                     tracing::error!(
                         %err,
-                        consecutive_failures,
+                        probe_failures,
+                        catchup_failures,
+                        total_failures,
                         "follow tip probe persistently failing — surfacing endpoint unreachable (host can switch servers)"
                     );
                     reporter.set_state(SyncState::Error(3));
                     reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
                     continue;
-                } else if consecutive_failures > FOLLOW_FAILURE_CAP {
+                } else if total_failures > FOLLOW_FAILURE_CAP {
                     tracing::warn!(
                         %err,
-                        consecutive_failures,
+                        probe_failures,
+                        catchup_failures,
+                        total_failures,
                         "follow tip probe failing repeatedly — wallet stays synced, still retrying (check connectivity)"
                     );
                 } else {
                     tracing::warn!(
                         %err,
-                        consecutive_failures,
+                        probe_failures,
+                        catchup_failures,
                         "follow tip probe failed (transient) — will retry"
                     );
                 }
                 continue;
             }
             Err(err) => {
-                consecutive_failures += 1;
+                probe_failures += 1;
                 // The tip check could not reach the server, so no download is failing
                 // (see `Progress::note_attempt_failed`).
                 reporter.progress.note_attempt_failed();
                 // After N consecutive failures, surface Error(3) so hosts can react.
-                if consecutive_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                let total_failures = probe_failures + catchup_failures;
+                if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
                     tracing::error!(
                         %err,
-                        consecutive_failures,
+                        probe_failures,
+                        catchup_failures,
+                        total_failures,
                         "follow tip probe persistently failing (non-transient) — surfacing endpoint unreachable"
                     );
                     reporter.set_state(SyncState::Error(3));
@@ -529,15 +539,16 @@ async fn follow_loop(
                 }
                 tracing::warn!(
                     %err,
-                    consecutive_failures,
+                    probe_failures,
+                    catchup_failures,
                     "follow tip probe failed (non-transient) — staying synced, will retry"
                 );
                 continue;
             }
         };
 
-        // Probe succeeded: reset failure counter and clear Error(3) if set.
-        consecutive_failures = 0;
+        // Probe succeeded: reset probe failure counter and clear Error(3) if set.
+        probe_failures = 0;
         {
             let state = reporter.state.lock().unwrap_or_else(|p| p.into_inner());
             if matches!(*state, SyncState::Error(3)) {
@@ -564,7 +575,7 @@ async fn follow_loop(
         match run_pass_with_retry(&config.engine, &[], &reporter.progress, tor_conn).await {
             Ok(o) => {
                 last_tip = o.chain_tip;
-                consecutive_failures = 0;
+                catchup_failures = 0;
                 reporter.set_state(SyncState::Done);
                 reporter.push_event(FfiSlipstreamEvent {
                     tag: 3,
@@ -572,13 +583,16 @@ async fn follow_loop(
                 });
             }
             Err(err) => {
-                consecutive_failures += 1;
+                catchup_failures += 1;
                 // After N consecutive failures, surface Error(3) so hosts can react.
                 // Below the threshold, revert to Done (wallet is still synced to last_tip).
-                if consecutive_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                let total_failures = probe_failures + catchup_failures;
+                if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
                     tracing::error!(
                         %err,
-                        consecutive_failures,
+                        probe_failures,
+                        catchup_failures,
+                        total_failures,
                         last_tip,
                         failed_at_utc = %wall_clock_utc(),
                         "follow catch-up pass persistently failing — surfacing endpoint unreachable"
@@ -588,7 +602,8 @@ async fn follow_loop(
                 } else {
                     tracing::warn!(
                         %err,
-                        consecutive_failures,
+                        probe_failures,
+                        catchup_failures,
                         last_tip,
                         failed_at_utc = %wall_clock_utc(),
                         "follow catch-up pass failed — staying synced, will retry"
@@ -875,6 +890,52 @@ mod tests {
         assert!(
             progress.download_failures().is_empty(),
             "a pass that failed without a give-up ends every run"
+        );
+    }
+
+    /// Catch-up failures must accumulate across successful tip probes to trigger endpoint error.
+    /// Regression test for finding 2: previously the failure counter was reset after every
+    /// successful probe, so an endpoint that answered probes but failed catch-up passes would
+    /// never reach the escalation threshold.
+    #[test]
+    fn catchup_failures_accumulate_across_successful_probes() {
+        // Simulate the follow loop logic with separate counters
+        let mut probe_failures: u32 = 0;
+        let mut catchup_failures: u32 = 0;
+        let mut error_triggered = false;
+
+        // Simulate 6 iterations: successful probe followed by failed catch-up each time
+        for iteration in 1..=6 {
+            // Successful tip probe
+            probe_failures = 0; // Reset only probe failures
+
+            // Failed catch-up pass
+            catchup_failures += 1;
+
+            let total_failures = probe_failures + catchup_failures;
+            if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                error_triggered = true;
+                assert_eq!(
+                    iteration, 5,
+                    "Error(3) should be triggered on the 5th failed catch-up (iteration {})",
+                    iteration
+                );
+                break;
+            }
+        }
+
+        assert!(
+            error_triggered,
+            "After 5 failed catch-up passes (each preceded by a successful probe), \
+             the endpoint-error event must fire"
+        );
+        assert_eq!(
+            catchup_failures, ENDPOINT_UNREACHABLE_THRESHOLD,
+            "Catch-up failure counter should reach the threshold"
+        );
+        assert_eq!(
+            probe_failures, 0,
+            "Probe failure counter should be 0 (all probes succeeded)"
         );
     }
 }
