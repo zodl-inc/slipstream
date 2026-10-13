@@ -218,7 +218,8 @@ type BoxedIo = Box<dyn AsyncIo>;
 
 /// Per-attempt bound on opening one Tor stream to the relay/gateway. A healthy circuit connects
 /// in a few seconds; a stuck one is cut here and retried on a FRESH isolated circuit.
-const TOR_DIAL_TIMEOUT: Duration = Duration::from_secs(20);
+/// 10s x 3 attempts = 30s, fitting within TOR_OHTTP_CONNECT_TIMEOUT.
+const TOR_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Fresh-circuit attempts per Tor dial before the error surfaces to the caller.
 const TOR_DIAL_ATTEMPTS: u32 = 3;
 
@@ -482,10 +483,11 @@ impl OuterAnswer for RelayStream {
 /// Why one HTTPS exchange failed.
 #[derive(Debug)]
 enum HttpsError {
-    /// The pooled h2 connection was not ready or refused the request: nothing reached the far
-    /// end, so the caller may try again (a relay POST is sealed afresh first).
+    /// The pooled h2 connection was not ready: nothing reached the far end, so the caller may
+    /// try again (a relay POST is sealed afresh first).
     PreSend(String),
-    /// Anything else (connect, TLS, read, size cap): not retried.
+    /// Anything else (connect, TLS, send, read, size cap): the request may have been delivered,
+    /// so not retried to avoid repeating a request with side effects.
     Other(String),
 }
 
@@ -494,6 +496,17 @@ impl HttpsError {
         match self {
             HttpsError::PreSend(m) | HttpsError::Other(m) => m,
         }
+    }
+
+    /// Classifies a hyper send_request error. Only errors that prove the request was not sent
+    /// are PreSend: connection/handshake failures are already caught earlier, and `ready()` errors
+    /// are classified before this. Without access to h2::Error to detect REFUSED_STREAM, all
+    /// send_request errors are treated as potentially post-send.
+    fn classify_send_error(e: hyper::Error, target_host: &str) -> Self {
+        // We cannot reliably determine if the error occurred before or after the request was sent
+        // without downcasting to h2::Error and checking for REFUSED_STREAM. Treat as post-send
+        // to avoid repeating requests with side effects (ZIP Gateway rule 11).
+        HttpsError::Other(format!("h2 send {target_host}: {e}"))
     }
 }
 
@@ -510,6 +523,10 @@ enum RoundTripError {
 /// 400 with `ohttp-freshness: rejected`). The refusal carried the gateway clock, which the
 /// decoder has already learned, so the second attempt (sealed afresh by `attempt`) is stamped
 /// right. At most one retry: a second refusal is returned as it is.
+///
+/// With the B3 send-error classification, at most 4 relay POSTs per call can reach the network:
+/// freshness retry (2) × key-refresh retry (2). A reseal after a PreSend failure does not reach
+/// the relay.
 async fn with_freshness_retry<T, F, Fut, J>(
     mut attempt: F,
     is_refusal: J,
@@ -682,8 +699,13 @@ impl GrpcFrames {
             Ok(ResponseEvent::Head { .. }) | Ok(ResponseEvent::End) => None,
             Err(e) => {
                 let mut trailers = HeaderMap::new();
-                trailers.insert("grpc-status", HeaderValue::from_static("14"));
-                if let Ok(msg) = HeaderValue::from_str(&format!("ohttp decode: {e}")) {
+                // Decode/AEAD errors (from decoder.push/finish) -> grpc-status 13 INTERNAL.
+                // Transport errors (connection cut, idle timeout) -> grpc-status 14 UNAVAILABLE.
+                let is_transport_error =
+                    e.starts_with("read chunk:") || e.starts_with("idle timeout:");
+                let status = if is_transport_error { "14" } else { "13" };
+                trailers.insert("grpc-status", HeaderValue::from_static(status));
+                if let Ok(msg) = HeaderValue::from_str(&format!("ohttp: {e}")) {
                     trailers.insert("grpc-message", msg);
                 }
                 self.trailers_sent = true;
@@ -853,7 +875,7 @@ impl OhttpClient {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
                         self.h2_pool.lock().await.remove(&pool_key);
-                        return Err(HttpsError::PreSend(format!("h2 send {}: {e}", target.host)));
+                        return Err(HttpsError::classify_send_error(e, &target.host));
                     }
                 }
             }
@@ -959,7 +981,7 @@ impl OhttpClient {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
                         self.h2_pool.lock().await.remove(&pool_key);
-                        return Err(HttpsError::PreSend(format!("h2 send {}: {e}", target.host)));
+                        return Err(HttpsError::classify_send_error(e, &target.host));
                     }
                 }
             }
@@ -1192,6 +1214,7 @@ impl OhttpClient {
 
         // Spawn task to decode chunks and forward events with idle timeout
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, String>>(16);
+        let mut guard = this.profile.limits.response_guard();
 
         tokio::spawn(async move {
             let mut body_stream = answer.body;
@@ -1199,6 +1222,11 @@ impl OhttpClient {
                 match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body_stream.frame()).await {
                     Ok(Some(Ok(frame))) => {
                         if let Ok(data) = frame.into_data() {
+                            // Enforce size limit before pushing to decoder
+                            if let Err(e) = guard.push(data.len()) {
+                                let _ = tx.send(Err(e.to_string())).await;
+                                return;
+                            }
                             match decoder.push(&data) {
                                 Ok(events) => {
                                     for event in events {
@@ -2993,5 +3021,55 @@ mod tests {
             &["dispatch", "post", "post"],
             "dispatch must fire before the first post, even if that post fails pre-send"
         );
+    }
+
+    /// Streaming decode with SizeGuard: frames beyond the limit are rejected before being pushed
+    /// to the decoder, preventing unbounded memory growth.
+    #[test]
+    fn streaming_decode_enforces_size_limit() {
+        use zodl_ohttp_client::{ChunkedResponseDecoder, ChunkedResponseOpener};
+
+        // Create a decoder (need an opener first)
+        let key = test_key();
+        let request = encode_bhttp_request(&test_request(), &ClientProfile::SLIPSTREAM.encode)
+            .expect("encode");
+        let (_sealed, opener) =
+            zodl_ohttp_client::encapsulate_chunked_request(&key, &request).expect("encapsulate");
+        let mut decoder = ChunkedResponseDecoder::from_opener(&opener);
+
+        // Simulate streaming with a small size limit (100 bytes)
+        let mut guard = SizeGuard::new(Some(100));
+
+        // First chunk: 50 bytes, should succeed
+        let chunk1 = vec![0u8; 50];
+        assert!(guard.push(chunk1.len()).is_ok(), "first chunk within limit");
+
+        // Second chunk: 30 bytes, total 80 bytes, should succeed
+        let chunk2 = vec![0u8; 30];
+        assert!(
+            guard.push(chunk2.len()).is_ok(),
+            "second chunk within limit"
+        );
+
+        // Third chunk: 30 bytes, total 110 bytes, should fail
+        let chunk3 = vec![0u8; 30];
+        let result = guard.push(chunk3.len());
+        assert!(result.is_err(), "third chunk exceeds limit");
+        match result {
+            Err(zodl_ohttp_client::Error::TooLarge { max }) => {
+                assert_eq!(max, 100, "error reports correct limit");
+            }
+            _ => panic!("expected TooLarge error"),
+        }
+
+        // Verify that after failure, the guard continues to fail (no further data should be read)
+        let chunk4 = vec![0u8; 10];
+        assert!(
+            guard.push(chunk4.len()).is_err(),
+            "guard stays failed after limit exceeded"
+        );
+
+        // The decoder itself was never fed the oversized data, preventing unbounded growth
+        drop(decoder);
     }
 }

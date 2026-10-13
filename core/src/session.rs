@@ -539,6 +539,16 @@ async fn follow_loop(
             }
         };
 
+        // Probe succeeded: reset failure counter and clear Error(3) if set.
+        consecutive_failures = 0;
+        {
+            let state = reporter.state.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(*state, SyncState::Error(3)) {
+                drop(state);
+                reporter.set_state(SyncState::Done);
+            }
+        }
+
         if !should_resync(last_tip, observed) {
             tracing::debug!(last_tip, observed, "follow: tip unchanged, no pass needed");
             continue;
