@@ -433,6 +433,8 @@ fn parse_https(url: &str) -> Result<HttpsTarget, String> {
 struct RelayAnswer {
     status: StatusCode,
     content_type: Option<String>,
+    /// `Retry-After` of a 429, see [`retry_after`].
+    retry_after: Option<Duration>,
     body: Vec<u8>,
 }
 
@@ -441,7 +443,26 @@ struct RelayAnswer {
 struct RelayStream {
     status: StatusCode,
     content_type: Option<String>,
+    /// `Retry-After` of a 429, see [`retry_after`].
+    retry_after: Option<Duration>,
     body: BoxBody<Bytes, hyper::Error>,
+}
+
+/// Longest `Retry-After` honoured on an outer 429: a relay asking for more is capped, and the
+/// session's own retry schedule takes over after it.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
+
+/// The `Retry-After` of an outer answer as delay-seconds (RFC 9110, section 10.2.3), capped at
+/// [`MAX_RETRY_AFTER`]. The HTTP-date form is not used by the relays and is ignored.
+fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
+    let secs: u64 = headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
 /// Streaming half of [`OhttpClient::round_trip_stream_once`]: reads the relay body frame by
@@ -529,6 +550,8 @@ trait OuterAnswer {
     fn content_type(&self) -> Option<&str>;
     /// The start of the body, for the error message of a non-success outer status.
     fn detail(&self) -> String;
+    /// How long the relay asked the client to wait (an outer 429).
+    fn retry_after(&self) -> Option<Duration>;
 }
 
 impl OuterAnswer for RelayAnswer {
@@ -544,6 +567,9 @@ impl OuterAnswer for RelayAnswer {
             .take(160)
             .collect()
     }
+    fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
+    }
 }
 
 impl OuterAnswer for RelayStream {
@@ -555,6 +581,9 @@ impl OuterAnswer for RelayStream {
     }
     fn detail(&self) -> String {
         String::new()
+    }
+    fn retry_after(&self) -> Option<Duration> {
+        self.retry_after
     }
 }
 
@@ -690,6 +719,19 @@ where
             key = refetch().await.map_err(RoundTripError::Transport)?;
             attempt += 1;
             continue;
+        }
+
+        // A rate-limited client waits as long as the relay asks (capped) before the error reaches
+        // the caller's retry schedule, so its next attempt does not land in the same window
+        // (ZIP: an outer 429 is a back-off signal, not an unreachable Gateway).
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            if let Some(wait) = answer.retry_after() {
+                tracing::warn!(
+                    wait_secs = wait.as_secs(),
+                    "ohttp: relay rate limit (429); waiting as asked"
+                );
+                tokio::time::sleep(wait).await;
+            }
         }
 
         if !status.is_success() {
@@ -1001,6 +1043,7 @@ impl OhttpClient {
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_owned),
+            retry_after: retry_after(&parts.headers),
             body: bytes,
         })
     }
@@ -1087,6 +1130,7 @@ impl OhttpClient {
         Ok(RelayStream {
             status: parts.status,
             content_type,
+            retry_after: retry_after(&parts.headers),
             body,
         })
     }
@@ -1709,6 +1753,7 @@ mod tests {
         RelayAnswer {
             status: StatusCode::from_u16(status).expect("status"),
             content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
+            retry_after: None,
             body: b"nope".to_vec(),
         }
     }
@@ -2039,6 +2084,7 @@ mod tests {
                 Ok::<RelayAnswer, HttpsError>(RelayAnswer {
                     status: StatusCode::OK,
                     content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
+                    retry_after: None,
                     body: vec![7; 64],
                 })
             },
@@ -2264,6 +2310,7 @@ mod tests {
             RelayStream {
                 status: StatusCode::from_u16(status).expect("status"),
                 content_type: Some(content_type.to_string()),
+                retry_after: None,
                 body: Full::new(Bytes::from_static(b"x"))
                     .map_err(|never: Infallible| match never {})
                     .boxed(),
@@ -3108,6 +3155,7 @@ mod tests {
                 Ok(RelayStream {
                     status: StatusCode::OK,
                     content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
+                    retry_after: None,
                     body: Full::new(Bytes::new())
                         .map_err(|never: Infallible| match never {})
                         .boxed(),
@@ -3136,5 +3184,54 @@ mod tests {
             .expect("the pump ends promptly once the receiver is dropped")
             .expect("the pump does not panic");
         assert!(dropped.load(Ordering::SeqCst), "the relay body is dropped");
+    }
+
+    #[test]
+    fn retry_after_reads_delay_seconds_capped() {
+        let mut h = http::HeaderMap::new();
+        assert_eq!(retry_after(&h), None);
+        h.insert(header::RETRY_AFTER, "7".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(7)));
+        h.insert(header::RETRY_AFTER, "86400".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(MAX_RETRY_AFTER));
+        h.insert(
+            header::RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), None, "HTTP-date form is ignored");
+    }
+
+    /// An outer 429 with Retry-After makes the exchange wait that long before it fails, and is
+    /// a plain transport error (no key refetch, no retry inside the exchange).
+    #[tokio::test]
+    async fn outer_429_waits_retry_after_then_fails() {
+        let started = std::time::Instant::now();
+        let err = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async {
+                Ok(RelayStream {
+                    status: StatusCode::TOO_MANY_REQUESTS,
+                    content_type: None,
+                    retry_after: Some(Duration::from_secs(1)),
+                    body: Full::new(Bytes::new())
+                        .map_err(|never: Infallible| match never {})
+                        .boxed(),
+                })
+            },
+            || async { unreachable!("no refetch on 429") },
+            || {},
+        )
+        .await
+        .err()
+        .expect("429 is final");
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "waited as asked"
+        );
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m.contains("429")),
+            "{err:?}"
+        );
     }
 }
