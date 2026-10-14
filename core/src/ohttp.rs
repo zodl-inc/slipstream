@@ -724,14 +724,14 @@ where
         // A rate-limited client waits as long as the relay asks (capped) before the error reaches
         // the caller's retry schedule, so its next attempt does not land in the same window
         // (ZIP: an outer 429 is a back-off signal, not an unreachable Gateway).
-        if status == StatusCode::TOO_MANY_REQUESTS {
-            if let Some(wait) = answer.retry_after() {
-                tracing::warn!(
-                    wait_secs = wait.as_secs(),
-                    "ohttp: relay rate limit (429); waiting as asked"
-                );
-                tokio::time::sleep(wait).await;
-            }
+        if status == StatusCode::TOO_MANY_REQUESTS
+            && let Some(wait) = answer.retry_after()
+        {
+            tracing::warn!(
+                wait_secs = wait.as_secs(),
+                "ohttp: relay rate limit (429); waiting as asked"
+            );
+            tokio::time::sleep(wait).await;
         }
 
         if !status.is_success() {
