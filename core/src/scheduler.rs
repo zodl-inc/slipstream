@@ -292,7 +292,7 @@ pub struct SyncReport {
     /// Total wall-clock time spent in scan_chunks (across all ranges).
     /// Measured around the scan call per range. Default: zero.
     pub scan_elapsed: Duration,
-    /// Total wall-clock time spent in per-range run_enhancement calls (F3).
+    /// Total wall-clock time spent in per-range run_enhancement_lazily calls (F3).
     /// The engine's final post-loop enhancement adds its own elapsed to SyncOutcome
     /// directly; this field covers the scheduler's interleaved runs only.
     pub enhance_elapsed: Duration,
@@ -372,7 +372,7 @@ impl<T> std::future::Future for AbortOnDrop<T> {
 }
 
 /// Process every suggested range until none remain. The caller has already
-/// run update_chain_tip + put_subtree_roots (engine.rs).
+/// run put_subtree_roots_at + update_chain_tip (engine.rs).
 ///
 /// `progress` — if `Some`, bumps `fetched_blocks`, `scanned_blocks`, `reorgs_recovered`,
 /// and `current_range_end` atomics so poll-based consumers (CLI ticker, iOS D8) get
@@ -546,8 +546,8 @@ pub async fn run_to_completion(
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
         // Wrapped in AbortOnDrop: if this whole future is dropped (a host restart aborts
-        // the session, not this task) or returns early, the fetch task is aborted instead
-        // of orphaned (see `AbortOnDrop`'s doc).
+        // the session, not this task), the fetch task is aborted instead of orphaned (see
+        // `AbortOnDrop`'s doc).
         let fetch_task = AbortOnDrop(tokio::spawn(async move {
             run_fetch(&endpoint, plan, tx, fetch_progress).await
         }));

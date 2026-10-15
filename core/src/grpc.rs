@@ -562,7 +562,10 @@ pub mod net_stats {
 
     /// Channel and RPC counts: since process start ([`totals`]), or over a pass
     /// ([`Totals::delta_since`]).
+    ///
+    /// Non-exhaustive so that a count for a future RPC kind is not a breaking change.
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
     pub struct Totals {
         pub direct_channels: u64,
         pub tor_channels: u64,

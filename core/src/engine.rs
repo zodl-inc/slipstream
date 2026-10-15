@@ -270,11 +270,12 @@ pub async fn sync_once(
 
     // Subtree roots. A follow pass asks only for the ones the wallet does not have yet: from
     // each pool's second-to-last stored shard, so the last complete one overlaps, instead of
-    // every root of every pool. A pass with Historic scan work asks from index 0 instead, so
-    // that its grafts see every stored root: a graft install or a fully pruned note-free shard
-    // leaves its row without one, and a download restores only the rows it reaches. A wallet
-    // with nothing stored starts at 0 either way, as does a pool whose stored shards are not
-    // a complete range from 0 (one seeded only near the tip).
+    // every root of every pool. A pass whose scan queue holds Historic work when it starts
+    // (before this pass's own tip update) asks from index 0 instead, so that its grafts see
+    // every stored root: a graft install or a fully pruned note-free shard leaves its row
+    // without one, and a download restores only the rows it reaches. A wallet with nothing
+    // stored starts at 0 either way, as does a pool whose stored shards are not a complete
+    // range from 0 (one seeded only near the tip).
     let roots_start = if session.has_historic_scan_ranges()? {
         grpc::SubtreeRootStart::default()
     } else {

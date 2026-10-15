@@ -386,8 +386,9 @@ impl WalletSession {
         self.import_account(&ufvk, birthday_treestate)
     }
 
-    /// Where this pass's subtree-root requests start, per pool (see
-    /// `next_subtree_root_index`).
+    /// Where an incremental pass's subtree-root requests start, per pool (see
+    /// `next_subtree_root_index`). A pass with `Historic` work starts at 0 instead
+    /// (`engine::sync_once`).
     pub fn next_subtree_root_start(&mut self) -> Result<SubtreeRootStart, SlipstreamError> {
         let (sapling, orchard, ironwood) = self.stored_shard_indices()?;
         Ok(SubtreeRootStart {

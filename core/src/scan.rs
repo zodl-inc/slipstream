@@ -1009,9 +1009,10 @@ async fn scan_chunks_inner(
                 );
             }
 
-            // Advance for the next sub-batch. (next_state was already updated
-            // inside the server-mode prefetch consumption above; local mode
-            // serves the next boundary from the running frontiers instead.)
+            // Advance for the next sub-batch. (In server mode next_state was updated
+            // inside the prefetch consumption above, except at the range's last
+            // boundary, which has no prefetch and no next sub-batch to read it; local
+            // mode serves the next boundary from the running frontiers instead.)
             sub_start = sub_end + 1;
         }
         // ── End sub-batch loop ────────────────────────────────────────────────
@@ -1707,6 +1708,9 @@ mod tests {
             !needs_server_boundary_state(false, false, 100, 100),
             "nothing in the range is scanned after its last block"
         );
+        // The scheduler's fetch-side call does not know which boundaries the scan audits, so
+        // it asks with `audit` set: server mode must still skip the range end.
+        assert!(!needs_server_boundary_state(false, true, 100, 100));
         // A one-block range: its only boundary is its end — no boundary fetch at all.
         assert!(!needs_server_boundary_state(false, false, 5, 5));
         // Local mode: fetched only to audit, the final boundary included.

@@ -56,7 +56,8 @@ use crate::{
     wallet_session::WalletSession,
 };
 
-/// Counters from one `run_enhancement` call.
+/// Counters from one enhancement run: `run_enhancement_lazily`, or [`run_enhancement`],
+/// which wraps it.
 #[derive(Debug, Default, Clone)]
 pub struct EnhanceStats {
     /// Total number of `TransactionDataRequest` items processed (across all rounds).

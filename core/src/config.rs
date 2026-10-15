@@ -98,7 +98,8 @@ pub struct EngineConfig {
     /// cools that endpoint, re-probes the rest, and resumes from the wallet
     /// DB. Default ON; this is the kill switch.
     pub wire_failover: bool,
-    /// Concurrent GetBlockRange sub-streams (P1).
+    /// Most concurrent GetBlockRange streams a range's fetch opens: one per plan chunk, up
+    /// to this many (P1; see `FetchPlan::worker_count`).
     pub fetch_streams: usize,
     /// Target blocks per in-memory chunk / per scan call (P1/P2).
     pub chunk_blocks: u32,

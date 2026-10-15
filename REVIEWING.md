@@ -36,7 +36,7 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `batch_sinsemilla.rs` | v0.4: batch-affine Sinsemilla combine (lockstep half-steps, one Montgomery batch inversion each) — byte-identical, KAT-gated. |
 | `lookup_build.rs` | v0.4: the shared lookup-build machinery (precompute map → verbatim `from_iter` → convert) parameterized by a batch-combine fn; routes batch > gpu > scalar. |
 | `treestate.rs` | v0.5 (parked, default OFF): local running-frontier treestate derivation + off-path server audit + process fuse — built, audited byte-identical, measured out (naive per-leaf absorb costs more than the RTT it saves); revival path = batch-affine bulk absorb. |
-| `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut; v0.7 P2: clock-free wire-collapse detector (STALL/COLLAPSE triggers) + bounded (≤ 2) mid-pass failover. |
+| `fetch.rs` | Concurrent `GetBlockRange` (up to N streams, one per plan chunk); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut; v0.7 P2: clock-free wire-collapse detector (STALL/COLLAPSE triggers) + bounded (≤ 2) mid-pass failover. |
 | `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**); v0.4: the pass-start graft-buffer sweep (`sweep_stranded_graft_rows`) — builds the buffered runs no pending range resumes when the wallet can check where they end (the tree's leaf there, or the stored root of the shard they complete), rescans the rest. |
 | `connector.rs` | Per-call Tor policy (`ConnPurpose` → circuit); `TorConn` bootstrap; bounded circuit-build + retry-on-fresh-circuit. |
 | `grpc.rs` | lightwalletd tonic client; unary/stream helpers + deadlines; `retry_get_tree_state`. |
@@ -63,7 +63,8 @@ combine; byte-identical to `MerkleHashOrchard::combine` (KAT-gated). Released bu
 
 ## Sync data flow (one pass)
 **Preflight** (`sync_once`): import account if the DB has none (UFVK + birthday treestate) →
-`get_subtree_roots` / `put_subtree_roots` → chain tip → **transparent UTXO refresh** (before shielded)
+`get_subtree_roots_from` / `put_subtree_roots_at` (incremental; from index 0 in a pass with Historic
+scan work) → chain tip → **transparent UTXO refresh** (before shielded)
 → `run_to_completion`:
 - **graft-buffer sweep** (`persist::sweep_stranded_graft_rows`), before any range plans: buffered graft
   rows that no pending range will resume (a range stopped after its last commit, before its range-end
