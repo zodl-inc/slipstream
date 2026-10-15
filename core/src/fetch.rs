@@ -60,6 +60,8 @@ pub struct FetchPlan {
     /// Inclusive.
     pub end: u64,
     pub chunk_blocks: u32,
+    /// Most concurrent `GetBlockRange` workers: a fetch starts one per plan chunk, up
+    /// to this ([`FetchPlan::worker_count`]).
     pub streams: usize,
     /// Budget of consecutive ZERO-PROGRESS attempts per plan chunk. An attempt
     /// that emitted at least one sub-chunk resets the counter (T6.8-S: resume
@@ -139,6 +141,27 @@ impl FetchPlan {
         let s = self.start + index * self.chunk_blocks as u64;
         let e = (s + self.chunk_blocks as u64 - 1).min(self.end);
         (s, e)
+    }
+
+    /// The workers a fetch of this plan starts: one per plan chunk, up to `streams`, and
+    /// at least one. A worker connects before it looks for a chunk, so one beyond the chunk
+    /// count would open a connection and find nothing to fetch — a follow pass's one-chunk
+    /// range used to open `streams` connections to download a single block.
+    pub fn worker_count(&self) -> usize {
+        let chunks = usize::try_from(self.chunk_count()).unwrap_or(usize::MAX);
+        self.streams.max(1).min(chunks)
+    }
+
+    /// Claims the next plan chunk from the shared cursor `next`: `(index, start, end)`, or
+    /// `None` once every chunk is claimed. Every worker claims until `None`, so each chunk is
+    /// fetched exactly once, whatever the worker count.
+    fn claim_chunk(&self, next: &AtomicU64) -> Option<(u64, u64, u64)> {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        if index >= self.chunk_count() {
+            return None;
+        }
+        let (start, end) = self.chunk_range(index);
+        Some((index, start, end))
     }
 }
 
@@ -625,12 +648,10 @@ async fn worker(
 ) -> Result<(), SlipstreamError> {
     let mut client = connect_direct_with_retry(&endpoint).await?;
     loop {
-        let index = next.fetch_add(1, Ordering::Relaxed);
-        if index >= plan.chunk_count() {
+        let Some((index, s, e)) = plan.claim_chunk(&next) else {
             debug!(worker_id, "no more chunks");
             return Ok(());
-        }
-        let (s, e) = plan.chunk_range(index);
+        };
         let mut cursor = PlanChunkCursor {
             plan_index: index,
             end: e,
@@ -961,11 +982,11 @@ fn note_give_up(progress: Option<&Progress>, unreleased_from: &AtomicU64, plan_e
 /// Every worker failure — an error or a panic, armed or not — is also recorded on `progress` as
 /// a download give-up at `unreleased_from`, the lowest block the ordered release has not handed
 /// to the scanner (see `Progress::note_download_gave_up`), as long as that block is within the
-/// plan (`unreleased_from <= plan_end`). The fetch starts a worker per stream whatever its chunk
-/// count, so an idle spare worker that cannot connect can fail it after every block was
-/// already released; the cursor then reads `plan_end + 1`, a block no release of this plan will
-/// ever cover, and nothing is recorded — the fetch still fails. A release error is not a
-/// download give-up and is not recorded.
+/// plan (`unreleased_from <= plan_end`). A worker connects before it claims a chunk, so one
+/// that cannot connect can fail the fetch after the others already released every block; the
+/// cursor then reads `plan_end + 1`, a block no release of this plan will ever cover, and
+/// nothing is recorded — the fetch still fails. A release error is not a download give-up and
+/// is not recorded.
 async fn supervise_fetch<R>(
     release: R,
     mut workers: JoinSet<Result<(), SlipstreamError>>,
@@ -1020,8 +1041,9 @@ where
     }
 }
 
-/// Fetch `plan.start..=plan.end` with `plan.streams` workers; emits ordered,
-/// continuity-verified chunks into `queue`. Returns stats on success.
+/// Fetch `plan.start..=plan.end` with [`FetchPlan::worker_count`] workers — one per plan
+/// chunk, up to `plan.streams`; emits ordered, continuity-verified chunks into `queue`.
+/// Returns stats on success.
 ///
 /// `progress` — if `Some`, bumps `fetched_blocks` by the block count of each
 /// ordered sub-chunk as it is released (Relaxed atomic; no cross-counter guarantees).
@@ -1033,11 +1055,13 @@ pub async fn run_fetch(
 ) -> Result<FetchStats, SlipstreamError> {
     let started = Instant::now();
     let chunk_count = plan.chunk_count();
+    let worker_count = plan.worker_count();
     info!(
         start = plan.start,
         end = plan.end,
         chunk_count,
         streams = plan.streams,
+        workers = worker_count,
         split_bytes = plan.split_bytes,
         "fetch begin"
     );
@@ -1048,15 +1072,15 @@ pub async fn run_fetch(
         plan.split_bytes.saturating_mul(AHEAD_BUDGET_FACTOR),
         Arc::clone(&floor),
     );
-    // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
-    let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
+    // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes), one per worker.
+    let (tx, mut rx) = mpsc::channel::<SubChunk>(worker_count);
 
     // The lowest block not yet handed to the scanner: where the download stands if a worker
     // gives up (see `supervise_fetch`).
     let unreleased_from = AtomicU64::new(plan.start);
 
     let mut workers = JoinSet::new();
-    for worker_id in 0..plan.streams.max(1) {
+    for worker_id in 0..worker_count {
         workers.spawn(worker(
             worker_id,
             endpoint.clone(),
@@ -1138,6 +1162,59 @@ mod tests {
     #[should_panic(expected = "FetchPlan: start")]
     fn plan_rejects_inverted_range() {
         FetchPlan::new(1000, 999, 100, 1);
+    }
+
+    /// A one-chunk range — a follow pass's single new block — starts exactly one
+    /// worker, whatever `streams` is.
+    #[test]
+    fn one_chunk_range_starts_one_worker() {
+        assert_eq!(FetchPlan::new(5, 5, 100, 4).worker_count(), 1);
+        assert_eq!(FetchPlan::new(1_000, 1_099, 100, 4).worker_count(), 1);
+        assert_eq!(FetchPlan::new(1_000, 1_000, 10_000, 64).worker_count(), 1);
+    }
+
+    /// Multi-chunk ranges start `min(streams, chunks)` workers, and at least one.
+    #[test]
+    fn worker_count_is_the_smaller_of_streams_and_chunks() {
+        assert_eq!(FetchPlan::new(1_000, 1_199, 100, 4).worker_count(), 2); // 2 chunks
+        assert_eq!(FetchPlan::new(1_000, 1_399, 100, 4).worker_count(), 4); // 4 chunks
+        assert_eq!(FetchPlan::new(1_000, 1_999, 100, 4).worker_count(), 4); // 10 chunks
+        assert_eq!(FetchPlan::new(1_000, 1_999, 100, 0).worker_count(), 1); // streams floor
+    }
+
+    /// Fewer workers than chunks still fetch every chunk exactly once: each worker
+    /// keeps claiming from the shared cursor until it runs out.
+    #[test]
+    fn workers_claim_every_chunk_exactly_once() {
+        let plan = FetchPlan::new(1_000, 1_999, 100, 4); // 10 chunks, 4 workers
+        let next = AtomicU64::new(0);
+        let mut claimed: Vec<Vec<(u64, u64, u64)>> = vec![Vec::new(); plan.worker_count()];
+        let mut idle = 0;
+        while idle < claimed.len() {
+            idle = 0;
+            for worker in claimed.iter_mut() {
+                match plan.claim_chunk(&next) {
+                    Some(chunk) => worker.push(chunk),
+                    None => idle += 1,
+                }
+            }
+        }
+        assert!(
+            claimed.iter().all(|w| !w.is_empty()),
+            "every worker got work"
+        );
+        let mut all: Vec<(u64, u64, u64)> = claimed.into_iter().flatten().collect();
+        all.sort_unstable();
+        assert_eq!(
+            all.iter().map(|c| c.0).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(all.first().map(|c| c.1), Some(1_000));
+        assert_eq!(all.last().map(|c| c.2), Some(1_999));
+        for pair in all.windows(2) {
+            assert_eq!(pair[1].1, pair[0].2 + 1, "chunks tile the range");
+        }
+        assert_eq!(plan.claim_chunk(&next), None, "the cursor stays exhausted");
     }
 
     // ── T6.8-S helpers ─────────────────────────────────────────────────────────
@@ -2454,10 +2531,10 @@ mod tests {
         assert_eq!(progress.download_failures(), vec![]);
     }
 
-    /// The fetch starts a worker per stream whatever its chunk count, so an idle spare worker
-    /// that cannot connect can fail it after every block was already handed to the scanner.
-    /// The cursor then reads one past the plan end, a block no release of this fetch will ever
-    /// cover: the fetch still fails, but no give-up is recorded.
+    /// A worker connects before it claims a chunk, so one that cannot connect can fail the
+    /// fetch after the others already handed every block to the scanner. The cursor then
+    /// reads one past the plan end, a block no release of this fetch will ever cover: the
+    /// fetch still fails, but no give-up is recorded.
     #[tokio::test(start_paused = true)]
     async fn supervise_records_nothing_once_every_block_was_released() {
         let progress = Progress::default();
@@ -2465,7 +2542,7 @@ mod tests {
         let mut workers = tokio::task::JoinSet::new();
         workers.spawn(async {
             Err(SlipstreamError::Transport(
-                "spare worker could not connect".into(),
+                "late worker could not connect".into(),
             ))
         });
         let release = std::future::pending::<Result<ReleaseSummary, SlipstreamError>>();
@@ -2480,7 +2557,7 @@ mod tests {
         .await
         .expect_err("the failed worker still fails the fetch");
         assert!(
-            err.to_string().contains("spare worker could not connect"),
+            err.to_string().contains("late worker could not connect"),
             "got: {err}"
         );
         assert_eq!(

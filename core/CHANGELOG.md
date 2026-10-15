@@ -18,11 +18,15 @@ workspace.
 - `grpc::net_stats`: process-wide counts of the lightwalletd channels the engine opens,
   direct and over Tor, and of the RPCs it issues, by kind (`net_stats::totals`,
   `net_stats::Totals::delta_since`).
+- `fetch::FetchPlan::worker_count`: the number of workers a fetch of the plan starts.
 
 ### Changed
-- `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
 - `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
   `report::log_pass_summary` logs them as a `pass network split` line.
+- A block fetch starts one worker per plan chunk, up to `EngineConfig::fetch_streams`,
+  instead of always `fetch_streams`. A range of one chunk, such as the new block of a
+  follow pass, opens one block-download connection instead of four.
+- `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
