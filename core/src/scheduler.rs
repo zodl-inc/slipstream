@@ -538,22 +538,18 @@ pub async fn run_to_completion(
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
-        // Wrapped in AbortOnDrop: if `connect_via` below fails (`?` returns early) or this
-        // whole future is dropped (a host restart aborts the session, not this task), the
-        // fetch task is aborted instead of orphaned (see `AbortOnDrop`'s doc).
+        // Wrapped in AbortOnDrop: if this whole future is dropped (a host restart aborts
+        // the session, not this task) or returns early, the fetch task is aborted instead
+        // of orphaned (see `AbortOnDrop`'s doc).
         let fetch_task = AbortOnDrop(tokio::spawn(async move {
             run_fetch(&endpoint, plan, tx, fetch_progress).await
         }));
 
-        // scan_chunks runs in the current task using a SEPARATE grpc client so it
-        // does not contend with the fetch workers' connections.
-        let mut scan_client =
-            connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-
+        // scan_chunks runs in the current task. Its interleaved enhancement opens its own
+        // connection when it first runs, separate from the fetch workers'.
         let scan_started = std::time::Instant::now();
         let scan_result: Result<ScanStats, SlipstreamError> = scan_chunks(
             session,
-            &mut scan_client,
             start,
             rx,
             progress.clone(),
@@ -637,11 +633,11 @@ pub async fn run_to_completion(
 
             // B3 (#1755): give a desynced load-balanced cluster a heal window before
             // retrying — see reorg_backoff_ms. Connection freshness on retry is
-            // structural, not added here: the next loop iteration creates a NEW
-            // scan-side client (grpc::connect per range, above) and run_fetch spawns
-            // NEW per-worker connections (fetch.rs worker() connects per worker, per
-            // range) — no gRPC channel survives into the retry, so the retry cannot
-            // be pinned to the same stale backend.
+            // structural, not added here: every client a range uses is opened within
+            // that range (scan_chunks' tree states and interleaved enhancement, and
+            // run_fetch's per-worker connections — fetch.rs worker() connects per
+            // worker, per range) — no gRPC channel survives into the retry, so the
+            // retry cannot be pinned to the same stale backend.
             let backoff_ms = reorg_backoff_ms(consecutive_reorgs);
             warn!(
                 backoff_ms,

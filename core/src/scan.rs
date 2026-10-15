@@ -50,11 +50,11 @@ use crate::{
     block_source::{MemBlockSource, StoppedForWalletChange},
     chunk::ChunkQueueReceiver,
     config::{Endpoint, EngineConfig},
-    connector::TorConn,
+    connector::{ConnPurpose, LazyConnection, TorConn, connect_via},
     enhance::run_enhancement,
     error::SlipstreamError,
     events::Progress,
-    grpc::{self, LwdClient},
+    grpc,
     wallet_session::WalletSession,
 };
 
@@ -404,8 +404,8 @@ struct WriteBehind {
 // ── Production scan driver ─────────────────────────────────────────────────────
 
 /// Scans every chunk arriving on `rx` (they are ordered and continuity-verified
-/// by the fetcher). `range_start` is the first height; the caller provides a
-/// client for treestate prefetches.
+/// by the fetcher). `range_start` is the first height. Interleaved enhancement
+/// opens its own connection, on first use.
 /// Preconditions: range_start >= 1 (treestate is fetched at range_start - 1) and
 /// range_start equals the first chunk's start height.
 ///
@@ -455,7 +455,6 @@ struct WriteBehind {
 #[allow(clippy::too_many_arguments)] // +tor (T-Tor.2); bundling would obscure the borrow structure
 pub async fn scan_chunks(
     session: &mut WalletSession,
-    client: &mut LwdClient,
     range_start: u64,
     rx: ChunkQueueReceiver,
     progress: Option<Arc<Progress>>,
@@ -498,7 +497,6 @@ pub async fn scan_chunks(
 
     let result = scan_chunks_inner(
         session,
-        client,
         range_start,
         rx,
         progress.clone(),
@@ -568,7 +566,6 @@ pub async fn scan_chunks(
 #[allow(clippy::too_many_arguments)] // internal seam of scan_chunks; bundling would obscure the borrow structure
 async fn scan_chunks_inner(
     session: &mut WalletSession,
-    client: &mut LwdClient,
     range_start: u64,
     mut rx: ChunkQueueReceiver,
     progress: Option<Arc<Progress>>,
@@ -588,6 +585,13 @@ async fn scan_chunks_inner(
     let network = config.network;
     // Clone endpoint once for use in retry-capable prefetch spawns (T6.8-H2).
     let endpoint: Endpoint = config.endpoint.clone();
+    // The interleaved enhancement's connection, opened when the first interleave runs and
+    // reused by later ones. Most ranges — a follow pass's single block among them — run no
+    // interleave, and used to connect anyway (with Tor on, an isolated circuit).
+    let enhance_endpoint = &config.endpoint;
+    let mut enhance_client = LazyConnection::new(move || {
+        connect_via(enhance_endpoint, tor, ConnPurpose::MetadataUnique)
+    });
 
     let mut stats = ScanStats::default();
     // State for the FIRST chunk: seed treestate at (range_start - 1).
@@ -1021,16 +1025,13 @@ async fn scan_chunks_inner(
                 stats.interleave_drain += drain_started.elapsed();
             }
             let started = Instant::now();
-            let mut enhance_client = client.clone();
-            match run_enhancement(
-                session,
-                &mut enhance_client,
-                network,
-                progress.clone(),
-                skipped_keys,
-            )
-            .await
-            {
+            let enhanced = match enhance_client.get().await {
+                Ok(client) => {
+                    run_enhancement(session, client, network, progress.clone(), skipped_keys).await
+                }
+                Err(err) => Err(err),
+            };
+            match enhanced {
                 Ok(es) => {
                     stats.interleaved_enhance.requests += es.requests;
                     stats.interleaved_enhance.txs_stored += es.txs_stored;

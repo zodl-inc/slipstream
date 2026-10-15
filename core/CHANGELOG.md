@@ -19,6 +19,7 @@ workspace.
   direct and over Tor, and of the RPCs it issues, by kind (`net_stats::totals`,
   `net_stats::Totals::delta_since`).
 - `fetch::FetchPlan::worker_count`: the number of workers a fetch of the plan starts.
+- `connector::LazyConnection`: a lightwalletd connection opened on first use.
 
 ### Changed
 - `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
@@ -26,6 +27,11 @@ workspace.
 - A block fetch starts one worker per plan chunk, up to `EngineConfig::fetch_streams`,
   instead of always `fetch_streams`. A range of one chunk, such as the new block of a
   follow pass, opens one block-download connection instead of four.
+- `scan::scan_chunks` no longer takes a `client`. Its interleaved enhancement opens a
+  connection the first time it runs in a range, so a range that runs none — such as the
+  single block of a follow pass — opens no connection for it (with Tor on, no isolated
+  circuit). A failed connect there is now non-fatal, like the rest of the interleaved
+  enhancement; before, it failed the range before the scan started.
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed
