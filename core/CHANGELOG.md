@@ -15,9 +15,14 @@ workspace.
   `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
   it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
   the height the wallet was truncated to. The scheduler's reorg recovery calls it.
+- `grpc::net_stats`: process-wide counts of the lightwalletd channels the engine opens,
+  direct and over Tor, and of the RPCs it issues, by kind (`net_stats::totals`,
+  `net_stats::Totals::delta_since`).
 
 ### Changed
 - `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+- `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
+  `report::log_pass_summary` logs them as a `pass network split` line.
 
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed

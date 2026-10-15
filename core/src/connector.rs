@@ -133,7 +133,10 @@ impl TorConn {
             )
             .await
             {
-                Ok(Ok(c)) => return Ok(c),
+                Ok(Ok(c)) => {
+                    grpc::net_stats::record(grpc::net_stats::NetEvent::TorChannel);
+                    return Ok(c);
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(attempt, err = %e, "tor connect failed — retrying on a fresh circuit");
                     last_err = Some(format!("tor connect: {e}"));

@@ -584,6 +584,7 @@ async fn open_and_pump(
     };
     // B2 (#1755): response-headers deadline. A server that accepts the request
     // but never answers must fail fast into the worker's retry+reconnect loop.
+    grpc::net_stats::record(grpc::net_stats::NetEvent::GetBlockRange);
     let mut stream = tokio::time::timeout(grpc::UNARY_TIMEOUT, client.get_block_range(req))
         .await
         .map_err(|_| {

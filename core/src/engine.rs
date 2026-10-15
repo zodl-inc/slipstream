@@ -114,6 +114,9 @@ pub struct SyncOutcome {
     pub wire_switches: u32,
     /// This pass's persist-lane telemetry (delta over the pass). Reporting input.
     pub persist_lane: crate::persist::lane_stats::Totals,
+    /// This pass's lightwalletd channels and RPCs (delta over the pass of
+    /// `grpc::net_stats`). Reporting input.
+    pub net: crate::grpc::net_stats::Totals,
 }
 
 impl SyncOutcome {
@@ -233,6 +236,8 @@ pub async fn sync_once(
     // v0.6 P2: persist-lane totals are process-cumulative atomics — snapshot
     // here so the pass-end log reports THIS pass's delta.
     let persist_lane_start = crate::persist::lane_stats::totals();
+    // Same pattern for the pass's lightwalletd channels and RPCs.
+    let net_start = grpc::net_stats::totals();
 
     // [v0.7 P1] Probe-then-commit (`EngineConfig::with_selected_endpoint`):
     // with alternates configured, race every endpoint and commit the winner
@@ -410,6 +415,7 @@ pub async fn sync_once(
     // v0.6 P2: this pass's persist-lane delta over the pass-start snapshot
     // (process-cumulative atomics; see the snapshot at pass start).
     let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
+    let net = grpc::net_stats::totals().delta_since(&net_start);
 
     let outcome = SyncOutcome {
         report,
@@ -421,6 +427,7 @@ pub async fn sync_once(
         wire_probe_ms,
         wire_switches,
         persist_lane,
+        net,
     };
 
     // A completed pass got past whatever the block download failed on before.
@@ -473,6 +480,7 @@ mod tests {
             wire_probe_ms: 0.0,
             wire_switches: 0,
             persist_lane: crate::persist::lane_stats::Totals::default(),
+            net: grpc::net_stats::Totals::default(),
         }
     }
 
