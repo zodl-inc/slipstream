@@ -20,6 +20,10 @@ workspace.
   `net_stats::Totals::delta_since`).
 - `fetch::FetchPlan::worker_count`: the number of workers a fetch of the plan starts.
 - `connector::LazyConnection`: a lightwalletd connection opened on first use.
+- `grpc::SubtreeRootStart` and `grpc::get_subtree_roots_from`, which request each pool's
+  subtree roots from a given index, and `wallet_session::WalletSession::next_subtree_root_start`
+  and `WalletSession::put_subtree_roots_at`, which pick those indices for a wallet and store
+  the roots at them.
 
 ### Changed
 - `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
@@ -47,6 +51,11 @@ workspace.
   tree state at its last block, which the scan never reads: one `GetTreeState` and one
   connection fewer per range, so a follow pass fetches one tree state instead of two.
   With `local_treestate` on, that boundary is still fetched, since it may be audited.
+- A sync pass requests each pool's subtree roots from the wallet's second-to-last stored
+  shard instead of from index 0, so after the first pass it downloads a few roots rather
+  than every root of every pool. A pool whose stored shards are not a complete range from
+  index 0 — a fresh wallet, or a pool seeded only near the tip — still downloads every
+  root, which keeps Ironwood's shard indices a complete range (see 0.3.0, Fixed).
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed

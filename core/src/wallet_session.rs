@@ -22,17 +22,21 @@
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
+use shardtree::{error::ShardTreeError, store::ShardStore};
 use tracing::info;
 use zcash_client_backend::data_api::{
     AccountBirthday, AccountPurpose, WalletCommitmentTrees, WalletRead, WalletWrite,
     scanning::ScanRange,
 };
 use zcash_client_backend::proto::service::TreeState;
-use zcash_client_sqlite::WalletDb;
+use zcash_client_sqlite::{WalletDb, error::SqliteClientError};
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::{ShieldedPool, consensus::BlockHeight};
 
-use crate::{error::SlipstreamError, grpc::SubtreeRoots};
+use crate::{
+    error::SlipstreamError,
+    grpc::{SubtreeRootStart, SubtreeRoots},
+};
 
 use crate::network::SlipstreamNetwork;
 
@@ -56,6 +60,35 @@ pub struct WalletSession {
 
 fn wallet_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Wallet(format!("{context}: {e}"))
+}
+
+/// The first subtree index to request for a pool whose store holds shards at `stored`
+/// (ascending, as `ShardStore::get_shard_roots` lists them).
+///
+/// Mirrors upstream's `next_subtree_index` (zcash_client_sqlite): the last stored shard is
+/// usually the incomplete one at the tip, so the request restarts at the second-to-last and
+/// overlaps the last complete shard — the only one whose root can still change. Unlike
+/// upstream, the stored indices must also be the complete range `0..=last`. A pool seeded
+/// only near the tip, or with a gap, starts at 0 instead, and the full download makes its
+/// indices a complete range again: an older-birthday scan crossing Ironwood activation relies
+/// on that (0.3.0, Fixed).
+pub(crate) fn next_subtree_root_index(stored: &[u64]) -> u64 {
+    let complete_from_zero = stored.iter().copied().eq(0..stored.len() as u64);
+    if complete_from_zero {
+        stored.len().saturating_sub(2) as u64
+    } else {
+        0
+    }
+}
+
+/// The indices of the shards `store` holds, ascending.
+fn shard_indices<S: ShardStore>(store: &S) -> Result<Vec<u64>, ShardTreeError<S::Error>> {
+    Ok(store
+        .get_shard_roots()
+        .map_err(ShardTreeError::Storage)?
+        .iter()
+        .map(|addr| addr.index())
+        .collect())
 }
 
 impl WalletSession {
@@ -353,17 +386,66 @@ impl WalletSession {
         self.import_account(&ufvk, birthday_treestate)
     }
 
-    pub fn put_subtree_roots(&mut self, roots: &SubtreeRoots) -> Result<(), SlipstreamError> {
+    /// Where this pass's subtree-root requests start, per pool (see
+    /// `next_subtree_root_index`).
+    pub fn next_subtree_root_start(&mut self) -> Result<SubtreeRootStart, SlipstreamError> {
+        let (sapling, orchard, ironwood) = self.stored_shard_indices()?;
+        Ok(SubtreeRootStart {
+            sapling: next_subtree_root_index(&sapling),
+            orchard: next_subtree_root_index(&orchard),
+            ironwood: next_subtree_root_index(&ironwood),
+        })
+    }
+
+    /// The shard indices each pool's note commitment tree stores, ascending:
+    /// `(sapling, orchard, ironwood)`. Read through `WalletCommitmentTrees`, with no SQL
+    /// against upstream tables (Issue #4).
+    #[allow(clippy::type_complexity)]
+    fn stored_shard_indices(&mut self) -> Result<(Vec<u64>, Vec<u64>, Vec<u64>), SlipstreamError> {
+        let sapling = self
+            .db
+            .with_sapling_tree_mut::<_, _, SqliteClientError>(|tree| {
+                shard_indices(tree.store()).map_err(SqliteClientError::CommitmentTree)
+            })
+            .map_err(|e| wallet_err("sapling shard indices", e))?;
+        let orchard = self
+            .db
+            .with_orchard_tree_mut::<_, _, SqliteClientError>(|tree| {
+                shard_indices(tree.store()).map_err(SqliteClientError::CommitmentTree)
+            })
+            .map_err(|e| wallet_err("orchard shard indices", e))?;
+        let ironwood = self
+            .db
+            .with_ironwood_tree_mut::<_, _, SqliteClientError>(|tree| {
+                shard_indices(tree.store()).map_err(SqliteClientError::CommitmentTree)
+            })
+            .map_err(|e| wallet_err("ironwood shard indices", e))?
+            .unwrap_or_default();
+        Ok((sapling, orchard, ironwood))
+    }
+
+    /// Stores `roots`, each pool's first root at its index in `start` — the `start` they were
+    /// requested from (`grpc::get_subtree_roots_from`).
+    pub fn put_subtree_roots_at(
+        &mut self,
+        start: SubtreeRootStart,
+        roots: &SubtreeRoots,
+    ) -> Result<(), SlipstreamError> {
         self.db
-            .put_sapling_subtree_roots(0, &roots.sapling)
+            .put_sapling_subtree_roots(start.sapling, &roots.sapling)
             .map_err(|e| wallet_err("put_sapling_subtree_roots", e))?;
         self.db
-            .put_orchard_subtree_roots(0, &roots.orchard)
+            .put_orchard_subtree_roots(start.orchard, &roots.orchard)
             .map_err(|e| wallet_err("put_orchard_subtree_roots", e))?;
         self.db
-            .put_ironwood_subtree_roots(0, &roots.ironwood)
+            .put_ironwood_subtree_roots(start.ironwood, &roots.ironwood)
             .map_err(|e| wallet_err("put_ironwood_subtree_roots", e))?;
         Ok(())
+    }
+
+    /// Stores `roots` downloaded from index 0 (`grpc::get_subtree_roots`).
+    pub fn put_subtree_roots(&mut self, roots: &SubtreeRoots) -> Result<(), SlipstreamError> {
+        self.put_subtree_roots_at(SubtreeRootStart::default(), roots)
     }
 
     pub fn update_chain_tip(&mut self, height: u64) -> Result<(), SlipstreamError> {
@@ -501,6 +583,9 @@ mod tests {
     // [IW-2b] IW-0.5 moved the session onto SlipstreamNetwork; the consensus
     // Network literal the fixtures use converts via `From<Network>`.
     use zcash_protocol::consensus::Network;
+
+    use incrementalmerkletree::{Hashable, Level};
+    use zcash_client_backend::data_api::chain::CommitmentTreeRoot;
 
     #[test]
     fn open_sets_wal_and_initializes_schema() {
@@ -676,5 +761,157 @@ mod tests {
             "present after import"
         );
         assert_eq!(s.db.get_account_ids().expect("get_account_ids").len(), 1);
+    }
+
+    // ── Incremental subtree roots ────────────────────────────────────────────
+
+    /// Roots `start..start + count` of every pool. A root's hash depends only on its index,
+    /// so an overlapping re-download stores identical roots.
+    fn roots(start: u64, count: u64) -> SubtreeRoots {
+        let height = |i: u64| BlockHeight::from_u32(1_000 + u32::try_from(i).expect("small"));
+        let level = |i: u64| Level::from(u8::try_from(i).expect("small"));
+        SubtreeRoots {
+            sapling: (start..start + count)
+                .map(|i| {
+                    CommitmentTreeRoot::from_parts(height(i), sapling::Node::empty_root(level(i)))
+                })
+                .collect(),
+            orchard: (start..start + count)
+                .map(|i| {
+                    CommitmentTreeRoot::from_parts(
+                        height(i),
+                        orchard::tree::MerkleHashOrchard::empty_root(level(i)),
+                    )
+                })
+                .collect(),
+            ironwood: (start..start + count)
+                .map(|i| {
+                    CommitmentTreeRoot::from_parts(
+                        height(i),
+                        orchard::tree::MerkleHashOrchard::empty_root(level(i)),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Only the Ironwood roots of `roots(start, count)`.
+    fn ironwood_only(start: u64, count: u64) -> SubtreeRoots {
+        let mut r = roots(start, count);
+        r.sapling.clear();
+        r.orchard.clear();
+        r
+    }
+
+    #[test]
+    fn next_subtree_root_index_overlaps_the_last_complete_shard() {
+        assert_eq!(
+            next_subtree_root_index(&[]),
+            0,
+            "nothing stored: everything"
+        );
+        assert_eq!(next_subtree_root_index(&[0]), 0);
+        assert_eq!(next_subtree_root_index(&[0, 1]), 0);
+        assert_eq!(
+            next_subtree_root_index(&[0, 1, 2, 3, 4, 5]),
+            4,
+            "second-to-last"
+        );
+        assert_eq!(
+            next_subtree_root_index(&[5]),
+            0,
+            "seeded near the tip: everything"
+        );
+        assert_eq!(next_subtree_root_index(&[5, 6]), 0);
+        assert_eq!(
+            next_subtree_root_index(&[0, 1, 3, 4]),
+            0,
+            "a gap: everything"
+        );
+    }
+
+    /// A fresh wallet stores no shards, so every pool asks from index 0.
+    #[test]
+    fn subtree_roots_start_at_zero_on_a_fresh_wallet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s =
+            WalletSession::open(Network::MainNetwork, &dir.path().join("data.db")).expect("open");
+        assert_eq!(
+            s.next_subtree_root_start().expect("start"),
+            SubtreeRootStart::default()
+        );
+    }
+
+    /// With roots stored, a pass asks from the second-to-last stored shard — the last
+    /// complete one overlaps — and every pool's indices stay one complete range.
+    #[test]
+    fn subtree_roots_resume_with_overlap_and_stay_contiguous() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s =
+            WalletSession::open(Network::MainNetwork, &dir.path().join("data.db")).expect("open");
+        s.put_subtree_roots_at(SubtreeRootStart::default(), &roots(0, 6))
+            .expect("the first pass downloads everything");
+        let start = s.next_subtree_root_start().expect("start");
+        assert_eq!(
+            start,
+            SubtreeRootStart {
+                sapling: 4,
+                orchard: 4,
+                ironwood: 4
+            }
+        );
+        // The next pass: the server answers from 4 — the overlap (4, 5) plus two new roots.
+        s.put_subtree_roots_at(start, &roots(4, 4))
+            .expect("an incremental download is continuous");
+        let all: Vec<u64> = (0..8).collect();
+        assert_eq!(
+            s.stored_shard_indices().expect("indices"),
+            (all.clone(), all.clone(), all)
+        );
+        assert_eq!(
+            s.next_subtree_root_start().expect("start"),
+            SubtreeRootStart {
+                sapling: 6,
+                orchard: 6,
+                ironwood: 6
+            }
+        );
+    }
+
+    /// A pool whose stored shards do not start at 0 — Ironwood seeded only near the tip —
+    /// downloads every root again, and its indices become one complete range, so a later
+    /// older-birthday scan cannot hit `SubtreeDiscontinuity`.
+    #[test]
+    fn a_pool_seeded_only_near_the_tip_downloads_everything_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s =
+            WalletSession::open(Network::MainNetwork, &dir.path().join("data.db")).expect("open");
+        let at = |ironwood: u64| SubtreeRootStart {
+            ironwood,
+            ..SubtreeRootStart::default()
+        };
+        s.put_subtree_roots_at(at(5), &ironwood_only(5, 2))
+            .expect("seeded near the tip");
+        assert_eq!(s.stored_shard_indices().expect("indices").2, vec![5, 6]);
+        // Why it matters: below a near-tip seed, a lower root is refused.
+        let err = s
+            .put_subtree_roots_at(at(2), &ironwood_only(2, 1))
+            .expect_err("a gap below the stored shards");
+        assert!(err.to_string().contains("discontinuous"), "got: {err}");
+
+        let start = s.next_subtree_root_start().expect("start");
+        assert_eq!(
+            start.ironwood, 0,
+            "not a complete range from 0: download everything"
+        );
+        s.put_subtree_roots_at(start, &roots(0, 8))
+            .expect("the full download overlaps the seeded shards");
+        assert_eq!(
+            s.stored_shard_indices().expect("indices").2,
+            (0..8).collect::<Vec<u64>>()
+        );
+        s.put_subtree_roots_at(at(2), &ironwood_only(2, 1))
+            .expect("inside the complete range now");
+        assert_eq!(s.next_subtree_root_start().expect("start").ironwood, 6);
     }
 }

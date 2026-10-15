@@ -270,17 +270,33 @@ pub struct SubtreeRoots {
     pub ironwood: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
 }
 
+/// The subtree index each pool's subtree-root request starts at — and so the index of its
+/// first returned root. All zero (the default) asks for every root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubtreeRootStart {
+    pub sapling: u64,
+    pub orchard: u64,
+    pub ironwood: u64,
+}
+
 /// One pool's subtree-root stream, collected under per-message idle deadlines (B2); every root
 /// received stamps `progress`.
 async fn collect_subtree_roots<H: HashSer>(
     client: &mut LwdClient,
     protocol: ShieldedProtocol,
+    start_index: u64,
     label: &str,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<CommitmentTreeRoot<H>>, SlipstreamError> {
-    let mut req = GetSubtreeRootsArg::default();
+    let mut req = GetSubtreeRootsArg {
+        start_index: u32::try_from(start_index).map_err(|_| {
+            SlipstreamError::Wallet(format!("{label} subtree index {start_index} exceeds u32"))
+        })?,
+        ..Default::default()
+    };
     req.set_shielded_protocol(protocol);
-    let context = format!("get_subtree_roots({label})");
+    let context = format!("get_subtree_roots({label} from {start_index})");
     net_stats::record(net_stats::NetEvent::GetSubtreeRoots);
     let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
     collect_stream(
@@ -300,13 +316,26 @@ async fn collect_subtree_roots<H: HashSer>(
     .await
 }
 
+/// Every subtree root of every pool, from index 0.
 pub async fn get_subtree_roots(
     client: &mut LwdClient,
+    progress: Option<&crate::events::Progress>,
+) -> Result<SubtreeRoots, SlipstreamError> {
+    get_subtree_roots_from(client, SubtreeRootStart::default(), progress).await
+}
+
+/// Each pool's subtree roots from its index in `start` onward: a pool's `i`-th root is the
+/// root of subtree `start + i`. Store them at the same `start`
+/// (`WalletSession::put_subtree_roots_at`).
+pub async fn get_subtree_roots_from(
+    client: &mut LwdClient,
+    start: SubtreeRootStart,
     progress: Option<&crate::events::Progress>,
 ) -> Result<SubtreeRoots, SlipstreamError> {
     let sapling_roots = collect_subtree_roots::<sapling::Node>(
         client,
         ShieldedProtocol::Sapling,
+        start.sapling,
         "sapling",
         progress,
     )
@@ -314,6 +343,7 @@ pub async fn get_subtree_roots(
     let orchard_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
         client,
         ShieldedProtocol::Orchard,
+        start.orchard,
         "orchard",
         progress,
     )
@@ -321,6 +351,7 @@ pub async fn get_subtree_roots(
     let ironwood_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
         client,
         ShieldedProtocol::Ironwood,
+        start.ironwood,
         "ironwood",
         progress,
     )

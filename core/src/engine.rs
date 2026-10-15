@@ -268,11 +268,25 @@ pub async fn sync_once(
         session.import_account(ufvk, birthday_ts)?;
     }
 
-    let roots = grpc::get_subtree_roots(&mut client, progress.as_deref()).await?;
+    // Ask only for the subtree roots the wallet does not have yet — from each pool's
+    // second-to-last stored shard, so the last complete one overlaps — instead of every
+    // root of every pool each pass. A pool whose stored shards are not a complete range
+    // from 0 (a fresh wallet; a pool seeded only near the tip) still downloads everything.
+    let roots_start = session.next_subtree_root_start()?;
+    let roots = grpc::get_subtree_roots_from(&mut client, roots_start, progress.as_deref()).await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
-    session.put_subtree_roots(&roots)?;
+    info!(
+        sapling_from = roots_start.sapling,
+        orchard_from = roots_start.orchard,
+        ironwood_from = roots_start.ironwood,
+        sapling = roots.sapling.len(),
+        orchard = roots.orchard.len(),
+        ironwood = roots.ironwood.len(),
+        "subtree roots updated"
+    );
+    session.put_subtree_roots_at(roots_start, &roots)?;
 
     let tip = grpc::get_latest_block_height(&mut client).await?;
     if let Some(ref p) = progress {
