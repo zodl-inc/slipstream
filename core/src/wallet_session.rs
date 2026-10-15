@@ -26,7 +26,7 @@ use shardtree::{error::ShardTreeError, store::ShardStore};
 use tracing::info;
 use zcash_client_backend::data_api::{
     AccountBirthday, AccountPurpose, WalletCommitmentTrees, WalletRead, WalletWrite,
-    scanning::ScanRange,
+    scanning::{ScanPriority, ScanRange},
 };
 use zcash_client_backend::proto::service::TreeState;
 use zcash_client_sqlite::{WalletDb, error::SqliteClientError};
@@ -460,6 +460,18 @@ impl WalletSession {
         self.db
             .suggest_scan_ranges()
             .map_err(|e| wallet_err("suggest_scan_ranges", e))
+    }
+
+    /// Whether the scan queue holds a `Historic` range: a restore under way, or the rescan an
+    /// account import below the tip queues. Only such a range grafts note-free shards against
+    /// the stored subtree roots, and a graft install or a fully pruned note-free shard leaves
+    /// its row without a stored root, which a download restores only for the shards it reaches.
+    /// So a pass with `Historic` work fetches every root again (`engine::sync_once`).
+    pub fn has_historic_scan_ranges(&self) -> Result<bool, SlipstreamError> {
+        Ok(self
+            .suggest_scan_ranges()?
+            .iter()
+            .any(|range| range.priority() == ScanPriority::Historic))
     }
 
     /// [API v2.1 E-3] The wallet's PERSISTED view of the chain tip (`WalletRead::chain_height`,
@@ -913,5 +925,66 @@ mod tests {
         s.put_subtree_roots_at(at(2), &ironwood_only(2, 1))
             .expect("inside the complete range now");
         assert_eq!(s.next_subtree_root_start().expect("start").ironwood, 6);
+    }
+
+    // ── Historic scan work ───────────────────────────────────────────────────
+
+    /// Imports `TEST_UFVK` with a mainnet birthday far below the tips these tests use, and
+    /// below any NU7 activation.
+    fn import_old_account(s: &mut WalletSession) {
+        let birthday = TreeState {
+            network: "main".into(),
+            height: 663_149,
+            hash: "0".repeat(64),
+            time: 1,
+            ..Default::default()
+        };
+        s.ensure_account(TEST_UFVK, birthday).expect("import");
+    }
+
+    /// A fresh wallet has no `Historic` scan work. An account whose birthday is far below
+    /// the tip queues some: the rescan from the birthday up to the tip.
+    #[test]
+    fn historic_scan_work_appears_with_an_account_imported_below_the_tip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s =
+            WalletSession::open(Network::MainNetwork, &dir.path().join("data.db")).expect("open");
+        assert!(
+            !s.has_historic_scan_ranges().expect("query"),
+            "a fresh wallet has nothing to scan"
+        );
+
+        import_old_account(&mut s);
+        s.update_chain_tip(700_000).expect("tip");
+        assert!(
+            s.has_historic_scan_ranges().expect("query"),
+            "the birthday is far below the tip"
+        );
+    }
+
+    /// Only `Historic` ranges count. With roots stored, the range up to the tip is queued as
+    /// `ChainTip` work instead, so a pass that has only that keeps its incremental start.
+    #[test]
+    fn scan_ranges_of_other_priorities_are_not_historic_work() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s =
+            WalletSession::open(Network::MainNetwork, &dir.path().join("data.db")).expect("open");
+        s.put_subtree_roots_at(SubtreeRootStart::default(), &roots(0, 6))
+            .expect("roots");
+        import_old_account(&mut s);
+        s.update_chain_tip(700_000).expect("tip");
+
+        let ranges = s.suggest_scan_ranges().expect("ranges");
+        assert!(
+            !ranges.is_empty()
+                && ranges
+                    .iter()
+                    .all(|range| range.priority() == ScanPriority::ChainTip),
+            "premise: scan work is queued, and none of it is Historic: {ranges:?}"
+        );
+        assert!(
+            !s.has_historic_scan_ranges().expect("query"),
+            "a queue of ChainTip ranges is not Historic work"
+        );
     }
 }
