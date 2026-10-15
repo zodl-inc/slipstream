@@ -28,10 +28,17 @@ workspace.
   instead of always `fetch_streams`. A range of one chunk, such as the new block of a
   follow pass, opens one block-download connection instead of four.
 - `scan::scan_chunks` no longer takes a `client`. Its interleaved enhancement opens a
-  connection the first time it runs in a range, so a range that runs none — such as the
-  single block of a follow pass — opens no connection for it (with Tor on, no isolated
-  circuit). A failed connect there is now non-fatal, like the rest of the interleaved
-  enhancement; before, it failed the range before the scan started.
+  connection at its first request that needs the server, so a range that runs no
+  interleave — such as the single block of a follow pass — opens no connection for it
+  (with Tor on, no isolated circuit). A failed connect there is now non-fatal, like the
+  rest of the interleaved enhancement; before, it failed the range before the scan
+  started.
+- The per-range enhancement opens its connection only at the first transaction data
+  request that needs the server; before, it connected after every range. Requests
+  skipped without asking the server — among them the ephemeral-address checks every
+  account with a transparent receiver is due — open none, so a range with nothing to
+  fetch, such as the block of a follow pass on a quiet wallet, opens no connection for
+  its enhancement (with Tor on, no isolated circuit).
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed

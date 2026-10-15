@@ -29,8 +29,8 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::{
     chunk::chunk_queue,
     config::EngineConfig,
-    connector::{ConnPurpose, TorConn, connect_via},
-    enhance::{EnhanceStats, run_enhancement},
+    connector::TorConn,
+    enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily},
     error::SlipstreamError,
     events::Progress,
     fetch::{FetchPlan, FetchStats, run_fetch},
@@ -546,7 +546,7 @@ pub async fn run_to_completion(
         }));
 
         // scan_chunks runs in the current task. Its interleaved enhancement opens its own
-        // connection when it first runs, separate from the fetch workers'.
+        // connection when it first needs the server, separate from the fetch workers'.
         let scan_started = std::time::Instant::now();
         let scan_result: Result<ScanStats, SlipstreamError> = scan_chunks(
             session,
@@ -750,7 +750,9 @@ pub async fn run_to_completion(
         // This makes transactions visible progressively during the sync, not just at
         // the very end. The engine's final post-loop run_enhancement still fires
         // (catches any leftovers) and its stats are accumulated into SyncOutcome
-        // separately. We reuse a fresh gRPC client per call (same pattern as engine.rs).
+        // separately. The connection is opened at the first request that needs the
+        // server, so a range with nothing to fetch — a follow pass on a quiet wallet,
+        // whose only requests are address checks the run skips — opens none.
         //
         // NON-FATAL: interleaved enhancement is an optimization (progressive tx
         // visibility), not a correctness guarantee — that is the final post-loop run's
@@ -758,18 +760,14 @@ pub async fn run_to_completion(
         // sync at a range boundary; we log and continue scanning.
         {
             let enhance_started = std::time::Instant::now();
-            let enhance_result = async {
-                let mut enhance_client =
-                    connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-                run_enhancement(
-                    session,
-                    &mut enhance_client,
-                    config.network,
-                    progress.clone(),
-                    skipped_keys,
-                )
-                .await
-            }
+            let mut enhance_client = enhancement_connection(&config.endpoint, tor);
+            let enhance_result = run_enhancement_lazily(
+                session,
+                &mut enhance_client,
+                config.network,
+                progress.clone(),
+                skipped_keys,
+            )
             .await;
             match enhance_result {
                 Ok(enhance_stats) => {

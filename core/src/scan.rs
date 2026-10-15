@@ -50,8 +50,8 @@ use crate::{
     block_source::{MemBlockSource, StoppedForWalletChange},
     chunk::ChunkQueueReceiver,
     config::{Endpoint, EngineConfig},
-    connector::{ConnPurpose, LazyConnection, TorConn, connect_via},
-    enhance::run_enhancement,
+    connector::TorConn,
+    enhance::{enhancement_connection, run_enhancement_lazily},
     error::SlipstreamError,
     events::Progress,
     grpc,
@@ -585,13 +585,11 @@ async fn scan_chunks_inner(
     let network = config.network;
     // Clone endpoint once for use in retry-capable prefetch spawns (T6.8-H2).
     let endpoint: Endpoint = config.endpoint.clone();
-    // The interleaved enhancement's connection, opened when the first interleave runs and
-    // reused by later ones. Most ranges — a follow pass's single block among them — run no
-    // interleave, and used to connect anyway (with Tor on, an isolated circuit).
-    let enhance_endpoint = &config.endpoint;
-    let mut enhance_client = LazyConnection::new(move || {
-        connect_via(enhance_endpoint, tor, ConnPurpose::MetadataUnique)
-    });
+    // The interleaved enhancement's connection, opened when an interleave first needs the
+    // server and reused by later ones. Most ranges — a follow pass's single block among
+    // them — run no interleave, and used to connect anyway (with Tor on, an isolated
+    // circuit).
+    let mut enhance_client = enhancement_connection(&config.endpoint, tor);
 
     let mut stats = ScanStats::default();
     // State for the FIRST chunk: seed treestate at (range_start - 1).
@@ -1025,13 +1023,15 @@ async fn scan_chunks_inner(
                 stats.interleave_drain += drain_started.elapsed();
             }
             let started = Instant::now();
-            let enhanced = match enhance_client.get().await {
-                Ok(client) => {
-                    run_enhancement(session, client, network, progress.clone(), skipped_keys).await
-                }
-                Err(err) => Err(err),
-            };
-            match enhanced {
+            match run_enhancement_lazily(
+                session,
+                &mut enhance_client,
+                network,
+                progress.clone(),
+                skipped_keys,
+            )
+            .await
+            {
                 Ok(es) => {
                     stats.interleaved_enhance.requests += es.requests;
                     stats.interleaved_enhance.txs_stored += es.txs_stored;

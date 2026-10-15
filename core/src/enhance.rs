@@ -48,6 +48,8 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
+    config::Endpoint,
+    connector::{ConnPurpose, LazyConnection, TorConn, connect_via},
     error::SlipstreamError,
     events::Progress,
     grpc::{self, LwdClient},
@@ -102,6 +104,48 @@ pub async fn run_enhancement(
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError> {
+    // The run takes its client at the first request that needs the server; this one is
+    // already open, so it gets a handle on the same channel.
+    let open = client.clone();
+    let mut client = LazyConnection::new(move || std::future::ready(Ok(open.clone())));
+    run_enhancement_lazily(session, &mut client, network, progress, skipped_keys).await
+}
+
+/// A connect in progress, boxed so that [`enhancement_connection`] can name its type.
+type ConnectFuture<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<LwdClient, SlipstreamError>> + Send + 'a>,
+>;
+
+/// The connection the scan's interleaved enhancement and the scheduler's per-range
+/// enhancement each run over, opened on first use (see [`run_enhancement_lazily`]). What it
+/// carries — transactions by txid, address histories — identifies the wallet, so with Tor
+/// on it is an isolated circuit ([`ConnPurpose::MetadataUnique`]).
+pub(crate) fn enhancement_connection<'a>(
+    endpoint: &'a Endpoint,
+    tor: Option<&'a TorConn>,
+) -> LazyConnection<LwdClient, impl FnMut() -> ConnectFuture<'a> + Send> {
+    LazyConnection::new(move || -> ConnectFuture<'a> {
+        Box::pin(connect_via(endpoint, tor, ConnPurpose::MetadataUnique))
+    })
+}
+
+/// [`run_enhancement`] over a connection opened at the first request that needs the
+/// server: a transaction fetch, or an address check that gets past the skip guards of
+/// [`apply_address_request`]. A run with nothing to fetch — no requests, or only checks it
+/// skips, such as the ephemeral-address checks every account with a transparent receiver
+/// is due — opens no connection (with Tor on, no isolated circuit). A failed connect fails
+/// the run.
+pub(crate) async fn run_enhancement_lazily<F, Fut>(
+    session: &mut WalletSession,
+    client: &mut LazyConnection<LwdClient, F>,
+    network: crate::network::SlipstreamNetwork,
+    progress: Option<Arc<Progress>>,
+    skipped_keys: &mut HashSet<String>,
+) -> Result<EnhanceStats, SlipstreamError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
+{
     let mut stats = EnhanceStats::default();
 
     for round in 0..3_u32 {
@@ -119,7 +163,8 @@ pub async fn run_enhancement(
         // ── Phase 1: concurrent txid fetches ──────────────────────────────────
         //
         // Build a set of futures, each cloning a lightweight `LwdClient` handle
-        // (backed by a shared `Channel` — no new TCP connections per clone).
+        // (backed by a shared `Channel` — no new TCP connections per clone; the
+        // run's connection is opened when its first handle is taken).
         // All fetch futures are pushed into FuturesUnordered at once; the gRPC
         // channel's HTTP/2 stream multiplexing provides the practical concurrency
         // bound. An explicit bound (e.g. stream::iter(futs).buffered(N)) is a
@@ -142,7 +187,7 @@ pub async fn run_enhancement(
         for req in requests {
             match req {
                 TransactionDataRequest::GetStatus(txid) => {
-                    let mut c = client.clone();
+                    let mut c = client.get().await?.clone();
                     let fut: BoxFut = Box::pin(async move {
                         let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
                         (txid, /*want_enhance=*/ false, raw)
@@ -150,7 +195,7 @@ pub async fn run_enhancement(
                     pending.push(fut);
                 }
                 TransactionDataRequest::Enhancement(txid) => {
-                    let mut c = client.clone();
+                    let mut c = client.get().await?.clone();
                     let fut: BoxFut = Box::pin(async move {
                         let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
                         (txid, /*want_enhance=*/ true, raw)
@@ -324,19 +369,26 @@ fn effective_range_end(
 /// 5. On success: call `notify_address_checked` with `block_range_end - 1` so the wallet
 ///    advances its check watermark.
 ///
+/// `client` is asked for its connection only at step 4, so a skipped request never opens
+/// one.
+///
 /// `skipped_keys` — the per-run dedupe set shared across all rounds.  When a skip guard
 /// fires, the skip key (`address:range_start-range_end` or `address:open-no-tip`) is inserted.
 /// If the key is already present (same request re-issued in a later round), the duplicate
 /// is silently counted without re-emitting a `warn!` or incrementing `stats.skipped`.
-async fn apply_address_request(
+async fn apply_address_request<F, Fut>(
     session: &mut WalletSession,
-    client: &mut LwdClient,
+    client: &mut LazyConnection<LwdClient, F>,
     network: &crate::network::SlipstreamNetwork,
     tia: TransactionsInvolvingAddress,
     stats: &mut EnhanceStats,
     skipped_keys: &mut HashSet<String>,
     progress: Option<&Progress>,
-) -> Result<(), SlipstreamError> {
+) -> Result<(), SlipstreamError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
+{
     // Guard 1 (T8.5): clamp an open-ended range to the wallet's current chain tip instead
     // of skipping it. An open range (None) means "unbounded above" (data_api.rs:1131-1135);
     // the completest answer lightwalletd can give now is through the tip — so we clamp via
@@ -433,6 +485,9 @@ async fn apply_address_request(
         }),
     };
 
+    // Past every skip guard the request needs the server: take the client, connecting if
+    // nothing earlier in the run has.
+    let client = client.get().await?;
     let raw_txs = grpc::get_taddress_txids(client, filter, progress)
         .await
         .map_err(|e| SlipstreamError::Wallet(format!("get_taddress_txids: {e}")))?;
@@ -563,5 +618,153 @@ mod tests {
             effective_range_end(None, tip),
             BlockHeight::from_u32(3_375_001)
         );
+    }
+
+    // ── Connecting only when a request needs the server ──────────────────────
+
+    /// A connection for tests without a lightwalletd: it counts its connect attempts in
+    /// `connects` and fails every one.
+    fn no_server(
+        connects: &std::cell::Cell<u32>,
+    ) -> LazyConnection<
+        LwdClient,
+        impl FnMut() -> std::future::Ready<Result<LwdClient, SlipstreamError>> + '_,
+    > {
+        LazyConnection::new(move || {
+            connects.set(connects.get() + 1);
+            std::future::ready(Err(SlipstreamError::Transport(
+                "no server in this test".into(),
+            )))
+        })
+    }
+
+    /// A mainnet wallet in `dir` with no accounts and no chain tip.
+    fn fresh_wallet(dir: &tempfile::TempDir) -> WalletSession {
+        WalletSession::open(
+            zcash_protocol::consensus::Network::MainNetwork,
+            &dir.path().join("data.db"),
+        )
+        .expect("open")
+    }
+
+    /// With no transaction data requests, the run returns at once and never opens its
+    /// connection.
+    #[tokio::test]
+    async fn no_requests_open_no_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = fresh_wallet(&dir);
+        let connects = std::cell::Cell::new(0u32);
+        let stats = run_enhancement_lazily(
+            &mut session,
+            &mut no_server(&connects),
+            crate::network::SlipstreamNetwork::MAIN,
+            None,
+            &mut HashSet::new(),
+        )
+        .await
+        .expect("nothing to enhance is not an error");
+        assert_eq!(stats.requests, 0);
+        assert_eq!(connects.get(), 0, "no requests, no connection");
+    }
+
+    /// Every account with a transparent receiver is due checks of its ephemeral
+    /// addresses, which the run skips without asking the server (see
+    /// `apply_address_request`). A wallet whose only requests are those — a quiet wallet
+    /// on a follow pass — opens no connection.
+    #[tokio::test]
+    async fn skipped_address_checks_open_no_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = fresh_wallet(&dir);
+        let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(
+            &session.network,
+            crate::wallet_session::TEST_UFVK,
+        )
+        .expect("decode TEST_UFVK");
+        let birthday = zcash_client_backend::proto::service::TreeState {
+            network: "main".into(),
+            height: 663_149,
+            hash: "0".repeat(64),
+            time: 1,
+            ..Default::default()
+        };
+        session.import_account(&ufvk, birthday).expect("import");
+        session.update_chain_tip(663_200).expect("chain tip");
+        let requests = session
+            .db_mut()
+            .transaction_data_requests()
+            .expect("requests");
+        assert!(
+            !requests.is_empty(),
+            "the account's ephemeral addresses are due a check"
+        );
+        assert!(
+            requests.iter().all(|request| matches!(
+                request,
+                TransactionDataRequest::TransactionsInvolvingAddress(_)
+            )),
+            "only address checks: {requests:?}"
+        );
+
+        let connects = std::cell::Cell::new(0u32);
+        let stats = run_enhancement_lazily(
+            &mut session,
+            &mut no_server(&connects),
+            crate::network::SlipstreamNetwork::MAIN,
+            None,
+            &mut HashSet::new(),
+        )
+        .await
+        .expect("skipping is not an error");
+        assert_eq!(
+            stats.skipped,
+            requests.len() as u64,
+            "every request was skipped"
+        );
+        assert_eq!(connects.get(), 0, "skipped requests open no connection");
+    }
+
+    /// A request only the server can answer opens the connection, and a failed connect
+    /// fails the run, as the up-front connect it replaces did.
+    #[tokio::test]
+    async fn a_request_for_the_server_opens_the_connection() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut session = fresh_wallet(&dir);
+        session.update_chain_tip(663_200).expect("chain tip");
+        // Queue an enhancement of one transaction (query type 1), as a scan does for each
+        // transaction it finds.
+        rusqlite::Connection::open(dir.path().join("data.db"))
+            .expect("side connection")
+            .execute(
+                "INSERT INTO tx_retrieval_queue (txid, query_type) VALUES (?1, 1)",
+                rusqlite::params![&[7u8; 32][..]],
+            )
+            .expect("queue an enhancement");
+        let requests = session
+            .db_mut()
+            .transaction_data_requests()
+            .expect("requests");
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [TransactionDataRequest::Enhancement(_)]
+            ),
+            "one enhancement: {requests:?}"
+        );
+
+        let connects = std::cell::Cell::new(0u32);
+        let err = run_enhancement_lazily(
+            &mut session,
+            &mut no_server(&connects),
+            crate::network::SlipstreamNetwork::MAIN,
+            None,
+            &mut HashSet::new(),
+        )
+        .await
+        .expect_err("the connect fails");
+        assert!(
+            matches!(err, SlipstreamError::Transport(_)),
+            "the connect error surfaces: {err}"
+        );
+        assert_eq!(connects.get(), 1, "the enhancement needed the server");
     }
 }
