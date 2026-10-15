@@ -447,7 +447,7 @@ pub async fn get_taddress_txids(
 /// with the first mempool tx, or when it closes the stream on a new block. On a
 /// quiet mempool the `.await` here legitimately blocks well past the 30 s unary
 /// timeout (blocks are ~75 s apart on mainnet), so wrapping it would spuriously
-/// fail. The CALLER bounds the open with `mempool::MEMPOOL_SESSION_IDLE` and
+/// fail. The CALLER bounds the open with `mempool::mempool_session_idle` and
 /// treats an over-idle open as a benign reconnect (Deviation D6), not a failure.
 pub async fn open_mempool_stream(
     client: &mut LwdClient,

@@ -558,14 +558,16 @@ async fn follow_loop(
     loop {
         // Between passes: hold a mempool session (surfaces 0-conf incoming) or jitter-sleep
         // if mempool is disabled. A live session blocks until the server closes the stream
-        // on a new block (then we probe immediately) or MEMPOOL_SESSION_IDLE elapses;
-        // either way it bounds the iteration cadence. Mempool failure is NON-FATAL (D6).
+        // on a new block (then we probe immediately) or its idle bound elapses
+        // (`mempool::mempool_session_idle`: 60 s before NU7, 40 s from NU7); either way it
+        // bounds the iteration cadence. Mempool failure is NON-FATAL (D6).
         if mempool_enabled {
+            let idle = crate::mempool::mempool_session_idle(&config.engine.network, last_tip);
             match crate::mempool::run_session(
                 &config.engine,
                 Some(reporter.progress.clone()),
                 &mut seen_txids,
-                crate::mempool::MEMPOOL_SESSION_IDLE,
+                idle,
                 tor_conn,
             )
             .await
@@ -577,6 +579,7 @@ async fn follow_loop(
                         received = stats.received,
                         hits = stats.stored_hits,
                         last_tip,
+                        idle_secs = idle.as_secs(),
                         "follow: mempool session ended"
                     );
                 }

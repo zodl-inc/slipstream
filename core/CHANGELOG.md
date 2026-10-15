@@ -24,6 +24,8 @@ workspace.
   subtree roots from a given index, and `wallet_session::WalletSession::next_subtree_root_start`
   and `WalletSession::put_subtree_roots_at`, which pick those indices for a wallet and store
   the roots at them.
+- `mempool::MEMPOOL_SESSION_IDLE_NU7` and `mempool::mempool_session_idle`, which pick a
+  mempool session's idle bound from the network upgrade active at the block after the tip.
 
 ### Changed
 - `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
@@ -56,6 +58,9 @@ workspace.
   than every root of every pool. A pool whose stored shards are not a complete range from
   index 0 — a fresh wallet, or a pool seeded only near the tip — still downloads every
   root, which keeps Ironwood's shard indices a complete range (see 0.3.0, Fixed).
+- From NU7 activation, the follow loop's mempool session reconnects after 40 s without a
+  message instead of 60 s; before NU7 it stays 60 s. Both stay above the 30 s stream stall
+  timeout, and 40 s is below the Tor client's default 60 s response-header timeout.
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed
