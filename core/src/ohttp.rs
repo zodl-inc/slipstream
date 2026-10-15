@@ -1974,7 +1974,7 @@ mod tests {
         let Err(RoundTripError::Transport(message)) = result else {
             panic!("expected a transport error, got {result:?}");
         };
-        assert!(message.contains("h2 send"), "got: {message}");
+        assert!(message.contains("h2 ready"), "got: {message}");
         let bodies = bodies.into_inner().unwrap();
         assert_eq!(bodies.len(), 2, "one pre-send retry");
         assert_eq!(bodies[0].len(), bodies[1].len());
