@@ -605,14 +605,12 @@ impl HttpsError {
         }
     }
 
-    /// Classifies a hyper send_request error. Only errors that prove the request was not sent
-    /// are PreSend: connection/handshake failures are already caught earlier, and `ready()` errors
-    /// are classified before this. Without access to h2::Error to detect REFUSED_STREAM, all
-    /// send_request errors are treated as potentially post-send.
-    fn classify_send_error(e: hyper::Error, target_host: &str) -> Self {
-        // We cannot reliably determine if the error occurred before or after the request was sent
-        // without downcasting to h2::Error and checking for REFUSED_STREAM. Treat as post-send
-        // to avoid repeating requests with side effects (ZIP Gateway rule 11).
+    /// Classifies a `send_request` error. It never returns `PreSend`: this code does not
+    /// currently distinguish a request that was never written from one that may have reached the
+    /// relay, so every send error is treated as potentially post-send (`Other`) and never resealed
+    /// or re-POSTed, to avoid repeating a request with side effects (ZIP Gateway rule 11). Only
+    /// `ready()` failures, classified at their own call sites, are `PreSend`.
+    fn classify_send_error(e: impl std::fmt::Display, target_host: &str) -> Self {
         HttpsError::Other(format!("h2 send {target_host}: {e}"))
     }
 }
@@ -1715,6 +1713,15 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use zodl_ohttp_client::encode_bhttp_request;
 
+    #[test]
+    fn send_errors_are_never_pre_send() {
+        // A send error cannot prove the request was not delivered, so it must not be retried.
+        match HttpsError::classify_send_error("stream closed", "relay.example") {
+            HttpsError::Other(m) => assert_eq!(m, "h2 send relay.example: stream closed"),
+            HttpsError::PreSend(m) => panic!("send error must not be PreSend: {m}"),
+        }
+    }
+
     fn contains(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
     }
@@ -1958,7 +1965,7 @@ mod tests {
             &test_request(),
             |body| {
                 bodies.lock().unwrap().push(body);
-                async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 send: closed".into())) }
+                async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 ready: closed".into())) }
             },
             || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
             || {},
