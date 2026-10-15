@@ -92,8 +92,12 @@ pub struct SessionStats {
 
 /// Runs one mempool session against `config.endpoint`.
 ///
-/// For each streamed tx: dedupe by txid → parse (`Transaction::read`, branch id
-/// irrelevant pre-consensus: `rust/src/lib.rs:2045-2050` rationale) →
+/// For each streamed tx: dedupe by txid → parse (`Transaction::read` with a
+/// placeholder `BranchId::Sapling`, which is harmless: v5 and v6 transactions carry
+/// their consensus branch id in the header, and `read` uses that instead; for v4 and
+/// earlier it is only recorded on the parsed value, where nothing but the v4
+/// signature hash reads it — and nothing signs a transaction parsed here, so the
+/// placeholder branch id never reaches a v4 signature hash) →
 /// `decrypt_and_store_transaction(…, mined_height=None)` (upstream's relevance
 /// gate stores ONLY wallet-involving txs — `ll/wallet.rs:655-662`) → hit check
 /// via `WalletRead::get_transaction(txid)` → `progress.add_enhanced(1)` per NEW
@@ -153,6 +157,7 @@ pub async fn run_session(
         stats.received += 1;
         // NOTE: raw.height is the SERVER TIP, not 0 (lightwalletd mempool.go;
         // fact E). We deliberately pass mined_height=None — Deviation D1.
+        // Placeholder branch id — harmless, see this function's doc.
         let tx = match Transaction::read(&raw.data[..], BranchId::Sapling) {
             Ok(tx) => tx,
             Err(e) => {

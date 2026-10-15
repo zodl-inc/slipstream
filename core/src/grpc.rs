@@ -445,8 +445,10 @@ pub async fn get_taddress_txids(
 /// Deliberately NOT wrapped in `with_unary_timeout`: `GetMempoolStream` is
 /// server-streaming and lightwalletd sends its response HEADERS lazily — only
 /// with the first mempool tx, or when it closes the stream on a new block. On a
-/// quiet mempool the `.await` here legitimately blocks well past the 30 s unary
-/// timeout (blocks are ~75 s apart on mainnet), so wrapping it would spuriously
+/// quiet mempool the `.await` here legitimately blocks past the 30 s unary
+/// timeout whenever the next block takes longer than that — routinely before
+/// NU7 (75 s target spacing), and still often from NU7 (a third of that, with
+/// block intervals spread around the target) — so wrapping it would spuriously
 /// fail. The CALLER bounds the open with `mempool::mempool_session_idle` and
 /// treats an over-idle open as a benign reconnect (Deviation D6), not a failure.
 pub async fn open_mempool_stream(

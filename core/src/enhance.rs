@@ -309,8 +309,13 @@ fn apply_txid_fetch(
                 };
 
             if want_enhance {
-                // Branch ID is irrelevant for decrypt/serialize/txid — we use Sapling
-                // as a dummy (see rust/src/lib.rs:2045-2051 load-bearing comment).
+                // `BranchId::Sapling` is a placeholder, and harmless: v5 and v6
+                // transactions carry their consensus branch id in the header and
+                // `Transaction::read` uses that instead. For v4 and earlier it is only
+                // recorded on the parsed value: v4 serialization does not write it, and
+                // only the v4 signature hash reads it. Nothing signs a transaction parsed
+                // here, so the placeholder branch id never reaches a v4 signature hash.
+                // The txid and trial decryption do not depend on it.
                 let tx =
                     Transaction::read(&raw.data[..], zcash_protocol::consensus::BranchId::Sapling)
                         .map_err(|e| SlipstreamError::Wallet(format!("tx parse: {e}")))?;
@@ -516,6 +521,7 @@ where
             _ => {}
         }
 
+        // Placeholder branch id — harmless, see `apply_txid_fetch`.
         let tx = Transaction::read(&raw.data[..], zcash_protocol::consensus::BranchId::Sapling)
             .map_err(|e| SlipstreamError::Wallet(format!("tx parse (taddr): {e}")))?;
         decrypt_and_store_transaction(network, session.db_mut(), &tx, mined_height)
