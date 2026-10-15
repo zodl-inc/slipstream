@@ -47,16 +47,24 @@ pub struct CustomActivations {
     pub nu5: Option<u32>,
     pub nu6: Option<u32>,
     pub nu6_1: Option<u32>,
-    /// The highest upgrade this crate's zcash_protocol knows un-gated (Nu7 sits
-    /// behind `zcash_unstable`); on the valargroup Ironwood testnet this is the
-    /// stand-in for the chain's "NU6.3"/Ironwood activation (5000).
     pub nu6_2: Option<u32>,
+    /// NU6.3, which activates the Ironwood pool (5000 on the valargroup Ironwood testnet).
+    pub nu6_3: Option<u32>,
+    /// NU7. Left unset by [`CustomActivations::all_from_genesis`]: a chain that runs it says
+    /// so with an explicit height.
+    pub nu7: Option<u32>,
 }
 
 impl CustomActivations {
-    /// Regtest-style default: every upgrade this crate knows active from height 1.
-    /// Matches the common shape of hosted test chains (only the upgrade under test
+    /// Regtest-style default: every deployed upgrade, through NU6.3 (Ironwood), active from
+    /// height 1. Matches the common shape of hosted test chains (only the upgrade under test
     /// gets a distinctive height, via the corresponding field).
+    ///
+    /// NU7 stays unset. It is still proposed: NU7 has no mainnet activation height in the
+    /// pinned `zcash_protocol`. A chain therefore opts in to it with an explicit `nu7` height,
+    /// just as the Swift SDK's regtest default `allActiveFromGenesis` leaves NU7 out. A genesis
+    /// NU7 would also break the non-decreasing order as soon as an earlier upgrade is given a
+    /// later height (`nu6_3 = 5000`, say).
     pub fn all_from_genesis() -> Self {
         Self {
             overwinter: Some(1),
@@ -68,6 +76,8 @@ impl CustomActivations {
             nu6: Some(1),
             nu6_1: Some(1),
             nu6_2: Some(1),
+            nu6_3: Some(1),
+            nu7: None,
         }
     }
 }
@@ -120,9 +130,11 @@ impl Parameters for SlipstreamNetwork {
                     NetworkUpgrade::Nu6 => heights.nu6,
                     NetworkUpgrade::Nu6_1 => heights.nu6_1,
                     NetworkUpgrade::Nu6_2 => heights.nu6_2,
-                    // Unstable/future upgrades (Nu7, ZFuture — cfg-gated in
-                    // zcash_protocol): never active on a custom chain until this
-                    // crate learns a field for them.
+                    NetworkUpgrade::Nu6_3 => heights.nu6_3,
+                    NetworkUpgrade::Nu7 => heights.nu7,
+                    // NuTachyon (cfg-gated behind `zcash_unstable = "nutachyon"` in
+                    // zcash_protocol): never active on a custom chain until this crate
+                    // learns a field for it.
                     #[allow(unreachable_patterns)]
                     _ => None,
                 };
@@ -153,10 +165,13 @@ mod tests {
 
     #[test]
     fn custom_reports_configured_heights_and_constants() {
+        // NU6.2 and Ironwood (NU6.3) get distinct heights, in upgrade order. `all_from_genesis`
+        // puts both at 1, which cannot tell a mapping arm from the field next to it.
         let net = SlipstreamNetwork::Custom {
             constants: NetworkType::Main,
             heights: CustomActivations {
-                nu6_2: Some(5000),
+                nu6_2: Some(3_000),
+                nu6_3: Some(5_000),
                 ..CustomActivations::all_from_genesis()
             },
         };
@@ -167,7 +182,11 @@ mod tests {
         );
         assert_eq!(
             net.activation_height(NetworkUpgrade::Nu6_2),
-            Some(BlockHeight::from_u32(5000))
+            Some(BlockHeight::from_u32(3_000))
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(5_000))
         );
 
         let sparse = SlipstreamNetwork::Custom {
@@ -175,6 +194,44 @@ mod tests {
             heights: CustomActivations::default(),
         };
         assert_eq!(sparse.activation_height(NetworkUpgrade::Sapling), None);
+    }
+
+    /// NU6.3 and NU7 heights reach consensus code on a custom chain.
+    #[test]
+    fn custom_reports_nu6_3_and_nu7_heights() {
+        let net = SlipstreamNetwork::Custom {
+            constants: NetworkType::Test,
+            heights: CustomActivations {
+                nu6_3: Some(5_000),
+                nu7: Some(6_000),
+                ..CustomActivations::all_from_genesis()
+            },
+        };
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(5_000))
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(6_000))
+        );
+        assert!(!net.is_nu_active(NetworkUpgrade::Nu7, BlockHeight::from_u32(5_999)));
+        assert!(net.is_nu_active(NetworkUpgrade::Nu7, BlockHeight::from_u32(6_000)));
+    }
+
+    /// `all_from_genesis` activates every deployed upgrade, Ironwood included, and leaves
+    /// NU7 unset.
+    #[test]
+    fn all_from_genesis_includes_ironwood_but_not_nu7() {
+        let net = SlipstreamNetwork::Custom {
+            constants: NetworkType::Main,
+            heights: CustomActivations::all_from_genesis(),
+        };
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(1))
+        );
+        assert_eq!(net.activation_height(NetworkUpgrade::Nu7), None);
     }
 
     /// The load-bearing regression: main-constants custom params must decode the

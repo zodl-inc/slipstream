@@ -65,6 +65,13 @@ workspace.
   five consecutive failed mempool sessions. It turns monitoring off, tries again no sooner
   than 60 s later, doubles the wait after each failed retry up to 10 minutes, and turns it
   back on with the first session that ends without error. Tip polling continues throughout.
+- `CustomActivations` has two new fields, `nu6_3` (Ironwood) and `nu7`, reported as a custom
+  chain's NU6.3 and NU7 activation heights. `CustomActivations::all_from_genesis` sets
+  `nu6_3` to 1 and leaves `nu7` unset. Code that builds a `CustomActivations` with a struct
+  literal must set the new fields. A schedule that used `nu6_2` as a stand-in for NU6.3 now
+  sets `nu6_3` instead: the CLI's `--custom-heights genesis,nu6_2=5000` becomes
+  `--custom-heights genesis,nu6_3=5000`. The old form now activates NU6.3 from height 1,
+  before the stand-in NU6.2 height of 5000.
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed
@@ -128,6 +135,16 @@ workspace.
   keeps its rows, with a warning. For an account a host imports into the wallet database
   itself, the first range to seed in the shard resumes only the run that ends right
   before its start, as above.
+- A custom chain (`SlipstreamNetwork::Custom`) now activates NU6.3 (Ironwood) at its
+  `CustomActivations::nu6_3` height. Before, it never activated NU6.3, whatever heights
+  were given. So a custom chain built from `CustomActivations::all_from_genesis`, or from the
+  CLI's `genesis` shorthand, now activates NU6.3 from height 1. This is deliberate and affects
+  custom chains only; the stock main and test networks are unchanged. A custom-chain wallet
+  database created before this change should be re-created, for example in a fresh wallet
+  directory: `zcash_client_sqlite`'s Ironwood migration bakes the network's NU6.3 height into
+  the `v_ironwood_shard_scan_ranges` view when it runs (as `NULL` when unset) and requeues
+  already-scanned NU6.3-era blocks only in that step, which ran for these databases with no
+  NU6.3 height.
 
 ## [0.4.0-pre.2] - 2026-10-20
 

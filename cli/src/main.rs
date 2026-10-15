@@ -126,11 +126,11 @@ enum Cmd {
         network: NetworkArg,
         /// [IW-0.5] Custom-chain activation heights: comma-separated
         /// `upgrade=height` pairs (keys: overwinter, sapling, blossom, heartwood,
-        /// canopy, nu5, nu6, nu6_1, nu6_2), with the literal `genesis` as
-        /// shorthand for "every known upgrade active from height 1" (later pairs
-        /// override). When set, --network selects only the CONSTANTS (HRPs, coin
-        /// type). The valargroup Ironwood testnet =
-        /// `--network main --custom-heights genesis,nu6_2=5000`.
+        /// canopy, nu5, nu6, nu6_1, nu6_2, nu6_3, nu7), with the literal `genesis`
+        /// as shorthand for "every upgrade through nu6_3 active from height 1"
+        /// (nu7 stays unset unless given; later pairs override). When set,
+        /// --network selects only the CONSTANTS (HRPs, coin type). The valargroup
+        /// Ironwood testnet = `--network main --custom-heights genesis,nu6_3=5000`.
         #[arg(long)]
         custom_heights: Option<String>,
         /// lightwalletd URL, e.g. <https://zec.rocks:443> or <http://127.0.0.1:9067>
@@ -401,6 +401,8 @@ fn parse_custom_heights(spec: &str) -> Result<zodl_slipstream::CustomActivations
             "nu6" => &mut h.nu6,
             "nu6_1" => &mut h.nu6_1,
             "nu6_2" => &mut h.nu6_2,
+            "nu6_3" => &mut h.nu6_3,
+            "nu7" => &mut h.nu7,
             other => return Err(format!("unknown upgrade {other:?}")),
         };
         *slot = Some(height);
@@ -1703,27 +1705,58 @@ mod tests {
 
     #[test]
     fn custom_heights_parse_and_resolve_to_custom_params() {
-        use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+        use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 
-        // The valargroup Ironwood-testnet shape: main constants, genesis base,
-        // the ironwood-era stand-in at 5000.
-        let net = resolve_network(NetworkArg::Main, Some("genesis,nu6_2=5000"));
+        // The valargroup Ironwood-testnet shape: main constants, genesis base, Ironwood
+        // (NU6.3) at 5000.
+        let net = resolve_network(NetworkArg::Main, Some("genesis,nu6_3=5000"));
         assert_eq!(
             net.network_type(),
             zcash_protocol::consensus::NetworkType::Main
         );
         assert_eq!(
             net.activation_height(NetworkUpgrade::Sapling),
-            Some(zcash_protocol::consensus::BlockHeight::from_u32(1))
+            Some(BlockHeight::from_u32(1))
         );
         assert_eq!(
             net.activation_height(NetworkUpgrade::Nu6_2),
-            Some(zcash_protocol::consensus::BlockHeight::from_u32(5000))
+            Some(BlockHeight::from_u32(1))
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(5000))
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu7),
+            None,
+            "genesis leaves NU7 unset"
         );
 
         assert!(parse_custom_heights("nu9=1").is_err());
         assert!(parse_custom_heights("sapling").is_err());
         assert!(parse_custom_heights("sapling=x").is_err());
+    }
+
+    #[test]
+    fn custom_heights_accept_nu6_3_and_nu7() {
+        use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
+
+        // NU6.2, NU6.3 and NU7 each get their own height, so a key that lands in a
+        // neighbouring field fails.
+        let heights =
+            parse_custom_heights("genesis,nu6_2=3000,nu6_3=5000,nu7=6000").expect("parses");
+        assert_eq!(heights.nu6_2, Some(3000));
+        assert_eq!(heights.nu6_3, Some(5000));
+        assert_eq!(heights.nu7, Some(6000));
+        let net = resolve_network(NetworkArg::Test, Some("nu6_3=10,nu7=20"));
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu6_3),
+            Some(BlockHeight::from_u32(10))
+        );
+        assert_eq!(
+            net.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(20))
+        );
     }
 
     #[test]

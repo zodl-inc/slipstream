@@ -263,6 +263,30 @@ mod tests {
         );
     }
 
+    /// The idle bound follows a custom chain's NU7 height too.
+    #[test]
+    fn session_idle_follows_a_custom_nu7_height() {
+        use crate::network::CustomActivations;
+        use zcash_protocol::consensus::NetworkType;
+        let net = SlipstreamNetwork::Custom {
+            constants: NetworkType::Test,
+            heights: CustomActivations {
+                nu7: Some(6_000),
+                ..CustomActivations::all_from_genesis()
+            },
+        };
+        assert_eq!(mempool_session_idle(&net, 5_998), MEMPOOL_SESSION_IDLE);
+        assert_eq!(mempool_session_idle(&net, 5_999), MEMPOOL_SESSION_IDLE_NU7);
+        let without_nu7 = SlipstreamNetwork::Custom {
+            constants: NetworkType::Test,
+            heights: CustomActivations::all_from_genesis(),
+        };
+        assert_eq!(
+            mempool_session_idle(&without_nu7, 1_000_000),
+            MEMPOOL_SESSION_IDLE
+        );
+    }
+
     /// A tip too large for a `u32` height clamps to the last height instead of wrapping to a
     /// low one, and `u64::MAX` does not overflow `tip + 1`.
     #[test]
