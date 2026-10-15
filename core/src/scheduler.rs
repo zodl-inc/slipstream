@@ -34,7 +34,7 @@ use crate::{
     error::SlipstreamError,
     events::Progress,
     fetch::{FetchPlan, FetchStats, run_fetch},
-    scan::{ScanStats, scan_chunks},
+    scan::{ScanStats, local_treestate_active, needs_server_boundary_state, scan_chunks},
     wallet_session::WalletSession,
 };
 
@@ -501,16 +501,23 @@ pub async fn run_to_completion(
         // v0.5 pacer fix: boundary treestate fetches start when the chunk is
         // EMITTED (fetch side), so the RTT hides under queue wait + scan
         // instead of racing one scan call (P1: that overhang was 62 % of the
-        // Mac scan wall on a slow-treestate day).
+        // Mac scan wall on a slow-treestate day). In server mode the range's
+        // last boundary is never read, so it is not fetched. Whether a
+        // local-mode boundary is audited is decided scan-side, so local mode
+        // still fetches every boundary here.
         {
             let ep = config.endpoint.clone();
             let tor_owned = tor.cloned();
             let boundary_progress = progress.clone();
+            let local_mode = local_treestate_active(config);
             tx.set_boundary_fetcher(std::sync::Arc::new(move |end_height| {
+                if !needs_server_boundary_state(local_mode, true, end_height, end) {
+                    return None;
+                }
                 let ep = ep.clone();
                 let tor_owned = tor_owned.clone();
                 let progress = boundary_progress.clone();
-                tokio::spawn(async move {
+                Some(tokio::spawn(async move {
                     crate::grpc::retry_get_tree_state(
                         &ep,
                         end_height,
@@ -519,7 +526,7 @@ pub async fn run_to_completion(
                         progress,
                     )
                     .await
-                })
+                }))
             }));
         }
         let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
@@ -551,6 +558,7 @@ pub async fn run_to_completion(
         let scan_result: Result<ScanStats, SlipstreamError> = scan_chunks(
             session,
             start,
+            end,
             rx,
             progress.clone(),
             config,

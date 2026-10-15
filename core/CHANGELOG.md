@@ -39,6 +39,14 @@ workspace.
   account with a transparent receiver is due — open none, so a range with nothing to
   fetch, such as the block of a follow pass on a quiet wallet, opens no connection for
   its enhancement (with Tor on, no isolated circuit).
+- `chunk::BoundaryFetcher` returns `Option<BoundaryHandle>`: a fetcher may decline a
+  boundary, and that chunk then carries no fetch.
+- `scan::scan_chunks` takes the range's last height, `range_end`, after `range_start`,
+  and returns an error for a chunk that runs past it.
+- With `EngineConfig::local_treestate` off (the default), a range no longer fetches the
+  tree state at its last block, which the scan never reads: one `GetTreeState` and one
+  connection fewer per range, so a follow pass fetches one tree state instead of two.
+  With `local_treestate` on, that boundary is still fetched, since it may be audited.
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed
