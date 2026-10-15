@@ -30,6 +30,7 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::time::Instant;
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::BlockHeight;
 
@@ -102,12 +103,81 @@ pub(crate) const FOLLOW_POLL_MAX_SECS: u64 = 30;
 /// INITIAL sync's non-transient errors (and panics, via the supervisor) surface Error.
 pub(crate) const FOLLOW_FAILURE_CAP: u32 = 8;
 
-/// Consecutive mempool-session failures tolerated before mempool monitoring is disabled for THIS
-/// handle (T8.2). Mempool is a non-fatal convenience layer on top of following: a persistently
-/// failing stream must NOT kill the follow loop — the handle drops back to plain tip-polling and
-/// the user still syncs (Deviation D6). Lower than `FOLLOW_FAILURE_CAP` because, unlike tip
-/// probes, losing mempool degrades nothing essential.
+/// Consecutive mempool-session failures that turn mempool monitoring off (T8.2). Mempool is a
+/// non-fatal convenience layer on top of following: a persistently failing stream must NOT kill
+/// the follow loop — the handle drops back to plain tip-polling and the user still syncs
+/// (Deviation D6) — and [`MempoolGate`] tries it again after a back-off instead of giving up for
+/// the rest of the session. Lower than `FOLLOW_FAILURE_CAP` because, unlike tip probes, losing
+/// mempool degrades nothing essential.
 pub(crate) const MEMPOOL_FAILURE_CAP: u32 = 5;
+
+/// How long mempool monitoring stays off after [`MEMPOOL_FAILURE_CAP`] consecutive failures
+/// before it is tried again.
+pub(crate) const MEMPOOL_RETRY_FIRST: Duration = Duration::from_secs(60);
+
+/// The longest wait between mempool retries: each failed retry doubles the wait, up to this.
+pub(crate) const MEMPOOL_RETRY_MAX: Duration = Duration::from_secs(600);
+
+/// What a failed mempool session did to the [`MempoolGate`], for the follow loop's log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MempoolGateEvent {
+    /// Below the cap: monitoring stays on.
+    StillOn { failures: u32 },
+    /// The cap was reached: monitoring is off until `retry_in` has passed.
+    TurnedOff { retry_in: Duration },
+    /// A retry after the back-off failed: off again, for twice as long (up to the maximum).
+    RetryFailed { retry_in: Duration },
+}
+
+/// The follow loop's mempool on/off state, with the back-off that schedules each retry.
+///
+/// Monitoring turns off after [`MEMPOOL_FAILURE_CAP`] consecutive failed sessions and is
+/// tried again [`MEMPOOL_RETRY_FIRST`] later. Each failed retry doubles the wait, up to
+/// [`MEMPOOL_RETRY_MAX`]; any session that ends without error turns monitoring back on and
+/// resets the count. Before, a handle whose mempool stream failed five times in a row never
+/// watched the mempool again. The time is passed in, so the schedule is testable without
+/// sleeping.
+#[derive(Debug, Default)]
+pub(crate) struct MempoolGate {
+    /// Consecutive failed sessions since the last success.
+    failures: u32,
+    /// While monitoring is off: when to try again, and the wait that set it.
+    retry: Option<(Instant, Duration)>,
+}
+
+impl MempoolGate {
+    /// Whether to hold a mempool session at `now`.
+    pub(crate) fn should_try(&self, now: Instant) -> bool {
+        self.retry.is_none_or(|(at, _)| now >= at)
+    }
+
+    /// A session ended without error. Returns whether that turned monitoring back on.
+    pub(crate) fn on_ok(&mut self) -> bool {
+        self.failures = 0;
+        self.retry.take().is_some()
+    }
+
+    /// A session failed at `now`.
+    pub(crate) fn on_err(&mut self, now: Instant) -> MempoolGateEvent {
+        self.failures = self.failures.saturating_add(1);
+        match self.retry {
+            Some((_, wait)) => {
+                let retry_in = wait.saturating_mul(2).min(MEMPOOL_RETRY_MAX);
+                self.retry = Some((now + retry_in, retry_in));
+                MempoolGateEvent::RetryFailed { retry_in }
+            }
+            None if self.failures >= MEMPOOL_FAILURE_CAP => {
+                self.retry = Some((now + MEMPOOL_RETRY_FIRST, MEMPOOL_RETRY_FIRST));
+                MempoolGateEvent::TurnedOff {
+                    retry_in: MEMPOOL_RETRY_FIRST,
+                }
+            }
+            None => MempoolGateEvent::StillOn {
+                failures: self.failures,
+            },
+        }
+    }
+}
 
 /// Maximum number of ADDITIONAL `sync_once` calls after the first failure (T6.8-H2 Fix B).
 /// Total attempts = `PASS_RETRY_MAX + 1` = 3.
@@ -549,19 +619,19 @@ async fn follow_loop(
     let mut last_tip = initial_tip;
     let mut consecutive_failures: u32 = 0;
     // T8.2 mempool monitoring state (per-session). Non-fatal: a persistently failing
-    // stream disables mempool for this session and the loop keeps tip-polling.
-    // `seen_txids` persists across reconnects because lightwalletd replays the whole
-    // mempool on every reconnect (Deviation D6).
-    let mut mempool_enabled = true;
-    let mut mempool_failures: u32 = 0;
+    // stream turns mempool off and the loop keeps tip-polling; the gate tries it again
+    // after a back-off (`MempoolGate`). `seen_txids` persists across reconnects — and
+    // across the gate turning mempool off and back on — because lightwalletd replays the
+    // whole mempool on every reconnect (Deviation D6).
+    let mut mempool = MempoolGate::default();
     let mut seen_txids: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     loop {
         // Between passes: hold a mempool session (surfaces 0-conf incoming) or jitter-sleep
-        // if mempool is disabled. A live session blocks until the server closes the stream
+        // while mempool is off. A live session blocks until the server closes the stream
         // on a new block (then we probe immediately) or its idle bound elapses
         // (`mempool::mempool_session_idle`: 60 s before NU7, 40 s from NU7); either way it
         // bounds the iteration cadence. Mempool failure is NON-FATAL (D6).
-        if mempool_enabled {
+        if mempool.should_try(Instant::now()) {
             let idle = crate::mempool::mempool_session_idle(&config.engine.network, last_tip);
             match crate::mempool::run_session(
                 &config.engine,
@@ -573,7 +643,9 @@ async fn follow_loop(
             .await
             {
                 Ok((end, stats)) => {
-                    mempool_failures = 0;
+                    if mempool.on_ok() {
+                        tracing::info!("follow: mempool monitoring back on");
+                    }
                     tracing::debug!(
                         ?end,
                         received = stats.received,
@@ -584,17 +656,23 @@ async fn follow_loop(
                     );
                 }
                 Err(err) => {
-                    mempool_failures += 1;
-                    tracing::warn!(
-                        %err,
-                        mempool_failures,
-                        "follow: mempool session failed (non-fatal)"
-                    );
-                    if mempool_failures >= MEMPOOL_FAILURE_CAP {
-                        tracing::warn!(
-                            "follow: mempool monitoring disabled for this handle (cap reached) — tip polling continues"
-                        );
-                        mempool_enabled = false;
+                    match mempool.on_err(Instant::now()) {
+                        MempoolGateEvent::StillOn { failures } => tracing::warn!(
+                            %err,
+                            mempool_failures = failures,
+                            "follow: mempool session failed (non-fatal)"
+                        ),
+                        MempoolGateEvent::TurnedOff { retry_in } => tracing::warn!(
+                            %err,
+                            cap = MEMPOOL_FAILURE_CAP,
+                            retry_in_secs = retry_in.as_secs(),
+                            "follow: mempool monitoring off after consecutive failures — tip polling continues"
+                        ),
+                        MempoolGateEvent::RetryFailed { retry_in } => tracing::warn!(
+                            %err,
+                            retry_in_secs = retry_in.as_secs(),
+                            "follow: mempool retry failed — tip polling continues"
+                        ),
                     }
                     // Back off with the same jittered cadence as the plain poll so a
                     // flapping stream cannot hot-loop.
@@ -972,7 +1050,126 @@ mod tests {
                 MEMPOOL_FAILURE_CAP < FOLLOW_FAILURE_CAP,
                 "mempool (non-essential) must give up before the essential tip poll"
             );
+            assert!(
+                MEMPOOL_RETRY_FIRST.as_secs() > 0
+                    && MEMPOOL_RETRY_FIRST.as_secs() <= MEMPOOL_RETRY_MAX.as_secs(),
+                "the back-off starts above zero and never shrinks"
+            );
         }
+    }
+
+    // ── Mempool gate ─────────────────────────────────────────────────────────
+
+    /// Failures below the cap keep mempool on.
+    #[test]
+    fn mempool_gate_stays_on_below_the_cap() {
+        let now = Instant::now();
+        let mut gate = MempoolGate::default();
+        for failures in 1..MEMPOOL_FAILURE_CAP {
+            assert_eq!(gate.on_err(now), MempoolGateEvent::StillOn { failures });
+            assert!(gate.should_try(now), "below the cap, mempool stays on");
+        }
+    }
+
+    /// At the cap mempool turns off. It is retried after 60 s, then 120 s, 240 s, 480 s,
+    /// and then every 600 s.
+    #[test]
+    fn mempool_gate_retries_with_a_doubling_back_off_capped_at_ten_minutes() {
+        let mut now = Instant::now();
+        let mut gate = MempoolGate::default();
+        for _ in 1..MEMPOOL_FAILURE_CAP {
+            gate.on_err(now);
+        }
+        assert_eq!(
+            gate.on_err(now),
+            MempoolGateEvent::TurnedOff {
+                retry_in: Duration::from_secs(60)
+            }
+        );
+        assert!(!gate.should_try(now), "off at the cap");
+        let waits = [60, 120, 240, 480, 600, 600];
+        for (i, secs) in waits.iter().copied().enumerate() {
+            let wait = Duration::from_secs(secs);
+            assert!(
+                !gate.should_try(now + wait - Duration::from_secs(1)),
+                "still off just before {secs} s"
+            );
+            now += wait;
+            assert!(gate.should_try(now), "retried after {secs} s");
+            if let Some(next) = waits.get(i + 1) {
+                assert_eq!(
+                    gate.on_err(now),
+                    MempoolGateEvent::RetryFailed {
+                        retry_in: Duration::from_secs(*next)
+                    }
+                );
+            }
+        }
+    }
+
+    /// The follow loop reads the gate once per pass, so a retry fires some time after its
+    /// deadline. If it fails, the next wait counts from that attempt, not from the deadline
+    /// it missed.
+    #[test]
+    fn mempool_gate_counts_the_next_wait_from_a_late_retry() {
+        let now = Instant::now();
+        let mut gate = MempoolGate::default();
+        for _ in 0..MEMPOOL_FAILURE_CAP {
+            gate.on_err(now);
+        }
+        let deadline = now + MEMPOOL_RETRY_FIRST;
+        let late = deadline + Duration::from_secs(25);
+        assert!(gate.should_try(late), "a pass after the deadline retries");
+        assert_eq!(
+            gate.on_err(late),
+            MempoolGateEvent::RetryFailed {
+                retry_in: Duration::from_secs(120)
+            }
+        );
+        assert!(
+            !gate.should_try(late + Duration::from_secs(119)),
+            "the 120 s wait counts from the late attempt"
+        );
+        assert!(
+            gate.should_try(late + Duration::from_secs(120)),
+            "retried 120 s after the late attempt"
+        );
+    }
+
+    /// A session that ends without error resets everything: the gate is on at once, and the
+    /// count and the back-off start over.
+    #[test]
+    fn mempool_gate_ok_resets_everything() {
+        let now = Instant::now();
+        let mut gate = MempoolGate::default();
+        for _ in 0..MEMPOOL_FAILURE_CAP {
+            gate.on_err(now);
+        }
+        let retry_at = now + MEMPOOL_RETRY_FIRST;
+        assert!(gate.should_try(retry_at));
+        gate.on_err(retry_at); // the first retry fails: off again, for 120 s
+        assert!(!gate.should_try(retry_at));
+        assert!(
+            gate.on_ok(),
+            "a session that succeeds turns monitoring back on"
+        );
+        assert!(gate.should_try(retry_at), "on again at once");
+        for failures in 1..MEMPOOL_FAILURE_CAP {
+            assert_eq!(gate.on_err(now), MempoolGateEvent::StillOn { failures });
+        }
+        assert_eq!(
+            gate.on_err(now),
+            MempoolGateEvent::TurnedOff {
+                retry_in: MEMPOOL_RETRY_FIRST
+            }
+        );
+
+        // An Ok below the cap resets the count too, and reports no transition.
+        let mut gate = MempoolGate::default();
+        gate.on_err(now);
+        gate.on_err(now);
+        assert!(!gate.on_ok(), "mempool was never off");
+        assert_eq!(gate.on_err(now), MempoolGateEvent::StillOn { failures: 1 });
     }
 
     // ── SessionReporter ──────────────────────────────────────────────────────

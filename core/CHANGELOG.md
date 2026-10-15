@@ -61,6 +61,10 @@ workspace.
 - From NU7 activation, the follow loop's mempool session reconnects after 40 s without a
   message instead of 60 s; before NU7 it stays 60 s. Both stay above the 30 s stream stall
   timeout, and 40 s is below the Tor client's default 60 s response-header timeout.
+- The follow loop no longer gives up on mempool monitoring for the rest of a session after
+  five consecutive failed mempool sessions. It turns monitoring off, tries again no sooner
+  than 60 s later, doubles the wait after each failed retry up to 10 minutes, and turns it
+  back on with the first session that ends without error. Tip polling continues throughout.
 - `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
 
 ### Fixed
