@@ -1,9 +1,3 @@
-## [0.3.0-alpha.1] - Unreleased
-
-### Added
-- OHTTP (RFC 9458) transport support for privacy-preserving lightwalletd connections
-- Tor routing capability for all connection purposes (clearnet, Tor-only, Tor-over-OHTTP modes)
-- Client trace ID propagation for end-to-end request tracking
 # Changelog
 All notable changes to this library will be documented in this file.
 
@@ -16,12 +10,37 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
+  endpoint whose host has a relay (`ohttp::relay_for`) is never dialled
+  directly: every RPC is sealed to the gateway's signed key configuration and
+  posted to the relay, over Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08,
+  `message/ohttp-chunked-req` / `message/ohttp-chunked-res`), so the gateway
+  can stream `GetBlockRange` responses as blocks arrive. The protocol core is
+  the shared `zodl-ohttp-client` crate.
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` send a
+  plain HTTP request to a service behind the gateway through the relay, with
+  `ohttp::Dialer` choosing a direct or Tor leg to the relay.
+- `ohttp::set_default_client_trace_prefix` sets an optional
+  `X-Client-Trace-Id` prefix for end-to-end debug tracing. Gating it to debug
+  builds is the caller's job.
+- `connector::TorConn::from_client`, `TorConn::client`,
+  `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
+- `SlipstreamError::EndpointUnreachable`.
+
 ### Changed
-- OHTTP connector migrated to Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08).
-  Requests are sent as `message/ohttp-chunked-req` and responses are decoded
-  incrementally as `message/ohttp-chunked-res`. The gateway can now stream
-  GetBlockRange responses as blocks arrive from lightwalletd, improving
-  time-to-first-block for long-range syncs.
+- `connector::TorConn::bootstrap` takes the client trace prefix as a third
+  argument, and `TorConn` wraps an `arti_client::TorClient` directly (same
+  `arti-data` / `arti-cache` directory layout as
+  `zcash_client_backend::tor::Client`).
+- `fetch::run_fetch` takes the session's `Option<TorConn>` as its second
+  argument.
+- With Tor on, the bulk block fetch rides the default Tor circuit instead of
+  going direct, and an OHTTP gateway is reached with the relay leg dialled
+  through Tor.
+- The follow loop surfaces `SyncState::Error(3)` (event tag 4, value 3) after
+  5 consecutive tip-probe or catch-up failures, so a host can switch servers.
+  Follow-phase failures previously never surfaced an error.
 
 ## [0.4.0-pre.1] - 2026-10-06
 
