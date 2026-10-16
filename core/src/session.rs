@@ -401,18 +401,7 @@ pub async fn run_session(
     follow_loop(&config, &reporter, tor_conn.as_ref(), outcome.chain_tip).await;
 }
 
-/// ── T8.1 follow loop: track the chain while the host keeps the task alive ────
-/// Extracted verbatim from `run_session`'s success arm ([B4-16] revival refactor) —
-/// behaviour unchanged. Never returns; the host aborts the task on stop()/free()/restart
-/// (tokio sleeps/awaits are abort-safe).
-///
-/// State contract (Deviation D3): Done between passes, Syncing during real catch-up
-/// passes. Jitter (uniform [MIN, MAX] per cycle) defeats the timing fingerprint a fixed
-/// cadence would leak.
-/// Failure counters of the follow loop. Tip probes and catch-up passes fail independently: an
-/// endpoint that answers `GetLatestBlock` but cannot serve blocks must still reach the
-/// endpoint-unreachable escalation, so a successful probe clears only the probe count and only a
-/// fully successful catch-up pass clears the catch-up count.
+/// Follow-loop failure counts, kept apart so a good tip probe cannot clear failing catch-ups.
 #[derive(Debug, Default)]
 struct FollowFailures {
     probe: u32,
@@ -437,6 +426,14 @@ impl FollowFailures {
     }
 }
 
+/// ── T8.1 follow loop: track the chain while the host keeps the task alive ────
+/// Extracted verbatim from `run_session`'s success arm ([B4-16] revival refactor) —
+/// behaviour unchanged. Never returns; the host aborts the task on stop()/free()/restart
+/// (tokio sleeps/awaits are abort-safe).
+///
+/// State contract (Deviation D3): Done between passes, Syncing during real catch-up
+/// passes. Jitter (uniform [MIN, MAX] per cycle) defeats the timing fingerprint a fixed
+/// cadence would leak.
 async fn follow_loop(
     config: &SessionConfig,
     reporter: &SessionReporter,
