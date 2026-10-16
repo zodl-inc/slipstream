@@ -771,8 +771,9 @@ where
 /// gateway collected before sending (a cache hit, a backend error) have `grpc-status` there
 /// and an empty trailer section. tonic requires a `grpc-status` trailer on every stream that
 /// was not trailers-only, so those fields are moved into the one trailers frame this emits.
-/// A response without a status anywhere ends with `INTERNAL`; a decode failure with
-/// `UNAVAILABLE`. Nothing follows the trailers frame.
+/// A response without a status anywhere ends with `INTERNAL`, a decode failure with
+/// `INTERNAL`, and a transport failure (read error, idle timeout) with `UNAVAILABLE`. Nothing
+/// follows the trailers frame.
 struct GrpcFrames {
     /// The `grpc-*` fields taken out of the response headers.
     header_fields: HeaderMap,
