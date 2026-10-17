@@ -71,7 +71,7 @@ webpki-roots = "0.26"
 # Shared sans-IO OHTTP core (HPKE encapsulation, Binary HTTP, signed-config verification, key
 # selection, outer-status classification, size limits). `default-features = false`: the `client`
 # feature would pull reqwest, and Slipstream does its own I/O.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "607d8507feaffe128b359088e0cf2e10d6d69ae0", default-features = false }
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "e0a87714b4ec577e049a9b37b76fb24c82b8602b", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }
