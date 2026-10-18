@@ -33,20 +33,11 @@ fn check_gateway_network(host: &str, network: SlipstreamNetwork) -> Result<(), S
     if crate::ohttp::relay_for(host).is_none() {
         return Ok(());
     }
-    let gateway = crate::ohttp::gateway_network(host).map_err(SlipstreamError::Config)?;
-    let wallet = match zcash_protocol::consensus::Parameters::network_type(&network) {
-        zcash_protocol::consensus::NetworkType::Main => Some(zodl_ohttp_client::Network::Mainnet),
-        zcash_protocol::consensus::NetworkType::Test => Some(zodl_ohttp_client::Network::Testnet),
-        zcash_protocol::consensus::NetworkType::Regtest => None,
-    };
-    if wallet == Some(gateway) {
-        Ok(())
-    } else {
-        Err(SlipstreamError::Config(format!(
-            "OHTTP gateway {host} serves {}, not this wallet's network",
-            gateway.as_str()
-        )))
-    }
+    crate::ohttp::check_gateway_network(
+        host,
+        zcash_protocol::consensus::Parameters::network_type(&network),
+    )
+    .map_err(SlipstreamError::Config)
 }
 
 /// lightwalletd endpoint.

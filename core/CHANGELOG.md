@@ -38,6 +38,10 @@ workspace.
   `GetAddressUtxos` does too.
 
 ### Changed
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` take the
+  wallet's network (`ohttp::NetworkType`, re-exported from `zcash_protocol`)
+  as their second argument and refuse a gateway that serves another network
+  before anything is sent.
 - `EngineConfig::validate` refuses an OHTTP gateway (endpoint or alternate)
   that serves a network other than the wallet's; the signed key configuration
   is checked against the network of the gateway's exact host name.

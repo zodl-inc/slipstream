@@ -70,6 +70,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
+pub use zcash_protocol::consensus::NetworkType;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseDecoder, ClientProfile,
     ClientTrace, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, KeyConfig, Network, NetworkRule,
@@ -439,11 +440,33 @@ fn unix_now() -> Result<u64, String> {
 }
 
 /// The network a gateway serves, by exact host: the envelope must name it, and the wallet using
-/// the gateway must be on it (`EngineConfig::validate`).
+/// the gateway must be on it (`EngineConfig::validate`, [`http_round_trip`]).
 pub(crate) fn gateway_network(gateway_host: &str) -> Result<Network, String> {
     NetworkRule::KnownHosts
         .network_for(gateway_host)
         .map_err(|e| e.to_string())
+}
+
+/// Refuses an OHTTP gateway that serves another network than `network`: its calls would reach
+/// the wrong chain, under a key configuration signed for that chain. Regtest has no gateway.
+pub(crate) fn check_gateway_network(
+    gateway_host: &str,
+    network: NetworkType,
+) -> Result<(), String> {
+    let gateway = gateway_network(gateway_host)?;
+    let wallet = match network {
+        NetworkType::Main => Some(Network::Mainnet),
+        NetworkType::Test => Some(Network::Testnet),
+        NetworkType::Regtest => None,
+    };
+    if wallet == Some(gateway) {
+        Ok(())
+    } else {
+        Err(format!(
+            "OHTTP gateway {gateway_host} serves {}, not this wallet's network",
+            gateway.as_str()
+        ))
+    }
 }
 
 /// Verify a signed key-configuration envelope for `gateway_host` under `profile` (network from
@@ -1143,6 +1166,7 @@ impl OhttpClient {
             }
         };
         let (parts, mut body) = resp.into_parts();
+        self.note_retry_after(parts.status, &parts.headers);
         if let Some(declared) = parts
             .headers
             .get(header::CONTENT_LENGTH)
@@ -1258,6 +1282,7 @@ impl OhttpClient {
             }
         };
         let (parts, body) = resp.into_parts();
+        self.note_retry_after(parts.status, &parts.headers);
         let content_type = parts
             .headers
             .get(header::CONTENT_TYPE)
@@ -1373,22 +1398,21 @@ impl OhttpClient {
         }
     }
 
-    /// Records the pause an outer 429 asked for, so that every later request through this relay
+    /// Records the pause an outer 429 asks for as soon as its head arrives (before its body is
+    /// read, which may stall or be cancelled), so that every later request through this relay
     /// waits for it.
-    fn note_relay_pause<T>(&self, result: Result<T, RoundTripError>) -> Result<T, RoundTripError> {
-        if let Err(RoundTripError::RateLimited {
-            retry_after: Some(wait),
-            ..
-        }) = &result
-        {
+    fn note_retry_after(&self, status: StatusCode, headers: &HeaderMap) {
+        if status != StatusCode::TOO_MANY_REQUESTS {
+            return;
+        }
+        if let Some(wait) = retry_after(headers) {
             tracing::warn!(
                 wait_secs = wait.as_secs(),
                 relay = %self.relay_url,
                 "ohttp: relay rate limit (429); holding requests through it"
             );
-            RelayBackoff::global().note(&self.relay_url, *wait);
+            RelayBackoff::global().note(&self.relay_url, wait);
         }
-        result
     }
 
     /// [`Self::round_trip_once`], sent once more (sealed afresh) when the gateway refused it
@@ -1429,16 +1453,14 @@ impl OhttpClient {
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        let (mut decoder, answer) = self.note_relay_pause(
-            run_exchange_chunked(
-                key,
-                request,
-                move |body| this.post_sealed(body),
-                move || this.key_config(true),
-                on_dispatch,
-            )
-            .await,
-        )?;
+        let (mut decoder, answer) = run_exchange_chunked(
+            key,
+            request,
+            move |body| this.post_sealed(body),
+            move || this.key_config(true),
+            on_dispatch,
+        )
+        .await?;
 
         // Decode the buffered response body through the chunked decoder
         let mut events = decoder
@@ -1515,16 +1537,14 @@ impl OhttpClient {
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        let (decoder, answer) = self.note_relay_pause(
-            run_exchange_chunked(
-                key,
-                &request,
-                move |body| this.post_sealed_stream(body),
-                move || this.key_config(true),
-                on_dispatch,
-            )
-            .await,
-        )?;
+        let (decoder, answer) = run_exchange_chunked(
+            key,
+            &request,
+            move |body| this.post_sealed_stream(body),
+            move || this.key_config(true),
+            on_dispatch,
+        )
+        .await?;
 
         // Spawn task to decode chunks and forward events with idle timeout
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
@@ -1605,8 +1625,16 @@ impl OhttpClient {
                     tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
                     return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
                 }
-                Ok(Err(RoundTripError::RateLimited { detail, .. })) => {
-                    tracing::warn!(path = %path, err = %detail, "ohttp: rate limited");
+                Ok(Err(RoundTripError::RateLimited {
+                    detail,
+                    retry_after,
+                })) => {
+                    tracing::warn!(
+                        path = %path,
+                        err = %detail,
+                        retry_after_secs = retry_after.map(|d| d.as_secs()),
+                        "ohttp: rate limited"
+                    );
                     return grpc_error_with(
                         GRPC_UNAVAILABLE,
                         &format!("ohttp: {detail}"),
@@ -1726,6 +1754,8 @@ fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
 ///
 /// # Arguments
 /// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
+/// * `network` - The wallet's network; a gateway serving another one is refused before
+///   anything is sent
 /// * `dialer` - How to reach the relay: `Dialer::Direct` or `Dialer::Tor(_)`
 /// * `method` - HTTP method (e.g., "GET", "POST")
 /// * `url` - Full target URL (e.g., "<https://voting.valargroup.dev/api/vote>")
@@ -1733,7 +1763,8 @@ fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
 /// * `body` - Request body bytes
 ///
 /// # Returns
-/// `Ok((status, headers, body))` on success, or `Err(msg)` on failure.
+/// `Ok((status, headers, body))` on success, or `Err(msg)` on failure. The whole exchange is
+/// bounded by 100 s.
 ///
 /// # Privacy
 /// The relay sees the client IP (or Tor exit with `Dialer::Tor`) and the HPKE-encrypted
@@ -1750,13 +1781,24 @@ fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
 /// host, avoiding repeated key fetches and TLS handshakes.
 pub async fn http_round_trip(
     gateway_host: &str,
+    network: NetworkType,
     dialer: Dialer,
     method: &str,
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    http_round_trip_with_dispatch(gateway_host, dialer, method, url, headers, body, || {}).await
+    http_round_trip_with_dispatch(
+        gateway_host,
+        network,
+        dialer,
+        method,
+        url,
+        headers,
+        body,
+        || {},
+    )
+    .await
 }
 
 /// Like [`http_round_trip`], but calls `on_dispatch` right before the sealed request is posted
@@ -1766,6 +1808,8 @@ pub async fn http_round_trip(
 ///
 /// # Arguments
 /// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
+/// * `network` - The wallet's network; a gateway serving another one is refused before
+///   anything is sent
 /// * `dialer` - How to reach the relay: `Dialer::Direct` or `Dialer::Tor(_)`
 /// * `method` - HTTP method (e.g., "GET", "POST")
 /// * `url` - Full target URL (e.g., "<https://voting.valargroup.dev/api/vote>")
@@ -1780,11 +1824,12 @@ pub async fn http_round_trip(
 /// ```no_run
 /// # async fn demo() -> Result<(), String> {
 /// use std::sync::atomic::{AtomicBool, Ordering};
-/// use zodl_slipstream::ohttp::{Dialer, http_round_trip_with_dispatch};
+/// use zodl_slipstream::ohttp::{Dialer, NetworkType, http_round_trip_with_dispatch};
 ///
 /// let dispatched = AtomicBool::new(false);
 /// match http_round_trip_with_dispatch(
 ///     "ohttp-gateway.example",
+///     NetworkType::Main,
 ///     Dialer::Direct,
 ///     "POST",
 ///     "https://voting.example/api/vote",
@@ -1806,8 +1851,10 @@ pub async fn http_round_trip(
 /// }
 /// # Ok(()) }
 /// ```
+#[allow(clippy::too_many_arguments)] // the public shape of http_round_trip plus the hook
 pub async fn http_round_trip_with_dispatch<D>(
     gateway_host: &str,
+    network: NetworkType,
     dialer: Dialer,
     method: &str,
     url: &str,
@@ -1818,6 +1865,8 @@ pub async fn http_round_trip_with_dispatch<D>(
 where
     D: Fn() + Send + Sync,
 {
+    check_gateway_network(gateway_host, network)?;
+
     // Parse URL to extract scheme, host, path for BHTTP encoding
     let target = parse_http_target(url)?;
 
@@ -1969,6 +2018,33 @@ mod tests {
     use std::cell::Cell;
     use std::sync::Mutex as StdMutex;
     use zodl_ohttp_client::encode_bhttp_request;
+
+    /// `http_round_trip` refuses a gateway of another network before anything is sent.
+    #[tokio::test]
+    async fn http_round_trip_refuses_a_gateway_of_another_network() {
+        let dispatched = Cell::new(false);
+        let err = http_round_trip_with_dispatch(
+            "ohttp-gateway.example",
+            NetworkType::Test,
+            Dialer::Direct,
+            "GET",
+            "https://vote.example/api",
+            &[],
+            b"",
+            || dispatched.set(true),
+        )
+        .await
+        .expect_err("refused");
+        assert!(err.contains("mainnet"), "{err}");
+        assert!(!dispatched.get());
+        assert!(check_gateway_network("ohttp-gateway.example", NetworkType::Main).is_ok());
+        assert!(check_gateway_network("ohttp-gateway-testnet.example", NetworkType::Test).is_ok());
+        assert!(
+            check_gateway_network("ohttp-gateway-testnet.example", NetworkType::Main).is_err()
+        );
+        assert!(check_gateway_network("ohttp-gateway.example", NetworkType::Regtest).is_err());
+        assert!(check_gateway_network("gw.example", NetworkType::Main).is_err());
+    }
 
     #[test]
     fn send_errors_are_never_pre_send() {
@@ -3638,12 +3714,13 @@ mod tests {
             ClientProfile::SLIPSTREAM,
         )
         .expect("client");
-        let noted: Result<(), RoundTripError> =
-            client.note_relay_pause(Err(RoundTripError::RateLimited {
-                detail: "relay/gateway HTTP 429".into(),
-                retry_after: Some(Duration::from_secs(60)),
-            }));
-        assert!(noted.is_err());
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        // Only a 429 sets a pause.
+        client.note_retry_after(StatusCode::SERVICE_UNAVAILABLE, &headers);
+        assert!(RelayBackoff::global().remaining(relay).is_none());
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert!(RelayBackoff::global().remaining(relay).is_some());
 
         let other = OhttpClient::new(
             "ohttp-gateway-testnet.example",
