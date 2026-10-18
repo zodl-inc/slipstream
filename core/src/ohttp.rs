@@ -477,6 +477,30 @@ fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
     Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
 }
 
+/// Error from the chunked body pump: transport (network) or decode (BHTTP format).
+enum PumpError {
+    /// Transport failure: network read error, idle timeout, or truncated stream.
+    Transport(String),
+    /// Decode failure: invalid BHTTP format, but the sealed response was received intact.
+    Decode(String),
+}
+
+impl PumpError {
+    fn transport(msg: impl Into<String>) -> Self {
+        PumpError::Transport(msg.into())
+    }
+
+    fn decode(msg: impl Into<String>) -> Self {
+        PumpError::Decode(msg.into())
+    }
+
+    fn into_message(self) -> String {
+        match self {
+            PumpError::Transport(s) | PumpError::Decode(s) => s,
+        }
+    }
+}
+
 /// Streaming half of [`OhttpClient::round_trip_stream_once`]: reads the relay body frame by
 /// frame, enforces the response size bound, feeds the chunked decoder and forwards its events.
 /// It stops as soon as the receiver is gone (the RPC was cancelled or timed out) and drops the
@@ -486,7 +510,7 @@ async fn pump_chunked_body(
     mut body_stream: BoxBody<Bytes, hyper::Error>,
     mut decoder: ChunkedResponseDecoder,
     mut guard: SizeGuard,
-    tx: tokio::sync::mpsc::Sender<Result<ResponseEvent, String>>,
+    tx: tokio::sync::mpsc::Sender<Result<ResponseEvent, PumpError>>,
 ) {
     loop {
         tokio::select! {
@@ -502,7 +526,7 @@ async fn pump_chunked_body(
                         if let Ok(data) = frame.into_data() {
                             // Enforce size limit before pushing to decoder
                             if let Err(e) = guard.push(data.len()) {
-                                let _ = tx.send(Err(e.to_string())).await;
+                                let _ = tx.send(Err(PumpError::transport(format!("response too large: {e}")))).await;
                                 return;
                             }
                             match decoder.push(&data) {
@@ -514,14 +538,14 @@ async fn pump_chunked_body(
                                     }
                                 }
                                 Err(e) => {
-                                    let _ = tx.send(Err(e.to_string())).await;
+                                    let _ = tx.send(Err(PumpError::decode(format!("bhttp decode: {e}")))).await;
                                     return;
                                 }
                             }
                         }
                     }
                     Ok(Some(Err(e))) => {
-                        let _ = tx.send(Err(format!("read chunk: {e}"))).await;
+                        let _ = tx.send(Err(PumpError::transport(format!("read chunk: {e}")))).await;
                         return;
                     }
                     Ok(None) => {
@@ -530,7 +554,7 @@ async fn pump_chunked_body(
                     }
                     Err(_) => {
                         let _ = tx
-                            .send(Err("idle timeout: no chunk received in 30s".into()))
+                            .send(Err(PumpError::transport("idle timeout: no chunk received in 30s")))
                             .await;
                         return;
                     }
@@ -549,7 +573,14 @@ async fn pump_chunked_body(
             }
         }
         Err(e) => {
-            let _ = tx.send(Err(format!("finish decode: {e}"))).await;
+            let error_msg = e.to_string();
+            let pump_err = if error_msg.contains("does not open") || error_msg.contains("truncated")
+            {
+                PumpError::transport(format!("incomplete response: {e}"))
+            } else {
+                PumpError::decode(format!("finish decode: {e}"))
+            };
+            let _ = tx.send(Err(pump_err)).await;
         }
     }
 }
@@ -791,7 +822,7 @@ impl GrpcFrames {
         }
     }
 
-    fn frame(&mut self, event: Result<ResponseEvent, String>) -> Option<Frame<Bytes>> {
+    fn frame(&mut self, event: Result<ResponseEvent, PumpError>) -> Option<Frame<Bytes>> {
         if self.trailers_sent {
             return None;
         }
@@ -830,14 +861,18 @@ impl GrpcFrames {
             }
             // The head was taken before this; `End` only confirms the final chunk opened.
             Ok(ResponseEvent::Head { .. }) | Ok(ResponseEvent::End) => None,
-            Err(e) => {
+            Err(PumpError::Transport(e)) => {
                 let mut trailers = HeaderMap::new();
-                // Decode/AEAD errors (from decoder.push/finish) -> grpc-status 13 INTERNAL.
-                // Transport errors (connection cut, idle timeout) -> grpc-status 14 UNAVAILABLE.
-                let is_transport_error =
-                    e.starts_with("read chunk:") || e.starts_with("idle timeout:");
-                let status = if is_transport_error { "14" } else { "13" };
-                trailers.insert("grpc-status", HeaderValue::from_static(status));
+                trailers.insert("grpc-status", HeaderValue::from_static("14"));
+                if let Ok(msg) = HeaderValue::from_str(&format!("ohttp: {e}")) {
+                    trailers.insert("grpc-message", msg);
+                }
+                self.trailers_sent = true;
+                Some(Frame::trailers(trailers))
+            }
+            Err(PumpError::Decode(e)) => {
+                let mut trailers = HeaderMap::new();
+                trailers.insert("grpc-status", HeaderValue::from_static("13"));
                 if let Ok(msg) = HeaderValue::from_str(&format!("ohttp: {e}")) {
                     trailers.insert("grpc-message", msg);
                 }
@@ -850,7 +885,7 @@ impl GrpcFrames {
 
 /// The decoded events of one response after its head.
 type EventStream =
-    Pin<Box<dyn futures_util::Stream<Item = Result<ResponseEvent, String>> + Send + Sync>>;
+    Pin<Box<dyn futures_util::Stream<Item = Result<ResponseEvent, PumpError>> + Send + Sync>>;
 
 struct OhttpClient {
     gateway_host: String,
@@ -1348,7 +1383,7 @@ impl OhttpClient {
         .await?;
 
         // Spawn task to decode chunks and forward events with idle timeout
-        let (tx, rx) = mpsc::channel::<Result<ResponseEvent, String>>(16);
+        let (tx, rx) = mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
         let guard = this.profile.limits.response_guard();
 
         tokio::spawn(pump_chunked_body(answer.body, decoder, guard, tx));
@@ -1368,11 +1403,14 @@ impl OhttpClient {
                 }
                 (status, header_map)
             }
-            Some(Err(e)) => {
+            Some(Err(PumpError::Transport(e))) => {
+                return Err(RoundTripError::Transport(e));
+            }
+            Some(Err(PumpError::Decode(e))) => {
                 return Err(RoundTripError::Decode(e));
             }
             None => {
-                return Err(RoundTripError::Decode("no Head event received".into()));
+                return Err(RoundTripError::Transport("no Head event received".into()));
             }
             _ => {
                 return Err(RoundTripError::Decode(
