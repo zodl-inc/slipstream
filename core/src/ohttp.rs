@@ -1103,10 +1103,13 @@ impl OhttpClient {
     /// POST one sealed chunked request body to the relay. Returns buffered response.
     async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
-        let mut headers = vec![("content-type", CONTENT_TYPE_CHUNKED_REQ.to_string())];
-        if let Some(trace_id) = trace {
-            headers.push(("x-client-trace-id", trace_id));
-        }
+        let headers = self
+            .profile
+            .headers
+            .relay_post(trace.as_deref())
+            .into_iter()
+            .map(|(k, v)| (k, v))
+            .collect::<Vec<_>>();
         self.https_once(
             &self.relay,
             Method::POST,
@@ -1121,10 +1124,13 @@ impl OhttpClient {
     /// unread.
     async fn post_sealed_stream(&self, body: Vec<u8>) -> Result<RelayStream, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
-        let mut headers = vec![("content-type", CONTENT_TYPE_CHUNKED_REQ.to_string())];
-        if let Some(trace_id) = trace {
-            headers.push(("x-client-trace-id", trace_id));
-        }
+        let headers = self
+            .profile
+            .headers
+            .relay_post(trace.as_deref())
+            .into_iter()
+            .map(|(k, v)| (k, v))
+            .collect::<Vec<_>>();
         self.https_once_stream(&self.relay, Method::POST, &headers, body)
             .await
     }
