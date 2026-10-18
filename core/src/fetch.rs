@@ -457,6 +457,34 @@ async fn flush_then_fail(
     Err(err)
 }
 
+/// `pump_block_window` over the whole plan chunk (the request ends at `cursor.end`).
+#[cfg(test)]
+async fn pump_block_stream<S>(
+    stream: &mut S,
+    cursor: &mut PlanChunkCursor,
+    split_bytes: usize,
+    progress_deadline: Duration,
+    gate: &AheadGate,
+    out: &mpsc::Sender<SubChunk>,
+    progress: Option<&Progress>,
+) -> Result<PumpOutcome, SlipstreamError>
+where
+    S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
+{
+    let window_end = cursor.end;
+    pump_block_window(
+        stream,
+        cursor,
+        window_end,
+        split_bytes,
+        progress_deadline,
+        gate,
+        out,
+        progress,
+    )
+    .await
+}
+
 /// Streams one (possibly resumed) plan-chunk request into byte-budgeted
 /// sub-chunks. Generic over the message stream so hermetic tests can inject
 /// synthetic/flaky streams (production passes tonic's `Streaming`).
@@ -475,9 +503,15 @@ async fn flush_then_fail(
 /// [`flush_then_fail`]), so the worker's retry resumes after those blocks
 /// instead of downloading them again. Only a clean end that reaches
 /// `cursor.end` carries `is_last`.
-async fn pump_block_stream<S>(
+///
+/// The request ends at `window_end`, at or before the plan chunk's end: a clean end at
+/// `window_end` completes the window, and carries `is_last` only when the window reaches
+/// `cursor.end`.
+#[allow(clippy::too_many_arguments)]
+async fn pump_block_window<S>(
     stream: &mut S,
     cursor: &mut PlanChunkCursor,
+    window_end: u64,
     split_bytes: usize,
     progress_deadline: Duration,
     gate: &AheadGate,
@@ -489,7 +523,7 @@ where
 {
     let ctx = format!(
         "block stream {}..{} (plan chunk {})",
-        cursor.resume_from, cursor.end, cursor.plan_index
+        cursor.resume_from, window_end, cursor.plan_index
     );
     let mut splitter = ChunkSplitter::new(split_bytes);
     // tokio Instant (not std) so start_paused tests drive the deadline.
@@ -504,12 +538,17 @@ where
             // Clean end of stream: the tail carries `is_last` iff it completes the
             // plan chunk; a short delivery hands on what it got and fails.
             return match splitter.finish() {
-                Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(cursor.end) => {
-                    if emit_sub_chunk(cursor, blocks, bytes, true, gate, out).await {
+                Some((blocks, bytes)) if blocks.last().map(|b| b.height) == Some(window_end) => {
+                    let is_last = window_end == cursor.end;
+                    if emit_sub_chunk(cursor, blocks, bytes, is_last, gate, out).await {
                         Ok(PumpOutcome::Completed)
                     } else {
                         Ok(PumpOutcome::ConsumerGone)
                     }
+                }
+                // A window before the plan chunk's end, already handed on in full.
+                None if window_end < cursor.end && cursor.resume_from == window_end + 1 => {
+                    Ok(PumpOutcome::Completed)
                 }
                 tail => {
                     let got = tail
@@ -517,8 +556,7 @@ where
                         .and_then(|(blocks, _)| blocks.last().map(|b| b.height))
                         .unwrap_or_else(|| cursor.resume_from.saturating_sub(1));
                     let err = SlipstreamError::Transport(format!(
-                        "{ctx}: stream ended short at {got}, expected {}",
-                        cursor.end
+                        "{ctx}: stream ended short at {got}, expected {window_end}"
                     ));
                     flush_then_fail(tail, cursor, gate, out, err).await
                 }
@@ -527,7 +565,7 @@ where
         let block = match item {
             Ok(block) => block,
             Err(status) => {
-                let err = SlipstreamError::Transport(format!("{ctx}: {status}"));
+                let err = grpc::status_err(&ctx, status);
                 return flush_then_fail(splitter.finish(), cursor, gate, out, err).await;
             }
         };
@@ -562,7 +600,19 @@ where
     }
 }
 
+/// The span of the next `GetBlockRange` request after a refusal of `span` blocks with
+/// `INVALID_ARGUMENT`: half of it (rounded up), or `None` once it is a single block.
+fn split_span(span: u64) -> Option<u64> {
+    (span > 1).then(|| span.div_ceil(2))
+}
+
 /// Opens the (resume-aware) GetBlockRange stream and pumps it into sub-chunks.
+///
+/// `max_span` caps the blocks asked for in one request. An OHTTP gateway refuses a range over
+/// its span limit with `INVALID_ARGUMENT` (`split_on_invalid`): the cap is halved and the rest
+/// of the plan chunk is fetched in windows of that size; the cap stays for the worker's later
+/// chunks.
+#[allow(clippy::too_many_arguments)]
 async fn open_and_pump(
     client: &mut LwdClient,
     cursor: &mut PlanChunkCursor,
@@ -571,49 +621,78 @@ async fn open_and_pump(
     out: &mpsc::Sender<SubChunk>,
     open_timeout: Duration,
     progress: Option<&Progress>,
+    max_span: &mut u64,
+    split_on_invalid: bool,
 ) -> Result<PumpOutcome, SlipstreamError> {
-    let req = BlockRange {
-        start: Some(BlockId {
-            height: cursor.resume_from,
-            hash: vec![],
-        }),
-        end: Some(BlockId {
-            height: cursor.end,
-            hash: vec![],
-        }),
-        ..Default::default()
-    };
-    // B2 (#1755): response-headers deadline. A server that accepts the request
-    // but never answers must fail fast into the worker's retry+reconnect loop.
-    // (Longer for OHTTP gateways, whose buffered response = the whole chunk —
-    // grpc::range_open_timeout.)
-    let mut stream = tokio::time::timeout(open_timeout, client.get_block_range(req))
-        .await
-        .map_err(|_| {
-            SlipstreamError::Transport(format!(
-                "get_block_range {}..{}: timed out after {}s",
-                cursor.resume_from,
-                cursor.end,
-                open_timeout.as_secs()
-            ))
-        })?
-        .map_err(|e| {
-            SlipstreamError::Transport(format!(
-                "get_block_range {}..{}: {e}",
-                cursor.resume_from, cursor.end
-            ))
-        })?
-        .into_inner();
-    pump_block_stream(
-        &mut stream,
-        cursor,
-        plan.split_bytes,
-        plan.chunk_timeout,
-        gate,
-        out,
-        progress,
-    )
-    .await
+    loop {
+        let window_end = cursor
+            .end
+            .min(cursor.resume_from.saturating_add((*max_span).max(1) - 1));
+        let req = BlockRange {
+            start: Some(BlockId {
+                height: cursor.resume_from,
+                hash: vec![],
+            }),
+            end: Some(BlockId {
+                height: window_end,
+                hash: vec![],
+            }),
+            ..Default::default()
+        };
+        // B2 (#1755): response-headers deadline. A server that accepts the request
+        // but never answers must fail fast into the worker's retry+reconnect loop.
+        // (Longer for OHTTP gateways, whose buffered response = the whole chunk —
+        // grpc::range_open_timeout.)
+        let opened = tokio::time::timeout(open_timeout, client.get_block_range(req))
+            .await
+            .map_err(|_| {
+                SlipstreamError::Transport(format!(
+                    "get_block_range {}..{}: timed out after {}s",
+                    cursor.resume_from,
+                    window_end,
+                    open_timeout.as_secs()
+                ))
+            })?;
+        let mut stream = match opened {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                let span = window_end - cursor.resume_from + 1;
+                if split_on_invalid
+                    && status.code() == tonic::Code::InvalidArgument
+                    && let Some(smaller) = split_span(span)
+                {
+                    warn!(
+                        span,
+                        smaller,
+                        resume_from = cursor.resume_from,
+                        err = %status,
+                        "get_block_range refused as invalid — splitting the range"
+                    );
+                    *max_span = smaller;
+                    continue;
+                }
+                return Err(grpc::status_err(
+                    &format!("get_block_range {}..{}", cursor.resume_from, window_end),
+                    status,
+                ));
+            }
+        };
+        match pump_block_window(
+            &mut stream,
+            cursor,
+            window_end,
+            plan.split_bytes,
+            plan.chunk_timeout,
+            gate,
+            out,
+            progress,
+        )
+        .await?
+        {
+            PumpOutcome::Completed if window_end < cursor.end => continue,
+            outcome => return Ok(outcome),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -631,6 +710,8 @@ async fn worker(
     // with Tor on, `connect_via` routes it OHTTP-over-Tor so nothing bypasses the relay/Tor.
     let mut client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
     let open_timeout = grpc::range_open_timeout(&endpoint);
+    let split_on_invalid = crate::ohttp::relay_for(&endpoint.host).is_some();
+    let mut max_span = u64::MAX;
     loop {
         let index = next.fetch_add(1, Ordering::Relaxed);
         if index >= plan.chunk_count() {
@@ -660,17 +741,26 @@ async fn worker(
                 &out,
                 open_timeout,
                 progress.as_deref(),
+                &mut max_span,
+                split_on_invalid,
             )
             .await
             {
                 Ok(PumpOutcome::Completed) => break,
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
+                // An OHTTP policy denial or an oversized request is refused again on a retry.
+                Err(err) if !err.is_transient() && !err.counts_as_unreachable() => {
+                    return Err(err);
+                }
                 Err(err) => {
                     let failed_attempt = attempt;
                     if cursor.emitted_this_attempt {
                         attempt = 0; // progress was made — fresh retry budget
                     }
                     if attempt > plan.retries_per_chunk {
+                        if !err.counts_as_unreachable() {
+                            return Err(err);
+                        }
                         return Err(SlipstreamError::Transport(format!(
                             "plan chunk {index} ({s}..{e}) failed after {attempt} zero-progress attempts: {err}"
                         )));
@@ -1124,6 +1214,26 @@ pub async fn run_fetch(
         "fetch done"
     );
     Ok(stats)
+}
+
+#[cfg(test)]
+mod split_span_tests {
+    use super::split_span;
+
+    #[test]
+    fn a_refused_range_is_halved_down_to_one_block() {
+        assert_eq!(split_span(2_000), Some(1_000));
+        assert_eq!(split_span(1_001), Some(501));
+        assert_eq!(split_span(2), Some(1));
+        assert_eq!(split_span(1), None);
+        let mut span = 10_000u64;
+        let mut steps = 0;
+        while let Some(next) = split_span(span) {
+            span = next;
+            steps += 1;
+        }
+        assert_eq!((span, steps), (1, 14));
+    }
 }
 
 #[cfg(test)]

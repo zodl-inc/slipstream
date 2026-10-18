@@ -48,11 +48,54 @@ use zcash_primitives::transaction::Transaction;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
+    config::Endpoint,
+    connector::TorConn,
     error::SlipstreamError,
     events::Progress,
     grpc::{self, LwdClient},
     wallet_session::WalletSession,
 };
+
+/// The answer to one txid fetch: the txid, whether it was an enhancement, the result.
+type FetchResult = (
+    zcash_primitives::transaction::TxId,
+    bool,
+    Result<Option<zcash_client_backend::proto::service::RawTransaction>, SlipstreamError>,
+);
+type FetchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = FetchResult> + Send>>;
+
+/// One `GetTransaction`: over a clone of `client` (Tor off), or over a fresh isolated Tor
+/// client, at most [`ISOLATED_FETCH_CONCURRENCY`] at a time.
+fn fetch_transaction(
+    client: &LwdClient,
+    isolate: Option<&(TorConn, Endpoint, Arc<tokio::sync::Semaphore>)>,
+    txid: zcash_primitives::transaction::TxId,
+    want_enhance: bool,
+) -> FetchFuture {
+    match isolate {
+        None => {
+            let mut c = client.clone();
+            Box::pin(async move {
+                let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
+                (txid, want_enhance, raw)
+            })
+        }
+        Some((tor, endpoint, permits)) => {
+            let (tor, endpoint, permits) = (tor.clone(), endpoint.clone(), Arc::clone(permits));
+            Box::pin(async move {
+                let raw = async {
+                    let _permit = permits.acquire_owned().await.map_err(|e| {
+                        SlipstreamError::Transport(format!("isolated fetch permits: {e}"))
+                    })?;
+                    let mut c = tor.connect_isolated(&endpoint).await?;
+                    grpc::get_transaction(&mut c, *txid.as_ref()).await
+                }
+                .await;
+                (txid, want_enhance, raw)
+            })
+        }
+    }
+}
 
 /// Counters from one `run_enhancement` call.
 #[derive(Debug, Default, Clone)]
@@ -102,7 +145,32 @@ pub async fn run_enhancement(
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError> {
+    run_enhancement_isolated(session, client, network, progress, skipped_keys, None).await
+}
+
+/// Concurrent isolated Tor connections opened for wallet-identifying fetches.
+const ISOLATED_FETCH_CONCURRENCY: usize = 4;
+
+/// [`run_enhancement`], with every wallet-identifying call (each `GetTransaction`, each
+/// `GetTaddressTxids`) on its own isolated Tor circuit when `isolate` names the Tor client and
+/// the endpoint, so that the relay cannot link them to each other or to the sync traffic.
+/// `client` is used when `isolate` is `None` (Tor off).
+pub async fn run_enhancement_isolated(
+    session: &mut WalletSession,
+    client: &mut LwdClient,
+    network: crate::network::SlipstreamNetwork,
+    progress: Option<Arc<Progress>>,
+    skipped_keys: &mut HashSet<String>,
+    isolate: Option<(&TorConn, &Endpoint)>,
+) -> Result<EnhanceStats, SlipstreamError> {
     let mut stats = EnhanceStats::default();
+    let isolate = isolate.map(|(tor, endpoint)| {
+        (
+            tor.clone(),
+            endpoint.clone(),
+            Arc::new(tokio::sync::Semaphore::new(ISOLATED_FETCH_CONCURRENCY)),
+        )
+    });
 
     for round in 0..3_u32 {
         let requests = session
@@ -126,36 +194,18 @@ pub async fn run_enhancement(
         // future upgrade if unbounded concurrency ever needs capping. DB applies
         // are serial below — `session` is never held across an await point.
         //
-        // Each future yields `(TxId, bool, Result<Option<RawTransaction>, SlipstreamError>)`.
-        // The two arms of the match produce different anonymous `async` block types, so
-        // we box them to a uniform `Pin<Box<dyn Future<Output = ...> + Send>>`.
-        type FetchResult = (
-            zcash_primitives::transaction::TxId,
-            bool,
-            Result<Option<zcash_client_backend::proto::service::RawTransaction>, SlipstreamError>,
-        );
-        type BoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = FetchResult> + Send>>;
-
+        // Each future yields a `FetchResult`, boxed (`fetch_transaction`). With Tor on,
+        // each fetch opens its own isolated client, bounded by the semaphore.
         let mut address_reqs: Vec<TransactionsInvolvingAddress> = Vec::new();
-        let mut pending: FuturesUnordered<BoxFut> = FuturesUnordered::new();
+        let mut pending: FuturesUnordered<FetchFuture> = FuturesUnordered::new();
 
         for req in requests {
             match req {
                 TransactionDataRequest::GetStatus(txid) => {
-                    let mut c = client.clone();
-                    let fut: BoxFut = Box::pin(async move {
-                        let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
-                        (txid, /*want_enhance=*/ false, raw)
-                    });
-                    pending.push(fut);
+                    pending.push(fetch_transaction(client, isolate.as_ref(), txid, false));
                 }
                 TransactionDataRequest::Enhancement(txid) => {
-                    let mut c = client.clone();
-                    let fut: BoxFut = Box::pin(async move {
-                        let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
-                        (txid, /*want_enhance=*/ true, raw)
-                    });
-                    pending.push(fut);
+                    pending.push(fetch_transaction(client, isolate.as_ref(), txid, true));
                 }
                 TransactionDataRequest::TransactionsInvolvingAddress(tia) => {
                     address_reqs.push(tia);
@@ -197,9 +247,17 @@ pub async fn run_enhancement(
         // ── Phase 2: serial address-window requests ────────────────────────────
         let address_started = std::time::Instant::now();
         for tia in address_reqs {
+            let mut isolated;
+            let address_client = match &isolate {
+                Some((tor, endpoint, _)) => {
+                    isolated = tor.connect_isolated(endpoint).await?;
+                    &mut isolated
+                }
+                None => &mut *client,
+            };
             apply_address_request(
                 session,
-                client,
+                address_client,
                 &network,
                 tia,
                 &mut stats,
@@ -435,7 +493,13 @@ async fn apply_address_request(
 
     let raw_txs = grpc::get_taddress_txids(client, filter, progress)
         .await
-        .map_err(|e| SlipstreamError::Wallet(format!("get_taddress_txids: {e}")))?;
+        .map_err(|e| {
+            if e.counts_as_unreachable() {
+                SlipstreamError::Wallet(format!("get_taddress_txids: {e}"))
+            } else {
+                e
+            }
+        })?;
     if let Some(p) = progress {
         p.touch(); // liveness: the address-history answer is forward progress
     }

@@ -36,11 +36,21 @@ pub enum SlipstreamError {
     #[error("misbehaving server (invalid or out-of-range data in response)")]
     MisbehavingServer,
 
-    /// Policy denial (inner 403, outer 429): the server or gateway refuses to
-    /// serve the request, not due to a transient condition. This is non-retryable
-    /// and must not trigger failover or contribute to the unreachable count.
+    /// The OHTTP gateway refused this operation by policy (an inner 403). Not a sign that the
+    /// server is unreachable: not retried, and never counted towards `EndpointUnreachable`.
     #[error("policy denied: {0}")]
     PolicyDenied(String),
+
+    /// The OHTTP relay asked for a pause (an outer 429), or a request was held back while that
+    /// pause runs. A back-off signal: retried with the normal back-off, but never counted
+    /// towards `EndpointUnreachable` nor a reason to switch servers.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+
+    /// The request is larger than the OHTTP relay and gateway accept (an outer 413, or a sealed
+    /// request over 10 MiB that was not sent). Not retried.
+    #[error("request too large: {0}")]
+    RequestTooLarge(String),
 
     #[error("engine is stopped")]
     Stopped,
@@ -86,11 +96,28 @@ impl SlipstreamError {
     /// - `Discontinuity`   → false     (fetch continuity bug; retry would loop)
     /// - `MisbehavingServer` → false   (bad proto / decode error; not a transport transient)
     /// - `PolicyDenied`    → false     (server policy refusal; not a transport issue)
+    /// - `RateLimited`     → **true**  (back off and retry; not counted as unreachable)
+    /// - `RequestTooLarge` → false     (the same request is refused again)
     /// - `Stopped`         → false     (engine lifecycle; not retryable)
     /// - `WireCollapse`    → false     (handled by the v0.7 failover loop — the generic
     ///   transient-reconnect path would dial the SAME collapsed server again)
     pub fn is_transient(&self) -> bool {
-        matches!(self, SlipstreamError::Transport(_))
+        matches!(
+            self,
+            SlipstreamError::Transport(_) | SlipstreamError::RateLimited(_)
+        )
+    }
+
+    /// Whether this failure says the server could not be reached, as opposed to an OHTTP policy
+    /// denial, a rate limit or an oversized request: only those count towards
+    /// `EndpointUnreachable` (and so towards a server switch).
+    pub fn counts_as_unreachable(&self) -> bool {
+        !matches!(
+            self,
+            SlipstreamError::PolicyDenied(_)
+                | SlipstreamError::RateLimited(_)
+                | SlipstreamError::RequestTooLarge(_)
+        )
     }
 }
 
@@ -162,5 +189,19 @@ mod tests {
     #[test]
     fn stopped_is_not_transient() {
         assert!(!SlipstreamError::Stopped.is_transient());
+    }
+
+    #[test]
+    fn ohttp_outcomes_are_not_unreachable() {
+        let rate = SlipstreamError::RateLimited("relay/gateway HTTP 429".into());
+        assert!(rate.is_transient());
+        assert!(!rate.counts_as_unreachable());
+        let denied = SlipstreamError::PolicyDenied("inner 403".into());
+        assert!(!denied.is_transient());
+        assert!(!denied.counts_as_unreachable());
+        let big = SlipstreamError::RequestTooLarge("413".into());
+        assert!(!big.is_transient());
+        assert!(!big.counts_as_unreachable());
+        assert!(SlipstreamError::Transport("timeout".into()).counts_as_unreachable());
     }
 }

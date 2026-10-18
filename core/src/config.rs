@@ -26,6 +26,29 @@ use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 use crate::error::SlipstreamError;
 use crate::network::SlipstreamNetwork;
 
+/// An OHTTP gateway serves one network: a wallet on another network must not use it (its
+/// calls would reach the wrong chain, under a key configuration signed for that chain). Hosts
+/// that are not gateways are not checked here.
+fn check_gateway_network(host: &str, network: SlipstreamNetwork) -> Result<(), SlipstreamError> {
+    if crate::ohttp::relay_for(host).is_none() {
+        return Ok(());
+    }
+    let gateway = crate::ohttp::gateway_network(host).map_err(SlipstreamError::Config)?;
+    let wallet = match zcash_protocol::consensus::Parameters::network_type(&network) {
+        zcash_protocol::consensus::NetworkType::Main => Some(zodl_ohttp_client::Network::Mainnet),
+        zcash_protocol::consensus::NetworkType::Test => Some(zodl_ohttp_client::Network::Testnet),
+        zcash_protocol::consensus::NetworkType::Regtest => None,
+    };
+    if wallet == Some(gateway) {
+        Ok(())
+    } else {
+        Err(SlipstreamError::Config(format!(
+            "OHTTP gateway {host} serves {}, not this wallet's network",
+            gateway.as_str()
+        )))
+    }
+}
+
 /// lightwalletd endpoint.
 // Deliberately exhaustive: an endpoint is exactly (host, port, tls).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -267,6 +290,9 @@ impl EngineConfig {
                 ));
             }
         }
+        for ep in std::iter::once(&self.endpoint).chain(&self.alternate_endpoints) {
+            check_gateway_network(&ep.host, self.network)?;
+        }
         if self.fetch_streams == 0 {
             return Err(SlipstreamError::Config("fetch_streams must be >= 1".into()));
         }
@@ -500,6 +526,53 @@ mod tests {
         ] {
             assert!(Endpoint::parse_uri(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn a_gateway_must_serve_the_wallet_network() {
+        let gateway = |host: &str| Endpoint {
+            host: host.into(),
+            port: 443,
+            tls: true,
+        };
+        let main = |ep: Endpoint| {
+            EngineConfig::new(
+                crate::Network::MainNetwork,
+                PathBuf::from("/tmp/data.db"),
+                ep,
+            )
+        };
+        let test = |ep: Endpoint| {
+            EngineConfig::new(
+                crate::Network::TestNetwork,
+                PathBuf::from("/tmp/data.db"),
+                ep,
+            )
+        };
+        assert!(main(gateway("ohttp-gateway.example")).validate().is_ok());
+        assert!(
+            test(gateway("ohttp-gateway-testnet.example"))
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            test(gateway("ohttp-gateway.example")).validate(),
+            Err(SlipstreamError::Config(m)) if m.contains("mainnet")
+        ));
+        assert!(matches!(
+            main(gateway("ohttp-gateway-testnet.example")).validate(),
+            Err(SlipstreamError::Config(_))
+        ));
+        // An alternate gateway on the other network is refused as well.
+        let mut c = main(gateway("ohttp-gateway.example"));
+        c.alternate_endpoints = vec![gateway("ohttp-gateway-testnet.example")];
+        assert!(matches!(c.validate(), Err(SlipstreamError::Config(_))));
+        // Clearnet servers are not checked.
+        assert!(
+            test(gateway("lightwalletd.testnet.example"))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]

@@ -506,7 +506,9 @@ async fn follow_loop(
         let observed = match probe_tip(&config.engine, tor_conn).await {
             Ok(t) => t,
             Err(err) if err.is_transient() => {
-                failures.probe_failed();
+                if err.counts_as_unreachable() {
+                    failures.probe_failed();
+                }
                 // The tip check could not reach the server, so no download is failing
                 // (see `Progress::note_attempt_failed`).
                 reporter.progress.note_attempt_failed();
@@ -543,7 +545,7 @@ async fn follow_loop(
                 continue;
             }
             Err(err) => {
-                if !matches!(err, SlipstreamError::PolicyDenied(_)) {
+                if err.counts_as_unreachable() {
                     failures.probe_failed();
                 }
                 // The tip check could not reach the server, so no download is failing
@@ -609,7 +611,7 @@ async fn follow_loop(
                 });
             }
             Err(err) => {
-                if !matches!(err, SlipstreamError::PolicyDenied(_)) {
+                if err.counts_as_unreachable() {
                     failures.catchup_failed();
                 }
                 // After N consecutive failures, surface Error(3) so hosts can react.

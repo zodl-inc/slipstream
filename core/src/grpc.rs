@@ -76,11 +76,25 @@ fn transport_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Transport(format!("{context}: {e}"))
 }
 
-fn grpc_err(context: &str, status: tonic::Status) -> SlipstreamError {
-    if status.code() == tonic::Code::PermissionDenied {
-        SlipstreamError::PolicyDenied(format!("{context}: inner 403 (PERMISSION_DENIED)"))
-    } else {
-        transport_err(context, status)
+/// A gRPC status as an engine error. The OHTTP connector marks its own outcomes (an inner
+/// 403, a relay rate limit, an oversized request) in the status metadata; every other status is
+/// a transport error, as before.
+pub(crate) fn status_err(context: &str, status: tonic::Status) -> SlipstreamError {
+    let outcome = status
+        .metadata()
+        .get(crate::ohttp::OHTTP_OUTCOME_HEADER)
+        .and_then(|v| v.to_str().ok());
+    match outcome {
+        Some(crate::ohttp::OUTCOME_POLICY_DENIED) => {
+            SlipstreamError::PolicyDenied(format!("{context}: {status}"))
+        }
+        Some(crate::ohttp::OUTCOME_RATE_LIMITED) => {
+            SlipstreamError::RateLimited(format!("{context}: {status}"))
+        }
+        Some(crate::ohttp::OUTCOME_TOO_LARGE) => {
+            SlipstreamError::RequestTooLarge(format!("{context}: {status}"))
+        }
+        _ => transport_err(context, status),
     }
 }
 
@@ -167,7 +181,7 @@ async fn with_unary_timeout<T>(
 ) -> Result<T, SlipstreamError> {
     match tokio::time::timeout(UNARY_TIMEOUT, fut).await {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(status)) => Err(grpc_err(context, status)),
+        Ok(Err(status)) => Err(status_err(context, status)),
         Err(_) => Err(SlipstreamError::Transport(format!(
             "{context}: timed out after {}s",
             UNARY_TIMEOUT.as_secs()
@@ -214,8 +228,7 @@ where
 {
     let mut collected = Vec::new();
     while let Some(item) = next_with_idle_timeout(stream, context).await? {
-        let message =
-            item.map_err(|e| SlipstreamError::Transport(format!("{stream_label}: {e}")))?;
+        let message = item.map_err(|e| status_err(stream_label, e))?;
         if let Some(p) = progress {
             p.touch(); // liveness: a message from the server arrived
         }
@@ -426,7 +439,7 @@ pub async fn get_transaction(
             {
                 Ok(None)
             } else {
-                Err(transport_err("get_transaction", status))
+                Err(status_err("get_transaction", status))
             }
         }
     }
@@ -470,7 +483,7 @@ pub async fn open_mempool_stream(
         .get_mempool_stream(Empty {})
         .await
         .map(tonic::Response::into_inner)
-        .map_err(|status| SlipstreamError::Transport(format!("get_mempool_stream: {status}")))
+        .map_err(|status| status_err("get_mempool_stream", status))
 }
 
 /// Collect UTXOs for the given transparent addresses from `start_height`; every UTXO received

@@ -30,7 +30,7 @@ use crate::{
     chunk::chunk_queue,
     config::EngineConfig,
     connector::{ConnPurpose, TorConn, connect_via},
-    enhance::{EnhanceStats, run_enhancement},
+    enhance::{EnhanceStats, run_enhancement_isolated},
     error::SlipstreamError,
     events::Progress,
     fetch::{FetchPlan, FetchStats, run_fetch},
@@ -741,12 +741,13 @@ pub async fn run_to_completion(
             let enhance_result = async {
                 let mut enhance_client =
                     connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-                run_enhancement(
+                run_enhancement_isolated(
                     session,
                     &mut enhance_client,
                     config.network,
                     progress.clone(),
                     skipped_keys,
+                    tor.map(|t| (t, &config.endpoint)),
                 )
                 .await
             }

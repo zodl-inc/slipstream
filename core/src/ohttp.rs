@@ -71,9 +71,9 @@ use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
 use zodl_ohttp_client::{
-    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseDecoder, ClientProfile, ClientTrace, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
-    KeyConfig, ResponseEvent, SizeGuard, check_size, encapsulate_chunked_request,
+    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseDecoder, ClientProfile,
+    ClientTrace, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, KeyConfig, Network, NetworkRule,
+    RelayBackoff, ResponseEvent, SizeGuard, check_size, encapsulate_chunked_request,
     signed_config_url, verify_signed_config,
 };
 
@@ -87,6 +87,38 @@ const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
 /// Idle timeout between chunks in a streaming OHTTP response. A healthy stream delivers chunks
 /// continuously; 30 s of silence means the connection is dead.
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound on opening a direct TCP connection to the relay.
+const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Longest a pooled relay connection is reused with Tor off: connection lifetime is linkable
+/// metadata the relay sees, so a long-lived wallet process moves to a fresh connection now and
+/// then. In-flight requests finish on the old one.
+const H2_MAX_CONNECTION_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// Trailers-only metadata the in-process server attaches to a gRPC error so that the engine can
+/// tell an OHTTP outcome from an unreachable server (see `grpc::status_err`). It never leaves
+/// the process.
+pub(crate) const OHTTP_OUTCOME_HEADER: &str = "x-ohttp-outcome";
+/// An inner 403: the gateway refused this operation by policy.
+pub(crate) const OUTCOME_POLICY_DENIED: &str = "policy-denied";
+/// An outer 429, or a request held back while the relay's `Retry-After` pause runs.
+pub(crate) const OUTCOME_RATE_LIMITED: &str = "rate-limited";
+/// An outer 413, or a sealed request over 10 MiB that was not sent.
+pub(crate) const OUTCOME_TOO_LARGE: &str = "too-large";
+
+/// Verified key configurations shared by every connection to the same gateway through the same
+/// relay, so that a new connection (a tip probe, a fetch worker, an isolated Tor client) does
+/// not fetch the signed configuration again while it is valid. Entries end at `not_after`.
+static SHARED_KEYS: OnceLock<std::sync::Mutex<HashMap<(String, String), CachedKey>>> =
+    OnceLock::new();
+
+fn shared_keys() -> std::sync::MutexGuard<'static, HashMap<(String, String), CachedKey>> {
+    SHARED_KEYS
+        .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
 
 /// Hostname prefix that marks an endpoint as an OHTTP gateway (mirrors the Kotlin SDK).
 pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
@@ -255,9 +287,18 @@ impl Dialer {
     async fn dial(&self, host: &str, port: u16) -> Result<BoxedIo, String> {
         match self {
             Dialer::Direct => {
-                let tcp = tokio::net::TcpStream::connect((host, port))
-                    .await
-                    .map_err(|e| format!("connect {host}: {e}"))?;
+                let tcp = tokio::time::timeout(
+                    DIRECT_DIAL_TIMEOUT,
+                    tokio::net::TcpStream::connect((host, port)),
+                )
+                .await
+                .map_err(|_| {
+                    format!(
+                        "connect {host}: exceeded {}s",
+                        DIRECT_DIAL_TIMEOUT.as_secs()
+                    )
+                })?
+                .map_err(|e| format!("connect {host}: {e}"))?;
                 let _ = tcp.set_nodelay(true);
                 Ok(Box::new(tcp))
             }
@@ -397,19 +438,24 @@ fn unix_now() -> Result<u64, String> {
         .map_err(|e| format!("system time: {e}"))
 }
 
+/// The network a gateway serves, by exact host: the envelope must name it, and the wallet using
+/// the gateway must be on it (`EngineConfig::validate`).
+pub(crate) fn gateway_network(gateway_host: &str) -> Result<Network, String> {
+    NetworkRule::KnownHosts
+        .network_for(gateway_host)
+        .map_err(|e| e.to_string())
+}
+
 /// Verify a signed key-configuration envelope for `gateway_host` under `profile` (network from
-/// the host, pinned signing key, validity window at `now`, signature) and pick the key out of it.
-/// Pure: the fetch and the cache are the caller's.
+/// the host's exact name, pinned signing key, validity window at `now`, signature) and pick the
+/// key out of it. Pure: the fetch and the cache are the caller's.
 fn open_signed_keys(
     profile: &ClientProfile,
     json: &[u8],
     gateway_host: &str,
     now: u64,
 ) -> Result<CachedKey, String> {
-    let network = profile
-        .network_rule
-        .network_for(gateway_host)
-        .map_err(|e| e.to_string())?;
+    let network = gateway_network(gateway_host)?;
     let keys = verify_signed_config(json, network, now, &profile.signed_config)
         .map_err(|e| e.to_string())?;
     let config = KeyConfig::select_with(&keys.document, &profile.key_selection)
@@ -460,21 +506,11 @@ struct RelayStream {
     body: BoxBody<Bytes, hyper::Error>,
 }
 
-/// Longest `Retry-After` honoured on an outer 429: a relay asking for more is capped, and the
-/// session's own retry schedule takes over after it.
-const MAX_RETRY_AFTER: Duration = Duration::from_secs(120);
-
 /// The `Retry-After` of an outer answer as delay-seconds (RFC 9110, section 10.2.3), capped at
-/// [`MAX_RETRY_AFTER`]. The HTTP-date form is not used by the relays and is ignored.
+/// 120 s (`zodl_ohttp_client::MAX_RETRY_AFTER`). The HTTP-date form is not used by the relays
+/// and is ignored.
 fn retry_after(headers: &http::HeaderMap) -> Option<Duration> {
-    let secs: u64 = headers
-        .get(header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
-    Some(Duration::from_secs(secs).min(MAX_RETRY_AFTER))
+    zodl_ohttp_client::retry_after_delay(headers.get(header::RETRY_AFTER)?.to_str().ok())
 }
 
 /// Error from the chunked body pump: transport (network) or decode (BHTTP format).
@@ -492,12 +528,6 @@ impl PumpError {
 
     fn decode(msg: impl Into<String>) -> Self {
         PumpError::Decode(msg.into())
-    }
-
-    fn into_message(self) -> String {
-        match self {
-            PumpError::Transport(s) | PumpError::Decode(s) => s,
-        }
     }
 }
 
@@ -572,15 +602,17 @@ async fn pump_chunked_body(
                 }
             }
         }
+        Err(e @ zodl_ohttp_client::Error::Truncated) => {
+            let _ = tx
+                .send(Err(PumpError::transport(format!(
+                    "incomplete response: {e}"
+                ))))
+                .await;
+        }
         Err(e) => {
-            let error_msg = e.to_string();
-            let pump_err = if error_msg.contains("does not open") || error_msg.contains("truncated")
-            {
-                PumpError::transport(format!("incomplete response: {e}"))
-            } else {
-                PumpError::decode(format!("finish decode: {e}"))
-            };
-            let _ = tx.send(Err(pump_err)).await;
+            let _ = tx
+                .send(Err(PumpError::decode(format!("finish decode: {e}"))))
+                .await;
         }
     }
 }
@@ -658,15 +690,32 @@ impl HttpsError {
     }
 }
 
-/// Why a whole OHTTP round trip failed; the gRPC bridge maps the three differently.
+/// Why a whole OHTTP round trip failed; the gRPC bridge maps each differently.
 #[derive(Debug)]
 enum RoundTripError {
-    /// Key fetch, relay, gateway or decryption failed (gRPC `UNAVAILABLE`).
+    /// Key fetch, relay, gateway or the exchange broke off (gRPC `UNAVAILABLE`).
     Transport(String),
-    /// The decrypted answer is not a Binary HTTP response (gRPC `INTERNAL`).
+    /// The answer does not authenticate or is not a Binary HTTP response (gRPC `INTERNAL`).
     Decode(String),
-    /// Policy denial: outer 429, non-retryable (SlipstreamError::PolicyDenied).
-    PolicyDenied(String),
+    /// An outer 429, or not sent because the relay's `Retry-After` pause is still running: a
+    /// back-off signal, not an unreachable gateway (gRPC `UNAVAILABLE`, marked rate-limited).
+    RateLimited {
+        detail: String,
+        retry_after: Option<Duration>,
+    },
+    /// An outer 413, or a sealed request over 10 MiB refused before it was sent (gRPC
+    /// `RESOURCE_EXHAUSTED`, not retried).
+    TooLarge(String),
+}
+
+impl RoundTripError {
+    fn into_message(self) -> String {
+        match self {
+            RoundTripError::Transport(e) | RoundTripError::TooLarge(e) => e,
+            RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
+            RoundTripError::RateLimited { detail, .. } => detail,
+        }
+    }
 }
 
 /// Runs `attempt`, and once more when its answer is the gateway's freshness refusal (an inner
@@ -738,7 +787,7 @@ where
             let (sealed, opener) = encapsulate_chunked_request(&key, &encoded)
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
             check_size(sealed.len(), Some(GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES))
-                .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+                .map_err(|e| RoundTripError::TooLarge(format!("sealed request not sent: {e}")))?;
             // Signal dispatch right before posting the sealed request to the relay
             if !dispatched {
                 on_dispatch();
@@ -766,25 +815,17 @@ where
             continue;
         }
 
-        // A rate-limited client waits as long as the relay asks (capped) before the error reaches
-        // the caller's retry schedule, so its next attempt does not land in the same window
-        // (ZIP: an outer 429 is a back-off signal, not an unreachable Gateway).
-        if status == StatusCode::TOO_MANY_REQUESTS
-            && let Some(wait) = answer.retry_after()
-        {
-            tracing::warn!(
-                wait_secs = wait.as_secs(),
-                "ohttp: relay rate limit (429); waiting as asked"
-            );
-            tokio::time::sleep(wait).await;
-        }
-
         if !status.is_success() {
             let msg = format!("relay/gateway HTTP {status}: {}", answer.detail());
-            return Err(if status == StatusCode::TOO_MANY_REQUESTS {
-                RoundTripError::PolicyDenied(msg)
-            } else {
-                RoundTripError::Transport(msg)
+            return Err(match status {
+                // A back-off signal, not an unreachable gateway: the caller records the pause
+                // for the relay and every later request through it waits for it.
+                StatusCode::TOO_MANY_REQUESTS => RoundTripError::RateLimited {
+                    detail: msg,
+                    retry_after: answer.retry_after(),
+                },
+                StatusCode::PAYLOAD_TOO_LARGE => RoundTripError::TooLarge(msg),
+                _ => RoundTripError::Transport(msg),
             });
         }
 
@@ -810,11 +851,15 @@ where
 /// and an empty trailer section. tonic requires a `grpc-status` trailer on every stream that
 /// was not trailers-only, so those fields are moved into the one trailers frame this emits.
 /// A response without a status anywhere ends with `INTERNAL`, a decode failure with
-/// `INTERNAL`, and a transport failure (read error, idle timeout) with `UNAVAILABLE`. Nothing
-/// follows the trailers frame.
+/// `INTERNAL`, and a transport failure (read error, idle timeout, a body that ends before the
+/// final chunk) with `UNAVAILABLE`. The trailers are held until the final chunk has opened
+/// (`End`): a failure after them, in a later chunk or in the padding, still ends the call with
+/// its error instead of the gateway's status. Nothing follows the trailers frame.
 struct GrpcFrames {
     /// The `grpc-*` fields taken out of the response headers.
     header_fields: HeaderMap,
+    /// The trailers received, waiting for the final chunk.
+    pending: Option<HeaderMap>,
     trailers_sent: bool,
 }
 
@@ -822,8 +867,42 @@ impl GrpcFrames {
     fn new(header_fields: HeaderMap) -> Self {
         Self {
             header_fields,
+            pending: None,
             trailers_sent: false,
         }
+    }
+
+    /// The trailers to deliver: the trailer section's fields, else the header section's
+    /// `grpc-*` fields, else `INTERNAL`.
+    fn status_trailers(&mut self, fields: Vec<(String, String)>) -> HeaderMap {
+        let mut trailers = HeaderMap::new();
+        for (k, v) in fields {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_bytes(v.as_bytes()),
+            ) {
+                trailers.insert(name, value);
+            }
+        }
+        if !trailers.contains_key("grpc-status") {
+            let mut name = None;
+            for (n, value) in self.header_fields.drain() {
+                if n.is_some() {
+                    name = n;
+                }
+                if let Some(n) = name.clone() {
+                    trailers.append(n, value);
+                }
+            }
+        }
+        if !trailers.contains_key("grpc-status") {
+            trailers.insert("grpc-status", HeaderValue::from_static("13"));
+            trailers.insert(
+                "grpc-message",
+                HeaderValue::from_static("ohttp: gateway response without grpc-status"),
+            );
+        }
+        trailers
     }
 
     fn frame(&mut self, event: Result<ResponseEvent, PumpError>) -> Option<Frame<Bytes>> {
@@ -833,38 +912,22 @@ impl GrpcFrames {
         match event {
             Ok(ResponseEvent::Data(bytes)) => Some(Frame::data(Bytes::from(bytes))),
             Ok(ResponseEvent::Trailers(fields)) => {
-                let mut trailers = HeaderMap::new();
-                for (k, v) in fields {
-                    if let (Ok(name), Ok(value)) = (
-                        HeaderName::from_bytes(k.as_bytes()),
-                        HeaderValue::from_bytes(v.as_bytes()),
-                    ) {
-                        trailers.insert(name, value);
-                    }
+                if self.pending.is_none() {
+                    self.pending = Some(self.status_trailers(fields));
                 }
-                if !trailers.contains_key("grpc-status") {
-                    let mut name = None;
-                    for (n, value) in self.header_fields.drain() {
-                        if n.is_some() {
-                            name = n;
-                        }
-                        if let Some(n) = name.clone() {
-                            trailers.append(n, value);
-                        }
-                    }
-                }
-                if !trailers.contains_key("grpc-status") {
-                    trailers.insert("grpc-status", HeaderValue::from_static("13"));
-                    trailers.insert(
-                        "grpc-message",
-                        HeaderValue::from_static("ohttp: gateway response without grpc-status"),
-                    );
-                }
+                None
+            }
+            // The final chunk opened and the message ended in it: deliver the status.
+            Ok(ResponseEvent::End) => {
+                let trailers = match self.pending.take() {
+                    Some(trailers) => trailers,
+                    None => self.status_trailers(Vec::new()),
+                };
                 self.trailers_sent = true;
                 Some(Frame::trailers(trailers))
             }
-            // The head was taken before this; `End` only confirms the final chunk opened.
-            Ok(ResponseEvent::Head { .. }) | Ok(ResponseEvent::End) => None,
+            // The head was taken before this.
+            Ok(ResponseEvent::Head { .. }) => None,
             Err(PumpError::Transport(e)) => {
                 let mut trailers = HeaderMap::new();
                 trailers.insert("grpc-status", HeaderValue::from_static("14"));
@@ -902,7 +965,8 @@ struct OhttpClient {
     /// TCP+TLS connection per call is both slow and, on the Android emulator's user-mode network
     /// stack, a reliable way to crash qemu under connection churn. Over Tor this matters even
     /// more: every new connection would be a new circuit build.
-    h2_pool: Mutex<HashMap<String, http2::SendRequest<Full<Bytes>>>>,
+    /// Each with the time it was opened, see [`H2_MAX_CONNECTION_AGE`].
+    h2_pool: Mutex<HashMap<String, (http2::SendRequest<Full<Bytes>>, std::time::Instant)>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
     client_trace: Option<ClientTrace>,
     /// The shared core's options for this client (`SLIPSTREAM` for gRPC, `SLIPSTREAM_HTTP` for
@@ -971,8 +1035,9 @@ impl OhttpClient {
         let key = format!("{}:{}", target.host, target.port);
         {
             let pool = self.h2_pool.lock().await;
-            if let Some(s) = pool.get(&key)
+            if let Some((s, opened)) = pool.get(&key)
                 && !s.is_closed()
+                && (self.dialer.is_tor() || opened.elapsed() < H2_MAX_CONNECTION_AGE)
             {
                 return Ok(Some(s.clone()));
             }
@@ -993,7 +1058,7 @@ impl OhttpClient {
         });
         tracing::info!(host = %target.host, via_tor = self.dialer.is_tor(), "ohttp: opened pooled h2 connection");
         let mut pool = self.h2_pool.lock().await;
-        pool.insert(key, sender.clone());
+        pool.insert(key, (sender.clone(), std::time::Instant::now()));
         Ok(Some(sender))
     }
 
@@ -1078,7 +1143,19 @@ impl OhttpClient {
                 .map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
         }
         let mut bytes = Vec::new();
-        while let Some(frame) = body.frame().await {
+        loop {
+            let Some(frame) = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body.frame())
+                .await
+                .map_err(|_| {
+                    HttpsError::Other(format!(
+                        "read {}: idle timeout ({}s without data)",
+                        target.host,
+                        CHUNK_IDLE_TIMEOUT.as_secs()
+                    ))
+                })?
+            else {
+                break;
+            };
             let frame =
                 frame.map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
             if let Ok(data) = frame.into_data() {
@@ -1103,13 +1180,7 @@ impl OhttpClient {
     /// POST one sealed chunked request body to the relay. Returns buffered response.
     async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
-        let headers = self
-            .profile
-            .headers
-            .relay_post(trace.as_deref())
-            .into_iter()
-            .map(|(k, v)| (k, v))
-            .collect::<Vec<_>>();
+        let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once(
             &self.relay,
             Method::POST,
@@ -1124,13 +1195,7 @@ impl OhttpClient {
     /// unread.
     async fn post_sealed_stream(&self, body: Vec<u8>) -> Result<RelayStream, HttpsError> {
         let trace = self.client_trace.as_ref().map(|t| t.next());
-        let headers = self
-            .profile
-            .headers
-            .relay_post(trace.as_deref())
-            .into_iter()
-            .map(|(k, v)| (k, v))
-            .collect::<Vec<_>>();
+        let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once_stream(&self.relay, Method::POST, &headers, body)
             .await
     }
@@ -1194,25 +1259,36 @@ impl OhttpClient {
     }
 
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
-        // C-01 fix: Check cache expiry based on not_after timestamp
+        let shared_key = (self.gateway_host.clone(), self.relay_url.clone());
         {
             let mut cached = self.key_config.lock().await;
-            if !refresh && let Some(k) = cached.as_ref() {
+            if !refresh {
                 let now = unix_now()?;
-                if self.profile.cache.is_fresh(Some(k.not_after), now) {
+                if let Some(k) = cached.as_ref() {
+                    if self.profile.cache.is_fresh(Some(k.not_after), now) {
+                        return Ok(k.config);
+                    }
+                    tracing::info!(
+                        gateway = %self.gateway_host,
+                        not_after = k.not_after,
+                        now,
+                        "ohttp: cached key config expired, refreshing"
+                    );
+                }
+                // Another connection to this gateway through this relay may hold a valid one.
+                let shared = shared_keys().get(&shared_key).copied();
+                if let Some(k) = shared
+                    && self.profile.cache.is_fresh(Some(k.not_after), now)
+                {
+                    *cached = Some(k);
                     return Ok(k.config);
                 }
-                tracing::info!(
-                    gateway = %self.gateway_host,
-                    not_after = k.not_after,
-                    now,
-                    "ohttp: cached key config expired, refreshing"
-                );
             }
             // The kept key is discarded before the fetch that replaces it, so a failed fetch
             // leaves none to be used next.
             if self.profile.cache.drop_before_refetch {
                 *cached = None;
+                shared_keys().remove(&shared_key);
             }
         }
 
@@ -1259,7 +1335,40 @@ impl OhttpClient {
             "ohttp: signed key config loaded and verified"
         );
         *self.key_config.lock().await = Some(cfg);
+        shared_keys().insert(shared_key, cfg);
         Ok(cfg.config)
+    }
+
+    /// Fails at once, without posting, while the relay's `Retry-After` pause runs.
+    fn check_relay_pause(&self) -> Result<(), RoundTripError> {
+        match RelayBackoff::global().remaining(&self.relay_url) {
+            Some(wait) => Err(RoundTripError::RateLimited {
+                detail: format!(
+                    "relay rate limit: not sent, {}s of the relay's pause left",
+                    wait.as_secs().max(1)
+                ),
+                retry_after: None,
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Records the pause an outer 429 asked for, so that every later request through this relay
+    /// waits for it.
+    fn note_relay_pause<T>(&self, result: Result<T, RoundTripError>) -> Result<T, RoundTripError> {
+        if let Err(RoundTripError::RateLimited {
+            retry_after: Some(wait),
+            ..
+        }) = &result
+        {
+            tracing::warn!(
+                wait_secs = wait.as_secs(),
+                relay = %self.relay_url,
+                "ohttp: relay rate limit (429); holding requests through it"
+            );
+            RelayBackoff::global().note(&self.relay_url, *wait);
+        }
+        result
     }
 
     /// [`Self::round_trip_once`], sent once more (sealed afresh) when the gateway refused it
@@ -1294,29 +1403,31 @@ impl OhttpClient {
     where
         D: Fn(),
     {
+        self.check_relay_pause()?;
         let key = self
             .key_config(false)
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        let (mut decoder, answer) = run_exchange_chunked(
-            key,
-            request,
-            move |body| this.post_sealed(body),
-            move || this.key_config(true),
-            on_dispatch,
-        )
-        .await?;
+        let (mut decoder, answer) = self.note_relay_pause(
+            run_exchange_chunked(
+                key,
+                request,
+                move |body| this.post_sealed(body),
+                move || this.key_config(true),
+                on_dispatch,
+            )
+            .await,
+        )?;
 
         // Decode the buffered response body through the chunked decoder
         let mut events = decoder
             .push(&answer.body)
             .map_err(|e| RoundTripError::Decode(e.to_string()))?;
-        events.extend(
-            decoder
-                .finish()
-                .map_err(|e| RoundTripError::Decode(e.to_string()))?,
-        );
+        events.extend(decoder.finish().map_err(|e| match e {
+            zodl_ohttp_client::Error::Truncated => RoundTripError::Transport(e.to_string()),
+            e => RoundTripError::Decode(e.to_string()),
+        })?);
 
         // Collect events into a Response and convert to BhttpResponse
         let response = zodl_ohttp_client::collect_response(events)
@@ -1378,19 +1489,22 @@ impl OhttpClient {
         use futures_util::stream::StreamExt as _;
         use tokio::sync::mpsc;
 
+        self.check_relay_pause()?;
         let key = self
             .key_config(false)
             .await
             .map_err(RoundTripError::Transport)?;
         let this = self;
-        let (decoder, answer) = run_exchange_chunked(
-            key,
-            &request,
-            move |body| this.post_sealed_stream(body),
-            move || this.key_config(true),
-            on_dispatch,
-        )
-        .await?;
+        let (decoder, answer) = self.note_relay_pause(
+            run_exchange_chunked(
+                key,
+                &request,
+                move |body| this.post_sealed_stream(body),
+                move || this.key_config(true),
+                on_dispatch,
+            )
+            .await,
+        )?;
 
         // Spawn task to decode chunks and forward events with idle timeout
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
@@ -1471,9 +1585,21 @@ impl OhttpClient {
                     tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
                     return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
                 }
-                Ok(Err(RoundTripError::PolicyDenied(e))) => {
-                    tracing::warn!(path = %path, err = %e, "ohttp: policy denied");
-                    return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
+                Ok(Err(RoundTripError::RateLimited { detail, .. })) => {
+                    tracing::warn!(path = %path, err = %detail, "ohttp: rate limited");
+                    return grpc_error_with(
+                        GRPC_UNAVAILABLE,
+                        &format!("ohttp: {detail}"),
+                        Some(OUTCOME_RATE_LIMITED),
+                    );
+                }
+                Ok(Err(RoundTripError::TooLarge(e))) => {
+                    tracing::warn!(path = %path, err = %e, "ohttp: request too large");
+                    return grpc_error_with(
+                        GRPC_RESOURCE_EXHAUSTED,
+                        &format!("ohttp: {e}"),
+                        Some(OUTCOME_TOO_LARGE),
+                    );
                 }
                 Err(_) => {
                     tracing::warn!(path = %path, "ohttp: round trip timed out waiting for Head");
@@ -1481,22 +1607,11 @@ impl OhttpClient {
                 }
             };
 
-        // Inner response must be HTTP 200 with application/grpc content-type per ZIP L1488-1489
-        if http_status != 200 {
-            return grpc_error(
-                GRPC_INTERNAL,
-                &format!("inner HTTP {http_status} (expected 200)"),
-            );
-        }
-        let content_type = headers
-            .get(header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        if !content_type.starts_with("application/grpc") {
-            return grpc_error(
-                GRPC_INTERNAL,
-                &format!("inner content-type {content_type:?} (expected application/grpc)"),
-            );
+        if let Some(response) = inner_not_grpc(http_status, &headers) {
+            if http_status == 403 {
+                tracing::warn!(path = %path, "ohttp: the gateway refused this call by policy (inner 403)");
+            }
+            return response;
         }
 
         // Keep content-type and date as response headers; `grpc-*` fields found in the header
@@ -1517,14 +1632,6 @@ impl OhttpClient {
             } else if name == header::CONTENT_TYPE || name == header::DATE {
                 response_headers.append(name, value);
             }
-        }
-
-        // Ensure content-type is set
-        if !response_headers.contains_key(header::CONTENT_TYPE) {
-            response_headers.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/grpc"),
-            );
         }
 
         tracing::debug!(
@@ -1746,15 +1853,17 @@ where
         request = request.header(name.as_str(), value.as_str());
     }
 
-    // Send through OHTTP relay (encapsulate, POST, decapsulate)
-    let response = client
-        .round_trip(&request, on_dispatch)
-        .await
-        .map_err(|e| match e {
-            RoundTripError::Transport(e) => e,
-            RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
-            RoundTripError::PolicyDenied(e) => e,
-        })?;
+    // Send through OHTTP relay (encapsulate, POST, decapsulate), the whole exchange bounded
+    let response =
+        tokio::time::timeout(ROUND_TRIP_TIMEOUT, client.round_trip(&request, on_dispatch))
+            .await
+            .map_err(|_| {
+                format!(
+                    "ohttp: round trip timed out after {}s",
+                    ROUND_TRIP_TIMEOUT.as_secs()
+                )
+            })?
+            .map_err(RoundTripError::into_message)?;
 
     // Headers as lossy UTF-8 text; the trailer section is not read
     let response_headers = response.headers_utf8_lossy();
@@ -1763,11 +1872,50 @@ where
 
 const GRPC_UNAVAILABLE: &str = "14";
 const GRPC_INTERNAL: &str = "13";
+const GRPC_RESOURCE_EXHAUSTED: &str = "8";
+
+/// The error a decrypted answer gets when it is not a gRPC response: an inner status other
+/// than 200, or a content type other than `application/grpc*`, is `INTERNAL`. An inner 403 is
+/// marked as a policy denial, which the engine never counts as an unreachable server.
+fn inner_not_grpc(
+    http_status: u16,
+    headers: &HeaderMap,
+) -> Option<Response<BoxBody<Bytes, Infallible>>> {
+    if http_status != 200 {
+        let outcome = (http_status == 403).then_some(OUTCOME_POLICY_DENIED);
+        return Some(grpc_error_with(
+            GRPC_INTERNAL,
+            &format!("ohttp: inner HTTP {http_status}, not a gRPC response"),
+            outcome,
+        ));
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    if !content_type.starts_with("application/grpc") {
+        return Some(grpc_error(
+            GRPC_INTERNAL,
+            &format!("ohttp: inner content-type {content_type:?}, not a gRPC response"),
+        ));
+    }
+    None
+}
 
 /// gRPC "trailers-only" error response: status in the headers, empty body. tonic surfaces it as
 /// a `Status` with that code, which this crate's retry logic already treats as transient for
 /// `UNAVAILABLE`.
 fn grpc_error(code: &'static str, message: &str) -> Response<BoxBody<Bytes, Infallible>> {
+    grpc_error_with(code, message, None)
+}
+
+/// [`grpc_error`] carrying an [`OHTTP_OUTCOME_HEADER`] (tonic hands it over as the status's
+/// metadata).
+fn grpc_error_with(
+    code: &'static str,
+    message: &str,
+    outcome: Option<&'static str>,
+) -> Response<BoxBody<Bytes, Infallible>> {
     let mut resp = Response::new(Full::new(Bytes::new()).boxed());
     let h = resp.headers_mut();
     h.insert(
@@ -1775,6 +1923,9 @@ fn grpc_error(code: &'static str, message: &str) -> Response<BoxBody<Bytes, Infa
         HeaderValue::from_static("application/grpc"),
     );
     h.insert("grpc-status", HeaderValue::from_static(code));
+    if let Some(outcome) = outcome {
+        h.insert(OHTTP_OUTCOME_HEADER, HeaderValue::from_static(outcome));
+    }
     let msg: String = message
         .chars()
         .map(|c| {
@@ -2280,7 +2431,7 @@ mod tests {
     /// Runs the events through one `GrpcFrames` and returns `(data frames, trailers frames)`.
     fn frames_of(
         header_grpc: &[(&str, &str)],
-        events: Vec<Result<ResponseEvent, String>>,
+        events: Vec<Result<ResponseEvent, PumpError>>,
     ) -> (Vec<Vec<u8>>, Vec<HeaderMap>) {
         let mut frames = GrpcFrames::new(header_fields(header_grpc));
         let mut data = Vec::new();
@@ -2357,16 +2508,97 @@ mod tests {
     fn the_trailer_section_wins_over_header_fields() {
         let (_, trailers) = frames_of(
             &[("grpc-status", "0")],
-            vec![Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "8")])))],
+            vec![
+                Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "8")]))),
+                Ok(ResponseEvent::End),
+            ],
         );
         assert_eq!(grpc_status(&trailers[0]), Some("8"));
     }
 
     #[test]
     fn no_status_anywhere_ends_the_stream_with_internal() {
-        let (_, trailers) = frames_of(&[], vec![Ok(ResponseEvent::Trailers(vec![]))]);
+        let (_, trailers) = frames_of(
+            &[],
+            vec![Ok(ResponseEvent::Trailers(vec![])), Ok(ResponseEvent::End)],
+        );
         assert_eq!(trailers.len(), 1);
         assert_eq!(grpc_status(&trailers[0]), Some("13"));
+    }
+
+    /// Trailers that arrive before the final chunk are held: a failure after them (a body cut
+    /// before the final chunk, bad padding) ends the call with that failure, not with the
+    /// gateway's status.
+    #[test]
+    fn trailers_wait_for_the_final_chunk() {
+        let (data, trailers) = frames_of(
+            &[],
+            vec![
+                Ok(ResponseEvent::Data(vec![1])),
+                Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "0")]))),
+                Err(PumpError::transport("incomplete response")),
+            ],
+        );
+        assert_eq!(data, vec![vec![1]]);
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(grpc_status(&trailers[0]), Some("14"));
+
+        let (_, trailers) = frames_of(
+            &[],
+            vec![
+                Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "0")]))),
+                Err(PumpError::decode("finish decode: non-zero padding")),
+            ],
+        );
+        assert_eq!(grpc_status(&trailers[0]), Some("13"));
+
+        // Without the final chunk nothing is delivered as the status.
+        let (_, trailers) = frames_of(
+            &[],
+            vec![Ok(ResponseEvent::Trailers(owned(&[("grpc-status", "0")])))],
+        );
+        assert!(trailers.is_empty());
+    }
+
+    #[test]
+    fn a_transport_error_ends_the_stream_with_unavailable() {
+        let (_, trailers) = frames_of(
+            &[("grpc-status", "0")],
+            vec![
+                Ok(ResponseEvent::Data(vec![1])),
+                Err(PumpError::transport("read chunk: connection reset")),
+            ],
+        );
+        assert_eq!(trailers.len(), 1);
+        assert_eq!(grpc_status(&trailers[0]), Some("14"));
+    }
+
+    /// An inner answer that is not gRPC is `INTERNAL`; an inner 403 is marked as a policy
+    /// denial for the engine, which does not count it as an unreachable server.
+    #[test]
+    fn an_inner_answer_that_is_not_grpc_is_internal() {
+        let grpc = header_fields(&[("content-type", "application/grpc+proto")]);
+        assert!(inner_not_grpc(200, &grpc).is_none());
+        for (status, headers, outcome) in [
+            (403, grpc.clone(), Some(OUTCOME_POLICY_DENIED)),
+            (502, grpc.clone(), None),
+            (429, grpc.clone(), None),
+            (200, header_fields(&[("content-type", "text/html")]), None),
+            (200, HeaderMap::new(), None),
+        ] {
+            let response = inner_not_grpc(status, &headers).expect("refused");
+            let h = response.headers();
+            assert_eq!(
+                h.get("grpc-status").map(|v| v.as_bytes()),
+                Some(&b"13"[..]),
+                "{status}"
+            );
+            assert_eq!(
+                h.get(OHTTP_OUTCOME_HEADER).and_then(|v| v.to_str().ok()),
+                outcome,
+                "{status}"
+            );
+        }
     }
 
     #[test]
@@ -2375,9 +2607,10 @@ mod tests {
             &[("grpc-status", "0")],
             vec![
                 Ok(ResponseEvent::Data(vec![1])),
-                Err("truncated".into()),
+                Err(PumpError::decode("truncated")),
                 Ok(ResponseEvent::Data(vec![2])),
                 Ok(ResponseEvent::Trailers(vec![])),
+                Ok(ResponseEvent::End),
             ],
         );
         assert_eq!(
@@ -3262,7 +3495,7 @@ mod tests {
 
         let dropped = Arc::new(AtomicBool::new(false));
         let body = StreamBody::new(PendingBody(dropped.clone())).boxed();
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, String>>(16);
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
         let task = tokio::spawn(pump_chunked_body(body, decoder, SizeGuard::new(None), tx));
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -3286,7 +3519,7 @@ mod tests {
         h.insert(header::RETRY_AFTER, "7".parse().unwrap());
         assert_eq!(retry_after(&h), Some(Duration::from_secs(7)));
         h.insert(header::RETRY_AFTER, "86400".parse().unwrap());
-        assert_eq!(retry_after(&h), Some(MAX_RETRY_AFTER));
+        assert_eq!(retry_after(&h), Some(zodl_ohttp_client::MAX_RETRY_AFTER));
         h.insert(
             header::RETRY_AFTER,
             "Wed, 21 Oct 2026 07:28:00 GMT".parse().unwrap(),
@@ -3294,10 +3527,10 @@ mod tests {
         assert_eq!(retry_after(&h), None, "HTTP-date form is ignored");
     }
 
-    /// An outer 429 with Retry-After makes the exchange wait that long before it fails, and is
-    /// a plain transport error (no key refetch, no retry inside the exchange).
+    /// An outer 429 is a back-off signal: no key refetch, no retry inside the exchange, no wait
+    /// here (the pause is recorded for the relay instead), and not a transport failure.
     #[tokio::test]
-    async fn outer_429_waits_retry_after_then_fails() {
+    async fn outer_429_is_rate_limited_with_its_pause() {
         let started = std::time::Instant::now();
         let err = run_exchange_chunked(
             test_key(),
@@ -3306,7 +3539,7 @@ mod tests {
                 Ok(RelayStream {
                     status: StatusCode::TOO_MANY_REQUESTS,
                     content_type: None,
-                    retry_after: Some(Duration::from_secs(1)),
+                    retry_after: Some(Duration::from_secs(30)),
                     body: Full::new(Bytes::new())
                         .map_err(|never: Infallible| match never {})
                         .boxed(),
@@ -3318,13 +3551,135 @@ mod tests {
         .await
         .err()
         .expect("429 is final");
+        assert!(started.elapsed() < Duration::from_secs(5), "no sleep");
         assert!(
-            started.elapsed() >= Duration::from_secs(1),
-            "waited as asked"
-        );
-        assert!(
-            matches!(&err, RoundTripError::Transport(m) if m.contains("429")),
+            matches!(
+                &err,
+                RoundTripError::RateLimited { detail, retry_after: Some(d) }
+                    if detail.contains("429") && *d == Duration::from_secs(30)
+            ),
             "{err:?}"
         );
+    }
+
+    /// An outer 413 and a sealed request over 10 MiB are `TooLarge`; the oversized one is never
+    /// posted.
+    #[tokio::test]
+    async fn too_large_requests_are_not_posted_and_413_is_too_large() {
+        let posts = Cell::new(0u32);
+        let big = BhttpRequest::new(
+            "POST",
+            "gw.example",
+            "/cash.z.wallet.sdk.rpc.CompactTxStreamer/SendTransaction",
+        )
+        .header("content-type", "application/grpc")
+        .body(vec![0u8; GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES]);
+        let err = run_exchange_chunked(
+            test_key(),
+            &big,
+            |_sealed| {
+                posts.set(posts.get() + 1);
+                async { Ok(outer_answer(200)) }
+            },
+            || async { unreachable!("no refetch") },
+            || {},
+        )
+        .await
+        .err()
+        .expect("refused locally");
+        assert!(matches!(err, RoundTripError::TooLarge(_)), "{err:?}");
+        assert_eq!(posts.get(), 0, "nothing was posted");
+
+        let err = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async { Ok(outer_answer(413)) },
+            || async { unreachable!("no refetch on 413") },
+            || {},
+        )
+        .await
+        .err()
+        .expect("413 is final");
+        assert!(matches!(err, RoundTripError::TooLarge(_)), "{err:?}");
+    }
+
+    /// The pause a 429 asked for holds every later request through that relay, from any
+    /// client, before anything is fetched or posted.
+    #[tokio::test]
+    async fn a_relay_pause_holds_later_requests_without_posting() {
+        let relay = "https://relay-pause-test.invalid/relay";
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let noted: Result<(), RoundTripError> =
+            client.note_relay_pause(Err(RoundTripError::RateLimited {
+                detail: "relay/gateway HTTP 429".into(),
+                retry_after: Some(Duration::from_secs(60)),
+            }));
+        assert!(noted.is_err());
+
+        let other = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .expect("client");
+        let dispatched = Cell::new(false);
+        let err = other
+            .round_trip(&test_request(), || dispatched.set(true))
+            .await
+            .err()
+            .expect("held");
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(!dispatched.get(), "nothing was sent");
+    }
+
+    /// A body that ends before the final chunk is a transport failure (`UNAVAILABLE`), not a
+    /// decode failure.
+    #[tokio::test]
+    async fn a_body_cut_before_the_final_chunk_is_a_transport_failure() {
+        let (decoder, _answer) = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| async {
+                Ok(RelayStream {
+                    status: StatusCode::OK,
+                    content_type: Some(CONTENT_TYPE_CHUNKED_RES.to_string()),
+                    retry_after: None,
+                    body: Full::new(Bytes::new())
+                        .map_err(|never: Infallible| match never {})
+                        .boxed(),
+                })
+            },
+            || async { unreachable!("no refetch on 200") },
+            || {},
+        )
+        .await
+        .expect("a chunked 200 is handed back unread");
+        let body: BoxBody<Bytes, hyper::Error> = Full::new(Bytes::from_static(&[0u8; 8]))
+            .map_err(|never: Infallible| match never {})
+            .boxed();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
+        pump_chunked_body(body, decoder, SizeGuard::new(None), tx).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(Err(PumpError::Transport(_)))
+        ));
     }
 }

@@ -27,8 +27,30 @@ workspace.
 - `connector::TorConn::from_client`, `TorConn::client`,
   `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
 - `SlipstreamError::EndpointUnreachable`.
+- `SlipstreamError::{RateLimited, RequestTooLarge}` and
+  `SlipstreamError::counts_as_unreachable`: an OHTTP relay rate limit (outer
+  429, or a request held back while its `Retry-After` pause runs; transient),
+  an oversized request (outer 413, or a sealed request over 10 MiB, which is
+  not sent) and an inner 403 (`PolicyDenied`) never count towards
+  `EndpointUnreachable`.
+- `enhance::run_enhancement_isolated`: with Tor on, each `GetTransaction` and
+  `GetTaddressTxids` of the enhancement step opens its own isolated circuit;
+  `GetAddressUtxos` does too.
 
 ### Changed
+- `EngineConfig::validate` refuses an OHTTP gateway (endpoint or alternate)
+  that serves a network other than the wallet's; the signed key configuration
+  is checked against the network of the gateway's exact host name.
+- OHTTP: an outer 429's `Retry-After` holds every request through that relay
+  until it has run (no sleep inside the call); an outer 413 and a local size
+  refusal are `RESOURCE_EXHAUSTED`; a response that ends before its final chunk
+  is `UNAVAILABLE`; an inner status other than 200 or a non-gRPC content type
+  is `INTERNAL`; the gRPC status is delivered only once the final chunk has
+  opened; the verified key configuration is shared by every connection to the
+  same gateway and relay until its `not_after`; `http_round_trip` is bounded
+  (100 s overall, 30 s idle body read, 15 s direct dial); a pooled relay
+  connection is replaced after 10 minutes with Tor off; a `GetBlockRange` the
+  gateway refuses with `INVALID_ARGUMENT` is split into smaller windows.
 - `connector::TorConn::bootstrap` takes the client trace prefix as a third
   argument, and `TorConn` wraps an `arti_client::TorClient` directly (same
   `arti-data` / `arti-cache` directory layout as

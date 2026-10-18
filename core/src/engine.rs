@@ -26,7 +26,7 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::{
     config::{Endpoint, EngineConfig},
     connector::{ConnPurpose, TorConn, connect_via},
-    enhance::{EnhanceStats, run_enhancement},
+    enhance::{EnhanceStats, run_enhancement_isolated},
     error::SlipstreamError,
     events::Progress,
     grpc,
@@ -288,7 +288,14 @@ pub async fn sync_once(
     // sync.rs:108-121 ("We do this before we perform any shielded scanning, to ensure
     // that we discover any UTXOs between the old fully-scanned height and the current
     // chain tip.").
-    let transparent = refresh_utxos(&mut session, &mut client, progress.as_deref()).await?;
+    // GetAddressUtxos names the wallet's addresses: with Tor on it gets a circuit of its own.
+    let transparent = match tor {
+        Some(t) => {
+            let mut utxo_client = t.connect_isolated(&config.endpoint).await?;
+            refresh_utxos(&mut session, &mut utxo_client, progress.as_deref()).await?
+        }
+        None => refresh_utxos(&mut session, &mut client, progress.as_deref()).await?,
+    };
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -389,12 +396,13 @@ pub async fn sync_once(
     // Stats are merged into the report's `enhance` field so the stage-split log
     // reports total enhancement time (per-range runs + this final run) correctly.
     let enhance_started = Instant::now();
-    let final_enhance = run_enhancement(
+    let final_enhance = run_enhancement_isolated(
         &mut session,
         &mut client,
         config.network,
         progress.clone(),
         &mut skipped_keys,
+        tor.map(|t| (t, &config.endpoint)),
     )
     .await?;
     let final_enhance_elapsed = enhance_started.elapsed();

@@ -50,7 +50,7 @@ use crate::{
     chunk::ChunkQueueReceiver,
     config::{Endpoint, EngineConfig},
     connector::TorConn,
-    enhance::run_enhancement,
+    enhance::run_enhancement_isolated,
     error::SlipstreamError,
     events::Progress,
     grpc::{self, LwdClient},
@@ -829,12 +829,13 @@ async fn scan_chunks_inner(
             }
             let started = Instant::now();
             let mut enhance_client = client.clone();
-            match run_enhancement(
+            match run_enhancement_isolated(
                 session,
                 &mut enhance_client,
                 network,
                 progress.clone(),
                 skipped_keys,
+                tor.map(|t| (t, &endpoint)),
             )
             .await
             {
