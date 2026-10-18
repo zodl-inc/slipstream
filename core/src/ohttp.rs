@@ -1481,6 +1481,24 @@ impl OhttpClient {
                 }
             };
 
+        // Inner response must be HTTP 200 with application/grpc content-type per ZIP L1488-1489
+        if http_status != 200 {
+            return grpc_error(
+                GRPC_INTERNAL,
+                &format!("inner HTTP {http_status} (expected 200)"),
+            );
+        }
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !content_type.starts_with("application/grpc") {
+            return grpc_error(
+                GRPC_INTERNAL,
+                &format!("inner content-type {content_type:?} (expected application/grpc)"),
+            );
+        }
+
         // Keep content-type and date as response headers; `grpc-*` fields found in the header
         // section (a trailers-only or a collected answer) go out as HTTP/2 trailers, where tonic
         // reads the status, see `GrpcFrames`.
