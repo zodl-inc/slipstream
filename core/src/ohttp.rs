@@ -72,8 +72,9 @@ use tokio::sync::Mutex;
 use tower_service::Service;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_REQ, CONTENT_TYPE_CHUNKED_RES,
-    ChunkedResponseDecoder, ClientProfile, ClientTrace, KeyConfig, ResponseEvent, SizeGuard,
-    encapsulate_chunked_request, signed_config_url, verify_signed_config,
+    ChunkedResponseDecoder, ClientProfile, ClientTrace, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
+    KeyConfig, ResponseEvent, SizeGuard, check_size, encapsulate_chunked_request,
+    signed_config_url, verify_signed_config,
 };
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
@@ -702,6 +703,8 @@ where
                 zodl_ohttp_client::encode_bhttp_request(request, &ClientProfile::SLIPSTREAM.encode)
                     .map_err(|e| RoundTripError::Transport(e.to_string()))?;
             let (sealed, opener) = encapsulate_chunked_request(&key, &encoded)
+                .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+            check_size(sealed.len(), Some(GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES))
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
             // Signal dispatch right before posting the sealed request to the relay
             if !dispatched {
