@@ -76,6 +76,14 @@ fn transport_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Transport(format!("{context}: {e}"))
 }
 
+fn grpc_err(context: &str, status: tonic::Status) -> SlipstreamError {
+    if status.code() == tonic::Code::PermissionDenied {
+        SlipstreamError::PolicyDenied(format!("{context}: inner 403 (PERMISSION_DENIED)"))
+    } else {
+        transport_err(context, status)
+    }
+}
+
 // ── T6.8-H2 scan-path transient retries ───────────────────────────────────────
 //
 // The initial treestate seed and per-chunk-boundary prefetch calls in scan.rs
@@ -151,15 +159,15 @@ pub(crate) async fn retry_get_tree_state(
     }
 }
 
-/// Awaits a unary gRPC call under [`UNARY_TIMEOUT`]; maps both the gRPC status
-/// and a deadline expiry into [`SlipstreamError::Transport`].
+/// Awaits a unary gRPC call under [`UNARY_TIMEOUT`]; maps the gRPC status
+/// into [`SlipstreamError::Transport`] or [`SlipstreamError::PolicyDenied`].
 async fn with_unary_timeout<T>(
     context: &str,
     fut: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 ) -> Result<T, SlipstreamError> {
     match tokio::time::timeout(UNARY_TIMEOUT, fut).await {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(status)) => Err(transport_err(context, status)),
+        Ok(Err(status)) => Err(grpc_err(context, status)),
         Err(_) => Err(SlipstreamError::Transport(format!(
             "{context}: timed out after {}s",
             UNARY_TIMEOUT.as_secs()

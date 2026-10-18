@@ -543,7 +543,9 @@ async fn follow_loop(
                 continue;
             }
             Err(err) => {
-                failures.probe_failed();
+                if !matches!(err, SlipstreamError::PolicyDenied(_)) {
+                    failures.probe_failed();
+                }
                 // The tip check could not reach the server, so no download is failing
                 // (see `Progress::note_attempt_failed`).
                 reporter.progress.note_attempt_failed();
@@ -607,7 +609,9 @@ async fn follow_loop(
                 });
             }
             Err(err) => {
-                failures.catchup_failed();
+                if !matches!(err, SlipstreamError::PolicyDenied(_)) {
+                    failures.catchup_failed();
+                }
                 // After N consecutive failures, surface Error(3) so hosts can react.
                 // Below the threshold, revert to Done (wallet is still synced to last_tip).
                 let total_failures = failures.total();

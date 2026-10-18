@@ -658,13 +658,15 @@ impl HttpsError {
     }
 }
 
-/// Why a whole OHTTP round trip failed; the gRPC bridge maps the two differently.
+/// Why a whole OHTTP round trip failed; the gRPC bridge maps the three differently.
 #[derive(Debug)]
 enum RoundTripError {
     /// Key fetch, relay, gateway or decryption failed (gRPC `UNAVAILABLE`).
     Transport(String),
     /// The decrypted answer is not a Binary HTTP response (gRPC `INTERNAL`).
     Decode(String),
+    /// Policy denial: outer 429, non-retryable (SlipstreamError::PolicyDenied).
+    PolicyDenied(String),
 }
 
 /// Runs `attempt`, and once more when its answer is the gateway's freshness refusal (an inner
@@ -778,10 +780,12 @@ where
         }
 
         if !status.is_success() {
-            return Err(RoundTripError::Transport(format!(
-                "relay/gateway HTTP {status}: {}",
-                answer.detail()
-            )));
+            let msg = format!("relay/gateway HTTP {status}: {}", answer.detail());
+            return Err(if status == StatusCode::TOO_MANY_REQUESTS {
+                RoundTripError::PolicyDenied(msg)
+            } else {
+                RoundTripError::Transport(msg)
+            });
         }
 
         // Check content-type
@@ -1461,6 +1465,10 @@ impl OhttpClient {
                     tracing::warn!(path = %path, err = %e, "ohttp: round trip failed");
                     return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
                 }
+                Ok(Err(RoundTripError::PolicyDenied(e))) => {
+                    tracing::warn!(path = %path, err = %e, "ohttp: policy denied");
+                    return grpc_error(GRPC_UNAVAILABLE, &format!("ohttp: {e}"));
+                }
                 Err(_) => {
                     tracing::warn!(path = %path, "ohttp: round trip timed out waiting for Head");
                     return grpc_error(GRPC_UNAVAILABLE, "ohttp: round trip timed out");
@@ -1721,6 +1729,7 @@ where
         .map_err(|e| match e {
             RoundTripError::Transport(e) => e,
             RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
+            RoundTripError::PolicyDenied(e) => e,
         })?;
 
     // Headers as lossy UTF-8 text; the trailer section is not read

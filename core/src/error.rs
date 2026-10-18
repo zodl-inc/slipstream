@@ -36,6 +36,12 @@ pub enum SlipstreamError {
     #[error("misbehaving server (invalid or out-of-range data in response)")]
     MisbehavingServer,
 
+    /// Policy denial (inner 403, outer 429): the server or gateway refuses to
+    /// serve the request, not due to a transient condition. This is non-retryable
+    /// and must not trigger failover or contribute to the unreachable count.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
+
     #[error("engine is stopped")]
     Stopped,
 
@@ -79,6 +85,7 @@ impl SlipstreamError {
     /// - `ScanContinuity`  → false     (internally handled by the reorg recovery arm)
     /// - `Discontinuity`   → false     (fetch continuity bug; retry would loop)
     /// - `MisbehavingServer` → false   (bad proto / decode error; not a transport transient)
+    /// - `PolicyDenied`    → false     (server policy refusal; not a transport issue)
     /// - `Stopped`         → false     (engine lifecycle; not retryable)
     /// - `WireCollapse`    → false     (handled by the v0.7 failover loop — the generic
     ///   transient-reconnect path would dial the SAME collapsed server again)
