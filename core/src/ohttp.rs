@@ -954,6 +954,9 @@ impl GrpcFrames {
 type EventStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<ResponseEvent, PumpError>> + Send + Sync>>;
 
+/// A pooled HTTP/2 sender to the relay and the time its connection was opened.
+type PooledH2 = (http2::SendRequest<Full<Bytes>>, std::time::Instant);
+
 struct OhttpClient {
     gateway_host: String,
     relay_url: String,
@@ -966,7 +969,7 @@ struct OhttpClient {
     /// stack, a reliable way to crash qemu under connection churn. Over Tor this matters even
     /// more: every new connection would be a new circuit build.
     /// Each with the time it was opened, see [`H2_MAX_CONNECTION_AGE`].
-    h2_pool: Mutex<HashMap<String, (http2::SendRequest<Full<Bytes>>, std::time::Instant)>>,
+    h2_pool: Mutex<HashMap<String, PooledH2>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
     client_trace: Option<ClientTrace>,
     /// The shared core's options for this client (`SLIPSTREAM` for gRPC, `SLIPSTREAM_HTTP` for
@@ -2305,8 +2308,10 @@ mod tests {
                 || {},
             )
             .await;
-            let Err(RoundTripError::Transport(message)) = result else {
-                panic!("expected a transport error, got {result:?}");
+            let message = match result {
+                Err(RoundTripError::TooLarge(message)) if status == 413 => message,
+                Err(RoundTripError::Transport(message)) if status != 413 => message,
+                other => panic!("unexpected result for {status}: {other:?}"),
             };
             assert!(
                 message.starts_with(&format!("relay/gateway HTTP {status}")),
@@ -3635,8 +3640,7 @@ mod tests {
         let err = other
             .round_trip(&test_request(), || dispatched.set(true))
             .await
-            .err()
-            .expect("held");
+            .expect_err("held");
         assert!(
             matches!(
                 &err,
