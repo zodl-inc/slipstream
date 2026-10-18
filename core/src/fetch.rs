@@ -472,6 +472,7 @@ where
     S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
 {
     let window_end = cursor.end;
+    let mut refused = false;
     pump_block_window(
         stream,
         cursor,
@@ -481,6 +482,7 @@ where
         gate,
         out,
         progress,
+        &mut refused,
     )
     .await
 }
@@ -506,7 +508,9 @@ where
 ///
 /// The request ends at `window_end`, at or before the plan chunk's end: a clean end at
 /// `window_end` completes the window, and carries `is_last` only when the window reaches
-/// `cursor.end`.
+/// `cursor.end`. `refused` is set when the stream ended with `INVALID_ARGUMENT` (an OHTTP
+/// gateway answers a range over its span limit that way, with the status as the stream's
+/// trailers).
 #[allow(clippy::too_many_arguments)]
 async fn pump_block_window<S>(
     stream: &mut S,
@@ -517,6 +521,7 @@ async fn pump_block_window<S>(
     gate: &AheadGate,
     out: &mpsc::Sender<SubChunk>,
     progress: Option<&Progress>,
+    refused: &mut bool,
 ) -> Result<PumpOutcome, SlipstreamError>
 where
     S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
@@ -565,6 +570,7 @@ where
         let block = match item {
             Ok(block) => block,
             Err(status) => {
+                *refused = status.code() == tonic::Code::InvalidArgument;
                 let err = grpc::status_err(&ctx, status);
                 return flush_then_fail(splitter.finish(), cursor, gate, out, err).await;
             }
@@ -653,22 +659,26 @@ async fn open_and_pump(
                     open_timeout.as_secs()
                 ))
             })?;
+        let start = cursor.resume_from;
+        let span = window_end - start + 1;
+        let split = |refusal: &dyn std::fmt::Display, max_span: &mut u64| {
+            let smaller = split_span(span).filter(|_| split_on_invalid)?;
+            warn!(
+                span,
+                smaller,
+                resume_from = start,
+                err = %refusal,
+                "get_block_range refused as invalid — splitting the range"
+            );
+            *max_span = smaller;
+            Some(())
+        };
         let mut stream = match opened {
             Ok(response) => response.into_inner(),
             Err(status) => {
-                let span = window_end - cursor.resume_from + 1;
-                if split_on_invalid
-                    && status.code() == tonic::Code::InvalidArgument
-                    && let Some(smaller) = split_span(span)
+                if status.code() == tonic::Code::InvalidArgument
+                    && split(&status, max_span).is_some()
                 {
-                    warn!(
-                        span,
-                        smaller,
-                        resume_from = cursor.resume_from,
-                        err = %status,
-                        "get_block_range refused as invalid — splitting the range"
-                    );
-                    *max_span = smaller;
                     continue;
                 }
                 return Err(grpc::status_err(
@@ -677,7 +687,11 @@ async fn open_and_pump(
                 ));
             }
         };
-        match pump_block_window(
+        // The refusal may also come as the stream's status (a trailers-only answer through the
+        // OHTTP connector): the blocks before it are handed on, the rest is asked for in
+        // smaller windows.
+        let mut refused = false;
+        let pumped = pump_block_window(
             &mut stream,
             cursor,
             window_end,
@@ -686,11 +700,14 @@ async fn open_and_pump(
             gate,
             out,
             progress,
+            &mut refused,
         )
-        .await?
-        {
-            PumpOutcome::Completed if window_end < cursor.end => continue,
-            outcome => return Ok(outcome),
+        .await;
+        match pumped {
+            Ok(PumpOutcome::Completed) if window_end < cursor.end => continue,
+            Ok(outcome) => return Ok(outcome),
+            Err(err) if refused && split(&err, max_span).is_some() => continue,
+            Err(err) => return Err(err),
         }
     }
 }
@@ -1788,6 +1805,67 @@ mod tests {
         assert!(
             cursor.emitted_this_attempt,
             "handing on counts as progress for the retry budget"
+        );
+    }
+
+    /// A window that ends early (`window_end` before the plan chunk's end) completes without
+    /// `is_last`; a stream that ends with `INVALID_ARGUMENT` hands on what it received and
+    /// reports the refusal, so the range can be split.
+    #[tokio::test]
+    async fn a_window_completes_and_an_invalid_argument_is_reported_as_a_refusal() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut refused = false;
+        let mut s = stream::iter(
+            linked(100, 10, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let out = pump_block_window(
+            &mut s,
+            &mut cursor,
+            109,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+        )
+        .await
+        .expect("the window completes");
+        assert!(matches!(out, PumpOutcome::Completed));
+        assert!(!refused);
+        assert_eq!(cursor.resume_from, 110);
+        let subs = drain_subs(&mut rx);
+        assert!(
+            subs.iter().all(|s| !s.is_last),
+            "no is_last before the plan chunk's end"
+        );
+
+        let mut items: Vec<Result<CompactBlock, tonic::Status>> =
+            linked(110, 3, 1000).into_iter().map(Ok).collect();
+        items.push(Err(tonic::Status::invalid_argument("range over the limit")));
+        let mut s = stream::iter(items);
+        let err = pump_block_window(
+            &mut s,
+            &mut cursor,
+            129,
+            usize::MAX >> 8,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+        )
+        .await
+        .expect_err("the refusal fails the window");
+        assert!(refused, "{err}");
+        assert_eq!(
+            cursor.resume_from, 113,
+            "the blocks before it were handed on"
         );
     }
 

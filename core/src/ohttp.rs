@@ -2022,7 +2022,7 @@ mod tests {
     /// `http_round_trip` refuses a gateway of another network before anything is sent.
     #[tokio::test]
     async fn http_round_trip_refuses_a_gateway_of_another_network() {
-        let dispatched = Cell::new(false);
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
         let err = http_round_trip_with_dispatch(
             "ohttp-gateway.example",
             NetworkType::Test,
@@ -2031,12 +2031,12 @@ mod tests {
             "https://vote.example/api",
             &[],
             b"",
-            || dispatched.set(true),
+            || dispatched.store(true, std::sync::atomic::Ordering::SeqCst),
         )
         .await
         .expect_err("refused");
         assert!(err.contains("mainnet"), "{err}");
-        assert!(!dispatched.get());
+        assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
         assert!(check_gateway_network("ohttp-gateway.example", NetworkType::Main).is_ok());
         assert!(check_gateway_network("ohttp-gateway-testnet.example", NetworkType::Test).is_ok());
         assert!(
