@@ -334,9 +334,14 @@ pub async fn sync_once(
                     "wire collapse — failing over"
                 );
                 cooled.push(attempt_config.endpoint.clone());
+                let current_is_gateway =
+                    crate::ohttp::relay_for(&attempt_config.endpoint.host).is_some();
                 let mut candidates: Vec<Endpoint> = std::iter::once(config.endpoint.clone())
                     .chain(config.alternate_endpoints.iter().cloned())
-                    .filter(|e| !cooled.contains(e))
+                    .filter(|e| {
+                        !cooled.contains(e)
+                            && crate::ohttp::relay_for(&e.host).is_some() == current_is_gateway
+                    })
                     .collect();
                 if candidates.is_empty() {
                     // Everything configured has collapsed at least once this
@@ -344,7 +349,10 @@ pub async fn sync_once(
                     cooled.clear();
                     candidates = std::iter::once(config.endpoint.clone())
                         .chain(config.alternate_endpoints.iter().cloned())
-                        .filter(|e| *e != attempt_config.endpoint)
+                        .filter(|e| {
+                            *e != attempt_config.endpoint
+                                && crate::ohttp::relay_for(&e.host).is_some() == current_is_gateway
+                        })
                         .collect();
                 }
                 let next = if candidates.len() == 1 {

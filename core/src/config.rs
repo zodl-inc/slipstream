@@ -258,6 +258,15 @@ impl EngineConfig {
         if self.endpoint.host.is_empty() {
             return Err(SlipstreamError::Config("endpoint host is empty".into()));
         }
+        let primary_is_gateway = crate::ohttp::relay_for(&self.endpoint.host).is_some();
+        for alt in &self.alternate_endpoints {
+            let alt_is_gateway = crate::ohttp::relay_for(&alt.host).is_some();
+            if primary_is_gateway != alt_is_gateway {
+                return Err(SlipstreamError::Config(
+                    "alternate_endpoints must not mix Gateway hosts (tier 0) and clearnet servers (tier 1)".into(),
+                ));
+            }
+        }
         if self.fetch_streams == 0 {
             return Err(SlipstreamError::Config("fetch_streams must be >= 1".into()));
         }
@@ -357,9 +366,19 @@ impl EngineConfig {
         if self.alternate_endpoints.is_empty() || via_tor {
             return (self, Duration::ZERO);
         }
-        let mut endpoints = Vec::with_capacity(1 + self.alternate_endpoints.len());
+        let primary_is_gateway = crate::ohttp::relay_for(&self.endpoint.host).is_some();
+        let same_tier: Vec<_> = self
+            .alternate_endpoints
+            .iter()
+            .filter(|ep| {
+                let is_gateway = crate::ohttp::relay_for(&ep.host).is_some();
+                is_gateway == primary_is_gateway
+            })
+            .cloned()
+            .collect();
+        let mut endpoints = Vec::with_capacity(1 + same_tier.len());
         endpoints.push(self.endpoint.clone());
-        endpoints.extend(self.alternate_endpoints.iter().cloned());
+        endpoints.extend(same_tier);
         let outcome =
             crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
         info!(
