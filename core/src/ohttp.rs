@@ -671,12 +671,14 @@ enum HttpsError {
     /// Anything else (connect, TLS, send, read, size cap): the request may have been delivered,
     /// so not retried to avoid repeating a request with side effects.
     Other(String),
+    /// Not sent: the relay's `Retry-After` pause began while this request was being prepared.
+    RelayPaused(String),
 }
 
 impl HttpsError {
     fn into_message(self) -> String {
         match self {
-            HttpsError::PreSend(m) | HttpsError::Other(m) => m,
+            HttpsError::PreSend(m) | HttpsError::Other(m) | HttpsError::RelayPaused(m) => m,
         }
     }
 
@@ -798,6 +800,12 @@ where
                 Err(HttpsError::PreSend(e)) if !resent => {
                     resent = true;
                     tracing::debug!(err = %e, "ohttp: relay post failed before send; sealing again");
+                }
+                Err(HttpsError::RelayPaused(detail)) => {
+                    return Err(RoundTripError::RateLimited {
+                        detail,
+                        retry_after: None,
+                    });
                 }
                 Err(e) => return Err(RoundTripError::Transport(e.into_message())),
             }
@@ -1182,6 +1190,7 @@ impl OhttpClient {
 
     /// POST one sealed chunked request body to the relay. Returns buffered response.
     async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
+        self.relay_pause_before_post()?;
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once(
@@ -1197,6 +1206,7 @@ impl OhttpClient {
     /// POST one sealed chunked request body to the relay. Returns the response with its body
     /// unread.
     async fn post_sealed_stream(&self, body: Vec<u8>) -> Result<RelayStream, HttpsError> {
+        self.relay_pause_before_post()?;
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once_stream(&self.relay, Method::POST, &headers, body)
@@ -1340,6 +1350,13 @@ impl OhttpClient {
         *self.key_config.lock().await = Some(cfg);
         shared_keys().insert(shared_key, cfg);
         Ok(cfg.config)
+    }
+
+    /// The pause check again, right before a post: another request may have been answered 429
+    /// while this one fetched the key configuration.
+    fn relay_pause_before_post(&self) -> Result<(), HttpsError> {
+        self.check_relay_pause()
+            .map_err(|e| HttpsError::RelayPaused(e.into_message()))
     }
 
     /// Fails at once, without posting, while the relay's `Retry-After` pause runs.
@@ -1958,7 +1975,7 @@ mod tests {
         // A send error cannot prove the request was not delivered, so it must not be retried.
         match HttpsError::classify_send_error("stream closed", "relay.example") {
             HttpsError::Other(m) => assert_eq!(m, "h2 send relay.example: stream closed"),
-            HttpsError::PreSend(m) => panic!("send error must not be PreSend: {m}"),
+            other => panic!("send error must not be PreSend: {other:?}"),
         }
     }
 
@@ -3652,6 +3669,40 @@ mod tests {
             "{err:?}"
         );
         assert!(!dispatched.get(), "nothing was sent");
+    }
+
+    /// A pause that began while the request was prepared stops the post: rate limited, no retry.
+    #[tokio::test]
+    async fn a_pause_noticed_at_the_post_is_rate_limited() {
+        let posts = Cell::new(0u32);
+        let err = run_exchange_chunked(
+            test_key(),
+            &test_request(),
+            |_sealed| {
+                posts.set(posts.get() + 1);
+                async {
+                    Err::<RelayAnswer, _>(HttpsError::RelayPaused(
+                        "relay rate limit: not sent".into(),
+                    ))
+                }
+            },
+            || async { unreachable!("no refetch") },
+            || {},
+        )
+        .await
+        .err()
+        .expect("held");
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert_eq!(posts.get(), 1, "not tried again");
     }
 
     /// A body that ends before the final chunk is a transport failure (`UNAVAILABLE`), not a
