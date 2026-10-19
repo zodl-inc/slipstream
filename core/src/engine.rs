@@ -57,7 +57,7 @@ use crate::{
 /// hand cannot be relied on — and this is the evidence that it cannot — it should be
 /// derived from something that moves on its own (git describe at build time) rather
 /// than maintained.
-pub const ENGINE_BUILD: &str = "2026-10-22.v0.17-nu7-block-cadence";
+pub const ENGINE_BUILD: &str = "2026-10-22.v0.18-restore-anchor-height-bound";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick

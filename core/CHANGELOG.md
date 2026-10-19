@@ -96,7 +96,7 @@ workspace.
 - On mainnet, the behaviours these entries describe from NU7 activation, such as the mempool
   session's 40 s idle bound, apply from height 3,543,405, the activation height
   `zcash_protocol 0.11.0` sets.
-- `engine::ENGINE_BUILD` is `2026-10-22.v0.17-nu7-block-cadence`.
+- `engine::ENGINE_BUILD` is `2026-10-22.v0.18-restore-anchor-height-bound`.
 
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
@@ -169,6 +169,12 @@ workspace.
   the `v_ironwood_shard_scan_ranges` view when it runs (as `NULL` when unset) and requeues
   already-scanned NU6.3-era blocks only in that step, which ran for these databases with no
   NU6.3 height.
+- `anchor::restore_anchor` treats a server that reports a chain tip or tree-state height
+  above `i32::MAX` as unreachable: a restore gets the offline `recover_until` fallback,
+  `max(fallback_checkpoint, birthday + 1)`, and a new wallet gets no anchor. It used to
+  return such a height as reported, which a host that bounds server heights at `i32::MAX`
+  cannot use, leaving a restore without a `recover_until`, so that it looked like a new
+  wallet.
 
 ## [0.4.0-pre.2] - 2026-10-20
 
