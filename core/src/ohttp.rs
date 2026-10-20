@@ -1331,11 +1331,13 @@ impl OhttpClient {
             }
         }
 
-        // Try fetching signed config through relay first (primary source)
+        // Try fetching signed config through relay first: fetch AND verify.
+        // If either fails (fetch or verification), fall back to DNS.
         let network = gateway_network(&self.gateway_host)?;
         let now = unix_now()?;
 
-        let relay_result = async {
+        // Try relay: fetch and verify
+        let relay_fetch_and_verify = async {
             // C-01 fix: Fetch signed config through relay host at /ohttp-configs/signed
             // Construct target from relay host (not gateway) to avoid direct gateway access
             let signed_config_target = parse_https(
@@ -1368,56 +1370,62 @@ impl OhttpClient {
             if !self.profile.outer.success.accepts(answer.status.as_u16()) {
                 return Err(format!("signed config fetch from relay: HTTP {}", answer.status));
             }
-            Ok(answer.body)
-        }.await;
 
-        let envelope = match relay_result {
-            Ok(body) => {
-                tracing::debug!("ohttp: key config fetched from relay");
-                body
-            }
+            // Verify the relay envelope
+            let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, now)
+                .map_err(|e| format!("relay envelope verification failed: {}", e))?;
+            tracing::debug!("ohttp: key config fetched and verified from relay");
+            Ok(cfg)
+        }
+        .await;
+
+        // If relay failed (fetch OR verification), try DNS resolvers
+        let cfg = match relay_fetch_and_verify {
+            Ok(verified_cfg) => verified_cfg,
             Err(relay_err) => {
-                // Relay fetch failed, try DNS fallback
-                tracing::info!(err = %relay_err, "ohttp: relay key config fetch failed, trying DNS");
+                // Relay failed (fetch or verification), try DNS fallback
+                tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
 
-                let mut last_dns_err = relay_err;
+                let mut last_err = relay_err;
                 let dns_name = key_config_dns_name(network);
-                let mut envelope_found = None;
+                let mut verified_cfg = None;
 
                 for resolver in DOH_RESOLVERS {
                     let doh_url = doh_query_url(resolver, network);
                     tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
 
-                    match self.fetch_dns_key_config(&doh_url).await {
-                        Ok(doh_body) => match envelope_from_doh_json(&doh_body, network) {
-                            Ok(env) => {
-                                tracing::info!(resolver = %resolver, "ohttp: key config fetched from DNS");
-                                envelope_found = Some(env);
-                                break;
-                            }
-                            Err(e) => {
-                                last_dns_err = format!("DoH parse from {}: {}", resolver, e);
-                                tracing::debug!(err = %last_dns_err, "ohttp: DoH response parse failed");
-                            }
-                        },
+                    // For DNS, we fetch, parse, AND verify. If any step fails, try next resolver.
+                    let dns_result = async {
+                        let doh_body = self.fetch_dns_key_config(&doh_url).await?;
+                        let envelope = envelope_from_doh_json(&doh_body, network)
+                            .map_err(|e| format!("parse error: {}", e))?;
+                        open_signed_keys(&self.profile, &envelope, &self.gateway_host, now)
+                            .map_err(|e| format!("verification failed: {}", e))
+                    }
+                    .await;
+
+                    match dns_result {
+                        Ok(cfg) => {
+                            tracing::info!(resolver = %resolver, "ohttp: key config fetched and verified from DNS");
+                            verified_cfg = Some(cfg);
+                            break;
+                        }
                         Err(e) => {
-                            last_dns_err = format!("DoH fetch from {}: {}", resolver, e);
-                            tracing::debug!(err = %last_dns_err, "ohttp: DoH fetch failed");
+                            last_err = format!("{}: {}", resolver, e);
+                            tracing::debug!(err = %last_err, "ohttp: DNS resolver failed");
                         }
                     }
                 }
 
-                envelope_found.ok_or_else(|| {
+                verified_cfg.ok_or_else(|| {
                     format!(
                         "key config fetch failed: relay and all DNS resolvers tried: {}",
-                        last_dns_err
+                        last_err
                     )
                 })?
             }
         };
 
-        // Verify signature and parse config (same verification for both sources)
-        let cfg = open_signed_keys(&self.profile, &envelope, &self.gateway_host, now)?;
         tracing::info!(
             gateway = %self.gateway_host,
             key_id = cfg.config.key_id(),
@@ -3903,11 +3911,12 @@ mod tests {
         ));
     }
 
-    /// DNS fallback is tried when the relay fetch fails, and the verified config comes from DNS.
-    /// Uses a captured real DoH JSON response fixture.
+    /// DNS fallback: Parse and verify a real DoH JSON response.
+    /// Note: Full integration tests (relay failure -> DNS fallback, relay verify failure -> DNS,
+    /// etc.) would require mocking the network layer.
     #[tokio::test]
-    async fn dns_fallback_on_relay_failure() {
-        use zodl_ohttp_client::{DOH_RESOLVERS, SignedConfigPolicy};
+    async fn dns_response_parsing_and_verification() {
+        use zodl_ohttp_client::SignedConfigPolicy;
 
         // Real captured mainnet DoH JSON from Cloudflare (2026-10-20)
         let cloudflare_fixture = r#"{
@@ -3949,12 +3958,12 @@ mod tests {
 
         assert_eq!(keys.not_after, 1792536900);
 
-        // Select a key from it
-        let config =
+        // Select a key from it - just verify it succeeds
+        let _config =
             KeyConfig::select_with(&keys.document, &ClientProfile::SLIPSTREAM.key_selection)
                 .expect("select");
-
-        assert_eq!(config.key_id(), "ba8a2dbd");
+        // Note: config.key_id() returns a u8 (the HPKE key_id from the config), not the signing
+        // key identifier "ba8a2dbd" from the envelope JSON.
     }
 
     /// DNS resolvers are tried in order; the second succeeds when the first fails.
@@ -3969,6 +3978,12 @@ mod tests {
         let url0 = doh_query_url(resolvers[0], network);
         assert!(url0.contains("cloudflare-dns.com"));
         assert!(url0.contains("ohttp-keys.example"));
+        assert!(url0.contains("type=TXT"));
+
+        let url1 = doh_query_url(resolvers[1], network);
+        assert!(url1.contains("dns.google"));
+        assert!(url1.contains("edns_client_subnet=0.0.0.0/0"));
+    }
         assert!(url0.contains("type=TXT"));
 
         let url1 = doh_query_url(resolvers[1], network);
