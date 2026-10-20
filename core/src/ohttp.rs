@@ -1336,7 +1336,7 @@ impl OhttpClient {
         let now = unix_now()?;
 
         // Validate relay URL is https
-        let _relay_target = parse_https(&self.relay_url)?;
+        parse_https(&self.relay_url)?;
 
         // Validate signed config URL is https
         let signed_config_url_str =
