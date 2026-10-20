@@ -10,6 +10,45 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
+  host calls the first right before it changes the wallet (adding or removing an account,
+  a rewind, a wipe), and the running session's scan ends at its next block instead of
+  after the whole chunk. `Progress::begin_session` re-arms the stop, so a request never
+  stops a later session.
+- `block_source::StoppedForWalletChange` and `block_source::MemBlockSource::with_stop`,
+  which make the in-memory block source refuse its next block once a stop is requested.
+  The check is two relaxed atomic loads per block.
+- `SlipstreamError::StoppedForWalletChange` and
+  `SlipstreamError::is_stop_for_wallet_change`.
+- `ffi_handle::StopReport`, `ffi_handle::SlipstreamHandle::{stop, stop_for_wallet_change,
+  quiesce_before_start}`, `ffi_handle::{settle_passes, drain_wallet_writers}` and the
+  `SlipstreamHandle::unfinished_passes` field: the bounded stop that proves the wallet
+  file quiescent, which every host wrapper used to keep its own copy of. Its report says
+  whether each wait finished and how long it took. A pass that outlives a stop's budget
+  stays on record, so a later stop still answers for it.
+- `ffi_handle::FfiSlipstreamStopReport`, the by-value C form of `StopReport` that the C
+  ABI's two stop functions return: `settled` and `drained` as 1 or 0, `settle_ms` and
+  `drain_ms` in milliseconds (`From<StopReport>`). The report return and
+  `zcashlc_slipstream_stop_for_wallet_change` are the C ABI wrappers adopt with this
+  release (today's wrappers return `bool` from `zcashlc_slipstream_stop`), and a wrapper's
+  cbindgen re-declaration of the struct must keep its field order.
+
+### Changed
+- `block_source::MemBlockSource`'s `BlockSource::Error` is `StoppedForWalletChange` (was
+  `Infallible`). A source built without `with_stop` never returns it.
+- `session::run_session` returns when the host stops it for a wallet change, leaving
+  `SyncState::Idle` and pushing no error event. It still never returns otherwise.
+- Each `Progress::request_stop_for_wallet_change` owes, process-wide, a wait for the trial
+  decryption the stopped scan leaves queued on rayon's global pool: the next scan in the
+  process, on any handle (one reopened on the same wallet too), waits right before its
+  first scan call until rayon has taken that backlog, so a stop that follows quickly is
+  seen at the next block instead of after it. The wait overlaps the Tor bootstrap and the
+  fetch of the first chunk, and one cut short by an abort leaves it owed.
+- `ffi_handle::SlipstreamHandle` has a new public field, `unfinished_passes`: code that
+  builds the handle with a struct literal must set it (to `Vec::new()`).
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.15-stop-for-wallet-change`.
+
 ## [0.4.0-pre.1] - 2026-10-06
 
 ### Changed

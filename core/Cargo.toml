@@ -103,6 +103,10 @@ name = "stress_sparse_join"
 required-features = ["zcash_client_sqlite"]
 
 [[test]]
+name = "stop_for_wallet_change"
+required-features = ["zcash_client_sqlite"]
+
+[[test]]
 name = "darkside_follow"
 required-features = ["darkside"]
 
