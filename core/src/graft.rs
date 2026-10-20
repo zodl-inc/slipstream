@@ -589,19 +589,38 @@ fn first_block_past<E>(
     Ok(Some(BlockHeight::from(lo)))
 }
 
+/// The rewind delete of [`delete_from_position`] and [`delete_from_position_in`].
+const DELETE_FROM_POSITION: &str =
+    "DELETE FROM ext_slipstream_graft_buffer WHERE pool = ?1 AND position >= ?2";
+
 /// Rewind support (plan Task 9): drop every buffered row at or above `min_position`.
 ///
-/// Upstream's rewinds never see this engine-owned table, so the engine calls this
-/// after its own: the reorg recovery's truncation and an account import's rewind
-/// (`WalletSession::truncate_to_height`, `WalletSession::import_account`). The blocks
-/// they queue again hold exactly the rows at or above the rewind's tree size.
+/// Upstream's rewinds never see this engine-owned table, so the engine drops the rows
+/// with its own: after an account import's rewind (`WalletSession::import_account`),
+/// and inside the reorg recovery's truncation ([`delete_from_position_in`]). The
+/// blocks they queue again hold exactly the rows at or above the rewind's tree size.
 pub(crate) fn delete_from_position(
     conn: &Connection,
     pool: ShieldedPool,
     min_position: u64,
 ) -> Result<(), SqliteClientError> {
     conn.execute(
-        "DELETE FROM ext_slipstream_graft_buffer WHERE pool = ?1 AND position >= ?2",
+        DELETE_FROM_POSITION,
+        params![pool_code(pool), min_position as i64],
+    )?;
+    Ok(())
+}
+
+/// [`delete_from_position`] inside a wallet transaction, through its extension handle
+/// (`WalletDb::transactionally_with_extension`): `WalletSession::truncate_to_height`
+/// drops the rows in upstream's own truncation transaction, so both commit or neither.
+pub(crate) fn delete_from_position_in(
+    ext: &zcash_client_sqlite::ExtensionTransaction<'_>,
+    pool: ShieldedPool,
+    min_position: u64,
+) -> Result<(), SqliteClientError> {
+    ext.execute(
+        DELETE_FROM_POSITION,
         params![pool_code(pool), min_position as i64],
     )?;
     Ok(())

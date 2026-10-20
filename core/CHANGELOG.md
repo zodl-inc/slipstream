@@ -56,15 +56,18 @@ workspace.
   of the blocks they queue again, though after a reorg those may be another chain's
   commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own
   account import (`WalletSession::import_account`) now drop every buffered row at or
-  above their rewind point. For an account a host imports into the wallet database
+  above their rewind point. The truncation drops them in upstream's own truncation
+  transaction, so a crash or an error never leaves the wallet truncated with those rows
+  still buffered; a pool whose tree size the highest remaining block does not record
+  keeps its rows, with a warning. For an account a host imports into the wallet database
   itself, the first range to seed in the shard resumes only the run that ends right
   before its start, as above.
 
 ### Added
 - `wallet_session::WalletSession::truncate_to_height`: upstream's
-  `WalletWrite::truncate_to_height`, then the removal of the graft-buffer rows of the
-  blocks it removed. It returns the height the wallet was truncated to. The scheduler's
-  reorg recovery calls it.
+  `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
+  it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
+  the height the wallet was truncated to. The scheduler's reorg recovery calls it.
 - `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
   host calls the first right before it changes the wallet (adding or removing an account,
   a rewind, a wipe), and the running session's scan ends at its next block instead of

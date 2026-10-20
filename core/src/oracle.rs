@@ -3525,6 +3525,86 @@ mod tests {
             assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
         }
 
+        /// The truncation and the drop of its graft-buffer rows share upstream's transaction,
+        /// so a drop that fails (here a trigger refuses the delete) leaves the wallet as it
+        /// was: not truncated, its queue unchanged and its rows still buffered. Before, the
+        /// truncation committed first, and a failure or a crash before the drop left the
+        /// abandoned chain's rows buffered under blocks queued again. Once the delete works,
+        /// the truncation runs as usual and drops the rows above the blocks it keeps.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_truncation_whose_buffer_cleanup_fails_truncates_nothing() {
+            use zcash_client_backend::data_api::WalletRead as _;
+
+            let base_size = SHARD - 30;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 80);
+            let tip = blocks.last().expect("blocks").height;
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("atomic");
+            open_wallet(&dir, &base, &blocks, tip);
+            // R, Historic: blocks [0, 70) in units [50, 20], stopped before its finish, so
+            // shard 1's rows [30, 70) stay buffered.
+            scan_range(&dir, &base, &blocks, 0, &[50, 20], true, None, End::Abort)
+                .await
+                .expect("historic range R");
+            let highest = || {
+                session(&dir)
+                    .db_mut()
+                    .block_max_scanned()
+                    .expect("block_max_scanned")
+                    .map(|block| u64::from(u32::from(block.block_height())))
+            };
+            let (rows, queue) = (buffer_rows(&dir), suggested(&dir));
+            assert_eq!(rows.len(), 40, "shard 1's rows [30, 70) are buffered");
+            assert_eq!(highest(), Some(START + 69), "the wallet holds R's blocks");
+            let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+            conn.execute_batch(
+                "CREATE TRIGGER refuse_graft_cleanup BEFORE DELETE ON ext_slipstream_graft_buffer
+                 BEGIN SELECT RAISE(ABORT, 'graft cleanup refused'); END;",
+            )
+            .expect("make the buffer cleanup fail");
+            let truncate = || {
+                session(&dir)
+                    .truncate_to_height(BlockHeight::from(u32::try_from(START + 59).expect("fits")))
+            };
+            let refused = truncate();
+            assert!(
+                matches!(&refused, Err(e) if e.to_string().contains("graft cleanup refused")),
+                "a failed cleanup fails the truncation: {refused:?}"
+            );
+            assert_eq!(
+                highest(),
+                Some(START + 69),
+                "the wallet is not truncated: it still holds R's blocks"
+            );
+            assert_eq!(suggested(&dir), queue, "its scan queue is as it was");
+            assert_eq!(
+                buffer_rows(&dir),
+                rows,
+                "its graft-buffer rows are as they were"
+            );
+            conn.execute_batch("DROP TRIGGER refuse_graft_cleanup")
+                .expect("let the cleanup run");
+            let truncated_to = truncate().expect("truncate");
+            let kept = u64::from(u32::from(truncated_to)) + 1 - START;
+            assert!(
+                (31..70).contains(&kept),
+                "the truncation keeps some of shard 1's buffered blocks and drops the others \
+                 (it keeps [0, {kept}))"
+            );
+            assert_eq!(highest(), Some(START + kept - 1), "the wallet is truncated");
+            assert_eq!(
+                buffer_rows(&dir)
+                    .iter()
+                    .map(|row| row.2)
+                    .collect::<Vec<_>>(),
+                (SHARD..base_size + kept)
+                    .map(|p| i64::try_from(p).expect("fits"))
+                    .collect::<Vec<_>>(),
+                "only the rows of the blocks the wallet still holds stay buffered"
+            );
+        }
+
         /// An account import rewinds the wallet to the chain state below its birthday and
         /// queues every later block again (upstream `add_account` → `rewind_to_chain_state`).
         /// The engine's import (`WalletSession::import_account`) drops the graft-buffer rows

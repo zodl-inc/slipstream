@@ -617,8 +617,9 @@ pub async fn run_to_completion(
                 "continuity break detected — truncating wallet DB and re-suggesting"
             );
 
-            // Upstream's truncate_to_height (data_api.rs:3233), then the graft-buffer rows of
-            // the blocks it removed: they may be the abandoned chain's.
+            // Upstream's truncate_to_height (data_api.rs:3233) and, in its transaction, the
+            // drop of the graft-buffer rows of the blocks it removed: they may be the
+            // abandoned chain's.
             session.truncate_to_height(BlockHeight::from(rewind_height))?;
 
             // [h16-2] The truncate discards blocks above rewind_height, but the blocks

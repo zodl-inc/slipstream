@@ -260,38 +260,52 @@ impl WalletSession {
     }
 
     /// Truncates the wallet to at most `height` (upstream
-    /// [`WalletWrite::truncate_to_height`]; the scheduler's reorg recovery), then drops the
+    /// [`WalletWrite::truncate_to_height`]; the scheduler's reorg recovery), and drops the
     /// graft-buffer rows of the blocks the truncation removed: every row at or above the
     /// tree sizes at the end of the highest block the wallet still holds. Those blocks are
     /// queued again and may come back from another chain, so a range must not resume rows
-    /// scanned from the one the wallet left. Returns the height the wallet was truncated to.
+    /// scanned from the one the wallet left. Both run in upstream's truncation transaction
+    /// ([`WalletDb::transactionally_with_extension`]): a crash or an error undoes both, so
+    /// the wallet is never left truncated with those rows buffered. A pool whose tree size
+    /// the highest remaining block does not record keeps its rows, with a warning: no other
+    /// size bounds them (a lower block's would also drop rows of blocks the wallet keeps).
+    /// Returns the height the wallet was truncated to.
     pub fn truncate_to_height(
         &mut self,
         height: BlockHeight,
     ) -> Result<BlockHeight, SlipstreamError> {
-        let truncated_to = self
-            .db
-            .truncate_to_height(height)
-            .map_err(|e| wallet_err("truncate_to_height", e))?;
-        let (sapling, orchard) = match self
-            .db
-            .block_max_scanned()
-            .map_err(|e| wallet_err("block_max_scanned", e))?
-        {
-            Some(highest) => (
-                highest.sapling_tree_size().map(u64::from),
-                highest.orchard_tree_size().map(u64::from),
-            ),
-            // No block left: every buffered row is a removed block's.
-            None => (Some(0), Some(0)),
-        };
-        self.drop_graft_rows_from(sapling, orchard)?;
-        Ok(truncated_to)
+        self.db
+            .transactionally_with_extension(|wdb, ext| {
+                let truncated_to = wdb.truncate_to_height(height)?;
+                let (sapling, orchard) = match wdb.block_max_scanned()? {
+                    Some(highest) => (
+                        highest.sapling_tree_size().map(u64::from),
+                        highest.orchard_tree_size().map(u64::from),
+                    ),
+                    // No block left: every buffered row is a removed block's.
+                    None => (Some(0), Some(0)),
+                };
+                for (pool, from) in [
+                    (ShieldedPool::Sapling, sapling),
+                    (ShieldedPool::Orchard, orchard),
+                ] {
+                    match from {
+                        Some(from) => crate::graft::delete_from_position_in(ext, pool, from)?,
+                        None => tracing::warn!(
+                            ?pool,
+                            %truncated_to,
+                            "truncation: the highest remaining block records no tree size for this pool; its graft-buffer rows stay"
+                        ),
+                    }
+                }
+                Ok::<_, zcash_client_sqlite::error::SqliteClientError>(truncated_to)
+            })
+            .map_err(|e| wallet_err("truncate_to_height", e))
     }
 
     /// Drops every graft-buffer row at or above these tree sizes (Sapling, Orchard;
     /// `None` leaves that pool's rows), over a side connection: upstream `WalletDb` never
-    /// exposes its own.
+    /// exposes its own. An account import's rewind uses it, after the import commits.
     fn drop_graft_rows_from(
         &self,
         sapling: Option<u64>,
