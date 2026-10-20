@@ -406,14 +406,10 @@ pub(crate) fn scanned_stretches(
 
 /// Rewind support (plan Task 9): drop every buffered row at or above `min_position`.
 ///
-/// NOT currently called from any production path — the scheduler's reorg-recovery
-/// arm (`scheduler.rs`) truncates the wallet DB via upstream's
-/// `truncate_to_height`, which has no visibility into this engine-owned table.
-/// Exercised only by this module's own tests. Kept (not deleted) because it is
-/// real, tested rewind support the recovery arm appears to need but does not yet
-/// call — flagged separately rather than wired up here, since fixing the gap
-/// itself is out of scope for a dead-code cleanup pass.
-#[allow(dead_code)]
+/// Upstream's rewinds never see this engine-owned table, so the engine calls this
+/// after its own: the reorg recovery's truncation and an account import's rewind
+/// (`WalletSession::truncate_to_height`, `WalletSession::import_account`). The blocks
+/// they queue again hold exactly the rows at or above the rewind's tree size.
 pub(crate) fn delete_from_position(
     conn: &Connection,
     pool: ShieldedPool,

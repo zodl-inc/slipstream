@@ -3002,5 +3002,131 @@ mod tests {
             );
             assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
         }
+
+        /// A reorg recovery truncates the wallet (`WalletSession::truncate_to_height`, as the
+        /// scheduler's ScanContinuity arm calls it) and queues the blocks above the
+        /// truncation again, possibly from another chain. Their graft-buffer rows go with
+        /// them; the rows of the blocks the wallet keeps stay for the range that continues
+        /// them, and the rescan ends with the chain's sapling tree.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_reorg_truncation_drops_the_buffered_rows_above_it() {
+            let base_size = SHARD - 30;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 80);
+            let tip = blocks.last().expect("blocks").height;
+            let true_root = state_after(&base, &blocks, blocks.len())
+                .final_sapling_tree()
+                .root();
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("reorged");
+            open_wallet(&dir, &base, &blocks, tip);
+            // R, Historic: blocks [0, 70) in units [50, 20], stopped before its finish, so
+            // shard 1's rows [30, 70) stay buffered.
+            scan_range(&dir, &base, &blocks, 0, &[50, 20], true, None, End::Abort)
+                .await
+                .expect("historic range R");
+            assert_eq!(
+                buffer_rows(&dir).len(),
+                40,
+                "shard 1's rows [30, 70) are buffered"
+            );
+            let truncated_to = session(&dir)
+                .truncate_to_height(BlockHeight::from(u32::try_from(START + 59).expect("fits")))
+                .expect("truncate");
+            // The wallet keeps blocks [0, kept).
+            let kept = u64::from(u32::from(truncated_to)) + 1 - START;
+            assert!(
+                (31..70).contains(&kept),
+                "the truncation keeps some of shard 1's buffered blocks and drops the others \
+                 (it keeps [0, {kept}))"
+            );
+            let positions: Vec<i64> = buffer_rows(&dir).iter().map(|row| row.2).collect();
+            assert_eq!(
+                positions,
+                (SHARD..base_size + kept)
+                    .map(|p| i64::try_from(p).expect("fits"))
+                    .collect::<Vec<_>>(),
+                "only the rows of the blocks the wallet still holds stay buffered"
+            );
+            let idx = usize::try_from(kept).expect("fits");
+            scan_range(
+                &dir,
+                &base,
+                &blocks,
+                idx,
+                &[blocks.len() - idx],
+                true,
+                None,
+                End::Finish,
+            )
+            .await
+            .expect("the rescan");
+            assert_eq!(
+                sapling_root_at(&dir, tip),
+                Ok(Some(true_root)),
+                "the rescanned wallet's sapling root at the tip is the chain's"
+            );
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+        }
+
+        /// An account import rewinds the wallet to the chain state below its birthday and
+        /// queues every later block again (upstream `add_account` → `rewind_to_chain_state`).
+        /// The engine's import (`WalletSession::import_account`) drops the graft-buffer rows
+        /// of those blocks at once, and the rescan continues the rows below the birthday.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_import_drops_the_buffered_rows_its_rescan_covers() {
+            let base_size = SHARD - 30;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 80);
+            let tip = blocks.last().expect("blocks").height;
+            let true_root = state_after(&base, &blocks, blocks.len())
+                .final_sapling_tree()
+                .root();
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("imported");
+            open_wallet(&dir, &base, &blocks, tip);
+            // R, Historic: only its first unit [0, 50) commits, so shard 1's rows [30, 50)
+            // stay buffered.
+            scan_range(&dir, &base, &blocks, 0, &[50], true, None, End::Abort)
+                .await
+                .expect("historic range R, first unit");
+            assert_eq!(
+                buffer_rows(&dir).len(),
+                20,
+                "shard 1's rows [30, 50) are buffered"
+            );
+            // A second account through the engine's import, birthday at block 40
+            // (position 65,546).
+            let usk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+                &zcash_protocol::consensus::MAIN_NETWORK,
+                &[9u8; 32],
+                zip32::AccountId::ZERO,
+            )
+            .expect("usk");
+            let birthday = AccountBirthday::from_parts(state_after(&base, &blocks, 40), None);
+            session(&dir)
+                .import_account_with_birthday(&usk.to_unified_full_viewing_key(), &birthday)
+                .expect("import the second account");
+            let positions: Vec<i64> = buffer_rows(&dir).iter().map(|row| row.2).collect();
+            assert_eq!(
+                positions,
+                (65_536..65_546).collect::<Vec<i64>>(),
+                "only the rows below the birthday stay buffered"
+            );
+            assert_eq!(
+                suggested(&dir),
+                ["Historic(1500040..1500080)"],
+                "the import queues the blocks from its birthday again"
+            );
+            scan_range(&dir, &base, &blocks, 40, &[40], true, None, End::Finish)
+                .await
+                .expect("the rescan");
+            assert_eq!(
+                sapling_root_at(&dir, tip),
+                Ok(Some(true_root)),
+                "the rescanned wallet's sapling root at the tip is the chain's"
+            );
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+        }
     }
 }

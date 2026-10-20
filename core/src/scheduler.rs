@@ -23,7 +23,7 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use tracing::{debug, info, warn};
-use zcash_client_backend::data_api::{WalletWrite, scanning::ScanPriority};
+use zcash_client_backend::data_api::scanning::ScanPriority;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
@@ -604,12 +604,9 @@ pub async fn run_to_completion(
                 "continuity break detected — truncating wallet DB and re-suggesting"
             );
 
-            // truncate_to_height returns Result<BlockHeight, WalletDb::Error>
-            // (data_api.rs:3233: `fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error>`)
-            session
-                .db_mut()
-                .truncate_to_height(BlockHeight::from(rewind_height))
-                .map_err(|e| SlipstreamError::Wallet(format!("truncate_to_height: {e}")))?;
+            // Upstream's truncate_to_height (data_api.rs:3233), then the graft-buffer rows of
+            // the blocks it removed: they may be the abandoned chain's.
+            session.truncate_to_height(BlockHeight::from(rewind_height))?;
 
             // [h16-2] The truncate discards blocks above rewind_height, but the blocks
             // BELOW it (the surviving prefix of the aborted range) are still done — credit
@@ -809,6 +806,7 @@ pub async fn run_to_completion(
 mod tests {
     use super::*;
     use crate::ffi_handle::{SyncState, derive_snapshot};
+    use zcash_client_backend::data_api::WalletWrite as _;
 
     #[test]
     fn sync_report_default_is_zero() {
