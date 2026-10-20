@@ -147,6 +147,16 @@ let abort = spawn_supervised(
 transient-failure retries → then it **stays live**, following the chain tip (jittered
 10–30 s probes) and watching the mempool, until you `abort()` it. You never re-poke it.
 
+It returns by itself in one case only: you stopped it for a wallet change. An abort alone
+cannot reach a scan call until it has scanned its whole chunk, so right before you add or
+remove an account, rewind or wipe, call `reporter.progress.request_stop_for_wallet_change()`
+and then abort. The scan ends at its next block, without writing anything for that chunk;
+the session sets `Idle` and returns, and the next session scans the chunk again. Before you
+write, prove the wallet file idle: wait for the aborted task and the engine's writers with
+`ffi_handle::settle_passes` and `ffi_handle::drain_wallet_writers`, or keep an
+`ffi_handle::SlipstreamHandle` and call its `stop_for_wallet_change`, which does all of it
+(§9).
+
 ### 3.3 The poll loop (this is your entire integration)
 
 ```rust
@@ -178,13 +188,14 @@ transactions with **zero wallet math of its own**; treat it as executable docume
 
 ## 4. Any-language host — the C ABI
 
-Nine functions. `SlipstreamHandle` is opaque; snapshot is returned **by value**.
+Ten functions. `SlipstreamHandle` is opaque; snapshot and stop report are returned **by value**.
 
 | Function | What it does |
 |---|---|
 | `zcashlc_slipstream_open(db_path, path_len, host, host_len, port, use_tls, network_id, total_memory_bytes) → *Handle` | Allocates the handle (its own tokio runtime + atomics + event ring), runs DB schema migrations, installs the read views, and **seeds the snapshot from persisted wallet state** (truthful from open, §5). `network_id`: 1 = mainnet, 0 = testnet. `total_memory_bytes`: pass physical RAM or 0. Null on failure. |
 | `zcashlc_slipstream_start(handle, ufvk, ufvk_len, birthday, tor_dir, tor_dir_len) → bool` | Spawns the session (initial pass → follow + mempool). `ufvk` null/0 = keyless (account already exists); non-null = view-only import on first pass. `tor_dir` non-empty = engine-owned Tor for the identifying calls. Call again after `stop` to restart (aborts any in-flight pass first, safely). |
-| `zcashlc_slipstream_stop(handle) → bool` | Cancels the sync task. Handle stays usable (snapshot/drain still work). |
+| `zcashlc_slipstream_stop(handle) → FfiSlipstreamStopReport` | Cancels the sync task, then waits (≤ 10 s each) for the aborted pass and for the engine's background wallet commit to finish. The report says whether each wait finished (`settled`, `drained`) and how long it took (`settle_ms`, `drain_ms`); the wallet file is proved quiet only when both finished. A scan in the middle of a chunk finishes that chunk first. Handle stays usable (snapshot/drain still work). |
+| `zcashlc_slipstream_stop_for_wallet_change(handle) → FfiSlipstreamStopReport` | The stop to use right before you change the wallet (add or remove an account, rewind, wipe, or reopen a handle on the same wallet): it asks the scan to end at its next block, then stops exactly like `stop`. Refuse the change unless both waits finished (§9). |
 | `zcashlc_slipstream_snapshot(handle) → FfiSlipstreamSnapshot` | The poll read (§5). By value, cheap, call every tick. |
 | `zcashlc_slipstream_drain_events(handle, buf, buf_len) → usize` | Atomically drains up to `buf_len` events (§6) into your buffer. Drain every tick (even if you ignore the contents) so the 64-slot ring never warns. |
 | `zcashlc_slipstream_wallet_summary(handle, confirmations_policy) → *FfiWalletSummary` | **Phase-resolving balances** (§7.2): recovery-safe values while restoring, upstream summary otherwise. Internally cost-rationed — safe to call every tick. Free with `zcashlc_free_wallet_summary`. |
@@ -376,6 +387,11 @@ Feed the result into account creation (your `zcash_client_sqlite` calls, or
 - Poll snapshot + drain events on a steady tick (1–2 s) while the UI is visible.
 - Serialize all calls on one handle; `stop()` on background, `start()` on foreground
   (position is durable — restarts are cheap and resume).
+- Right before you change the wallet (add or remove an account, rewind, wipe, or reopen a
+  handle on the same wallet), stop with `stop_for_wallet_change`, refuse the change unless
+  both of its waits finished, and start again afterwards. A plain `stop` lets the current
+  scan call finish its chunk first, which can take longer than the 10 s budget when
+  accounts are added in quick succession.
 - Apply the two documented rules verbatim: visibility (§7.1) and the tx re-query rule
   (§5.4); use `busy_timeout` on your DB connections (§7.3).
 - Treat `state == 2` as "offer retry" (call `start` again). Transient network trouble
