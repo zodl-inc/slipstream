@@ -179,6 +179,97 @@ pub(crate) fn should_retry(err: &SlipstreamError, attempt: u32) -> Option<Durati
     }
 }
 
+// ── What the session does with a failed pass ─────────────────────────────────
+//
+// Pure decisions, so each one is table-tested without a server: the loops below only `match`
+// on them. The host's wallet-change stop is decided FIRST in each: it is not transient, so
+// decided later it would count as a failed attempt, surface `Error` and revive the session, or
+// keep the follow loop polling.
+
+/// What [`run_pass_with_retry`] does with a pass that failed ([`failed_pass_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailedPassAction {
+    /// The host stopped the pass for a wallet change: return the stop at once, never retried
+    /// and not counted as a failed attempt.
+    ReturnStop,
+    /// A transient failure with retries left: count the failed attempt, sleep this long, and
+    /// run the pass again.
+    RetryAfter(Duration),
+    /// Count the failed attempt and return the error: it is not transient, or the retries are
+    /// spent.
+    GiveUp,
+}
+
+impl FailedPassAction {
+    /// Whether the failure counts as a failed attempt ([`Progress::note_attempt_failed`] and the
+    /// attempt count): every failure does but the host's wallet-change stop.
+    pub(crate) fn counts_as_failed_attempt(self) -> bool {
+        !matches!(self, Self::ReturnStop)
+    }
+}
+
+/// The decision [`run_pass_with_retry`] makes for a pass that failed with `err`, `attempt` being
+/// the 1-based number of that attempt: the wallet-change stop first, whatever the attempt, then
+/// [`should_retry`]'s ladder.
+pub(crate) fn failed_pass_action(err: &SlipstreamError, attempt: u32) -> FailedPassAction {
+    if err.is_stop_for_wallet_change() {
+        return FailedPassAction::ReturnStop;
+    }
+    match should_retry(err, attempt) {
+        Some(sleep) => FailedPassAction::RetryAfter(sleep),
+        None => FailedPassAction::GiveUp,
+    }
+}
+
+/// What [`run_session`]'s initial-pass loop does with a pass that failed, once
+/// [`run_pass_with_retry`] has run its own retries ([`initial_pass_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InitialPassFailure {
+    /// The host stopped the session for a wallet change: `Idle`, one info line, and the session
+    /// ends. No backoff, no `Error(1)`, no tag-4 event, no revival.
+    EndQuietly,
+    /// A transient failure (T8.7): `Idle` (shown as disconnected), back off, and run the
+    /// initial pass again. Never surfaces `Error`.
+    RetryTransient,
+    /// A non-transient failure ([B4-16]): surface `Error(1)` and the tag-4 event, back off, and
+    /// revive the session with a fresh pass.
+    Revive,
+}
+
+/// Classifies a failed initial pass for [`run_session`]: the wallet-change stop first, then
+/// transient against non-transient.
+pub(crate) fn initial_pass_failure(err: &SlipstreamError) -> InitialPassFailure {
+    if err.is_stop_for_wallet_change() {
+        InitialPassFailure::EndQuietly
+    } else if err.is_transient() {
+        InitialPassFailure::RetryTransient
+    } else {
+        InitialPassFailure::Revive
+    }
+}
+
+/// What [`follow_loop`] does with a catch-up pass that failed, once [`run_pass_with_retry`] has
+/// run its own retries ([`catch_up_failure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CatchUpFailure {
+    /// The host stopped the catch-up pass for a wallet change: `Idle`, one info line, and the
+    /// session ends.
+    EndQuietly,
+    /// Any other failure (T8.7): the wallet is still synced to the last tip, so it goes back to
+    /// `Done` and tries again on the next tick. Never surfaces `Error`.
+    StaySynced,
+}
+
+/// Classifies a failed catch-up pass for [`follow_loop`]: only the wallet-change stop ends the
+/// session; every other failure keeps following.
+pub(crate) fn catch_up_failure(err: &SlipstreamError) -> CatchUpFailure {
+    if err.is_stop_for_wallet_change() {
+        CatchUpFailure::EndQuietly
+    } else {
+        CatchUpFailure::StaySynced
+    }
+}
+
 /// Run `sync_once` with the T6.8-H2 bounded retry ladder and return the first successful
 /// `SyncOutcome` or the last error.
 ///
@@ -200,7 +291,7 @@ pub(crate) async fn run_pass_with_retry(
     let mut attempt: u32 = 0;
     loop {
         let result = sync_once(cfg, accounts, Some(progress.clone()), tor).await;
-        match result {
+        let err = match result {
             Ok(outcome) => {
                 // The engine returns a bare result; the orchestration layer owns
                 // presentation — emit the per-pass tracing summary here (covers the
@@ -208,28 +299,31 @@ pub(crate) async fn run_pass_with_retry(
                 crate::report::log_pass_summary(&outcome, cfg);
                 return Ok(outcome);
             }
-            // The host stopped the pass for a wallet change: hand it straight back, ahead of
-            // the failed-attempt bookkeeping and the retry below (see the doc above).
-            Err(err) if err.is_stop_for_wallet_change() => return Err(err),
-            Err(err) => {
-                // A failed attempt that did not give up its download ends every
-                // download-failure run (see `Progress::note_attempt_failed`).
-                progress.note_attempt_failed();
-                attempt += 1;
-                match should_retry(&err, attempt) {
-                    Some(sleep_dur) => {
-                        tracing::warn!(
-                            %err,
-                            attempt,
-                            sleep_secs = sleep_dur.as_secs(),
-                            "slipstream sync failed (transient) — retrying pass"
-                        );
-                        tokio::time::sleep(sleep_dur).await;
-                        // Continue with SyncState::Syncing (caller owns state transitions).
-                    }
-                    None => return Err(err),
-                }
+            Err(err) => err,
+        };
+        // `attempt + 1` is the number of the attempt that just failed.
+        let action = failed_pass_action(&err, attempt + 1);
+        if action.counts_as_failed_attempt() {
+            // A failed attempt that did not give up its download ends every
+            // download-failure run (see `Progress::note_attempt_failed`).
+            progress.note_attempt_failed();
+            attempt += 1;
+        }
+        match action {
+            // The host stopped the pass for a wallet change: hand it straight back, with none
+            // of the failed-attempt bookkeeping above and no retry (see the doc above).
+            FailedPassAction::ReturnStop => return Err(err),
+            FailedPassAction::RetryAfter(sleep_dur) => {
+                tracing::warn!(
+                    %err,
+                    attempt,
+                    sleep_secs = sleep_dur.as_secs(),
+                    "slipstream sync failed (transient) — retrying pass"
+                );
+                tokio::time::sleep(sleep_dur).await;
+                // Continue with SyncState::Syncing (caller owns state transitions).
             }
+            FailedPassAction::GiveUp => return Err(err),
         }
     }
 }
@@ -389,54 +483,56 @@ pub async fn run_session(
         .await
         {
             Ok(outcome) => break outcome,
-            // The host stopped the session for a wallet change. Matched BEFORE the transient
-            // and non-transient arms below, so none of their handling runs: no backoff, no
-            // `Error(1)`, no tag-4 event, no revival. Idle is the state a host's own stop
-            // leaves too.
-            Err(err) if err.is_stop_for_wallet_change() => {
-                reporter.set_state(SyncState::Idle);
-                tracing::info!(
-                    stopped_at_utc = %wall_clock_utc(),
-                    "initial sync pass stopped for a wallet change — session ends"
-                );
-                return;
-            }
-            Err(err) if err.is_transient() => {
-                initial_failures += 1;
-                let backoff = sync_retry_backoff(initial_failures);
-                tracing::warn!(
-                    %err,
-                    initial_failures,
-                    backoff_secs = backoff.as_secs(),
-                    "initial sync attempt failed (transient) — retrying, NOT surfacing Error"
-                );
-                reporter.set_state(SyncState::Idle);
-                tokio::time::sleep(backoff).await;
-            }
-            Err(err) => {
-                // [B4-16] Non-transient failure: surface truthfully (state + tag-4 — exactly
-                // the pre-revival behaviour, hosts still see every failure), then REVIVE.
-                // The revived pass re-derives everything from the committed DB (façade seed,
-                // suggest round, keys), so one-shot causes — the field case: an account
-                // deleted while a range was in flight — self-heal on the first attempt.
-                // State stays Error for the whole wait; the next iteration flips it back to
-                // Syncing. A host abort cancels the sleep like any other await.
-                tracing::error!(
-                    %err,
-                    failed_at_utc = %wall_clock_utc(),
-                    "slipstream sync failed"
-                );
-                reporter.set_state(SyncState::Error(1));
-                reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 1 });
-                revivals += 1;
-                let backoff = wedge_revival_backoff(revivals);
-                tracing::warn!(
-                    revivals,
-                    backoff_secs = backoff.as_secs(),
-                    "session stays alive — reviving after non-transient failure"
-                );
-                tokio::time::sleep(backoff).await;
-            }
+            Err(err) => match initial_pass_failure(&err) {
+                // The host stopped the session for a wallet change. Classified BEFORE the
+                // transient and non-transient cases (`initial_pass_failure`), so none of their
+                // handling runs: no backoff, no `Error(1)`, no tag-4 event, no revival. Idle is
+                // the state a host's own stop leaves too.
+                InitialPassFailure::EndQuietly => {
+                    reporter.set_state(SyncState::Idle);
+                    tracing::info!(
+                        stopped_at_utc = %wall_clock_utc(),
+                        "initial sync pass stopped for a wallet change — session ends"
+                    );
+                    return;
+                }
+                InitialPassFailure::RetryTransient => {
+                    initial_failures += 1;
+                    let backoff = sync_retry_backoff(initial_failures);
+                    tracing::warn!(
+                        %err,
+                        initial_failures,
+                        backoff_secs = backoff.as_secs(),
+                        "initial sync attempt failed (transient) — retrying, NOT surfacing Error"
+                    );
+                    reporter.set_state(SyncState::Idle);
+                    tokio::time::sleep(backoff).await;
+                }
+                InitialPassFailure::Revive => {
+                    // [B4-16] Non-transient failure: surface truthfully (state + tag-4 — exactly
+                    // the pre-revival behaviour, hosts still see every failure), then REVIVE.
+                    // The revived pass re-derives everything from the committed DB (façade seed,
+                    // suggest round, keys), so one-shot causes — the field case: an account
+                    // deleted while a range was in flight — self-heal on the first attempt.
+                    // State stays Error for the whole wait; the next iteration flips it back to
+                    // Syncing. A host abort cancels the sleep like any other await.
+                    tracing::error!(
+                        %err,
+                        failed_at_utc = %wall_clock_utc(),
+                        "slipstream sync failed"
+                    );
+                    reporter.set_state(SyncState::Error(1));
+                    reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 1 });
+                    revivals += 1;
+                    let backoff = wedge_revival_backoff(revivals);
+                    tracing::warn!(
+                        revivals,
+                        backoff_secs = backoff.as_secs(),
+                        "session stays alive — reviving after non-transient failure"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
+            },
         }
     };
 
@@ -599,32 +695,34 @@ async fn follow_loop(
                     value: o.enhance.txs_stored,
                 });
             }
-            // The host stopped the catch-up pass for a wallet change: end the session, ahead
-            // of the failure arm below (which would revert to Done and poll again). Idle, not
-            // Done: the host is about to change the wallet, so it is no longer known to be
-            // synced to `last_tip`.
-            Err(err) if err.is_stop_for_wallet_change() => {
-                reporter.set_state(SyncState::Idle);
-                tracing::info!(
-                    last_tip,
-                    stopped_at_utc = %wall_clock_utc(),
-                    "follow catch-up pass stopped for a wallet change — session ends"
-                );
-                return;
-            }
-            Err(err) => {
-                consecutive_failures += 1;
-                // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
-                // to last_tip. Revert to Done (NOT Error) and retry on the next tick.
-                tracing::warn!(
-                    %err,
-                    consecutive_failures,
-                    last_tip,
-                    failed_at_utc = %wall_clock_utc(),
-                    "follow catch-up pass failed — staying synced, will retry"
-                );
-                reporter.set_state(SyncState::Done);
-            }
+            Err(err) => match catch_up_failure(&err) {
+                // The host stopped the catch-up pass for a wallet change: end the session,
+                // ahead of the failure handling below (which would revert to Done and poll
+                // again). Idle, not Done: the host is about to change the wallet, so it is no
+                // longer known to be synced to `last_tip`.
+                CatchUpFailure::EndQuietly => {
+                    reporter.set_state(SyncState::Idle);
+                    tracing::info!(
+                        last_tip,
+                        stopped_at_utc = %wall_clock_utc(),
+                        "follow catch-up pass stopped for a wallet change — session ends"
+                    );
+                    return;
+                }
+                CatchUpFailure::StaySynced => {
+                    consecutive_failures += 1;
+                    // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
+                    // to last_tip. Revert to Done (NOT Error) and retry on the next tick.
+                    tracing::warn!(
+                        %err,
+                        consecutive_failures,
+                        last_tip,
+                        failed_at_utc = %wall_clock_utc(),
+                        "follow catch-up pass failed — staying synced, will retry"
+                    );
+                    reporter.set_state(SyncState::Done);
+                }
+            },
         }
     }
 }
@@ -679,6 +777,111 @@ mod tests {
         assert_eq!(pass_retry_sleep(1), Duration::from_secs(5));
         assert_eq!(pass_retry_sleep(2), Duration::from_secs(15));
         assert_eq!(pass_retry_sleep(3), Duration::from_secs(15)); // default arm
+    }
+
+    // ── What the session does with a failed pass ─────────────────────────────
+    //
+    // One table per decision the loops `match` on. Each covers the host's wallet-change stop,
+    // the engine's closed-channel `Stopped` (no request from the host: it must NOT end a session
+    // quietly), a transient transport failure and a non-transient wallet failure, so deciding
+    // the stop after any other case fails a row.
+
+    #[test]
+    fn a_failed_pass_returns_the_stop_retries_or_gives_up() {
+        use FailedPassAction::{GiveUp, RetryAfter, ReturnStop};
+        // (error, number of the attempt that failed, what `run_pass_with_retry` does, whether
+        // the failure counts as a failed attempt)
+        let table = [
+            (
+                SlipstreamError::StoppedForWalletChange,
+                1,
+                ReturnStop,
+                false,
+            ),
+            (
+                SlipstreamError::StoppedForWalletChange,
+                PASS_RETRY_MAX + 1,
+                ReturnStop,
+                false,
+            ),
+            (SlipstreamError::Stopped, 1, GiveUp, true),
+            (
+                SlipstreamError::Transport("timed out after 30s".into()),
+                1,
+                RetryAfter(Duration::from_secs(5)),
+                true,
+            ),
+            (
+                SlipstreamError::Transport("stream idle timeout".into()),
+                2,
+                RetryAfter(Duration::from_secs(15)),
+                true,
+            ),
+            (
+                SlipstreamError::Transport("connect refused".into()),
+                PASS_RETRY_MAX + 1,
+                GiveUp,
+                true,
+            ),
+            (
+                SlipstreamError::Wallet("database is locked".into()),
+                1,
+                GiveUp,
+                true,
+            ),
+        ];
+        for (err, attempt, action, counted) in &table {
+            let decided = failed_pass_action(err, *attempt);
+            assert_eq!(decided, *action, "{err} (attempt {attempt})");
+            assert_eq!(
+                decided.counts_as_failed_attempt(),
+                *counted,
+                "{err} (attempt {attempt}): failed-attempt bookkeeping"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_initial_pass_ends_quietly_retries_or_revives() {
+        use InitialPassFailure::{EndQuietly, RetryTransient, Revive};
+        let table = [
+            (SlipstreamError::StoppedForWalletChange, EndQuietly),
+            (SlipstreamError::Stopped, Revive),
+            (
+                SlipstreamError::Transport("connect refused".into()),
+                RetryTransient,
+            ),
+            (SlipstreamError::Wallet("database is locked".into()), Revive),
+            (SlipstreamError::Config("bad birthday".into()), Revive),
+            (SlipstreamError::MisbehavingServer, Revive),
+            (SlipstreamError::ScanContinuity { at: 663_195 }, Revive),
+        ];
+        for (err, expected) in &table {
+            assert_eq!(initial_pass_failure(err), *expected, "{err}");
+        }
+    }
+
+    #[test]
+    fn a_failed_catch_up_pass_ends_quietly_or_stays_synced() {
+        use CatchUpFailure::{EndQuietly, StaySynced};
+        let table = [
+            (SlipstreamError::StoppedForWalletChange, EndQuietly),
+            (SlipstreamError::Stopped, StaySynced),
+            (
+                SlipstreamError::Transport("stream idle timeout".into()),
+                StaySynced,
+            ),
+            (
+                SlipstreamError::Wallet("database is locked".into()),
+                StaySynced,
+            ),
+            (SlipstreamError::Config("bad birthday".into()), StaySynced),
+            (SlipstreamError::MisbehavingServer, StaySynced),
+            (SlipstreamError::ScanContinuity { at: 663_195 }, StaySynced),
+        ];
+        for (err, expected) in &table {
+            assert_eq!(catch_up_failure(err), *expected, "{err}");
+        }
     }
 
     // ── T8.1 follow-poll jitter ──────────────────────────────────────────────
