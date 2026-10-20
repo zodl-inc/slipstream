@@ -199,6 +199,21 @@ pub struct Progress {
     /// give-up, spent by [`Self::note_attempt_failed`], and cleared by
     /// [`Self::note_pass_completed`] and [`Self::begin_session`].
     download_gave_up_this_attempt: AtomicBool,
+    /// How many times the host has asked the running session to stop because it is about to
+    /// change the wallet (see [`Self::request_stop_for_wallet_change`]), over the handle's whole
+    /// life. A session is told to stop when this differs from the value it started with, which
+    /// `session_stop_requests` holds; read the verdict with [`Self::stop_requested`].
+    /// Monotonic per handle: deliberately NOT reset by [`Self::begin_pass`] (a request outlives
+    /// the pass it interrupts) and NOT by [`Self::begin_session`] either, which re-arms the
+    /// next session by COPYING this count into `session_stop_requests`, never by clearing it.
+    stop_requests: AtomicU64,
+    /// The `stop_requests` value the running session started with: stored by
+    /// [`Self::begin_session`], which `run_session` calls right after it takes the handle's
+    /// pass lock. Every request made for an EARLIER session has been counted by then, so it can
+    /// never stop this one; only a request made after the session began makes the two counts
+    /// differ. Deliberately NOT reset by [`Self::begin_pass`]: it belongs to the session, not to
+    /// one of its passes.
+    session_stop_requests: AtomicU64,
 }
 
 impl Default for Progress {
@@ -229,6 +244,8 @@ impl Default for Progress {
             wallet_writers: AtomicUsize::new(0),
             download_failures: std::sync::Mutex::new(std::collections::BTreeMap::new()),
             download_gave_up_this_attempt: AtomicBool::new(false),
+            stop_requests: AtomicU64::new(0),
+            session_stop_requests: AtomicU64::new(0),
         }
     }
 }
@@ -462,10 +479,24 @@ impl Progress {
     /// A new sync session starts (a host start or restart). It gets a fresh count: every run
     /// ends, so the session's first give-up at any block starts a new run instead of extending
     /// one from before the restart.
+    ///
+    /// It also re-arms the wallet-change stop: the session starts with every request made so far
+    /// already counted as answered, so a request aimed at the PREVIOUS session never stops this
+    /// one (see [`Self::request_stop_for_wallet_change`]). `run_session` calls this right after it
+    /// takes the handle's pass lock, the point where the previous session has unwound and this one
+    /// has not scanned a block yet. Only a request made after this call, while this session is the
+    /// one running, makes [`Self::stop_requested`] true again.
     pub fn begin_session(&self) {
         self.download_gave_up_this_attempt
             .store(false, Ordering::SeqCst);
         self.clear_download_failures("new session");
+        // Re-arm the wallet-change stop. Copy the request count into the session, never clear it:
+        // the two counts are only ever compared for inequality, so a `stop_requests` that moved
+        // backwards would read as a fresh request.
+        self.session_stop_requests.store(
+            self.stop_requests.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
     }
 
     /// A sync attempt failed: a pass, or the tip check between passes. If the block download
@@ -726,6 +757,10 @@ impl Progress {
     /// Deliberately NOT reset (monotonic per handle — Swift consumes these as deltas
     /// via strict-greater/last-seen comparisons): `enhanced_txs`, `ranges_completed`,
     /// `reorgs_recovered`. `chain_tip` is overwritten early in every pass anyway.
+    ///
+    /// Also deliberately left alone: the wallet-change stop request (see
+    /// [`Self::request_stop_for_wallet_change`]). It outlives the pass it interrupts, and only
+    /// [`Self::begin_session`] re-arms it.
     pub fn begin_pass(&self) {
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
@@ -793,6 +828,40 @@ impl Progress {
     #[inline]
     pub fn ranges_completed(&self) -> u64 {
         self.ranges_completed.load(Ordering::Relaxed)
+    }
+
+    // ── stop for a wallet change ──
+
+    /// Ask the running sync session to stop at its next block because the host is about to
+    /// change the wallet: adding or removing an account, a rewind, a wipe. The host calls this
+    /// right before the change, so that its stop can prove the wallet file idle in time.
+    ///
+    /// Call it BEFORE aborting the session's task. An abort lands only at the task's next
+    /// `.await`, and the scan runs synchronously inside `block_in_place`, so one scan call can
+    /// run for a whole chunk with the abort unable to reach it. The scan checks
+    /// [`Self::stop_requested`] between blocks instead, so it returns at the next block rather
+    /// than at the end of the chunk. A scan that returns this way writes nothing.
+    ///
+    /// The request is aimed at the session that is running now. [`Self::begin_session`] re-arms
+    /// the stop, so a session that starts later is not stopped by it. Every call counts
+    /// (`stop_requests` goes up by one), so two requests in a row are both answered by the one
+    /// session they interrupt.
+    pub fn request_stop_for_wallet_change(&self) {
+        self.stop_requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the host has asked the running session to stop for a wallet change since the
+    /// session began: `stop_requests` differs from `session_stop_requests` (see
+    /// [`Self::request_stop_for_wallet_change`] and [`Self::begin_session`]).
+    ///
+    /// The scan calls this between blocks, so it is two Relaxed loads and nothing else: no lock,
+    /// no clock read, no allocation. Relaxed is enough because the scan only has to see the
+    /// request soon, not in step with any other counter — the same eventually-consistent
+    /// contract as every other field here.
+    #[inline]
+    pub fn stop_requested(&self) -> bool {
+        self.stop_requests.load(Ordering::Relaxed)
+            != self.session_stop_requests.load(Ordering::Relaxed)
     }
 }
 
@@ -1636,6 +1705,87 @@ mod tests {
         assert!(
             p.download_failures().is_empty(),
             "the give-up was spent by the attempt before; this one failed without one"
+        );
+    }
+
+    // ── stop for a wallet change ─────────────────────────────────────────────
+
+    #[test]
+    fn a_fresh_progress_has_no_stop_requested() {
+        let p = Progress::default();
+        assert!(!p.stop_requested(), "nobody has asked for a stop yet");
+    }
+
+    /// A pass start is not a session start: the request is the running session's to answer, so
+    /// `begin_pass` must leave it standing (a pass that began after the request was made would
+    /// otherwise swallow it).
+    #[test]
+    fn a_stop_request_is_seen_and_survives_a_new_pass() {
+        let p = Progress::default();
+        p.request_stop_for_wallet_change();
+        assert!(
+            p.stop_requested(),
+            "the running session must see the request"
+        );
+
+        p.begin_pass();
+        assert!(
+            p.stop_requested(),
+            "a pass start must not clear a stop request"
+        );
+    }
+
+    #[test]
+    fn a_new_session_re_arms_the_stop() {
+        let p = Progress::default();
+        p.request_stop_for_wallet_change();
+        assert!(p.stop_requested());
+
+        p.begin_session();
+        assert!(
+            !p.stop_requested(),
+            "a request aimed at the previous session must not stop the next one"
+        );
+    }
+
+    #[test]
+    fn a_request_after_the_session_began_stops_it() {
+        let p = Progress::default();
+        p.request_stop_for_wallet_change(); // aimed at a session that is already gone
+        p.begin_session();
+        assert!(!p.stop_requested());
+
+        p.request_stop_for_wallet_change();
+        assert!(
+            p.stop_requested(),
+            "a request made while this session runs must stop it"
+        );
+    }
+
+    /// Re-arming copies the request count into the session; it never clears the count itself, so
+    /// any number of earlier requests is answered by the one `begin_session`.
+    #[test]
+    fn several_requests_are_all_answered_by_one_new_session() {
+        let p = Progress::default();
+        p.request_stop_for_wallet_change();
+        p.request_stop_for_wallet_change();
+        assert!(p.stop_requested());
+
+        p.begin_session();
+        assert!(
+            !p.stop_requested(),
+            "one session start answers every earlier request"
+        );
+        assert_eq!(
+            p.stop_requests.load(Ordering::Relaxed),
+            2,
+            "the count is per handle: begin_session copies it into the session, never resets it"
+        );
+
+        p.request_stop_for_wallet_change();
+        assert!(
+            p.stop_requested(),
+            "the count still moves forward after a re-arm"
         );
     }
 }
