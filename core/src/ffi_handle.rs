@@ -283,7 +283,8 @@ where
 /// [`SlipstreamHandle::unfinished_passes`]. It blocks the calling thread for up to `budget`,
 /// polling every 10 ms: call it from a host thread (Swift hops the C stop off its cooperative
 /// pool), never from a task on the runtime the passes run on, whose worker the unwinding pass
-/// may need.
+/// may need. A `budget` too large to add to the current time (`Duration::MAX`, say) means no
+/// deadline: the wait runs until every pass on record has finished.
 pub fn settle_passes(
     task: &mut Option<AbortHandle>,
     unfinished: &mut Vec<AbortHandle>,
@@ -293,13 +294,13 @@ pub fn settle_passes(
         pass.abort();
         unfinished.push(pass);
     }
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now().checked_add(budget);
     loop {
         unfinished.retain(|pass| !pass.is_finished());
         if unfinished.is_empty() {
             return true;
         }
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             tracing::warn!(
                 "slipstream stop/start: {} aborted pass(es) still unwinding at the deadline — reporting a non-quiescent stop",
                 unfinished.len()
@@ -326,12 +327,13 @@ pub fn settle_passes(
 /// callers that proceed anyway.
 ///
 /// Blocks the calling thread for up to `budget`, polling every 10 ms, under the same rule as
-/// [`settle_passes`].
+/// [`settle_passes`]. A `budget` too large to add to the current time (`Duration::MAX`, say)
+/// means no deadline: the wait runs until the writers are gone.
 pub fn drain_wallet_writers(progress: &Progress, budget: Duration) -> bool {
-    let deadline = Instant::now() + budget;
+    let deadline = Instant::now().checked_add(budget);
     let mut waited = false;
     while progress.wallet_writers() > 0 {
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             tracing::warn!(
                 "slipstream stop/start: in-flight wallet commit still running at the deadline — reporting a non-quiescent stop"
             );
@@ -1204,6 +1206,32 @@ mod tests {
         );
         drop(gate);
         assert!(drain_wallet_writers(&progress, Duration::from_millis(50)));
+    }
+
+    /// A host that means "wait as long as it takes" passes `Duration::MAX`. `Instant + Duration`
+    /// panics on overflow, which behind the C ABI is a caught panic answered as a false "not
+    /// quiescent" and behind JNI an exception, so a budget too large for an `Instant` must mean no
+    /// deadline instead. With no writer there is nothing to wait for, and the drain says so.
+    #[test]
+    fn drain_with_an_oversized_budget_returns_quiescent_without_panicking() {
+        let progress = crate::events::ProgressArc::default();
+        assert!(
+            drain_wallet_writers(&progress, Duration::MAX),
+            "an oversized budget means no deadline; with no writer there is nothing to wait for"
+        );
+    }
+
+    /// The pass half of the same rule: with no pass on record there is nothing to wait for, so
+    /// `settle_passes` answers `true` whatever the budget, and an oversized one must not panic on
+    /// its way there.
+    #[test]
+    fn settle_with_an_oversized_budget_returns_quiescent_without_panicking() {
+        let mut slot: Option<AbortHandle> = None;
+        let mut unfinished: Vec<AbortHandle> = Vec::new();
+        assert!(
+            settle_passes(&mut slot, &mut unfinished, Duration::MAX),
+            "an oversized budget means no deadline; with no pass there is nothing to wait for"
+        );
     }
 
     /// Releases a `spawn_gated_pass` loop, explicitly via `release()` or implicitly when this
