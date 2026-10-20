@@ -3984,10 +3984,4 @@ mod tests {
         assert!(url1.contains("dns.google"));
         assert!(url1.contains("edns_client_subnet=0.0.0.0/0"));
     }
-        assert!(url0.contains("type=TXT"));
-
-        let url1 = doh_query_url(resolvers[1], network);
-        assert!(url1.contains("dns.google"));
-        assert!(url1.contains("edns_client_subnet=0.0.0.0/0"));
-    }
 }
