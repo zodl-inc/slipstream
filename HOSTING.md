@@ -154,9 +154,11 @@ before you add or remove an account, rewind or wipe, call
 next block, without writing anything for the scan call it interrupted (earlier sub-batches
 of a chunk stay committed). The session then ends at its next `.await`, or returns on its
 own if you did not abort it; either way it ends `Idle` (it sets that itself when it
-returns; after an abort you set it, as with any stop). The next session first waits out
-the trial decryption the stopped scan left queued on rayon's global pool, so a stop that
-follows quickly is again seen at the next block, then scans the interrupted blocks again.
+returns; after an abort you set it, as with any stop). The next scan anywhere in the
+process, whichever reporter or handle it runs under (a handle you reopen on the same
+wallet too), first waits until rayon has taken the trial decryption the stopped scan left
+queued on its global pool, so a stop that follows quickly is again seen at the next block.
+The next session scans the interrupted blocks again.
 Before you write, prove the wallet file idle: wait for the aborted task and the engine's
 writers with `ffi_handle::settle_passes` and `ffi_handle::drain_wallet_writers`, or keep an
 `ffi_handle::SlipstreamHandle` and call its `stop_for_wallet_change`, which does all of it

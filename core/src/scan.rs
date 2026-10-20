@@ -35,7 +35,8 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::time::Instant;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::chain::{
@@ -153,10 +154,94 @@ pub fn should_interleave_enhancement(chunks_done: u64, every: u32) -> bool {
 
 // ── Trial-decryption backlog fence ─────────────────────────────────────────────
 
+/// The process-wide account of the fence ([`rayon_fifo_fence`]) that
+/// wallet-change stops leave owed: how many stops were requested, and how
+/// many of them a completed fence has paid for.
+///
+/// Process-wide because the backlog is: a stopped scan leaves its trial
+/// decryption queued on rayon's GLOBAL pool, which every handle in the
+/// process shares and which outlives each of them. A host that stops one
+/// handle for a wallet change, frees it and opens another on the same wallet
+/// (HOSTING.md counts reopening as a wallet change) would otherwise start the
+/// new handle's first scan behind the old handle's backlog.
+///
+/// Every [`Progress::request_stop_for_wallet_change`] owes one fence
+/// ([`owe_decryption_fence`]), whichever host calls it: the C and JNI
+/// wrappers' stops and a Rust host calling the request directly alike. A
+/// fence is owed while `requests` differs from `paid`. Each [`scan_chunks`]
+/// call checks that once, right before its first scan call, and waits for a
+/// fence when one is owed ([`Self::wait_if_owed`]): late enough that the
+/// backlog drains alongside the Tor bootstrap and the fetch of the first
+/// chunk, and before any of its own decryption queues behind the backlog.
+/// Only a fence that COMPLETES pays: it records the `requests` value it read
+/// just before it started, so a request made while it waits stays owed, and a
+/// fence cut short by the host's abort pays nothing.
+///
+/// [`DECRYPTION_FENCE`] is the process's instance. Tests build their own, so
+/// they neither depend on nor disturb the one every test in the binary shares.
+struct DecryptionFence {
+    /// Wallet-change stops requested in this process, on every handle.
+    requests: AtomicU64,
+    /// The highest `requests` value a completed fence read before it started.
+    paid: AtomicU64,
+}
+
+impl DecryptionFence {
+    /// Nothing requested, nothing paid.
+    const fn new() -> Self {
+        Self {
+            requests: AtomicU64::new(0),
+            paid: AtomicU64::new(0),
+        }
+    }
+
+    /// One more wallet-change stop requested: a fence is owed until one that
+    /// starts after this completes.
+    fn owe(&self) {
+        self.requests.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The `requests` value a fence starting now would pay, when a fence is
+    /// owed. Two relaxed loads: a request that happened before this call is
+    /// always seen (a host's stop happens before the session it lets start),
+    /// and a stale `paid` costs at most a fence nobody needed.
+    fn owed(&self) -> Option<u64> {
+        let requests = self.requests.load(Ordering::Relaxed);
+        (requests != self.paid.load(Ordering::Relaxed)).then_some(requests)
+    }
+
+    /// When a fence is owed, waits for one ([`rayon_fifo_fence`] on `pool`)
+    /// and, once it completes, records the requests it read as paid. Returns
+    /// how long it waited, or `None` at once, with nothing queued, when no
+    /// fence is owed.
+    async fn wait_if_owed(&self, pool: Option<&rayon::ThreadPool>) -> Option<Duration> {
+        let requests = self.owed()?;
+        let started = Instant::now();
+        rayon_fifo_fence(pool).await;
+        // Reached only once the fence completed: an abort drops this future at
+        // the `.await` above, so a fence cut short pays nothing. `fetch_max`, so
+        // a fence that read fewer requests and completes later (another
+        // session's) never moves the payment back.
+        self.paid.fetch_max(requests, Ordering::Relaxed);
+        Some(started.elapsed())
+    }
+}
+
+/// The process's [`DecryptionFence`]: every handle's wallet-change stops owe
+/// it, and every [`scan_chunks`] call pays it when owed.
+static DECRYPTION_FENCE: DecryptionFence = DecryptionFence::new();
+
+/// Owes the process's decryption fence for one wallet-change stop request
+/// (see [`DecryptionFence`]). Called by
+/// [`Progress::request_stop_for_wallet_change`].
+pub(crate) fn owe_decryption_fence() {
+    DECRYPTION_FENCE.owe();
+}
+
 /// Waits until rayon has taken every FIFO job queued before this call: it
 /// queues one more FIFO job, which only signals, and awaits that signal.
 ///
-/// Why a session needs it after a wallet-change stop: upstream
+/// Why a scan needs it after a wallet-change stop: upstream
 /// `scan_cached_blocks` queues a scan call's trial decryption on rayon's
 /// GLOBAL pool in its first walk, batch by batch (`rayon::spawn_fifo` in
 /// `zcash_client_backend`'s `scan.rs`), and its second walk waits for each
@@ -165,10 +250,11 @@ pub fn should_interleave_enhancement(chunks_done: u64, every: u32) -> bool {
 /// next block, but the call's remaining batches stay queued and still run:
 /// `Batch::run` decrypts before it finds its receiver gone. With one scan
 /// call per chunk (the default, `scan_batch_target_ms: None`) that is up to a
-/// chunk of decryption. The next session's first batches would queue behind
-/// it, and while its second walk waited for them a second stop would go
-/// unseen until the backlog drained. So `run_session` awaits this first when
-/// the previous session was stopped for a wallet change.
+/// chunk of decryption. The next scan's first batches, on any handle in the
+/// process, would queue behind it, and while its second walk waited for them
+/// a second stop would go unseen until the backlog drained. So [`scan_chunks`]
+/// awaits this right before its first scan call whenever a wallet-change stop
+/// left one owed ([`DecryptionFence`]).
 ///
 /// What it guarantees: FIFO is start order. A job queued from outside a pool
 /// goes to the pool's one injector queue, which its workers take from strictly
@@ -183,7 +269,7 @@ pub fn should_interleave_enhancement(chunks_done: u64, every: u32) -> bool {
 ///
 /// `pool`: `None` is the pool `rayon::spawn_fifo` picks for the calling
 /// thread, which outside every rayon pool (a tokio worker, as in
-/// `run_session`) is the global pool, the one upstream queued on: the scan
+/// [`scan_chunks`]) is the global pool, the one upstream queued on: the scan
 /// calls upstream from a tokio worker too. `Some` is the given pool, so tests
 /// never depend on the global one. Call it from outside the pool: on one of
 /// the pool's own workers, `spawn_fifo` uses that worker's local queue, which
@@ -333,6 +419,11 @@ struct WriteBehind {
 /// waits for, and skipping it would strand the range's tail shard in the graft
 /// buffer, which only a later range starting inside that shard resumes (and
 /// Historic ranges are scanned newest-first, so none does).
+///
+/// Right before its first scan call, it waits until rayon has taken the trial
+/// decryption a wallet-change stop left queued on its global pool, when that
+/// wait is owed: process-wide, whichever handle was stopped
+/// (`DecryptionFence`). Checking costs two relaxed loads per call.
 ///
 /// ## Adaptive sub-batching (T5.2)
 ///
@@ -534,6 +625,10 @@ async fn scan_chunks_inner(
     // per chunk (degenerate single-iteration).
     let mut batch_len: u32 = 0;
 
+    // Whether the next scan call is this call's first: the one the decryption fence (see
+    // `DecryptionFence`) is checked before, once per call and never per block.
+    let mut first_scan_call = true;
+
     loop {
         // v0.5 pacer: time the chunk wait — fetch/split starvation shows here.
         let recv_started = Instant::now();
@@ -658,6 +753,23 @@ async fn scan_chunks_inner(
 
             let from_height = u32::try_from(sub_start)
                 .map_err(|_| SlipstreamError::Wallet(format!("height {sub_start} exceeds u32")))?;
+
+            // Before this call's first scan: if a wallet-change stop (on any handle) left
+            // trial decryption queued on rayon's global pool, wait until rayon has taken it
+            // (see `DecryptionFence`), so that this scan's own batches do not queue behind it.
+            // Checked only now, so the backlog drains alongside the Tor bootstrap, the seed
+            // treestate fetch and this chunk's fetch instead of before them. Not counted as
+            // scan-call time, so the adaptive controller never sees the wait; a host's abort
+            // lands in it at once.
+            if first_scan_call {
+                first_scan_call = false;
+                if let Some(waited) = DECRYPTION_FENCE.wait_if_owed(None).await {
+                    debug!(
+                        waited_ms = waited.as_millis() as u64,
+                        "waited out the trial decryption a wallet-change stop left queued"
+                    );
+                }
+            }
 
             // Binding note 3: block_in_place for the synchronous scan call.
             // NOTE: the `from_state` passed to scan_cached_blocks must satisfy
@@ -1238,6 +1350,8 @@ async fn scan_chunks_from_treestate_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::FutureExt;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn scan_stats_default_is_zero() {
@@ -1281,50 +1395,63 @@ mod tests {
 
     /// Lets a parked job go, explicitly or when dropped: a failing assertion unwinds through
     /// this guard, so it can never leave the pool's only worker parked forever.
-    struct ParkedJobRelease(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    struct ParkedJobRelease(Arc<AtomicBool>);
 
     impl Drop for ParkedJobRelease {
         fn drop(&mut self) {
-            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            self.0.store(true, Ordering::SeqCst);
         }
     }
 
-    /// The job queued first stands in for the batches a stopped scan left behind. While it
-    /// holds the pool's only worker the fence must stay pending, and once it has run the fence
-    /// must resolve: FIFO order on one worker means it had finished before the fence's job ran.
-    #[tokio::test]
-    async fn the_fence_waits_for_a_job_queued_before_it() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let pool = one_thread_pool();
+    /// Parks the pool's only worker in a job, standing in for the batches a stopped scan left
+    /// behind, and returns once that job runs: until the guard lets it go, every job queued on
+    /// the pool waits in the pool's queue.
+    async fn park_the_only_worker(pool: &rayon::ThreadPool) -> ParkedJobRelease {
         let released = Arc::new(AtomicBool::new(false));
-        let finished = Arc::new(AtomicBool::new(false));
         let release = ParkedJobRelease(released.clone());
+        let (running_tx, running_rx) = tokio::sync::oneshot::channel::<()>();
+        pool.spawn_fifo(move || {
+            let _ = running_tx.send(());
+            while !released.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), running_rx)
+            .await
+            .expect("the idle worker takes the parked job")
+            .expect("the parked job signals that it runs");
+        release
+    }
+
+    /// FIFO order, the property the fence stands on. With the only worker parked in job A, job
+    /// B and then the fence's own job wait in the pool's queue, in that order; once A is let go,
+    /// the fence must not resolve before B has run to its end. B takes a while, so that a fence
+    /// whose job were taken first would resolve while B still runs.
+    #[tokio::test]
+    async fn the_fence_resolves_only_after_a_job_queued_before_it_has_run() {
+        let pool = one_thread_pool();
+        let release_a = park_the_only_worker(&pool).await;
+        let b_finished = Arc::new(AtomicBool::new(false));
         {
-            let finished = finished.clone();
+            let b_finished = b_finished.clone();
             pool.spawn_fifo(move || {
-                while !released.load(Ordering::SeqCst) {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-                finished.store(true, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(20));
+                b_finished.store(true, Ordering::SeqCst);
             });
         }
-
         let mut fence = std::pin::pin!(rayon_fifo_fence(Some(&pool)));
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(50), fence.as_mut())
-                .await
-                .is_err(),
-            "the fence must stay pending while a job queued before it holds the only worker"
+            fence.as_mut().now_or_never().is_none(),
+            "polled once, the fence queued its job behind A and B, and A holds the only worker"
         );
 
-        drop(release);
-        tokio::time::timeout(std::time::Duration::from_secs(5), fence.as_mut())
+        drop(release_a);
+        tokio::time::timeout(Duration::from_secs(5), fence)
             .await
-            .expect("the fence resolves once the job queued before it has been taken");
+            .expect("the fence resolves once the worker has taken its job");
         assert!(
-            finished.load(Ordering::SeqCst),
-            "one worker in FIFO order: the job queued first ran to the end before the fence's job"
+            b_finished.load(Ordering::SeqCst),
+            "FIFO: B, queued before the fence, had run to its end when the fence resolved"
         );
     }
 
@@ -1338,6 +1465,128 @@ mod tests {
         )
         .await
         .expect("nothing queued ahead of the fence: it resolves at once");
+    }
+
+    // ── DecryptionFence: the wait a wallet-change stop leaves owed ───────────
+    //
+    // Each test builds its own `DecryptionFence` and one-thread pool: the process's instance is
+    // shared by every test in this binary, and rayon's global pool by every scanning test.
+
+    /// Nothing is owed before a request, and then the wait returns at once without queuing a
+    /// job, even on a busy pool. A request owes a fence, and a fence that completes pays it.
+    #[tokio::test]
+    async fn a_request_owes_a_fence_and_a_completed_fence_pays_it() {
+        let pool = one_thread_pool();
+        let fence = DecryptionFence::new();
+        assert_eq!(fence.owed(), None, "nothing requested, nothing owed");
+        {
+            let _parked = park_the_only_worker(&pool).await;
+            assert_eq!(
+                fence.wait_if_owed(Some(&pool)).now_or_never(),
+                Some(None),
+                "nothing owed: the wait returns at once, with no job queued on the busy pool"
+            );
+        }
+
+        fence.owe();
+        assert_eq!(fence.owed(), Some(1), "a request owes a fence");
+        let waited = tokio::time::timeout(Duration::from_secs(5), fence.wait_if_owed(Some(&pool)))
+            .await
+            .expect("an idle pool takes the fence's job at once");
+        assert!(waited.is_some(), "an owed fence is waited for");
+        assert_eq!(fence.owed(), None, "the completed fence paid the request");
+    }
+
+    /// A fence cut short pays nothing. The host's abort drops the waiting future at its
+    /// `.await`; this test drops it by hand while the fence's job still waits behind a parked
+    /// one. The request stays owed, so the next scan waits again, and that wait pays it.
+    #[tokio::test]
+    async fn a_fence_aborted_mid_wait_pays_nothing() {
+        let pool = one_thread_pool();
+        let fence = DecryptionFence::new();
+        fence.owe();
+        let parked = park_the_only_worker(&pool).await;
+        {
+            let mut wait = std::pin::pin!(fence.wait_if_owed(Some(&pool)));
+            assert!(
+                wait.as_mut().now_or_never().is_none(),
+                "the fence's job waits behind the parked one"
+            );
+        } // dropped mid-wait, where an abort drops it
+        drop(parked);
+        assert_eq!(
+            fence.owed(),
+            Some(1),
+            "an aborted fence leaves the request owed"
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), fence.wait_if_owed(Some(&pool)))
+            .await
+            .expect("the next fence completes");
+        assert_eq!(fence.owed(), None, "the next completed fence pays it");
+    }
+
+    /// A request made while a fence waits is not covered by it: the fence pays only the
+    /// requests it read before it started, so the later one stays owed.
+    #[tokio::test]
+    async fn a_request_made_during_a_fence_stays_owed() {
+        let pool = one_thread_pool();
+        let fence = DecryptionFence::new();
+        fence.owe();
+        let parked = park_the_only_worker(&pool).await;
+        let mut wait = std::pin::pin!(fence.wait_if_owed(Some(&pool)));
+        assert!(
+            wait.as_mut().now_or_never().is_none(),
+            "the fence's job waits behind the parked one"
+        );
+        fence.owe(); // a second stop, requested while the fence waits
+
+        drop(parked);
+        let waited = tokio::time::timeout(Duration::from_secs(5), wait)
+            .await
+            .expect("the fence completes");
+        assert!(waited.is_some(), "the fence was owed and waited for");
+        assert_eq!(
+            fence.owed(),
+            Some(2),
+            "the fence paid the first request only; the one made while it waited stays owed"
+        );
+    }
+
+    /// Two sessions' fences can overlap. The one that read fewer requests and completes last
+    /// must not move the payment back (`fetch_max`): every request is paid, yet a fence would
+    /// read as owed again.
+    #[tokio::test]
+    async fn a_fence_that_completes_last_never_moves_the_payment_back() {
+        let pool = one_thread_pool();
+        let fence = DecryptionFence::new();
+        fence.owe();
+        let parked = park_the_only_worker(&pool).await;
+        let mut earlier = std::pin::pin!(fence.wait_if_owed(Some(&pool)));
+        assert!(
+            earlier.as_mut().now_or_never().is_none(),
+            "the earlier fence read one request and waits"
+        );
+        fence.owe();
+        let mut later = std::pin::pin!(fence.wait_if_owed(Some(&pool)));
+        assert!(
+            later.as_mut().now_or_never().is_none(),
+            "the later fence read both requests and waits"
+        );
+
+        drop(parked);
+        tokio::time::timeout(Duration::from_secs(5), later)
+            .await
+            .expect("the later fence completes");
+        assert_eq!(fence.owed(), None, "the later fence paid both requests");
+        tokio::time::timeout(Duration::from_secs(5), earlier)
+            .await
+            .expect("the earlier fence completes");
+        assert_eq!(
+            fence.owed(),
+            None,
+            "the earlier fence, completing last, must not move the payment back"
+        );
     }
 
     // ── Controller unit tests (T5.2) ──────────────────────────────────────────

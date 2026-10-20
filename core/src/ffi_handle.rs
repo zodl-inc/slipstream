@@ -473,9 +473,11 @@ impl SlipstreamHandle {
     /// can outlast the budget when accounts are added in quick succession. The scan checks the
     /// request between blocks instead, so the pass ends at its next block, without writing
     /// anything for the scan call it interrupted (earlier sub-batches of a chunk stay committed),
-    /// and the settle can see it finish within the budget. The next session waits out the trial
-    /// decryption that scan left queued, then scans those blocks again. The request is armed per
-    /// session, so it never stops a session that starts after it.
+    /// and the settle can see it finish within the budget. The next session scans those blocks
+    /// again. The trial decryption that scan left queued on rayon's global pool is owed
+    /// process-wide: the next scan in the process, on this handle or any other, first waits until
+    /// rayon has taken it. The request is armed per session, so it never stops a session that
+    /// starts after it.
     pub fn stop_for_wallet_change(&mut self, budget: Duration) -> StopReport {
         self.progress.request_stop_for_wallet_change();
         self.stop_and_report(budget, true)

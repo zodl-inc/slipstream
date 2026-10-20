@@ -36,9 +36,12 @@ workspace.
   `Infallible`). A source built without `with_stop` never returns it.
 - `session::run_session` returns when the host stops it for a wallet change, leaving
   `SyncState::Idle` and pushing no error event. It still never returns otherwise.
-- After a session is stopped for a wallet change, the next session first waits until
-  rayon has taken the trial decryption the stopped scan left queued on its global pool, so
-  a stop that follows quickly is seen at the next block instead of after that backlog.
+- Each `Progress::request_stop_for_wallet_change` owes, process-wide, a wait for the trial
+  decryption the stopped scan leaves queued on rayon's global pool: the next scan in the
+  process, on any handle (one reopened on the same wallet too), waits right before its
+  first scan call until rayon has taken that backlog, so a stop that follows quickly is
+  seen at the next block instead of after it. The wait overlaps the Tor bootstrap and the
+  fetch of the first chunk, and one cut short by an abort leaves it owed.
 - `ffi_handle::SlipstreamHandle` has a new public field, `unfinished_passes`: code that
   builds the handle with a struct literal must set it (to `Vec::new()`).
 - `engine::ENGINE_BUILD` is `2026-10-20.v0.15-stop-for-wallet-change`.

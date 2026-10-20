@@ -846,8 +846,17 @@ impl Progress {
     /// the stop, so a session that starts later is not stopped by it. Every call counts
     /// (`stop_requests` goes up by one), so two requests in a row are both answered by the one
     /// session they interrupt.
+    ///
+    /// Every call also owes a wait, process-wide (`scan::DecryptionFence`): the stopped scan
+    /// leaves trial decryption queued on rayon's global pool, which every handle in the process
+    /// shares, so the next scan in the process, on any handle (one reopened on the same wallet
+    /// too), first waits until rayon has taken it. That holds whoever calls this: a wrapper's
+    /// stop or a Rust host calling it directly.
     pub fn request_stop_for_wallet_change(&self) {
         self.stop_requests.fetch_add(1, Ordering::Relaxed);
+        // Without the sqlite backend the crate has no scan, so no backlog to owe a wait for.
+        #[cfg(feature = "zcash_client_sqlite")]
+        crate::scan::owe_decryption_fence();
     }
 
     /// Whether the host has asked the running session to stop for a wallet change since the
