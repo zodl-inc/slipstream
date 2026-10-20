@@ -27,6 +27,9 @@ workspace.
   file quiescent, which every host wrapper used to keep its own copy of. Its report says
   whether each wait finished and how long it took. A pass that outlives a stop's budget
   stays on record, so a later stop still answers for it.
+- `ffi_handle::FfiSlipstreamStopReport`, the by-value C form of `StopReport` that the C
+  ABI's two stop functions return: `settled` and `drained` as 1 or 0, `settle_ms` and
+  `drain_ms` in milliseconds (`From<StopReport>`).
 
 ### Changed
 - `block_source::MemBlockSource`'s `BlockSource::Error` is `StoppedForWalletChange` (was

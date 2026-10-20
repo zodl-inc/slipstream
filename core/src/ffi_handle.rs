@@ -106,6 +106,44 @@ pub struct FfiSlipstreamSnapshot {
     pub tx_set_version: u64,
 }
 
+/// C-compatible stop report: the by-value C form of [`StopReport`] that the C ABI's two stop
+/// functions return (`zcashlc_slipstream_stop` and `zcashlc_slipstream_stop_for_wallet_change`,
+/// HOSTING.md §4). All fields are C-safe integers. Like [`FfiSlipstreamSnapshot`], a C wrapper
+/// re-declares it for cbindgen, which generates it into `zcashlc.h`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FfiSlipstreamStopReport {
+    /// 1 when every aborted pass finished unwinding within the budget, 0 otherwise
+    /// ([`StopReport::settled`]).
+    pub settled: u8,
+    /// 1 when no engine wallet writer was still running within the budget, 0 otherwise
+    /// ([`StopReport::drained`]). The wallet file was proved quiescent only when this and
+    /// `settled` are both 1.
+    pub drained: u8,
+    /// How long the wait for the aborted passes took, in whole milliseconds
+    /// ([`StopReport::settle_wait`]; saturates at `u64::MAX`).
+    pub settle_ms: u64,
+    /// How long the wait for the engine's wallet writers took, in whole milliseconds
+    /// ([`StopReport::drain_wait`]; saturates at `u64::MAX`).
+    pub drain_ms: u64,
+}
+
+impl From<StopReport> for FfiSlipstreamStopReport {
+    /// Each verdict becomes 1 or 0, and each wait its whole milliseconds, saturating at
+    /// `u64::MAX` for a wait too long to count in a `u64`.
+    fn from(report: StopReport) -> Self {
+        fn millis(wait: Duration) -> u64 {
+            u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
+        }
+        Self {
+            settled: u8::from(report.settled),
+            drained: u8::from(report.drained),
+            settle_ms: millis(report.settle_wait),
+            drain_ms: millis(report.drain_wait),
+        }
+    }
+}
+
 /// C-compatible event record.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -352,10 +390,11 @@ pub fn drain_wallet_writers(progress: &Progress, budget: Duration) -> bool {
 /// long each took. Returned by [`SlipstreamHandle::stop`],
 /// [`SlipstreamHandle::stop_for_wallet_change`] and [`SlipstreamHandle::quiesce_before_start`].
 ///
-/// [MOB-1850] The verdict a caller acts on is [`Self::quiescent`], the `bool` the C stop answers
-/// with. The rest is the detail behind it: a bare `false` cannot say WHICH wait ran out or after
-/// how long, and the device log of a refused account import could not say it either. With the
-/// report, a host can tell the user, or its own log, exactly that.
+/// [MOB-1850] The verdict a caller acts on is [`Self::quiescent`]. The rest is the detail behind
+/// it: a bare `false` cannot say WHICH wait ran out or after how long, and the device log of a
+/// refused account import could not say it either. With the report, a host can tell the user, or
+/// its own log, exactly that. The C ABI's stops return it by value as [`FfiSlipstreamStopReport`].
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StopReport {
     /// Every aborted pass on record finished unwinding within the budget ([`settle_passes`]).
@@ -411,9 +450,9 @@ impl SlipstreamHandle {
     /// wait took and what it found: `settle_ms`, `drain_ms`, `settled`, `drained` and
     /// `for_wallet_change`.
     ///
-    /// This is the plain stop (backgrounding, shutdown): a scan in the middle of a chunk runs to
-    /// the end of that chunk before the abort reaches it. Right before changing the wallet, stop
-    /// with [`Self::stop_for_wallet_change`] instead.
+    /// This is the plain stop (backgrounding, shutdown): a scan call in progress runs to its end,
+    /// by default the end of its chunk, before the abort reaches it. Right before changing the
+    /// wallet, stop with [`Self::stop_for_wallet_change`] instead.
     ///
     /// Hosts call this instead of keeping their own copy of the waits; the C and JNI wrappers add
     /// only their own extras around it (on iOS, the `last_stop_at` stamp for tip freshness). It
@@ -430,12 +469,13 @@ impl SlipstreamHandle {
     ///
     /// The request ([`Progress::request_stop_for_wallet_change`]) goes out BEFORE the abort, and
     /// that order is the point: the scan runs synchronously inside `block_in_place`, where an
-    /// abort cannot reach it until the whole chunk is scanned, which can outlast the budget when
-    /// accounts are added in quick succession. The scan checks the request between blocks
-    /// instead, so the pass ends at its next block, without writing anything for the interrupted
-    /// chunk, and the settle can see it finish within the budget. The next session scans that
-    /// chunk again. The request is armed per session, so it never stops a session that starts
-    /// after it.
+    /// abort cannot reach it until the scan call returns, by default after its whole chunk, which
+    /// can outlast the budget when accounts are added in quick succession. The scan checks the
+    /// request between blocks instead, so the pass ends at its next block, without writing
+    /// anything for the scan call it interrupted (earlier sub-batches of a chunk stay committed),
+    /// and the settle can see it finish within the budget. The next session waits out the trial
+    /// decryption that scan left queued, then scans those blocks again. The request is armed per
+    /// session, so it never stops a session that starts after it.
     pub fn stop_for_wallet_change(&mut self, budget: Duration) -> StopReport {
         self.progress.request_stop_for_wallet_change();
         self.stop_and_report(budget, true)
@@ -444,9 +484,11 @@ impl SlipstreamHandle {
     /// Settles and drains before the host spawns a new session: aborts the previous pass (a
     /// start while running), waits it out, and waits for the engine's wallet commit, exactly as a
     /// stop does. [B4-16 drain] The aborted pass's write-behind commit may still be running
-    /// (`spawn_blocking`, uncancellable); once the drain has waited it out, BEFORE the new
-    /// session spawns, the new pass's first writes cannot collide with that orphan ("database is
-    /// locked" at pass start), and no orphan Scanned-mark can land after this point.
+    /// (`spawn_blocking`, uncancellable). Only when the drain finished ([`StopReport::drained`])
+    /// has it waited that orphan out BEFORE the new session spawns, so that the new pass's first
+    /// writes cannot collide with it ("database is locked" at pass start) and no orphan
+    /// Scanned-mark can land after this point. A drain that ran out of budget guarantees
+    /// neither: the orphan may still be committing.
     ///
     /// [MOB-1850] A start proceeds whatever the report says, as it always has: the new session
     /// waits for [`Self::pass_lock`] before it touches the wallet, so two passes never overlap,
@@ -1336,6 +1378,55 @@ mod tests {
             };
             assert_eq!(report.quiescent(), settled && drained, "{report:?}");
         }
+    }
+
+    /// The C form the two C stops return carries the whole report: each verdict as 1 or 0, each
+    /// wait in whole milliseconds, and a wait too long for a `u64` of milliseconds as `u64::MAX`.
+    #[test]
+    fn the_c_stop_report_carries_both_verdicts_and_both_waits() {
+        let report = StopReport {
+            settled: true,
+            drained: false,
+            settle_wait: Duration::from_micros(1_500_999),
+            drain_wait: Duration::MAX,
+        };
+        assert_eq!(
+            FfiSlipstreamStopReport::from(report),
+            FfiSlipstreamStopReport {
+                settled: 1,
+                drained: 0,
+                settle_ms: 1_500,
+                drain_ms: u64::MAX,
+            },
+            "a wait counts its whole milliseconds, and one too long to count saturates"
+        );
+
+        let report = StopReport {
+            settled: false,
+            drained: true,
+            settle_wait: Duration::ZERO,
+            drain_wait: Duration::from_millis(42),
+        };
+        assert_eq!(
+            FfiSlipstreamStopReport::from(report),
+            FfiSlipstreamStopReport {
+                settled: 0,
+                drained: 1,
+                settle_ms: 0,
+                drain_ms: 42,
+            }
+        );
+
+        assert_eq!(
+            FfiSlipstreamStopReport::default(),
+            FfiSlipstreamStopReport {
+                settled: 0,
+                drained: 0,
+                settle_ms: 0,
+                drain_ms: 0,
+            },
+            "the default is all zero, like the snapshot's"
+        );
     }
 
     /// Only the stop a host makes right before it changes the wallet asks the running session to

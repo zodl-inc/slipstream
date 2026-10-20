@@ -366,9 +366,10 @@ impl SessionReporter {
 /// [`SlipstreamError::StoppedForWalletChange`]. That is a request honoured, not a failure, so
 /// the session ends QUIETLY wherever it lands, in the initial pass or in a follow catch-up pass:
 /// `SyncState::Idle`, one info line, and a return — no `Error` state, no tag-4 event, no
-/// revival, no retry, no backoff. The interrupted chunk was not written (upstream writes only
-/// in its final `put_blocks`), so the next session scans it again, once it has waited until
-/// rayon took the trial decryption the stopped scan left queued (`scan::rayon_fifo_fence`).
+/// revival, no retry, no backoff. The scan call it interrupted wrote nothing (upstream writes
+/// only in its final `put_blocks`; earlier sub-batches of a chunk stay committed), so the next
+/// session scans those blocks again, once it has waited until rayon took the trial decryption
+/// the stopped scan left queued (`scan::rayon_fifo_fence`).
 /// The stop is armed per session ([`Progress::begin_session`], called right after the pass
 /// lock is taken), so a request aimed at an earlier session never ends this one.
 ///

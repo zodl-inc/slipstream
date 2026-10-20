@@ -52,9 +52,10 @@ pub enum SlipstreamError {
     ///
     /// It is not a failure. The session ends quietly: `run_session` sets `SyncState::Idle` and
     /// returns, with no `Error` state, no tag-4 event, no revival and no retry
-    /// ([`Self::is_stop_for_wallet_change`] is what the session checks). Nothing was written for
-    /// the interrupted chunk, because upstream `scan_cached_blocks` writes only in its final
-    /// `put_blocks`, so the next pass scans that chunk again.
+    /// ([`Self::is_stop_for_wallet_change`] is what the session checks). The scan call it
+    /// interrupted wrote nothing, because upstream `scan_cached_blocks` writes only in its final
+    /// `put_blocks` (earlier sub-batches of a chunk stay committed), so the next pass scans those
+    /// blocks again.
     ///
     /// Not to be confused with [`Self::Stopped`], an engine channel that closed.
     #[error("sync stopped for a wallet change")]
