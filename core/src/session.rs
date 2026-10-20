@@ -561,29 +561,6 @@ impl FollowFailures {
     }
 }
 
-/// Classifies a failed catch-up pass for [`follow_loop`]: only the wallet-change stop ends the
-/// session; every other failure keeps following and is tracked by [`FollowFailures`] for
-/// endpoint-unreachable escalation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CatchUpFailure {
-    /// The host stopped the catch-up pass for a wallet change: `Idle`, one info line, and the
-    /// session ends.
-    EndQuietly,
-    /// Any other failure (T8.7): the wallet is still synced to the last tip, so it goes back to
-    /// `Done` and tries again on the next tick. Counted towards endpoint-unreachable escalation.
-    StaySynced,
-}
-
-/// Classifies a failed catch-up pass: only the wallet-change stop ends the session; every other
-/// failure keeps following.
-pub(crate) fn catch_up_failure(err: &SlipstreamError) -> CatchUpFailure {
-    if err.is_stop_for_wallet_change() {
-        CatchUpFailure::EndQuietly
-    } else {
-        CatchUpFailure::StaySynced
-    }
-}
-
 /// ── T8.1 follow loop: track the chain while the host keeps the task alive ────
 /// Extracted verbatim from `run_session`'s success arm ([B4-16] revival refactor) —
 /// behaviour unchanged. Returns only when the host stops a catch-up pass for a wallet change
