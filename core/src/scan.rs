@@ -419,7 +419,8 @@ struct WriteBehind {
 /// waits for, and skipping it would leave the range's tail shard in the graft
 /// buffer, which no later range resumes (only one starting inside that shard
 /// could, and Historic ranges are scanned newest-first) until the next pass's
-/// start sweep (`persist::sweep_stranded_graft_rows`) builds it.
+/// start sweep (`persist::sweep_stranded_graft_rows`) builds it, or queues its
+/// blocks for a rescan.
 ///
 /// Right before its first scan call, it waits until rayon has taken the trial
 /// decryption a wallet-change stop left queued on its global pool, when that

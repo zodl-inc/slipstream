@@ -38,15 +38,17 @@
 //!   landing in the final drain) → the range is scanned, but its range-end shard's
 //!   rows stay buffered and no later range resumes them (Historic ranges run newest
 //!   first) → the next pass's start sweep (`persist::sweep_stranded_graft_rows`)
-//!   builds them, or deletes them and queues a rescan of their blocks.
+//!   builds them when data the wallet already holds checks where they end (the
+//!   tree's leaf there, or the stored root of the shard they complete), and
+//!   otherwise deletes them and queues a rescan of their blocks.
 //!
 //! The invariant "block marked scanned ⇒ its commitments are in the shard store
 //! OR in this buffer" therefore holds at every crash point. After a pass's start
 //! sweep, a buffered run of scanned blocks is one the first range to seed in its
-//! shard resumes, unless the wallet's block metadata cannot place it (the sweep
-//! then leaves it, with a warning).
+//! shard resumes, unless the sweep could not read its shard or the wallet's block
+//! metadata cannot place it (the sweep then leaves it, with a warning).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
 
 use incrementalmerkletree::{Marking, Retention};
@@ -358,23 +360,41 @@ pub(crate) fn stranded_runs(positions: &[u64], resume_at: Option<u64>) -> Vec<Ra
         .collect()
 }
 
-/// Whether a stranded run can be built as it is, because where it ends is known.
+/// What the wallet already holds that checks where a stranded run ends ([`end_check`]).
+/// The pass-start sweep builds only a run it can check this way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndCheck<H> {
+    /// The commitment tree holds a leaf at the run's last position, and it is the run's
+    /// last row. A range scanned above the run inserted it as its `from_state` frontier,
+    /// so the next commitment on the chain is that range's.
+    LastLeaf,
+    /// The run completes its shard, and the wallet stores a root for that shard: the
+    /// server's, which every pass start ingests before the sweep. Once the run is in the
+    /// tree, the shard's root computed from it must be this one.
+    ShardRoot(H),
+}
+
+/// How a stranded run's end can be checked against data the wallet already holds, or
+/// `None` when nothing does (the sweep then rescans the run's blocks).
 ///
-/// - `last_leaf_in_tree`: the commitment tree already holds a leaf at the run's last
-///   position, and it is the run's last row. A range scanned above the run inserted
-///   it, as its `from_state` frontier: the next commitment on the chain is that
-///   range's.
-/// - `pending_starts`: the start positions of the pending ranges, from the metadata
-///   of the block below each. A run that ends right below one is a committed prefix
-///   whose remainder is still queued.
-/// - A run that reaches the end of its shard has nothing in the shard after it.
-pub(crate) fn can_build(
+/// `last_leaf_matches`: the tree holds a leaf at the run's last position, and it is the
+/// run's last row; it is preferred. `stored_root`: the root the wallet stores for the
+/// run's shard, which checks only a run that completes the shard. Positions alone never
+/// check a run: neither a pending range that starts right after it nor the end of its
+/// shard says whether its rows are the chain's, and rows a reorg left buffered before
+/// the engine cleaned the buffer on rewinds may be another chain's.
+pub(crate) fn end_check<H>(
     run: &RangeInclusive<u64>,
-    last_leaf_in_tree: bool,
-    pending_starts: &BTreeSet<u64>,
-) -> bool {
-    let next = *run.end() + 1;
-    last_leaf_in_tree || pending_starts.contains(&next) || next.is_multiple_of(1 << SHARD_BITS)
+    last_leaf_matches: bool,
+    stored_root: Option<H>,
+) -> Option<EndCheck<H>> {
+    if last_leaf_matches {
+        Some(EndCheck::LastLeaf)
+    } else if (*run.end() + 1).is_multiple_of(1 << SHARD_BITS) {
+        stored_root.map(EndCheck::ShardRoot)
+    } else {
+        None
+    }
 }
 
 /// The stretches of `floor..end` that no `pending` range covers, ascending: the
@@ -611,21 +631,34 @@ mod tests {
     }
 
     #[test]
-    fn can_build_needs_a_known_end() {
-        let pending_starts = BTreeSet::from([100]);
-        assert!(
-            can_build(&(10..=50), true, &pending_starts),
+    fn end_check_needs_data_the_wallet_holds() {
+        let shard_end = 65_000..=65_535;
+        assert_eq!(
+            end_check(&(10..=50), true, Some(h(3))),
+            Some(EndCheck::LastLeaf),
             "the tree's leaf at the run's end is its last row"
         );
-        assert!(
-            can_build(&(10..=99), false, &pending_starts),
-            "a pending range starts right after it"
+        assert_eq!(
+            end_check(&shard_end, true, Some(h(3))),
+            Some(EndCheck::LastLeaf),
+            "the tree's leaf is preferred to the shard's root"
         );
-        assert!(
-            can_build(&(65_000..=65_535), false, &pending_starts),
-            "it reaches the end of its shard"
+        assert_eq!(
+            end_check(&shard_end, false, Some(h(3))),
+            Some(EndCheck::ShardRoot(h(3))),
+            "the run completes its shard, whose root the wallet stores"
         );
-        assert!(!can_build(&(10..=50), false, &pending_starts));
+        assert_eq!(
+            end_check::<MerkleHashOrchard>(&shard_end, false, None),
+            None,
+            "reaching the end of its shard does not check a run"
+        );
+        assert_eq!(
+            end_check(&(10..=99), false, Some(h(3))),
+            None,
+            "a stored root checks only a run that completes the shard, and nothing checks \
+             a run by the pending range that starts right after it"
+        );
     }
 
     #[test]
