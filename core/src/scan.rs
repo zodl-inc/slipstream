@@ -151,6 +151,57 @@ pub fn should_interleave_enhancement(chunks_done: u64, every: u32) -> bool {
     every > 0 && chunks_done > 0 && chunks_done.is_multiple_of(u64::from(every))
 }
 
+// ── Trial-decryption backlog fence ─────────────────────────────────────────────
+
+/// Waits until rayon has taken every FIFO job queued before this call: it
+/// queues one more FIFO job, which only signals, and awaits that signal.
+///
+/// Why a session needs it after a wallet-change stop: upstream
+/// `scan_cached_blocks` queues a scan call's trial decryption on rayon's
+/// GLOBAL pool in its first walk, batch by batch (`rayon::spawn_fifo` in
+/// `zcash_client_backend`'s `scan.rs`), and its second walk waits for each
+/// block's batch in turn (`collect_results`), a wait the block source's
+/// per-block stop check cannot interrupt. A stop ends the second walk at the
+/// next block, but the call's remaining batches stay queued and still run:
+/// `Batch::run` decrypts before it finds its receiver gone. With one scan
+/// call per chunk (the default, `scan_batch_target_ms: None`) that is up to a
+/// chunk of decryption. The next session's first batches would queue behind
+/// it, and while its second walk waited for them a second stop would go
+/// unseen until the backlog drained. So `run_session` awaits this first when
+/// the previous session was stopped for a wallet change.
+///
+/// What it guarantees: FIFO is start order. A job queued from outside a pool
+/// goes to the pool's one injector queue, which its workers take from strictly
+/// in order, so when the fence's job starts, every job queued before it has
+/// been dequeued: the backlog is gone, and at most one batch per worker may
+/// still be finishing (a worker runs one job at a time). The fence waits for
+/// neither those nor anything queued after it.
+///
+/// The wait is an `.await` on a oneshot channel, so it is abortable: a host's
+/// abort lands here at once, not after the backlog. The fence itself costs one
+/// empty job.
+///
+/// `pool`: `None` is the pool `rayon::spawn_fifo` picks for the calling
+/// thread, which outside every rayon pool (a tokio worker, as in
+/// `run_session`) is the global pool, the one upstream queued on: the scan
+/// calls upstream from a tokio worker too. `Some` is the given pool, so tests
+/// never depend on the global one. Call it from outside the pool: on one of
+/// the pool's own workers, `spawn_fifo` uses that worker's local queue, which
+/// is not ordered against the injector.
+pub(crate) async fn rayon_fifo_fence(pool: Option<&rayon::ThreadPool>) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let signal = move || {
+        // The receiver is gone only if the waiting session was aborted: no one to tell.
+        let _ = tx.send(());
+    };
+    match pool {
+        Some(pool) => pool.spawn_fifo(signal),
+        None => rayon::spawn_fifo(signal),
+    }
+    // `Err` only if the job was dropped without running; nothing is left to wait for either way.
+    let _ = rx.await;
+}
+
 // ── Scan-error mapper ──────────────────────────────────────────────────────────
 
 /// Convert a `scan_cached_blocks` error into a [`SlipstreamError`].
@@ -1215,6 +1266,78 @@ mod tests {
             matches!(wallet, SlipstreamError::Wallet(_)),
             "got: {wallet}"
         );
+    }
+
+    // ── rayon_fifo_fence: the backlog a wallet-change stop leaves queued ─────
+
+    /// A one-thread local pool, so these tests never depend on rayon's global pool, which
+    /// every other scanning test shares.
+    fn one_thread_pool() -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a one-thread rayon pool")
+    }
+
+    /// Lets a parked job go, explicitly or when dropped: a failing assertion unwinds through
+    /// this guard, so it can never leave the pool's only worker parked forever.
+    struct ParkedJobRelease(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for ParkedJobRelease {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The job queued first stands in for the batches a stopped scan left behind. While it
+    /// holds the pool's only worker the fence must stay pending, and once it has run the fence
+    /// must resolve: FIFO order on one worker means it had finished before the fence's job ran.
+    #[tokio::test]
+    async fn the_fence_waits_for_a_job_queued_before_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let pool = one_thread_pool();
+        let released = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let release = ParkedJobRelease(released.clone());
+        {
+            let finished = finished.clone();
+            pool.spawn_fifo(move || {
+                while !released.load(Ordering::SeqCst) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                finished.store(true, Ordering::SeqCst);
+            });
+        }
+
+        let mut fence = std::pin::pin!(rayon_fifo_fence(Some(&pool)));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), fence.as_mut())
+                .await
+                .is_err(),
+            "the fence must stay pending while a job queued before it holds the only worker"
+        );
+
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(5), fence.as_mut())
+            .await
+            .expect("the fence resolves once the job queued before it has been taken");
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "one worker in FIFO order: the job queued first ran to the end before the fence's job"
+        );
+    }
+
+    /// With nothing queued ahead of it, the fence costs one empty job and resolves at once.
+    #[tokio::test]
+    async fn the_fence_resolves_promptly_on_an_idle_pool() {
+        let pool = one_thread_pool();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rayon_fifo_fence(Some(&pool)),
+        )
+        .await
+        .expect("nothing queued ahead of the fence: it resolves at once");
     }
 
     // ── Controller unit tests (T5.2) ──────────────────────────────────────────

@@ -28,7 +28,7 @@
 //! the location moved (into the crate that already owns the state/event/handle types).
 
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::BlockHeight;
@@ -273,9 +273,10 @@ impl SessionReporter {
 /// the session ends QUIETLY wherever it lands, in the initial pass or in a follow catch-up pass:
 /// `SyncState::Idle`, one info line, and a return — no `Error` state, no tag-4 event, no
 /// revival, no retry, no backoff. The interrupted chunk was not written (upstream writes only
-/// in its final `put_blocks`), so the next session scans it again. The stop is armed per
-/// session ([`Progress::begin_session`], called right after the pass lock is taken), so a
-/// request aimed at an earlier session never ends this one.
+/// in its final `put_blocks`), so the next session scans it again, once it has waited until
+/// rayon took the trial decryption the stopped scan left queued (`scan::rayon_fifo_fence`).
+/// The stop is armed per session ([`Progress::begin_session`], called right after the pass
+/// lock is taken), so a request aimed at an earlier session never ends this one.
 ///
 /// Otherwise it never returns. A non-transient initial-pass error surfaces `Error` + the tag-4
 /// event to the reporter (exactly the pre-revival behaviour — hosts still see every failure),
@@ -303,9 +304,30 @@ pub async fn run_session(
     // panic/cancel, so even a panicking old pass frees the lock cleanly.
     let _pass_guard = pass_lock.lock().await;
 
+    // Whether the host asked for a stop for a wallet change since the previous session began,
+    // usually the stop that ended it. Read BEFORE `begin_session`, which re-arms the stop and
+    // so makes this false again.
+    let after_wallet_change_stop = reporter.progress.stop_requested();
+
     // A new session gets a fresh block-download failure count: a host start or restart is a
     // new attempt (see `Progress::begin_session`).
     reporter.progress.begin_session();
+
+    // After a wallet-change stop, wait until rayon has taken the trial decryption the stopped
+    // scan left queued on its global pool, before anything here scans (see
+    // `scan::rayon_fifo_fence`). Otherwise this session's first blocks would wait behind that
+    // backlog, where a second wallet-change stop is not seen until it drains. Awaited AFTER
+    // `begin_session`, so a stop requested meanwhile is this session's, and the host's abort
+    // lands here at once. A session no wallet-change stop preceded (the first after open, a
+    // restart after a plain stop) skips it.
+    if after_wallet_change_stop {
+        let fence_started = Instant::now();
+        crate::scan::rayon_fifo_fence(None).await;
+        tracing::debug!(
+            waited_ms = fence_started.elapsed().as_millis() as u64,
+            "session start: waited out the trial decryption a wallet-change stop left queued"
+        );
+    }
 
     // Notify SyncStarted (tag=1) — emitted exactly ONCE, before any retry or follow pass.
     reporter.push_event(FfiSlipstreamEvent { tag: 1, value: 0 });
