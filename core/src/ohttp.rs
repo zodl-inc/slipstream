@@ -1344,9 +1344,6 @@ impl OhttpClient {
                 .map_err(|e| e.to_string())?;
         let signed_config_target = parse_https(&signed_config_url_str)?;
 
-        // Validate gateway is known (has a network/DNS source) for potential DNS fallback
-        let network = gateway_network(&self.gateway_host)?;
-
         // Try relay: fetch and verify
         let relay_fetch_and_verify = async {
             let headers = self.profile.headers.key_fetch(None);
@@ -1388,7 +1385,10 @@ impl OhttpClient {
         let cfg = match relay_fetch_and_verify {
             Ok(verified_cfg) => verified_cfg,
             Err(relay_err) => {
-                // Relay failed (fetch or verification), try DNS fallback
+                // A gateway outside the static configuration has no DNS record to fall back to.
+                let Ok(network) = gateway_network(&self.gateway_host) else {
+                    return Err(relay_err);
+                };
                 tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
 
                 let dns_name = key_config_dns_name(network);
