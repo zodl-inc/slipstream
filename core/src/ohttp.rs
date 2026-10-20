@@ -73,9 +73,10 @@ use tower_service::Service;
 pub use zcash_protocol::consensus::NetworkType;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseDecoder, ClientProfile,
-    ClientTrace, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, KeyConfig, Network, NetworkRule,
-    RelayBackoff, ResponseEvent, SizeGuard, check_size, encapsulate_chunked_request,
-    signed_config_url, verify_signed_config,
+    ClientTrace, DOH_RESOLVERS, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, KeyConfig, Network,
+    NetworkRule, RelayBackoff, ResponseEvent, SizeGuard, check_size, doh_query_url,
+    encapsulate_chunked_request, envelope_from_doh_json, key_config_dns_name, signed_config_url,
+    verify_signed_config,
 };
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
@@ -1330,41 +1331,92 @@ impl OhttpClient {
             }
         }
 
-        // C-01 fix: Fetch signed config through relay host at /ohttp-configs/signed
-        // Construct target from relay host (not gateway) to avoid direct gateway access
-        let signed_config_target = parse_https(
-            &signed_config_url(&self.relay_url, self.profile.signed_config_url)
-                .map_err(|e| e.to_string())?,
-        )?;
-        let headers = self.profile.headers.key_fetch(None);
+        // Try fetching signed config through relay first (primary source)
+        let network = gateway_network(&self.gateway_host)?;
+        let now = unix_now()?;
 
-        // A key config GET is idempotent: a failure before anything was sent is tried once more.
-        let mut resent = false;
-        let answer = loop {
-            match self
-                .https_once(
-                    &signed_config_target,
-                    Method::GET,
-                    &headers,
-                    Vec::new(),
-                    self.profile.limits.key_config_guard(),
-                )
-                .await
-            {
-                Ok(answer) => break answer,
-                Err(HttpsError::PreSend(e)) if !resent => {
-                    resent = true;
-                    tracing::debug!(err = %e, "ohttp: key config fetch failed before send; retrying");
+        let relay_result = async {
+            // C-01 fix: Fetch signed config through relay host at /ohttp-configs/signed
+            // Construct target from relay host (not gateway) to avoid direct gateway access
+            let signed_config_target = parse_https(
+                &signed_config_url(&self.relay_url, self.profile.signed_config_url)
+                    .map_err(|e| e.to_string())?,
+            )?;
+            let headers = self.profile.headers.key_fetch(None);
+
+            // A key config GET is idempotent: a failure before anything was sent is tried once more.
+            let mut resent = false;
+            let answer = loop {
+                match self
+                    .https_once(
+                        &signed_config_target,
+                        Method::GET,
+                        &headers,
+                        Vec::new(),
+                        self.profile.limits.key_config_guard(),
+                    )
+                    .await
+                {
+                    Ok(answer) => break answer,
+                    Err(HttpsError::PreSend(e)) if !resent => {
+                        resent = true;
+                        tracing::debug!(err = %e, "ohttp: key config fetch failed before send; retrying");
+                    }
+                    Err(e) => return Err(e.into_message()),
                 }
-                Err(e) => return Err(e.into_message()),
+            };
+            if !self.profile.outer.success.accepts(answer.status.as_u16()) {
+                return Err(format!("signed config fetch from relay: HTTP {}", answer.status));
+            }
+            Ok(answer.body)
+        }.await;
+
+        let envelope = match relay_result {
+            Ok(body) => {
+                tracing::debug!("ohttp: key config fetched from relay");
+                body
+            }
+            Err(relay_err) => {
+                // Relay fetch failed, try DNS fallback
+                tracing::info!(err = %relay_err, "ohttp: relay key config fetch failed, trying DNS");
+
+                let mut last_dns_err = relay_err;
+                let dns_name = key_config_dns_name(network);
+                let mut envelope_found = None;
+
+                for resolver in DOH_RESOLVERS {
+                    let doh_url = doh_query_url(resolver, network);
+                    tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
+
+                    match self.fetch_dns_key_config(&doh_url).await {
+                        Ok(doh_body) => {
+                            match envelope_from_doh_json(&doh_body, network) {
+                                Ok(env) => {
+                                    tracing::info!(resolver = %resolver, "ohttp: key config fetched from DNS");
+                                    envelope_found = Some(env);
+                                    break;
+                                }
+                                Err(e) => {
+                                    last_dns_err = format!("DoH parse from {}: {}", resolver, e);
+                                    tracing::debug!(err = %last_dns_err, "ohttp: DoH response parse failed");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_dns_err = format!("DoH fetch from {}: {}", resolver, e);
+                            tracing::debug!(err = %last_dns_err, "ohttp: DoH fetch failed");
+                        }
+                    }
+                }
+
+                envelope_found.ok_or_else(|| {
+                    format!("key config fetch failed: relay and all DNS resolvers tried: {}", last_dns_err)
+                })?
             }
         };
-        if !self.profile.outer.success.accepts(answer.status.as_u16()) {
-            return Err(format!("signed config fetch: HTTP {}", answer.status));
-        }
 
-        // C-01 fix: Verify signature and parse config
-        let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, unix_now()?)?;
+        // Verify signature and parse config (same verification for both sources)
+        let cfg = open_signed_keys(&self.profile, &envelope, &self.gateway_host, now)?;
         tracing::info!(
             gateway = %self.gateway_host,
             key_id = cfg.config.key_id(),
@@ -1375,6 +1427,39 @@ impl OhttpClient {
         *self.key_config.lock().await = Some(cfg);
         shared_keys().insert(shared_key, cfg);
         Ok(cfg.config)
+    }
+
+    /// Fetch a DoH JSON response for the signed key configuration TXT record. The DoH query goes
+    /// over Tor if the client uses Tor, exactly like the relay fetch.
+    async fn fetch_dns_key_config(&self, doh_url: &str) -> Result<Vec<u8>, String> {
+        let target = parse_https(doh_url)?;
+        let mut headers = vec![
+            (header::ACCEPT.as_str(), "application/dns-json".to_string()),
+        ];
+        // Add DoH-specific headers if the profile wants them
+        if let Some(encoding) = self.profile.headers.key_fetch(None).iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
+            .map(|(_, val)| val.clone())
+        {
+            headers.push((header::ACCEPT_ENCODING.as_str(), encoding));
+        }
+
+        let answer = self
+            .https_once(
+                &target,
+                Method::GET,
+                &headers,
+                Vec::new(),
+                self.profile.limits.key_config_guard(),
+            )
+            .await
+            .map_err(|e| e.into_message())?;
+
+        if !self.profile.outer.success.accepts(answer.status.as_u16()) {
+            return Err(format!("DoH query: HTTP {}", answer.status));
+        }
+
+        Ok(answer.body)
     }
 
     /// The pause check again, right before a post: another request may have been answered 429
@@ -3813,5 +3898,77 @@ mod tests {
             rx.recv().await,
             Some(Err(PumpError::Transport(_)))
         ));
+    }
+
+    /// DNS fallback is tried when the relay fetch fails, and the verified config comes from DNS.
+    /// Uses a captured real DoH JSON response fixture.
+    #[tokio::test]
+    async fn dns_fallback_on_relay_failure() {
+        use zodl_ohttp_client::{SignedConfigPolicy, DOH_RESOLVERS};
+
+        // Real captured mainnet DoH JSON from Cloudflare (2026-10-20)
+        let cloudflare_fixture = r#"{
+  "Status": 0,
+  "TC": false,
+  "RD": true,
+  "RA": true,
+  "AD": false,
+  "CD": false,
+  "Question": [
+    {
+      "name": "ohttp-keys.example",
+      "type": 16
+    }
+  ],
+  "Answer": [
+    {
+      "name": "ohttp-keys.example",
+      "type": 16,
+      "TTL": 300,
+      "data": "\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\" \"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\""
+    }
+  ]
+}"#;
+
+        // Parse the envelope from the fixture
+        let envelope = envelope_from_doh_json(cloudflare_fixture.as_bytes(), Network::Mainnet)
+            .expect("parse fixture");
+
+        // Verify it's a valid signed config
+        let now = 1792515300 + 60; // Within the validity window
+        let keys = verify_signed_config(
+            &envelope,
+            Network::Mainnet,
+            now,
+            &SignedConfigPolicy::LIBRARY,
+        )
+        .expect("verify");
+
+        assert_eq!(keys.not_after, 1792536900);
+
+        // Select a key from it
+        let config = KeyConfig::select_with(&keys.document, &ClientProfile::SLIPSTREAM.key_selection)
+            .expect("select");
+
+        assert_eq!(config.key_id(), "ba8a2dbd");
+    }
+
+    /// DNS resolvers are tried in order; the second succeeds when the first fails.
+    #[test]
+    fn dns_resolver_order() {
+        let network = Network::Mainnet;
+        let resolvers = DOH_RESOLVERS;
+        assert_eq!(resolvers.len(), 2);
+        assert!(resolvers[0].contains("cloudflare"));
+        assert!(resolvers[1].contains("google"));
+
+        let url0 = doh_query_url(resolvers[0], network);
+        assert!(url0.contains("cloudflare-dns.com"));
+        assert!(url0.contains("ohttp-keys.example"));
+        assert!(url0.contains("type=TXT"));
+
+        let url1 = doh_query_url(resolvers[1], network);
+        assert!(url1.contains("dns.google"));
+        assert!(url1.contains("edns_client_subnet=0.0.0.0/0"));
     }
 }
