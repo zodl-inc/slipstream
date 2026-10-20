@@ -1331,18 +1331,23 @@ impl OhttpClient {
             }
         }
 
-        // Try fetching signed config through relay first: fetch AND verify.
-        // If either fails (fetch or verification), fall back to DNS.
+        // Configuration validation: check relay URL, gateway network, and signed config URL
+        // BEFORE any network call. Configuration errors fail closed without DNS fallback.
         let now = unix_now()?;
+
+        // Validate relay URL is https
+        let _relay_target = parse_https(&self.relay_url)?;
+
+        // Validate signed config URL is https
+        let signed_config_url_str = signed_config_url(&self.relay_url, self.profile.signed_config_url)
+            .map_err(|e| e.to_string())?;
+        let signed_config_target = parse_https(&signed_config_url_str)?;
+
+        // Validate gateway is known (has a network/DNS source) for potential DNS fallback
+        let network = gateway_network(&self.gateway_host)?;
 
         // Try relay: fetch and verify
         let relay_fetch_and_verify = async {
-            // C-01 fix: Fetch signed config through relay host at /ohttp-configs/signed
-            // Construct target from relay host (not gateway) to avoid direct gateway access
-            let signed_config_target = parse_https(
-                &signed_config_url(&self.relay_url, self.profile.signed_config_url)
-                    .map_err(|e| e.to_string())?,
-            )?;
             let headers = self.profile.headers.key_fetch(None);
 
             // A key config GET is idempotent: a failure before anything was sent is tried once more.
@@ -1385,11 +1390,7 @@ impl OhttpClient {
                 // Relay failed (fetch or verification), try DNS fallback
                 tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
 
-                // The DNS source needs the network from the static gateway configuration; a host
-                // outside it has no DNS record either, so the relay error stands.
-                let network = gateway_network(&self.gateway_host)
-                    .map_err(|e| format!("{relay_err} (no DNS source: {e})"))?;
-                let mut last_err = relay_err;
+                let mut last_err = relay_err.clone();
                 let dns_name = key_config_dns_name(network);
                 let mut verified_cfg = None;
 
@@ -1420,12 +1421,8 @@ impl OhttpClient {
                     }
                 }
 
-                verified_cfg.ok_or_else(|| {
-                    format!(
-                        "key config fetch failed: relay and all DNS resolvers tried: {}",
-                        last_err
-                    )
-                })?
+                // All DNS resolvers failed: return original relay error
+                verified_cfg.ok_or(relay_err)?
             }
         };
 
