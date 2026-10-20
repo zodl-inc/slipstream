@@ -31,9 +31,11 @@
 //! - crash after main-commit, before a close-verdict cleanup → rows of a built
 //!   shard stay buffered → a range that later seeds in that shard resumes only
 //!   the contiguous run ending right before its start, on its own frontier's
-//!   leaf (`graft_accumulator::resumable_run`), and deletes every other row; a
-//!   run it resumes on a shard the store already holds content for is built
-//!   again with its first span (same leaves at the same positions) — self-healing;
+//!   leaf (`graft_accumulator::resumable_run`), and deletes only the rows at the
+//!   positions it scans again; a run it resumes on a shard the store already
+//!   holds content for is built again with its first span (same leaves at the
+//!   same positions) — self-healing; any other row of the shard is left to the
+//!   next pass's start sweep;
 //! - stop after a range's last commit, before its range-end build (a host abort
 //!   landing in the final drain) → the range is scanned, but its range-end shard's
 //!   rows stay buffered and no later range resumes them (Historic ranges run newest
@@ -50,6 +52,13 @@
 //! whose rows will not decode is swept by position: its blocks are queued for a
 //! rescan and its rows deleted, and a seed that still meets one seeds without a
 //! resume instead of failing.
+//!
+//! No seed or cleanup deletes a row at a position its own range does not feed:
+//! a seed deletes the rows at the positions its call feeds again, and a build or
+//! graft deletes the rows of the row set it built. So when the sweep's forecast
+//! goes stale during a pass (it did not run, or the queue changed and another
+//! range seeds in a shard first), the runs no range continues stay buffered for
+//! the next pass's sweep, which builds them or rescans their blocks.
 
 use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
@@ -214,7 +223,8 @@ pub(crate) fn load_shard<H: HashSer>(
     Ok(out)
 }
 
-/// Drop one shard's buffer (close-verdict cleanup — graft installed or built).
+/// Drop one shard's buffer: the pass-start sweep's, for a shard whose rows will
+/// not decode, once their blocks are queued for a rescan.
 pub(crate) fn delete_shard(
     conn: &Connection,
     pool: ShieldedPool,
@@ -223,27 +233,6 @@ pub(crate) fn delete_shard(
     conn.execute(
         "DELETE FROM ext_slipstream_graft_buffer WHERE pool = ?1 AND shard_index = ?2",
         params![pool_code(pool), shard_index as i64],
-    )?;
-    Ok(())
-}
-
-/// Drop one shard's rows outside `keep`: what a resumed range's seed leaves out
-/// once it has kept the run it continues (`graft_accumulator::resumable_run`).
-pub(crate) fn delete_shard_outside(
-    conn: &Connection,
-    pool: ShieldedPool,
-    shard_index: u64,
-    keep: std::ops::Range<u64>,
-) -> Result<(), SqliteClientError> {
-    conn.execute(
-        "DELETE FROM ext_slipstream_graft_buffer
-         WHERE pool = ?1 AND shard_index = ?2 AND (position < ?3 OR position >= ?4)",
-        params![
-            pool_code(pool),
-            shard_index as i64,
-            keep.start as i64,
-            keep.end as i64
-        ],
     )?;
     Ok(())
 }
@@ -283,8 +272,9 @@ pub(crate) fn buffered_positions(
     Ok(positions)
 }
 
-/// Drop one shard's rows inside `run`: a stranded run the pass-start sweep has built
-/// or queued for a rescan.
+/// Drop one shard's rows inside `run`: the positions a range's seed feeds again, a row
+/// set a range built or grafted, or a stranded run the pass-start sweep has built or
+/// queued for a rescan.
 pub(crate) fn delete_rows_in(
     conn: &Connection,
     pool: ShieldedPool,
@@ -324,11 +314,15 @@ pub(crate) fn contiguous_runs(positions: &[u64]) -> Vec<RangeInclusive<u64>> {
 /// (`None` where a start is unknown: the wallet holds no metadata for the block
 /// below the range).
 ///
-/// A range seeds in the shard its start position falls in, and that seed deletes
-/// the shard's rows outside the run it continues
-/// (`graft_accumulator::resumable_run`), so only the first range to seed in a
-/// shard can resume one of its runs. A shard first claimed after a range whose
-/// start is unknown is left out: that range may seed in the same shard first.
+/// A range seeds in the shard its start position falls in, and only the first
+/// range to seed in a shard is trusted to resume one of its runs
+/// (`graft_accumulator::resumable_run`): it is the next range to meet the shard,
+/// while what a later one meets depends on the ranges before it, and its start can
+/// still change as the pass goes on (a found note, a rescan queued after the
+/// sweep). Every other run is the sweep's to build or rescan now. A run this
+/// forecast still gets wrong stays buffered for the next sweep, since no range
+/// deletes rows at positions it does not feed. A shard first claimed after a range
+/// whose start is unknown is left out: that range may seed in the same shard first.
 pub(crate) fn first_seeders(starts: impl IntoIterator<Item = Option<u64>>) -> BTreeMap<u64, u64> {
     let mut claimed: BTreeMap<u64, Option<u64>> = BTreeMap::new();
     let mut unknown_start_before = false;
@@ -352,9 +346,10 @@ pub(crate) fn first_seeders(starts: impl IntoIterator<Item = Option<u64>>) -> BT
 ///
 /// `resume_at` is the start position of the shard's first seeder
 /// ([`first_seeders`]). The run holding `resume_at - 1` is the one that seed
-/// continues; its rows at or above `resume_at` lie in the seeding range's own
-/// blocks, which it scans again, so that run is left whole. Every other run is
-/// stranded.
+/// continues; its rows at or above `resume_at` are at positions of the seeding
+/// range's blocks, which it scans again (its seed deletes those its first call
+/// feeds, and any its range does not reach stay for the next sweep), so that run
+/// is left whole. Every other run is stranded.
 pub(crate) fn stranded_runs(positions: &[u64], resume_at: Option<u64>) -> Vec<RangeInclusive<u64>> {
     let resumed = resume_at.and_then(|start| start.checked_sub(1));
     contiguous_runs(positions)
@@ -676,27 +671,5 @@ mod tests {
             vec![h(15)..h(20), h(30)..h(50), h(60)..h(90)]
         );
         assert_eq!(scanned_stretches([], h(10), h(100)), vec![h(10)..h(100)]);
-    }
-
-    #[test]
-    fn delete_shard_outside_keeps_only_the_range_in_that_shard() {
-        let conn = mem_conn();
-        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
-        let rows: Vec<BufferRow<MerkleHashOrchard>> = (0..6u64)
-            .map(|i| (100 + i, h(0), Retention::Ephemeral))
-            .collect();
-        append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append o0");
-        append_rows(&conn, ShieldedPool::Sapling, 0, &rows).expect("append s0");
-        delete_shard_outside(&conn, ShieldedPool::Orchard, 0, 101..104).expect("delete");
-        let orchard: Vec<BufferRow<MerkleHashOrchard>> =
-            load_shard(&conn, ShieldedPool::Orchard, 0).expect("load o0");
-        assert_eq!(
-            orchard.iter().map(|r| r.0).collect::<Vec<_>>(),
-            vec![101, 102, 103],
-            "only the kept range survives"
-        );
-        let sapling: Vec<BufferRow<sapling::Node>> =
-            load_shard(&conn, ShieldedPool::Sapling, 0).expect("load s0");
-        assert_eq!(sapling.len(), 6, "the other pool is untouched");
     }
 }

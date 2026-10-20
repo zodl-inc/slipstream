@@ -694,13 +694,16 @@ type BuildSegment<H> = (Position, Vec<Option<(H, Retention<BlockHeight>)>>);
 /// One pool's build plan for one put_blocks call: contiguous row segments to
 /// build inside the main txn (passthrough spans, eager note flushes, and — in
 /// Task 7, where the verdict is still always-build — closed clean shards), plus
-/// the shards whose buffer rows die once the txn commits.
+/// the buffer rows that die once the txn commits.
 struct PoolPlan<H> {
     segments: Vec<BuildSegment<H>>,
     /// Task 8: clean shards with a server root — installed as root-only shards
     /// (upstream's own put_shard_roots shape), ZERO combines.
     grafts: Vec<(u64, H)>,
-    cleanup_shards: Vec<u64>,
+    /// The positions each built or grafted row set covers, by shard ([`fed_span`]):
+    /// only those rows are deleted after the commit. Other rows of the shard are no
+    /// row set's of this range, and stay for whatever resumes or sweeps them.
+    cleanup_spans: Vec<(u64, Range<u64>)>,
     /// Clean shards with NO server root (tip lag / server gap) — built instead.
     fallbacks: u64,
     /// Task 10 sampling verify: shards built ANYWAY (their rows ride
@@ -721,6 +724,14 @@ fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<
     Some((Position::from(first), seg))
 }
 
+/// The shard and the positions of one row set an accumulator built or grafted:
+/// a contiguous run within one shard, as every `FeedAction` carries it. Its buffer
+/// rows are the ones that die once the build commits.
+fn fed_span<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Option<(u64, Range<u64>)> {
+    let (first, last) = (rows.first()?.0, rows.last()?.0);
+    Some((first >> 16, first..last + 1))
+}
+
 /// Pre-txn planner for one pool: lazily seed the accumulator (buffer resume +
 /// conservative store-presence probe), feed this call's stream, persist Buffer
 /// rows on the side connection, and return the build plan. Runs BEFORE the main
@@ -729,9 +740,11 @@ fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<
 ///
 /// `frontier_leaf`: the leaf of this call's `from_state` frontier for the pool,
 /// with its position (`start_position - 1`). The seed resumes only the buffered
-/// run that ends on it (`graft_accumulator::resumable_run`) and deletes the
-/// shard's other rows. A shard whose buffered rows will not decode is deleted,
-/// with a warning, and seeds without a resume.
+/// run that ends on it (`graft_accumulator::resumable_run`). It deletes only the
+/// shard's rows at the positions this call feeds, which the range scans again;
+/// every other row of the shard stays buffered, for a later range that continues
+/// it or for the next pass's sweep, which verifies or rescans it. A shard whose
+/// buffered rows will not decode seeds without a resume, with a warning.
 #[allow(clippy::too_many_arguments)]
 fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
     conn: &rusqlite::Connection,
@@ -750,8 +763,20 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
 
     if acc.is_none() {
         let shard = start_position >> 16;
-        let mut resume = match crate::graft::load_shard::<H>(conn, pool, shard) {
-            Ok(rows) => rows,
+        // The seed shard's positions this call feeds: the range scans their blocks again,
+        // so rows buffered there are stale. Rows elsewhere in the shard may be another
+        // range's (below the start, a run this range does not continue; above this call,
+        // rows of later blocks, which may lie past the range's end), so no seed deletes
+        // them: a later range continues them, or the next pass's sweep verifies or
+        // rescans them.
+        let fed = start_position..(start_position + stream.len() as u64).min((shard + 1) << 16);
+        let resume = match crate::graft::load_shard::<H>(conn, pool, shard) {
+            Ok(rows) => {
+                if rows.iter().any(|(p, ..)| fed.contains(p)) {
+                    crate::graft::delete_rows_in(conn, pool, shard, fed)?;
+                }
+                rows
+            }
             Err(e) => {
                 // A row that will not decode. The pass-start sweep rescans such a shard's
                 // blocks by position and deletes its rows, so this is the backstop for one
@@ -760,31 +785,26 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
                     ?pool,
                     shard,
                     %e,
-                    "graft seed: the shard's buffered rows will not decode; deleting them and seeding without a resume"
+                    "graft seed: the shard's buffered rows will not decode; seeding without a resume and leaving them to the next pass's sweep"
                 );
-                crate::graft::delete_shard(conn, pool, shard)?;
+                crate::graft::delete_rows_in(conn, pool, shard, fed)?;
                 vec![]
             }
         };
         let has_internals = store_has_shard(shard);
-        if !resume.is_empty() {
-            // Only a run that ends right before the start, on this range's own
-            // frontier leaf, can be continued. Rows an interrupted range left
-            // behind elsewhere in the shard, or rows from another chain, would
-            // be laid out from the wrong position.
-            let (run, left_out) = resumable_run(resume, start_position, frontier_leaf);
-            if left_out {
-                match run.first() {
-                    Some((first, ..)) => crate::graft::delete_shard_outside(
-                        conn,
-                        pool,
-                        shard,
-                        *first..start_position,
-                    )?,
-                    None => crate::graft::delete_shard(conn, pool, shard)?,
-                }
-            }
-            resume = run;
+        // Only a run that ends right before the start, on this range's own frontier
+        // leaf, can be continued. Rows an interrupted range left behind elsewhere in
+        // the shard, or rows from another chain, would be laid out from the wrong
+        // position.
+        let below_start = resume.partition_point(|(p, ..)| *p < start_position);
+        let (resume, _) = resumable_run(resume, start_position, frontier_leaf);
+        if below_start > resume.len() {
+            tracing::debug!(
+                ?pool,
+                shard,
+                left = below_start - resume.len(),
+                "graft seed: buffered rows below the start that this range does not continue stay for the next pass's sweep"
+            );
         }
         *acc = Some(ShardAccumulator::seed(
             start_position,
@@ -797,22 +817,24 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
     let mut plan = PoolPlan {
         segments: vec![],
         grafts: vec![],
-        cleanup_shards: vec![],
+        cleanup_spans: vec![],
         fallbacks: 0,
         verify_roots: vec![],
     };
     for action in acc.feed(start_position, stream, note_positions) {
         match action {
             FeedAction::Build(rows) => {
-                if let Some(first) = rows.first() {
-                    plan.cleanup_shards.push(first.0 >> 16);
-                }
+                plan.cleanup_spans.extend(fed_span(&rows));
                 plan.segments.extend(rows_to_segment(rows));
             }
             FeedAction::CloseCleanShard { shard_index, rows } => {
                 // Task 8 — THE verdict: note-free shard + server root ⇒ graft
                 // (zero combines); no root ⇒ build these exact rows (fallback).
-                plan.cleanup_shards.push(shard_index);
+                plan.cleanup_spans.extend(fed_span(&rows));
+                debug_assert!(
+                    rows.first().is_none_or(|row| row.0 >> 16 == shard_index),
+                    "a closed shard's rows lie in that shard"
+                );
                 // [B6] A graft installs a root-only leaf: the shard's interior —
                 // INCLUDING its checkpoint rows — never materializes. Pre-B6 that
                 // was free (the downgrade doomed those checkpoints anyway); a
@@ -1293,7 +1315,7 @@ pub fn sparse_put_blocks(
             },
             anchor_floor,
         )?;
-        let cleanup = (sp.cleanup_shards.clone(), op.cleanup_shards.clone());
+        let cleanup = (sp.cleanup_spans.clone(), op.cleanup_spans.clone());
         let verdicts = (
             (sp.grafts.len() as u64, sp.fallbacks),
             (op.grafts.len() as u64, op.fallbacks),
@@ -1888,17 +1910,19 @@ pub fn sparse_put_blocks(
         Ok(())
     })?;
 
-    // v0.4 Plan A: buffer rows for shards built/closed this call are dead now the
-    // txn committed. POST-commit on purpose (graft.rs contract): a crash before
-    // this point leaves rows that the next seed in that shard resumes or deletes.
+    // v0.4 Plan A: buffer rows of the row sets built/grafted this call are dead now
+    // the txn committed: exactly their positions, never the rest of their shard.
+    // POST-commit on purpose (graft.rs contract): a crash before this point leaves
+    // rows that a later seed in that shard resumes, or the next pass's sweep
+    // verifies or rescans.
     if let (Some(ctx), Some(((sap_cleanup, orch_cleanup), verdicts))) =
         (graft.as_ref(), graft_cleanup)
     {
-        for shard in sap_cleanup {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Sapling, shard)?;
+        for (shard, span) in sap_cleanup {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Sapling, shard, span)?;
         }
-        for shard in orch_cleanup {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Orchard, shard)?;
+        for (shard, span) in orch_cleanup {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Orchard, shard, span)?;
         }
         let ((sap_grafted, sap_fallback), (orch_grafted, orch_fallback)) = verdicts;
         if sap_grafted + sap_fallback + orch_grafted + orch_fallback > 0 {
@@ -2352,14 +2376,14 @@ impl GraftSweep {
 /// range-end build, as when a host abort lands in the final drain (`scan.rs`). The range
 /// is scanned, and Historic ranges run newest first, so no later range resumes that
 /// shard's rows: their leaves, and the checkpoints and durable anchors among them, never
-/// reach the tree. Worse, a later range that seeds in the same shard deletes them
-/// (`graft_accumulator::resumable_run` keeps only the run it continues), and so does the
-/// close or finish cleanup of a range that builds in that shard. So this runs first:
+/// reach the tree. No range deletes them either: a seed deletes only the rows at the
+/// positions its call feeds, and a build or graft only the rows of the row set it built
+/// (`plan_pool`), so they wait for this sweep, which runs first:
 ///
 /// - the first pending Historic range to seed in a shard resumes the run that ends right
-///   before its start ([`crate::graft::first_seeders`], [`crate::graft::stranded_runs`]);
-///   that run is left in place, as is every row when `graft_resumes` is false (no range
-///   buffers, so none resumes);
+///   before its start ([`crate::graft::first_seeders`], [`crate::graft::stranded_runs`]),
+///   and that run is left in place. With `graft_resumes` false (the kill switch: no range
+///   buffers, so none resumes) every run is stranded and swept as below;
 /// - a stranded run is built only when data the wallet already holds checks where it
 ///   ends ([`crate::graft::end_check`]): the tree's leaf at its last position, or the
 ///   stored root of the shard it completes, which the shard's root computed once the run
@@ -2379,10 +2403,16 @@ impl GraftSweep {
 ///
 /// Warn-and-continue, as the open-time heals in `WalletSession::open`: a pool, shard or run
 /// the sweep cannot read, build or rescan gets one warning and keeps its rows (the first
-/// range to seed in that shard keeps only the run it continues, and seeds without a resume
-/// when the shard's rows will not decode), and the sweep goes on with the rest. Only a
-/// failure before any pool is swept is returned, and the scheduler logs it and runs the
-/// pass.
+/// range to seed in that shard resumes only the run it continues, seeds without a resume
+/// when the shard's rows will not decode, and leaves the other rows to the next sweep),
+/// and the sweep goes on with the rest. Only a failure before any pool is swept is
+/// returned, and the scheduler logs it and runs the pass.
+///
+/// The forecast can go stale during the pass: the queue changes (a found note, a rescan
+/// queued after the sweep) and another range seeds in a shard first, or this sweep did not
+/// run. The rows of a run no range continues then stay buffered, never deleted unchecked,
+/// and the next pass's sweep builds or rescans them. The Orchard pool's forecast reads the
+/// queue again when the Sapling pool's sweep queued rescans.
 ///
 /// Deep history: each built row's checkpoint is doomed when its own block lies deep below
 /// the chain tip now ([`doom_deep_rows`]). Rows buffered before the graft stream got the
@@ -2410,38 +2440,63 @@ pub(crate) fn sweep_stranded_graft_rows(
     ) else {
         return Ok(GraftSweep::default());
     };
-    let pending = db.suggest_scan_ranges().map_err(werr)?;
-    let stretches = crate::graft::scanned_stretches(
-        pending.iter().map(|range| range.block_range().clone()),
-        floor,
-        chain_tip + 1,
-    );
-    let sweep = SweepInputs {
+    // The pending ranges, in the order the scheduler scans them, and the scanned
+    // stretches between them.
+    let read_queue = |db: &mut Db| -> Result<_, SqliteClientError> {
+        let pending = db.suggest_scan_ranges()?;
+        let stretches = crate::graft::scanned_stretches(
+            pending.iter().map(|range| range.block_range().clone()),
+            floor,
+            chain_tip + 1,
+        );
+        Ok((pending, stretches))
+    };
+    let (pending, stretches) = read_queue(db).map_err(werr)?;
+    let mut done = GraftSweep::default();
+    let swept = SweepInputs {
         conn: &ctx.conn,
         pending: &pending,
         stretches: &stretches,
         chain_tip,
         graft_resumes,
         anchor_retention,
-    };
-    let mut done = GraftSweep::default();
-    let swept = sweep
-        .pool::<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }, SAPLING_SHARD_HEIGHT>(
-            db,
-            ShieldedPool::Sapling,
-            &sapling_shards,
-            &mut done,
-        );
+    }
+    .pool::<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }, SAPLING_SHARD_HEIGHT>(
+        db,
+        ShieldedPool::Sapling,
+        &sapling_shards,
+        &mut done,
+    );
     if let Err(e) = swept {
         warn_pool_left(ShieldedPool::Sapling, &e);
     }
-    let swept = sweep.pool::<
-        orchard::tree::MerkleHashOrchard,
-        { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
-        ORCHARD_SHARD_HEIGHT,
-    >(db, ShieldedPool::Orchard, &orchard_shards, &mut done);
-    if let Err(e) = swept {
-        warn_pool_left(ShieldedPool::Orchard, &e);
+    // The rescans the Sapling pool queued change the queue: the Orchard forecast (its
+    // first seeders, its scanned stretches) reads it again.
+    let queue = if done.rescans.is_empty() || orchard_shards.is_empty() {
+        Ok((pending, stretches))
+    } else {
+        read_queue(db)
+    };
+    match queue {
+        Ok((pending, stretches)) => {
+            let swept = SweepInputs {
+                conn: &ctx.conn,
+                pending: &pending,
+                stretches: &stretches,
+                chain_tip,
+                graft_resumes,
+                anchor_retention,
+            }
+            .pool::<
+                orchard::tree::MerkleHashOrchard,
+                { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+                ORCHARD_SHARD_HEIGHT,
+            >(db, ShieldedPool::Orchard, &orchard_shards, &mut done);
+            if let Err(e) = swept {
+                warn_pool_left(ShieldedPool::Orchard, &e);
+            }
+        }
+        Err(e) => warn_pool_left(ShieldedPool::Orchard, &e),
     }
     if !done.is_empty() {
         info!(
@@ -4223,7 +4278,8 @@ impl PersistLane {
 
     /// v0.4 Plan A (Task 7b rev 2): build whatever the graft accumulators still
     /// hold — the range-end / tip shard, which NEVER grafts (accumulator rule 1)
-    /// — inside one small transaction, then drop its buffer rows. Call after
+    /// — inside one small transaction, then drop the buffer rows of the positions
+    /// it built (other rows of that shard stay for the next pass's sweep). Call after
     /// `drain()` on the success path only (on error exits the buffered rows stay
     /// for the restart-resume path; an abort that skips this call leaves them to
     /// the next pass's `sweep_stranded_graft_rows`). Blocking — wrap in
@@ -4258,13 +4314,9 @@ impl PersistLane {
         if sap_rows.is_empty() && orch_rows.is_empty() {
             return Ok(());
         }
-        fn shard_ids<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Vec<u64> {
-            let mut v: Vec<u64> = rows.iter().map(|r| r.0 >> 16).collect();
-            v.dedup();
-            v
-        }
-        let sap_shards = shard_ids(&sap_rows);
-        let orch_shards = shard_ids(&orch_rows);
+        // The positions the finish builds: only their buffer rows die with it.
+        let sap_span = fed_span(&sap_rows);
+        let orch_span = fed_span(&orch_rows);
 
         let (Some(sap_tree), Some(orch_tree)) = (sapling.as_mut(), orchard.as_mut()) else {
             // Rows only exist if put_blocks ran, which seeds the trees first.
@@ -4288,12 +4340,12 @@ impl PersistLane {
         .map_err(|e: SqliteClientError| werr("txn", e.to_string()))?;
 
         // Post-commit cleanup (ordering contract — crash before this self-heals).
-        for shard in sap_shards {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Sapling, shard)
+        if let Some((shard, span)) = sap_span {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Sapling, shard, span)
                 .map_err(|e| werr("cleanup sapling", e.to_string()))?;
         }
-        for shard in orch_shards {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Orchard, shard)
+        if let Some((shard, span)) = orch_span {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Orchard, shard, span)
                 .map_err(|e| werr("cleanup orchard", e.to_string()))?;
         }
         info!("graft finish: range-end shards built + buffer cleaned");
@@ -5555,9 +5607,10 @@ mod graft_resume_seed_tests {
     }
 
     /// A buffered row that will not decode never fails a range's seed. The pass-start sweep
-    /// rescans such a shard by position; for one it did not reach, the seed drops the shard's
-    /// rows, with a warning, and seeds without a resume, so the range builds what it scans
-    /// from its own start. Here the run [k_start, k_start + 20) would have been resumed.
+    /// rescans such a shard by position; for one it did not reach, the seed warns and seeds
+    /// without a resume, so the range builds what it scans from its own start, and the
+    /// shard's rows stay for the next pass's sweep. Here the run [k_start, k_start + 20)
+    /// would have been resumed.
     #[test]
     fn seed_survives_a_buffered_row_that_will_not_decode() {
         let shard = 1u64;
@@ -5599,11 +5652,75 @@ mod graft_resume_seed_tests {
             misplaced(&plan, k_start..k_start + 100).is_empty(),
             "every built row sits at its own position"
         );
-        assert!(
+        assert_eq!(
             crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
-                .expect("positions")
-                .is_empty(),
-            "the shard's rows are dropped"
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the shard's rows stay for the next pass's sweep"
+        );
+    }
+
+    /// A seed deletes only the rows at the positions its own call feeds, which the range
+    /// scans again. Rows below its start that it does not continue, and rows past what its
+    /// call feeds (later blocks, which may lie past the range's end, as another range's
+    /// rows do), stay buffered: a later range continues them, or the next pass's sweep
+    /// verifies or rescans them. Here the buffer holds [k_start, k_start + 20) and a range
+    /// starting at k_start + 8 feeds 4 rows in its first call: the run below it ends right
+    /// before its start and is resumed, its 4 positions are fed again, and the 8 rows past
+    /// them stay.
+    #[test]
+    fn seed_deletes_only_the_rows_its_own_call_feeds_again() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 8;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..4)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        // The fed positions' rows differ from what this call feeds there, so a stale row
+        // left in place would show.
+        let restamped = conn
+            .execute(
+                "UPDATE ext_slipstream_graft_buffer SET retention_kind = 1
+                 WHERE position >= ?1 AND position < ?2",
+                [
+                    i64::try_from(start).expect("fits"),
+                    i64::try_from(start + 4).expect("fits"),
+                ],
+            )
+            .expect("mark the stale rows");
+        assert_eq!(restamped, 4, "the four fed positions are buffered");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |_| Ok(None),
+            None,
+        )
+        .expect("plan");
+        assert!(
+            segments(&plan).is_empty(),
+            "nothing builds: the shard buffers"
+        );
+        let rows = crate::graft::load_shard::<sapling::Node>(&conn, ShieldedPool::Sapling, shard)
+            .expect("load");
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the rows below the start and past the call stay, and the fed ones are buffered again"
+        );
+        assert!(
+            rows.iter()
+                .all(|(p, h, r)| *h == node(*p) && *r == Retention::Ephemeral),
+            "every fed position holds what this call fed, not the stale row"
         );
     }
 }

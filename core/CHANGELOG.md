@@ -16,10 +16,12 @@ workspace.
   first row's position. Rows that did not end right before the range's start, as after an
   account import whose rescan starts inside an interrupted range's shard, put every later
   leaf of the commitment tree at the wrong position. A range now resumes only the run of
-  rows that ends right before its start, on its own `from_state` frontier's leaf, and
-  drops the shard's other rows. That run is no longer deleted when the wallet already
-  holds content for the shard (after a second committed unit of the interrupted range),
-  which lost its leaves and anchors.
+  rows that ends right before its start, on its own `from_state` frontier's leaf. That run
+  is no longer deleted when the wallet already holds content for the shard (after a second
+  committed unit of the interrupted range), which lost its leaves and anchors. A range
+  also no longer deletes the rest of the shard's rows, rows of blocks that may stay
+  scanned: its seed deletes only the rows at the positions it scans again, and a build or
+  graft only the rows it built, so the others wait for the next pass's sweep (below).
 - The range-end graft build, and every other build of buffered rows, inserted the rows
   without first registering their durable anchors as retained. With the wallet at its
   100-checkpoint budget (the ChainTip range's window), the build evicted the anchors it
@@ -47,8 +49,8 @@ workspace.
   commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own
   account import (`WalletSession::import_account`) now drop every buffered row at or
   above their rewind point. For an account a host imports into the wallet database
-  itself, the first range to seed in the shard keeps only the run that ends right before
-  its start, as above.
+  itself, the first range to seed in the shard resumes only the run that ends right
+  before its start, as above.
 
 ### Added
 - `wallet_session::WalletSession::truncate_to_height`: upstream's

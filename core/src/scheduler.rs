@@ -387,10 +387,10 @@ pub async fn run_to_completion(
     let mut report = SyncReport::default();
     // v0.4 Plan A: before any range plans, build (or queue a rescan of) the graft-buffer
     // runs no range will resume: a range stopped between its last commit and its range-end
-    // build leaves them, and the first range to seed in their shard would delete them.
-    // Nothing to do (one query) when the buffer is empty. Warn-and-continue, as the
-    // open-time heals: a sweep that fails leaves the rows buffered, where the first range
-    // to seed in their shard keeps only the run it continues, and the pass still runs.
+    // build leaves them, and Historic ranges run newest first, so none comes back for them.
+    // With the buffer empty it costs a connection open and two queries. Warn-and-continue,
+    // as the open-time heals: a sweep that fails leaves the rows buffered (no range deletes
+    // rows at positions it does not feed) for the next pass's sweep, and the pass runs.
     if let Err(e) = crate::persist::sweep_stranded_graft_rows(
         session.db_mut(),
         &config.wallet_db_path,
