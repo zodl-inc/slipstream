@@ -48,7 +48,7 @@ pub enum SlipstreamError {
     /// (adding or removing an account, a rewind, a wipe; see
     /// [`crate::events::Progress::request_stop_for_wallet_change`]), and the scan stopped at its
     /// next block. Raised from the session's block source
-    /// ([`crate::block_source::StoppedForWalletChange`]) and before the range-end tree build.
+    /// ([`crate::block_source::StoppedForWalletChange`]).
     ///
     /// It is not a failure. The session ends quietly: `run_session` sets `SyncState::Idle` and
     /// returns, with no `Error` state, no tag-4 event, no revival and no retry

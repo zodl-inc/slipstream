@@ -275,9 +275,13 @@ struct WriteBehind {
 /// `progress` — if `Some`, bumps `scanned_blocks` per chunk after a successful scan.
 /// It also carries the host's stop for a wallet change
 /// ([`Progress::request_stop_for_wallet_change`]): the scan then ends at its
-/// next block, or before the write-behind range-end tree build if every block
-/// is already scanned, with [`SlipstreamError::StoppedForWalletChange`]. The
+/// next block with [`SlipstreamError::StoppedForWalletChange`]. The
 /// interrupted scan call wrote nothing; what earlier calls committed stays.
+/// A stop that comes after the range's last block still lets the write-behind
+/// range-end tree build run: it is one bounded transaction the host's settle
+/// waits for, and skipping it would strand the range's tail shard in the graft
+/// buffer, which only a later range starting inside that shard resumes (and
+/// Historic ranges are scanned newest-first, so none does).
 ///
 /// ## Adaptive sub-batching (T5.2)
 ///
@@ -381,18 +385,6 @@ pub async fn scan_chunks(
         let final_drain_elapsed = final_drain_started.elapsed();
         return match (result, drain_result) {
             (Ok(mut stats), Ok(())) => {
-                // A host's stop for a wallet change that came after the last
-                // block was scanned must still not start another wallet write,
-                // and the build below is one: a transaction run synchronously in
-                // block_in_place, where the host's abort cannot reach it. Refuse
-                // it as the block source refuses a block. Every submitted unit
-                // is committed (the drain above), and the shard the
-                // accumulators still hold stays in the graft buffer, which the
-                // next pass resumes, as on any error exit. This also returns
-                // before the scheduler's per-range enhancement writes.
-                if progress.as_deref().is_some_and(Progress::stop_requested) {
-                    return Err(SlipstreamError::StoppedForWalletChange);
-                }
                 // v0.4 Plan A: build the range-end/tip shard the accumulators still
                 // hold (success path only — on errors the buffer resumes the shard).
                 tokio::task::block_in_place(|| wb.lane.finish_graft_blocking())?;
