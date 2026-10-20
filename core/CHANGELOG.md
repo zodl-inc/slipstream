@@ -10,7 +10,46 @@ workspace.
 
 ## [Unreleased]
 
+### Fixed
+- With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
+  whatever the graft buffer held for its first shard, and a build lays rows out from the
+  first row's position. Rows that did not end right before the range's start, as after an
+  account import whose rescan starts inside an interrupted range's shard, put every later
+  leaf of the commitment tree at the wrong position. A range now resumes only the run of
+  rows that ends right before its start, on its own `from_state` frontier's leaf, and
+  drops the shard's other rows. That run is no longer deleted when the wallet already
+  holds content for the shard (after a second committed unit of the interrupted range),
+  which lost its leaves and anchors.
+- The range-end graft build, and every other build of buffered rows, inserted the rows
+  without first registering their durable anchors as retained. With the wallet at its
+  100-checkpoint budget (the ChainTip range's window), the build evicted the anchors it
+  had just added, and the anchors it kept were never recorded as retained. Buffered rows
+  also kept every per-block checkpoint when they were scanned deep below the chain tip,
+  so a later build created checkpoints that graft off never creates. Graft on now leaves
+  the same checkpoints and retained anchors as graft off.
+- A pass stopped or aborted after a Historic range's last commit, such as a host abort
+  that lands in the range's final drain, skipped the range-end build: the range's last
+  shard stayed only in the graft buffer, so its leaves, checkpoints and durable anchors
+  never reached the tree, and a later range that seeded in that shard deleted them. Each
+  pass now starts with a sweep of the buffer for the runs no pending range will resume. A
+  run is built when data the wallet already holds checks where it ends (the tree's leaf at
+  its last position, or the stored server root of the shard it completes); any other run
+  is deleted and its blocks are queued for a rescan. Wallets already affected heal on their
+  next pass. A sweep that cannot read, build or rescan a run logs a warning, leaves its
+  rows buffered and never fails the pass.
+- A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
+  of the blocks they queue again, though after a reorg those may be another chain's
+  commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own
+  account import (`WalletSession::import_account`) now drop every buffered row at or
+  above their rewind point. For an account a host imports into the wallet database
+  itself, the first range to seed in the shard keeps only the run that ends right before
+  its start, as above.
+
 ### Added
+- `wallet_session::WalletSession::truncate_to_height`: upstream's
+  `WalletWrite::truncate_to_height`, then the removal of the graft-buffer rows of the
+  blocks it removed. It returns the height the wallet was truncated to. The scheduler's
+  reorg recovery calls it.
 - `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
   host calls the first right before it changes the wallet (adding or removing an account,
   a rewind, a wipe), and the running session's scan ends at its next block instead of
@@ -47,7 +86,7 @@ workspace.
   fetch of the first chunk, and one cut short by an abort leaves it owed.
 - `ffi_handle::SlipstreamHandle` has a new public field, `unfinished_passes`: code that
   builds the handle with a struct literal must set it (to `Vec::new()`).
-- `engine::ENGINE_BUILD` is `2026-10-20.v0.15-stop-for-wallet-change`.
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
 
 ## [0.4.0-pre.1] - 2026-10-06
 
