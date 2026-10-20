@@ -744,7 +744,9 @@ fn fed_span<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Option<(u64, Ran
 /// shard's rows at the positions this call feeds, which the range scans again;
 /// every other row of the shard stays buffered, for a later range that continues
 /// it or for the next pass's sweep, which verifies or rescans it. A shard whose
-/// buffered rows will not decode seeds without a resume, with a warning.
+/// buffered rows will not decode ([`crate::graft::will_not_decode`]) seeds
+/// without a resume and builds what the range scans in it, with a warning; any
+/// other error reading the shard's rows fails the call.
 #[allow(clippy::too_many_arguments)]
 fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
     conn: &rusqlite::Connection,
@@ -770,6 +772,7 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
         // them: a later range continues them, or the next pass's sweep verifies or
         // rescans them.
         let fed = start_position..(start_position + stream.len() as u64).min((shard + 1) << 16);
+        let mut will_not_decode = false;
         let resume = match crate::graft::load_shard::<H>(conn, pool, shard) {
             Ok(rows) => {
                 if rows.iter().any(|(p, ..)| fed.contains(p)) {
@@ -777,21 +780,30 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
                 }
                 rows
             }
-            Err(e) => {
+            Err(e) if crate::graft::will_not_decode(&e) => {
                 // A row that will not decode. The pass-start sweep rescans such a shard's
-                // blocks by position and deletes its rows, so this is the backstop for one
-                // it did not reach: failing here would fail this range on every pass.
+                // runs by position, so this is the backstop for one it did not reach or
+                // could not place: failing here would fail this range on every pass. No
+                // seed in this shard can read its rows, so rows buffered next to them
+                // could never be resumed; the range builds what it scans here instead.
                 tracing::warn!(
                     ?pool,
                     shard,
                     %e,
-                    "graft seed: the shard's buffered rows will not decode; seeding without a resume and leaving them to the next pass's sweep"
+                    "graft seed: the shard's buffered rows will not decode; seeding without a resume, building this shard as it is scanned, and leaving its rows to the next pass's sweep"
                 );
                 crate::graft::delete_rows_in(conn, pool, shard, fed)?;
+                will_not_decode = true;
                 vec![]
             }
+            // An SQLite error (a busy database past the timeout, an I/O error) says nothing
+            // about the rows: the range fails this pass and is retried, the rows untouched.
+            Err(e) => return Err(e),
         };
-        let has_internals = store_has_shard(shard);
+        // Passthrough: the range builds what it scans in this shard instead of buffering
+        // it, when the store already holds content for the shard or its rows will not
+        // decode.
+        let passthrough = store_has_shard(shard) || will_not_decode;
         // Only a run that ends right before the start, on this range's own frontier
         // leaf, can be continued. Rows an interrupted range left behind elsewhere in
         // the shard, or rows from another chain, would be laid out from the wrong
@@ -806,11 +818,7 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
                 "graft seed: buffered rows below the start that this range does not continue stay for the next pass's sweep"
             );
         }
-        *acc = Some(ShardAccumulator::seed(
-            start_position,
-            resume,
-            has_internals,
-        ));
+        *acc = Some(ShardAccumulator::seed(start_position, resume, passthrough));
     }
     let acc = acc.as_mut().unwrap_or_else(|| unreachable!("seeded above"));
 
@@ -2396,17 +2404,19 @@ impl GraftSweep {
 ///   holding it are queued for a rescan (in that order, so a crash in between leaves the
 ///   rows for the next sweep);
 /// - every buffered shard is decoded, a resumed run's too: a shard whose rows will not all
-///   decode can be neither built nor resumed (the seed of the first range in it would fail
-///   on them), so each of its runs is handled by its positions alone, the scanned blocks
-///   holding it queued for a rescan, and then the shard's rows are deleted
-///   (`SweepInputs::undecodable_shard`).
+///   decode can be neither built nor resumed (no seed in it can read them), so each of its
+///   runs is handled by its positions alone: the scanned blocks holding it are queued for a
+///   rescan, and then its rows are deleted (`SweepInputs::undecodable_shard`). Only a
+///   decode failure counts ([`crate::graft::will_not_decode`]): a shard whose read fails
+///   with an SQLite error keeps its rows for the next sweep.
 ///
 /// Warn-and-continue, as the open-time heals in `WalletSession::open`: a pool, shard or run
-/// the sweep cannot read, build or rescan gets one warning and keeps its rows (the first
-/// range to seed in that shard resumes only the run it continues, seeds without a resume
-/// when the shard's rows will not decode, and leaves the other rows to the next sweep),
-/// and the sweep goes on with the rest. Only a failure before any pool is swept is
-/// returned, and the scheduler logs it and runs the pass.
+/// the sweep cannot read, build or rescan, or whose blocks the wallet's block metadata
+/// cannot place, gets one warning and keeps its rows (the first range to seed in that shard
+/// resumes only the run it continues, seeds without a resume and builds what it scans when
+/// the shard's rows will not decode, and leaves the other rows to the next sweep), and the
+/// sweep goes on with the rest. Only a failure before any pool is swept is returned, and
+/// the scheduler logs it and runs the pass.
 ///
 /// The forecast can go stale during the pass: the queue changes (a found note, a rescan
 /// queued after the sweep) and another range seeds in a shard first, or this sweep did not
@@ -2611,7 +2621,8 @@ impl SweepInputs<'_> {
     /// One pool's sweep over its buffered `shards`. An error is the pool's own (the starts
     /// of its pending ranges, or its tree); a shard or run that fails gets a warning and
     /// keeps its rows, and the sweep goes on with the rest. A shard whose rows will not
-    /// decode is swept by position ([`Self::undecodable_shard`]).
+    /// decode is swept by position ([`Self::undecodable_shard`]); one whose read fails with
+    /// an SQLite error keeps its rows.
     fn pool<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
         &self,
         db: &mut Db,
@@ -2645,9 +2656,9 @@ impl SweepInputs<'_> {
         };
 
         // Positions decide which runs are stranded; a restart's resumable rows are never
-        // built. Every buffered shard is decoded all the same: the first range to seed in a
-        // shard decodes its rows, so one that will not decode would fail every pass there.
-        // Such a shard is swept by its positions alone ([`Self::undecodable_shard`]).
+        // built. Every buffered shard is decoded all the same: no seed can resume rows that
+        // will not decode, so even the run a seeder would continue is stranded there. Such a
+        // shard is swept by its positions alone ([`Self::undecodable_shard`]).
         let mut stranded = vec![];
         for &shard in shards {
             let positions = match crate::graft::buffered_positions(self.conn, pool, shard) {
@@ -2665,7 +2676,12 @@ impl SweepInputs<'_> {
                         stranded.push((shard, runs, rows));
                     }
                 }
-                Err(e) => self.undecodable_shard(db, pool, shard, &positions, &e, done),
+                Err(e) if crate::graft::will_not_decode(&e) => {
+                    self.undecodable_shard(db, pool, shard, &positions, &e, done)
+                }
+                // An SQLite error (a busy database past the timeout, an I/O error) says
+                // nothing about the rows: they stay as they are, for the next sweep.
+                Err(e) => warn_shard_left(pool, shard, &e),
             }
         }
         if stranded.is_empty() {
@@ -2831,12 +2847,16 @@ impl SweepInputs<'_> {
     }
 
     /// Sweep a shard whose buffered rows will not all decode, by their positions alone. No
-    /// range can resume or build such rows (its seed would fail on them), so each run is
-    /// handled as a run nothing checks: the scanned blocks holding it are queued for a
-    /// rescan ([`rescans_for`]), and once every run is queued the shard's rows are deleted,
-    /// in that order, so a crash in between leaves them for the next sweep. A run the
-    /// wallet's block metadata cannot place gets a warning and is deleted with the rest:
-    /// rows that do not decode would only fail every later seed in the shard.
+    /// range can resume or build such rows (a seed in the shard cannot read them, and seeds
+    /// without a resume), so each run is handled as a run nothing checks: the scanned blocks
+    /// holding it are queued for a rescan ([`rescans_for`]), then its rows are deleted, in
+    /// that order, so a crash in between leaves them for the next sweep. A run the wallet's
+    /// block metadata cannot place, or whose rescan cannot be queued, gets a warning and
+    /// keeps its rows, as on the decodable path: deleting it would leave scanned blocks
+    /// whose commitments are in neither the tree nor the buffer, with no rescan to bring
+    /// them back. A later sweep handles it as any other run once the rows that will not
+    /// decode are gone, or places it once the metadata does (as the pending ranges around
+    /// it are scanned and the stretches merge).
     fn undecodable_shard(
         &self,
         db: &mut Db,
@@ -2854,35 +2874,36 @@ impl SweepInputs<'_> {
         );
         for run in crate::graft::contiguous_runs(positions) {
             match self.queue_rescans(db, pool, &run, done) {
-                Ok(true) => {}
+                Ok(true) => {
+                    let span = *run.start()..*run.end() + 1;
+                    match crate::graft::delete_rows_in(self.conn, pool, shard, span) {
+                        Ok(()) => done.discarded_rows += *run.end() - *run.start() + 1,
+                        Err(e) => tracing::warn!(
+                            ?pool,
+                            shard,
+                            first = *run.start(),
+                            last = *run.end(),
+                            %e,
+                            "graft sweep: could not delete a run of rows that will not decode once its rescan was queued; it stays buffered"
+                        ),
+                    }
+                }
                 Ok(false) => tracing::warn!(
                     ?pool,
                     shard,
                     first = *run.start(),
                     last = *run.end(),
-                    "graft sweep: the wallet's block metadata does not place a run of rows that will not decode; deleting it"
+                    "graft sweep: the wallet's block metadata does not place a run of rows that will not decode; left buffered"
                 ),
-                Err(e) => {
-                    tracing::warn!(
-                        ?pool,
-                        shard,
-                        first = *run.start(),
-                        last = *run.end(),
-                        %e,
-                        "graft sweep: could not queue the rescan of a run of rows that will not decode; its shard stays buffered"
-                    );
-                    return;
-                }
+                Err(e) => tracing::warn!(
+                    ?pool,
+                    shard,
+                    first = *run.start(),
+                    last = *run.end(),
+                    %e,
+                    "graft sweep: could not queue the rescan of a run of rows that will not decode; left buffered"
+                ),
             }
-        }
-        match crate::graft::delete_shard(self.conn, pool, shard) {
-            Ok(()) => done.discarded_rows += positions.len() as u64,
-            Err(e) => tracing::warn!(
-                ?pool,
-                shard,
-                %e,
-                "graft sweep: could not delete the rows of a shard that will not decode; they stay buffered"
-            ),
         }
     }
 }
@@ -5701,6 +5722,106 @@ mod graft_resume_seed_tests {
             rows.iter()
                 .all(|(p, h, r)| *h == node(*p) && *r == Retention::Ephemeral),
             "every fed position holds what this call fed, not the stale row"
+        );
+    }
+
+    /// A seed in a shard whose rows will not decode builds what its range scans there
+    /// instead of buffering it: no seed in the shard can read its rows, so rows buffered
+    /// next to them could never be resumed. Here no note flushes the shard and the store
+    /// holds no content for it, so a seed that buffered would build nothing.
+    #[test]
+    fn seed_builds_what_it_scans_in_a_shard_that_will_not_decode() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let garbled = conn
+            .execute(
+                "UPDATE ext_slipstream_graft_buffer SET commitment = x'C7C7C7' WHERE position = ?1",
+                [i64::try_from(k_start + 3).expect("fits")],
+            )
+            .expect("garble a buffered row");
+        assert_eq!(garbled, 1, "the row is buffered");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |_| Ok(None),
+            None,
+        )
+        .expect("a row that will not decode does not fail the seed");
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans in the shard, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "nothing is buffered next to the shard's rows, which stay for the next pass's sweep"
+        );
+    }
+
+    /// Only a row that will not decode makes a seed go on without a resume. Any other error
+    /// reading the shard's rows says nothing about them (a busy database past the timeout,
+    /// an I/O error; here a renamed column, which fails the read of the rows but not the
+    /// writes the seed makes), so the call fails, as it did before rows that will not decode
+    /// had a backstop: the range fails this pass and is retried, the rows untouched. The
+    /// store holds content for the shard, so a seed that went on would build, not buffer.
+    #[test]
+    fn seed_fails_on_an_sqlite_error_reading_its_shard() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        conn.execute_batch(
+            "ALTER TABLE ext_slipstream_graft_buffer RENAME COLUMN marking TO marking_renamed",
+        )
+        .expect("rename a column the read selects");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let planned = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| true,
+            |_| Ok(None),
+            None,
+        );
+        assert!(
+            matches!(&planned, Err(SqliteClientError::DbError(_))),
+            "an SQLite error reading the shard's rows fails the seed, as that error"
+        );
+        assert!(acc.is_none(), "the range is not seeded");
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the shard's rows stay as they are"
         );
     }
 }

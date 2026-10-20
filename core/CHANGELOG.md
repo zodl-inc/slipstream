@@ -40,11 +40,14 @@ workspace.
   still buffered heals on its next pass. This change neither detects nor repairs what an
   earlier version already did: rows it deleted (their checkpoints and durable anchors are
   missing), or leaves it built at the wrong positions. A buffered row that will not decode
-  no longer fails every pass: the sweep queues the blocks of its shard for a rescan, by
-  position, wherever the wallet's block metadata places them, and deletes the shard's
-  rows, and a range that still meets such a row seeds without the shard's rows, with a
-  warning. Any other run the sweep cannot read, build or rescan gets a warning and keeps
-  its rows; a sweep that fails only warns, and the pass goes on.
+  no longer fails every pass: for each run of its shard, the sweep queues a rescan of the
+  blocks holding it, by position, and then deletes it; a run the wallet's block metadata
+  cannot place keeps its rows, with a warning. A range that still meets such a row seeds
+  without the shard's rows and builds what it scans in that shard, with a warning. Only a
+  row that will not decode counts: any other error reading the buffer (a busy database,
+  an I/O error) fails the range for the pass, as before, and the sweep leaves that
+  shard's rows as they are. Any other run the sweep cannot read, build or rescan gets a
+  warning and keeps its rows; a sweep that fails only warns, and the pass goes on.
 - A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
   of the blocks they queue again, though after a reorg those may be another chain's
   commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own

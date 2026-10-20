@@ -49,9 +49,12 @@
 //! sweep, a buffered run of scanned blocks is one the first range to seed in its
 //! shard resumes, unless the sweep could not read its shard or the wallet's block
 //! metadata cannot place it (the sweep then leaves it, with a warning). A shard
-//! whose rows will not decode is swept by position: its blocks are queued for a
-//! rescan and its rows deleted, and a seed that still meets one seeds without a
-//! resume instead of failing.
+//! whose rows will not decode is swept by position: each run whose blocks the
+//! metadata places is queued for a rescan and then deleted, and any other run
+//! stays, with a warning. A seed that still meets such a shard seeds without a
+//! resume and builds what its range scans there, instead of failing. Only a
+//! decode failure counts ([`will_not_decode`]): any other error reading a shard
+//! fails the seed's range for the pass, and the sweep leaves that shard's rows.
 //!
 //! No seed or cleanup deletes a row at a position its own range does not feed:
 //! a seed deletes the rows at the positions its call feeds again, and a build or
@@ -223,8 +226,19 @@ pub(crate) fn load_shard<H: HashSer>(
     Ok(out)
 }
 
-/// Drop one shard's buffer: the pass-start sweep's, for a shard whose rows will
-/// not decode, once their blocks are queued for a rescan.
+/// Whether `e`, an error of [`load_shard`], says that the shard's rows will not
+/// decode: a row's commitment or retention cannot be read back. `load_shard`
+/// reports exactly those as `CorruptedData`; any other error is SQLite's own (a
+/// busy database past the timeout, an I/O error), which says nothing about the
+/// rows.
+pub(crate) fn will_not_decode(e: &SqliteClientError) -> bool {
+    matches!(e, SqliteClientError::CorruptedData(_))
+}
+
+/// Drop one shard's buffer. Only tests drop a whole shard: every production delete
+/// covers just the positions its caller fed, built or queued for a rescan
+/// ([`delete_rows_in`], [`delete_from_position`]).
+#[cfg(test)]
 pub(crate) fn delete_shard(
     conn: &Connection,
     pool: ShieldedPool,
@@ -441,16 +455,38 @@ pub(crate) fn scanned_stretches(
 /// wallet holds that block's metadata; `None` (the result) when the metadata cannot
 /// place the run.
 ///
-/// The `stretches` (ascending, as [`scanned_stretches`] returns them) are walked from
-/// the newest down, and the walk stops at the first one that ends at or before the
-/// run's first position, or as soon as the run is seen to begin inside a stretch:
-/// positions only grow with heights, so no older stretch holds any of it. An older
-/// stretch is read only when the run may begin in the first block of the one above it,
-/// which nothing but the older stretch's end can tell. So the blocks of old stretches
-/// without a pool's tree sizes (scanned before the wallet recorded them) never stop a
-/// run above them from being placed.
+/// Two walks over the `stretches` (ascending, as [`scanned_stretches`] returns them)
+/// find these ranges, and a block without its size stops either. The walk from the
+/// newest stretch down ([`walk_from_newest`]) stops as soon as it sees where the run
+/// begins, so old stretches without a pool's tree sizes (blocks scanned before the
+/// wallet recorded them) stop it only where the run may begin in the first block of the
+/// stretch above them; but it reads the end of every stretch above the run. When one of
+/// those has no size, the walk from the oldest stretch up ([`walk_from_oldest`]), which
+/// stops at the stretch the run ends in, places the run instead. Neither guesses a size
+/// it lacks, so both place a run as they would with every size known. `None` means
+/// neither can: a block on the walks' path through the run's own stretches has no size,
+/// or each walk meets a stretch without sizes on its way to the run.
 pub(crate) fn rescans_for<E>(
     mut size_at: impl FnMut(BlockHeight) -> Result<Option<u64>, E>,
+    run: &RangeInclusive<u64>,
+    stretches: &[Range<BlockHeight>],
+) -> Result<Option<Vec<Range<BlockHeight>>>, E> {
+    match walk_from_newest(&mut size_at, run, stretches)? {
+        Some(rescans) => Ok(Some(rescans)),
+        None => walk_from_oldest(&mut size_at, run, stretches),
+    }
+}
+
+/// [`rescans_for`]'s walk from the newest stretch down. It stops at the first stretch
+/// that ends at or before the run's first position, or as soon as the run is seen to
+/// begin inside a stretch: positions only grow with heights, so no older stretch holds any
+/// of it. An older stretch is read only when the run may begin in the first block of the
+/// one above it, which nothing but the older stretch's end can tell. Every stretch above
+/// the run is read on the way down, so one whose last block has no size stops the walk:
+/// with stretches [10, 20), [30, 40) and [50, 60), sizes missing on 50..60 and the run
+/// 32..=35, it returns `None`, and [`walk_from_oldest`] places the run.
+fn walk_from_newest<E>(
+    size_at: &mut impl FnMut(BlockHeight) -> Result<Option<u64>, E>,
     run: &RangeInclusive<u64>,
     stretches: &[Range<BlockHeight>],
 ) -> Result<Option<Vec<Range<BlockHeight>>>, E> {
@@ -466,11 +502,11 @@ pub(crate) fn rescans_for<E>(
         if end_size <= first {
             break;
         }
-        let Some(from) = first_block_past(&mut size_at, first, stretch)? else {
+        let Some(from) = first_block_past(size_at, first, stretch)? else {
             return Ok(None);
         };
         if end_size > last {
-            let Some(to) = first_block_past(&mut size_at, last, stretch)? else {
+            let Some(to) = first_block_past(size_at, last, stretch)? else {
                 return Ok(None);
             };
             past_last = Some(from..to + 1);
@@ -486,6 +522,39 @@ pub(crate) fn rescans_for<E>(
     }
     rescans.extend(past_last);
     rescans.reverse();
+    Ok(Some(rescans))
+}
+
+/// [`rescans_for`]'s walk from the oldest stretch up. It stops at the first stretch that
+/// ends past the run's last position: positions only grow with heights, so no newer
+/// stretch holds any of it. It reads the end of every stretch below the run on the way
+/// up, so an old stretch whose last block has no size stops the walk.
+fn walk_from_oldest<E>(
+    size_at: &mut impl FnMut(BlockHeight) -> Result<Option<u64>, E>,
+    run: &RangeInclusive<u64>,
+    stretches: &[Range<BlockHeight>],
+) -> Result<Option<Vec<Range<BlockHeight>>>, E> {
+    let (first, last) = (*run.start(), *run.end());
+    let mut rescans = vec![];
+    for stretch in stretches {
+        let Some(end_size) = size_at(stretch.end - 1)? else {
+            return Ok(None);
+        };
+        if end_size <= first {
+            continue;
+        }
+        let Some(from) = first_block_past(size_at, first, stretch)? else {
+            return Ok(None);
+        };
+        if end_size > last {
+            let Some(to) = first_block_past(size_at, last, stretch)? else {
+                return Ok(None);
+            };
+            rescans.push(from..to + 1);
+            break;
+        }
+        rescans.push(from..stretch.end);
+    }
     Ok(Some(rescans))
 }
 
@@ -904,6 +973,101 @@ mod tests {
             Ok(None),
             "nor one that may begin below its stretch's first block, where only the old \
              stretch's end could tell"
+        );
+    }
+
+    /// A stretch ABOVE the run has no sizes. The walk from the newest stretch reads that
+    /// stretch's end on its way down and cannot place the run; the walk from the oldest
+    /// stretch stops at the stretch the run ends in and never reads it, so the run is placed.
+    #[test]
+    fn rescans_for_places_a_run_below_a_stretch_without_sizes() {
+        let h = BlockHeight::from;
+        let stretches = [h(10)..h(20), h(30)..h(40), h(50)..h(60)];
+        let new_gap = || sizes(50..60);
+        assert_eq!(
+            rescans_for(new_gap(), &(32..=35), &stretches),
+            Ok(Some(vec![h(32)..h(36)])),
+            "a run below the stretch without sizes is placed"
+        );
+        assert_eq!(
+            rescans_for(new_gap(), &(15..=35), &stretches),
+            Ok(Some(vec![h(15)..h(20), h(30)..h(36)])),
+            "so is one across the stretches below it"
+        );
+        assert_eq!(
+            rescans_for(new_gap(), &(52..=55), &stretches),
+            Ok(None),
+            "a run in the stretch without sizes is not"
+        );
+        assert_eq!(
+            rescans_for(new_gap(), &(35..=52), &stretches),
+            Ok(None),
+            "nor is one reaching into it"
+        );
+    }
+
+    /// Neither walk guesses a size it lacks: each places a run as it would with every size
+    /// known, or not at all, and `rescans_for` places it whenever either walk does. Checked
+    /// over runs of every span and sizes missing in each place, against the answer with
+    /// every size known.
+    #[test]
+    fn rescans_for_places_a_run_whenever_either_walk_does() {
+        let h = BlockHeight::from;
+        let stretches = [h(10)..h(20), h(30)..h(40), h(50)..h(60)];
+        assert_eq!(
+            walk_from_newest(&mut sizes(50..60), &(32..=35), &stretches),
+            Ok(None),
+            "the walk from the newest stops at the stretch without sizes above the run"
+        );
+        let gaps = [
+            10..20,
+            30..40,
+            50..60,
+            12..13,
+            17..18,
+            33..35,
+            39..40,
+            50..51,
+            55..57,
+            10..40,
+            30..60,
+            19..51,
+        ];
+        let mut only_from_oldest = 0;
+        for first in 0..70u64 {
+            for last in first..70 {
+                let run = first..=last;
+                let known = rescans_for(sizes(0..0), &run, &stretches).expect("sizes");
+                assert!(
+                    known.is_some(),
+                    "every size known places run {first}..={last}"
+                );
+                for gap in &gaps {
+                    let newest =
+                        walk_from_newest(&mut sizes(gap.clone()), &run, &stretches).expect("sizes");
+                    let oldest =
+                        walk_from_oldest(&mut sizes(gap.clone()), &run, &stretches).expect("sizes");
+                    for (walk, placed) in [("newest", &newest), ("oldest", &oldest)] {
+                        assert!(
+                            placed.is_none() || *placed == known,
+                            "the walk from the {walk} places run {first}..={last} as with \
+                             every size known (sizes missing on {gap:?})"
+                        );
+                    }
+                    assert_eq!(
+                        rescans_for(sizes(gap.clone()), &run, &stretches).expect("sizes"),
+                        newest.clone().or(oldest.clone()),
+                        "run {first}..={last}, sizes missing on {gap:?}"
+                    );
+                    if newest.is_none() && oldest.is_some() {
+                        only_from_oldest += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            only_from_oldest > 0,
+            "some runs only the walk from the oldest places"
         );
     }
 }

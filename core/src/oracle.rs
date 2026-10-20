@@ -3287,6 +3287,128 @@ mod tests {
             }
         }
 
+        /// A shard whose rows will not decode keeps every run the wallet's block metadata
+        /// cannot place: deleting one would leave scanned blocks whose commitments are in
+        /// neither the tree nor the buffer, with no rescan to bring them back. R's tail rows
+        /// (shard 1) are stranded here, as an abort in its final drain leaves them, and
+        /// shard 1 also holds a row whose commitment is three bytes long, at a position of
+        /// the pending range above R. R's block 42 has no sapling tree size (as blocks
+        /// scanned before the wallet recorded the sizes have none), and placing R's run reads
+        /// it. So the sweep deletes only the run it places, the row that will not decode (its
+        /// position lies in the pending range, so no block needs a rescan), and keeps R's
+        /// run. The next sweep finds the shard decodable and builds R's run, checked by the
+        /// tree's leaf at its last position, and the wallet holds R's anchors.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_keeps_a_run_it_cannot_place_in_a_shard_that_will_not_decode() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("unplaceable");
+            let t = tip_range_then_r_ending(&dir, End::Abort).await;
+            let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+            conn.execute(
+                "INSERT INTO ext_slipstream_graft_buffer
+                 (pool, shard_index, position, commitment, retention_kind)
+                 VALUES (2, 1, 65700, ?1, 0)",
+                [vec![0xC7u8; 3]],
+            )
+            .expect("buffer a row that will not decode");
+            let cleared = conn
+                .execute(
+                    "UPDATE blocks SET sapling_commitment_tree_size = NULL WHERE height = ?1",
+                    [i64::try_from(START + 42).expect("fits")],
+                )
+                .expect("clear a block's sapling tree size");
+            assert_eq!(cleared, 1, "R's block 42 is in the wallet");
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep {
+                    discarded_rows: 1,
+                    ..Default::default()
+                },
+                "the sweep deletes only the run whose blocks it places: the row that will not decode"
+            );
+            assert_eq!(
+                buffered_positions(&dir),
+                (SHARD..SHARD + 70).collect::<Vec<_>>(),
+                "R's run, which the block metadata does not place, stays buffered"
+            );
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep {
+                    built_rows: 70,
+                    ..Default::default()
+                },
+                "the next sweep builds R's run, checked by the tree's leaf where it ends"
+            );
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+            assert_eq!(
+                sapling_checkpoints_among(&dir, &TAIL_ANCHORS),
+                TAIL_ANCHORS,
+                "the wallet holds R's anchors"
+            );
+            for (anchor, idx) in TAIL_ANCHORS.iter().zip([50, 100]) {
+                assert_eq!(
+                    sapling_root_at(&dir, *anchor),
+                    Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                    "the root at R's anchor {anchor} is the chain's"
+                );
+            }
+        }
+
+        /// Only a row that will not decode counts as one. Any other error reading a shard's
+        /// rows says nothing about them (a busy database past the timeout, an I/O error;
+        /// here a renamed column, which fails the read of the rows but not the read of their
+        /// positions), so the sweep leaves the shard's rows as they are, for the next sweep,
+        /// instead of queueing their blocks for a rescan and deleting them. R's tail rows
+        /// (shard 1) are stranded here, as an abort in its final drain leaves them. Once the
+        /// rows can be read again, the next sweep builds them as usual.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_leaves_the_rows_of_a_shard_it_cannot_read() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("unreadable");
+            let t = tip_range_then_r_ending(&dir, End::Abort).await;
+            let rename = |from: &str, to: &str| {
+                rusqlite::Connection::open(dir.join("data.db"))
+                    .expect("side conn")
+                    .execute_batch(&format!(
+                        "ALTER TABLE ext_slipstream_graft_buffer RENAME COLUMN {from} TO {to}"
+                    ))
+                    .expect("rename a column the read of the rows selects");
+            };
+            rename("marking", "marking_renamed");
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep::default(),
+                "the sweep leaves the shard whose rows it cannot read"
+            );
+            assert_eq!(
+                buffered_positions(&dir),
+                (SHARD..SHARD + 70).collect::<Vec<_>>(),
+                "R's tail rows stay buffered"
+            );
+            assert_eq!(
+                suggested(&dir),
+                ["Historic(1500200..1520200)", "Historic(1500000..1500020)"],
+                "no rescan is queued"
+            );
+            rename("marking_renamed", "marking");
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep {
+                    built_rows: 70,
+                    ..Default::default()
+                },
+                "the next sweep builds R's tail rows"
+            );
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+            for (anchor, idx) in TAIL_ANCHORS.iter().zip([50, 100]) {
+                assert_eq!(
+                    sapling_root_at(&dir, *anchor),
+                    Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                    "the root at R's anchor {anchor} is the chain's"
+                );
+            }
+        }
+
         /// An account import whose birthday lies ABOVE an interrupted range's committed
         /// prefix: the forced Historic rescan [b, tip] coalesces with R's still-Historic
         /// remainder, so the next pass's first range starts right after the buffered rows.
