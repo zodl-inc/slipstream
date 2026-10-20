@@ -181,10 +181,12 @@ pub(crate) fn should_retry(err: &SlipstreamError, attempt: u32) -> Option<Durati
 
 // ── What the session does with a failed pass ─────────────────────────────────
 //
-// Pure decisions, so each one is table-tested without a server: the loops below only `match`
-// on them. The host's wallet-change stop is decided FIRST in each: it is not transient, so
-// decided later it would count as a failed attempt, surface `Error` and revive the session, or
-// keep the follow loop polling.
+// Pure decisions, so each one is table-tested without a server, and the loops below `match` on
+// them. The tables test the classification only: what each arm then does (for the quiet end,
+// `Idle`, one info line and the return) is checked by review, not by a test. The host's
+// wallet-change stop is decided FIRST in each: it is not transient, so decided later it would
+// count as a failed attempt, surface `Error` and revive the session, or keep the follow loop
+// polling.
 
 /// What [`run_pass_with_retry`] does with a pass that failed ([`failed_pass_action`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

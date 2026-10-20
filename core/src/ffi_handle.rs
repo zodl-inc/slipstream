@@ -108,8 +108,14 @@ pub struct FfiSlipstreamSnapshot {
 
 /// C-compatible stop report: the by-value C form of [`StopReport`] that the C ABI's two stop
 /// functions return (`zcashlc_slipstream_stop` and `zcashlc_slipstream_stop_for_wallet_change`,
-/// HOSTING.md §4). All fields are C-safe integers. Like [`FfiSlipstreamSnapshot`], a C wrapper
-/// re-declares it for cbindgen, which generates it into `zcashlc.h`.
+/// HOSTING.md §4). That return and `zcashlc_slipstream_stop_for_wallet_change` are the C ABI
+/// wrappers adopt with this release: today's wrappers return `bool` from
+/// `zcashlc_slipstream_stop` and have no wallet-change stop.
+///
+/// All fields are C-safe integers. Like [`FfiSlipstreamSnapshot`], a C wrapper re-declares it
+/// for cbindgen, which generates it into `zcashlc.h`. The re-declaration must keep these fields
+/// in this order: `repr(C)` lays them out in declaration order, so a reordered copy would read
+/// each field from another one's bytes.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FfiSlipstreamStopReport {
@@ -393,7 +399,9 @@ pub fn drain_wallet_writers(progress: &Progress, budget: Duration) -> bool {
 /// [MOB-1850] The verdict a caller acts on is [`Self::quiescent`]. The rest is the detail behind
 /// it: a bare `false` cannot say WHICH wait ran out or after how long, and the device log of a
 /// refused account import could not say it either. With the report, a host can tell the user, or
-/// its own log, exactly that. The C ABI's stops return it by value as [`FfiSlipstreamStopReport`].
+/// its own log, exactly that. The C ABI's stops return it by value as [`FfiSlipstreamStopReport`],
+/// the C ABI wrappers adopt with this release; today's wrappers return `bool` from
+/// `zcashlc_slipstream_stop`.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StopReport {

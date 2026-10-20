@@ -29,7 +29,10 @@ workspace.
   stays on record, so a later stop still answers for it.
 - `ffi_handle::FfiSlipstreamStopReport`, the by-value C form of `StopReport` that the C
   ABI's two stop functions return: `settled` and `drained` as 1 or 0, `settle_ms` and
-  `drain_ms` in milliseconds (`From<StopReport>`).
+  `drain_ms` in milliseconds (`From<StopReport>`). The report return and
+  `zcashlc_slipstream_stop_for_wallet_change` are the C ABI wrappers adopt with this
+  release (today's wrappers return `bool` from `zcashlc_slipstream_stop`), and a wrapper's
+  cbindgen re-declaration of the struct must keep its field order.
 
 ### Changed
 - `block_source::MemBlockSource`'s `BlockSource::Error` is `StoppedForWalletChange` (was

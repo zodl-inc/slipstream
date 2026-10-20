@@ -152,13 +152,16 @@ cannot reach a scan call until the call returns, by default after its whole chun
 before you add or remove an account, rewind or wipe, call
 `reporter.progress.request_stop_for_wallet_change()` and then abort. The scan ends at its
 next block, without writing anything for the scan call it interrupted (earlier sub-batches
-of a chunk stay committed). The session then ends at its next `.await`, or returns on its
-own if you did not abort it; either way it ends `Idle` (it sets that itself when it
-returns; after an abort you set it, as with any stop). The next scan anywhere in the
-process, whichever reporter or handle it runs under (a handle you reopen on the same
-wallet too), first waits until rayon has taken the trial decryption the stopped scan left
-queued on its global pool, so a stop that follows quickly is again seen at the next block.
-The next session scans the interrupted blocks again.
+of a chunk stay committed). Only the abort ends the session promptly, at its next
+`.await`. Without one, it returns at the next block it scans, which between ranges or
+passes (the mempool session, the tip-probe sleep) can be much later, in follow mode after
+the next mined block, and until then it can still write to the wallet. Either way it ends
+`Idle` (it sets that itself when it returns; after an abort you set it, as with any
+stop). The next scan anywhere in the process, whichever reporter or handle it runs under
+(a handle you reopen on the same wallet too), first waits until rayon has taken the trial
+decryption the stopped scan left queued on its global pool, so a stop that follows
+quickly is again seen at the next block. The next session scans the interrupted blocks
+again.
 Before you write, prove the wallet file idle: wait for the aborted task and the engine's
 writers with `ffi_handle::settle_passes` and `ffi_handle::drain_wallet_writers`, or keep an
 `ffi_handle::SlipstreamHandle` and call its `stop_for_wallet_change`, which does all of it
@@ -209,6 +212,13 @@ Ten functions. `SlipstreamHandle` is opaque; snapshot and stop report are return
 | `zcashlc_slipstream_notify_tx_change(handle) → bool` | Host poke after YOU stored a transaction (post-broadcast): bumps `tx_set_version` (+ a tag-5 event) so your own poll loop picks it up uniformly. |
 | `zcashlc_slipstream_restore_anchor(host, host_len, port, tls, network_id, intent, birthday, fallback_checkpoint_height, tor_dir, tor_dir_len) → *FfiRestoreAnchor` | Handle-less wallet-provisioning facts (§8). Free with `zcashlc_slipstream_free_restore_anchor`. |
 | `zcashlc_slipstream_free(handle)` | Drops the handle (cancels everything, drops the runtime). |
+
+The stop report and `zcashlc_slipstream_stop_for_wallet_change` are the C ABI wrappers
+adopt with this release: today's wrappers still return `bool` from
+`zcashlc_slipstream_stop` and have no `zcashlc_slipstream_stop_for_wallet_change`. A
+wrapper re-declares `FfiSlipstreamStopReport` for cbindgen, as it does the snapshot, and
+the re-declaration must keep the engine's field order (`settled`, `drained`, `settle_ms`,
+`drain_ms`): a `#[repr(C)]` struct is laid out in the order its fields are declared.
 
 Threading rules: **never pass one handle to two FFI calls concurrently** (serialize on
 your side — an actor, a mutex, a single dispatch queue). All calls are synchronous;
