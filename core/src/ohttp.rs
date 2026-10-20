@@ -1389,19 +1389,17 @@ impl OhttpClient {
                     tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
 
                     match self.fetch_dns_key_config(&doh_url).await {
-                        Ok(doh_body) => {
-                            match envelope_from_doh_json(&doh_body, network) {
-                                Ok(env) => {
-                                    tracing::info!(resolver = %resolver, "ohttp: key config fetched from DNS");
-                                    envelope_found = Some(env);
-                                    break;
-                                }
-                                Err(e) => {
-                                    last_dns_err = format!("DoH parse from {}: {}", resolver, e);
-                                    tracing::debug!(err = %last_dns_err, "ohttp: DoH response parse failed");
-                                }
+                        Ok(doh_body) => match envelope_from_doh_json(&doh_body, network) {
+                            Ok(env) => {
+                                tracing::info!(resolver = %resolver, "ohttp: key config fetched from DNS");
+                                envelope_found = Some(env);
+                                break;
                             }
-                        }
+                            Err(e) => {
+                                last_dns_err = format!("DoH parse from {}: {}", resolver, e);
+                                tracing::debug!(err = %last_dns_err, "ohttp: DoH response parse failed");
+                            }
+                        },
                         Err(e) => {
                             last_dns_err = format!("DoH fetch from {}: {}", resolver, e);
                             tracing::debug!(err = %last_dns_err, "ohttp: DoH fetch failed");
@@ -1410,7 +1408,10 @@ impl OhttpClient {
                 }
 
                 envelope_found.ok_or_else(|| {
-                    format!("key config fetch failed: relay and all DNS resolvers tried: {}", last_dns_err)
+                    format!(
+                        "key config fetch failed: relay and all DNS resolvers tried: {}",
+                        last_dns_err
+                    )
                 })?
             }
         };
@@ -1433,11 +1434,13 @@ impl OhttpClient {
     /// over Tor if the client uses Tor, exactly like the relay fetch.
     async fn fetch_dns_key_config(&self, doh_url: &str) -> Result<Vec<u8>, String> {
         let target = parse_https(doh_url)?;
-        let mut headers = vec![
-            (header::ACCEPT.as_str(), "application/dns-json".to_string()),
-        ];
+        let mut headers = vec![(header::ACCEPT.as_str(), "application/dns-json".to_string())];
         // Add DoH-specific headers if the profile wants them
-        if let Some(encoding) = self.profile.headers.key_fetch(None).iter()
+        if let Some(encoding) = self
+            .profile
+            .headers
+            .key_fetch(None)
+            .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
             .map(|(_, val)| val.clone())
         {
@@ -3904,7 +3907,7 @@ mod tests {
     /// Uses a captured real DoH JSON response fixture.
     #[tokio::test]
     async fn dns_fallback_on_relay_failure() {
-        use zodl_ohttp_client::{SignedConfigPolicy, DOH_RESOLVERS};
+        use zodl_ohttp_client::{DOH_RESOLVERS, SignedConfigPolicy};
 
         // Real captured mainnet DoH JSON from Cloudflare (2026-10-20)
         let cloudflare_fixture = r#"{
@@ -3947,8 +3950,9 @@ mod tests {
         assert_eq!(keys.not_after, 1792536900);
 
         // Select a key from it
-        let config = KeyConfig::select_with(&keys.document, &ClientProfile::SLIPSTREAM.key_selection)
-            .expect("select");
+        let config =
+            KeyConfig::select_with(&keys.document, &ClientProfile::SLIPSTREAM.key_selection)
+                .expect("select");
 
         assert_eq!(config.key_id(), "ba8a2dbd");
     }
