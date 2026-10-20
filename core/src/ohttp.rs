@@ -1391,7 +1391,6 @@ impl OhttpClient {
                 // Relay failed (fetch or verification), try DNS fallback
                 tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
 
-                let mut last_err = relay_err.clone();
                 let dns_name = key_config_dns_name(network);
                 let mut verified_cfg = None;
 
@@ -1416,8 +1415,7 @@ impl OhttpClient {
                             break;
                         }
                         Err(e) => {
-                            last_err = format!("{}: {}", resolver, e);
-                            tracing::debug!(err = %last_err, "ohttp: DNS resolver failed");
+                            tracing::debug!(resolver = %resolver, err = %e, "ohttp: DNS resolver failed");
                         }
                     }
                 }
