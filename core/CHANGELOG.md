@@ -34,9 +34,14 @@ workspace.
   pass now starts with a sweep of the buffer for the runs no pending range will resume. A
   run is built when data the wallet already holds checks where it ends (the tree's leaf at
   its last position, or the stored server root of the shard it completes); any other run
-  is deleted and its blocks are queued for a rescan. Wallets already affected heal on their
-  next pass. A sweep that cannot read, build or rescan a run logs a warning, leaves its
-  rows buffered and never fails the pass.
+  is deleted and its blocks are queued for a rescan. A wallet whose stranded rows are
+  still buffered heals on its next pass. This change neither detects nor repairs what an
+  earlier version already did: rows it deleted (their checkpoints and durable anchors are
+  missing), or leaves it built at the wrong positions. A buffered row that will not decode
+  no longer fails every pass: the sweep queues the blocks of its shard for a rescan, by
+  position, and deletes the shard's rows, and a range that still meets such a row seeds
+  without the shard's rows, with a warning. A run the sweep cannot read, build or rescan
+  gets a warning and keeps its rows; a sweep that fails only warns, and the pass goes on.
 - A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
   of the blocks they queue again, though after a reorg those may be another chain's
   commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own

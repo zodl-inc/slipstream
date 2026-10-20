@@ -3162,31 +3162,43 @@ mod tests {
             }
         }
 
-        /// A buffered row that will not decode does not fail the pass, and does not stop the
-        /// sweep: the shard holding it is left as it is, with a warning, and the other shards
-        /// are swept. R's tail-shard rows (shard 1) are stranded here, as an abort in its final
-        /// drain leaves them, and the buffer also holds a row whose commitment is three bytes
-        /// long, in another shard or in shard 1 itself.
+        /// A buffered row that will not decode neither stops the sweep nor fails the pass. No
+        /// range can resume or build the rows of its shard, so the sweep queues the scanned
+        /// blocks holding them for a rescan, by their positions alone, and deletes them; the
+        /// other shards are swept as usual. R's tail-shard rows (shard 1) are stranded here, as
+        /// an abort in its final drain leaves them, and the buffer also holds a row whose
+        /// commitment is three bytes long:
+        ///
+        /// - in another shard, shard 0, at the position R's block 30 holds: that block is
+        ///   queued for a rescan, and R's tail rows are built as usual;
+        /// - in shard 1 itself, at a position of the pending range above R: the blocks of R
+        ///   holding the tail rows are queued for a rescan. The next Historic range,
+        ///   [200, 20200), then seeds in shard 1 and scans, and the rescan of R's blocks puts
+        ///   R's anchors in the tree.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn next_pass_sweeps_past_a_row_that_will_not_decode() {
+            let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
             let root = tempfile::tempdir().expect("tempdir");
-            for (case, shard, position, sweep, left) in [
+            for (case, shard, position, sweep) in [
                 (
                     "another shard",
                     0i64,
-                    5i64,
+                    i64::try_from(SHARD - 10).expect("fits"),
                     crate::persist::GraftSweep {
                         built_rows: 70,
-                        ..Default::default()
+                        discarded_rows: 1,
+                        rescans: vec![height(30)..height(31)],
                     },
-                    1,
                 ),
                 (
                     "its own shard",
                     1,
                     65_700,
-                    crate::persist::GraftSweep::default(),
-                    71,
+                    crate::persist::GraftSweep {
+                        discarded_rows: 71,
+                        rescans: vec![height(40)..height(110)],
+                        ..Default::default()
+                    },
                 ),
             ] {
                 let dir = root.path().join(case.replace(' ', "-"));
@@ -3202,18 +3214,69 @@ mod tests {
                 assert_eq!(
                     start_next_pass(&dir, Some(&t.anchors)),
                     sweep,
-                    "[{case}] the sweep goes on past the shard it cannot read"
+                    "[{case}] the sweep rescans the blocks of the shard it cannot decode, and goes on"
                 );
                 let rows = buffer_rows(&dir);
-                assert_eq!(
-                    rows.len(),
-                    left,
-                    "[{case}] only the rows of the shard it cannot read stay buffered: {}",
+                assert!(
+                    rows.is_empty(),
+                    "[{case}] the buffer is drained: {}",
                     summarize(&rows)
                 );
+                let mut blocks = t.blocks.clone();
+                if shard == 1 {
+                    assert_eq!(
+                        suggested(&dir),
+                        [
+                            "Historic(1500200..1520200)",
+                            "Historic(1500040..1500110)",
+                            "Historic(1500000..1500020)"
+                        ],
+                        "[{case}] R's blocks holding its tail rows are queued for a rescan"
+                    );
+                    // The pass goes on: the next Historic range seeds in shard 1 and scans
+                    // (its first blocks stand in for all of it) ...
+                    blocks.extend(chain_at(200, SHARD - 40 + 200, 10));
+                    scan_range(
+                        &dir,
+                        &t.base,
+                        &blocks,
+                        200,
+                        &[10],
+                        true,
+                        Some(t.anchors.clone()),
+                        End::Finish,
+                    )
+                    .await
+                    .expect("the next Historic range seeds in shard 1 and scans");
+                    // ... and the rescan of R's blocks puts its tail shard in the tree.
+                    scan_range(
+                        &dir,
+                        &t.base,
+                        &blocks,
+                        40,
+                        &[70],
+                        true,
+                        Some(t.anchors.clone()),
+                        End::Finish,
+                    )
+                    .await
+                    .expect("the rescan of R's blocks");
+                }
+                assert_eq!(
+                    sapling_checkpoints_among(&dir, &TAIL_ANCHORS),
+                    TAIL_ANCHORS,
+                    "[{case}] the wallet holds R's anchors"
+                );
+                for (anchor, idx) in TAIL_ANCHORS.iter().zip([50, 100]) {
+                    assert_eq!(
+                        sapling_root_at(&dir, *anchor),
+                        Ok(Some(chain_root_at(&t.base, &blocks, idx))),
+                        "[{case}] the root at R's anchor {anchor} is the chain's"
+                    );
+                }
                 assert!(
-                    rows.contains(&(2, shard, position)),
-                    "[{case}] the row that will not decode stays buffered"
+                    buffer_rows(&dir).is_empty(),
+                    "[{case}] the graft buffer is drained"
                 );
             }
         }

@@ -46,7 +46,10 @@
 //! OR in this buffer" therefore holds at every crash point. After a pass's start
 //! sweep, a buffered run of scanned blocks is one the first range to seed in its
 //! shard resumes, unless the sweep could not read its shard or the wallet's block
-//! metadata cannot place it (the sweep then leaves it, with a warning).
+//! metadata cannot place it (the sweep then leaves it, with a warning). A shard
+//! whose rows will not decode is swept by position: its blocks are queued for a
+//! rescan and its rows deleted, and a seed that still meets one seeds without a
+//! resume instead of failing.
 
 use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
