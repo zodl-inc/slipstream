@@ -344,7 +344,8 @@ impl<H> SparseShardStore<H> {
     /// after the pass-start root ingest EVERY completed shard has a row, so a
     /// presence check silently forfeits the graft of any shard a range starts
     /// exactly on. Root-only leaves are graft/build-eligible; only a built
-    /// interior means "already have it" (the crash-heal case).
+    /// interior means "already have it", and the seed then stays passthrough
+    /// (never grafts over that interior).
     pub fn shard_has_interior(&self, idx: u64) -> bool {
         match self.shards.get(&idx) {
             Some(t) => !t.root().is_leaf(),
@@ -705,30 +706,49 @@ fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<
 /// rows on the side connection, and return the build plan. Runs BEFORE the main
 /// transaction opens — no lock conflict, and a crash after these appends is the
 /// benign "rescan re-appends identical rows" window (graft.rs header).
+///
+/// `frontier_leaf`: the leaf of this call's `from_state` frontier for the pool,
+/// with its position (`start_position - 1`). The seed resumes only the buffered
+/// run that ends on it (`graft_accumulator::resumable_run`) and deletes the
+/// shard's other rows.
 #[allow(clippy::too_many_arguments)]
-fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
+fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
     conn: &rusqlite::Connection,
     verify_sample: u32,
     acc: &mut Option<crate::graft_accumulator::ShardAccumulator<H>>,
     pool: ShieldedPool,
     start_position: u64,
+    frontier_leaf: Option<(u64, &H)>,
     stream: Vec<(H, Retention<BlockHeight>)>,
     note_positions: &[u64],
     store_has_shard: impl Fn(u64) -> bool,
     mut server_root: impl FnMut(u64) -> Result<Option<H>, SqliteClientError>,
     anchor_retention: Option<&AnchorRetention>,
 ) -> Result<PoolPlan<H>, SqliteClientError> {
-    use crate::graft_accumulator::{FeedAction, ShardAccumulator};
+    use crate::graft_accumulator::{FeedAction, ShardAccumulator, resumable_run};
 
     if acc.is_none() {
         let shard = start_position >> 16;
         let mut resume = crate::graft::load_shard::<H>(conn, pool, shard)?;
         let has_internals = store_has_shard(shard);
-        if has_internals && !resume.is_empty() {
-            // Stale rows for a shard the store already holds (crash between a
-            // build-commit and its cleanup) — the documented self-heal path.
-            crate::graft::delete_shard(conn, pool, shard)?;
-            resume = vec![];
+        if !resume.is_empty() {
+            // Only a run that ends right before the start, on this range's own
+            // frontier leaf, can be continued. Rows an interrupted range left
+            // behind elsewhere in the shard, or rows from another chain, would
+            // be laid out from the wrong position.
+            let (run, left_out) = resumable_run(resume, start_position, frontier_leaf);
+            if left_out {
+                match run.first() {
+                    Some((first, ..)) => crate::graft::delete_shard_outside(
+                        conn,
+                        pool,
+                        shard,
+                        *first..start_position,
+                    )?,
+                    None => crate::graft::delete_shard(conn, pool, shard)?,
+                }
+            }
+            resume = run;
         }
         *acc = Some(ShardAccumulator::seed(
             start_position,
@@ -1206,6 +1226,10 @@ pub fn sparse_put_blocks(
             &mut ctx.acc_sapling,
             ShieldedPool::Sapling,
             sap_start_u64,
+            from_state
+                .final_sapling_tree()
+                .value()
+                .map(|f| (u64::from(f.position()), f.leaf())),
             sap_stream,
             &sap_notes,
             |s| sap_tree.store().shard_has_interior(s),
@@ -1222,6 +1246,10 @@ pub fn sparse_put_blocks(
             &mut ctx.acc_orchard,
             ShieldedPool::Orchard,
             orch_start_u64,
+            from_state
+                .final_orchard_tree()
+                .value()
+                .map(|f| (u64::from(f.position()), f.leaf())),
             orch_stream,
             &orch_notes,
             |s| orch_tree.store().shard_has_interior(s),
@@ -1831,7 +1859,7 @@ pub fn sparse_put_blocks(
 
     // v0.4 Plan A: buffer rows for shards built/closed this call are dead now the
     // txn committed. POST-commit on purpose (graft.rs contract): a crash before
-    // this point leaves stale rows that the store-has-internals seed rule heals.
+    // this point leaves rows that the next seed in that shard resumes or deletes.
     if let (Some(ctx), Some(((sap_cleanup, orch_cleanup), verdicts))) =
         (graft.as_ref(), graft_cleanup)
     {
@@ -4612,5 +4640,191 @@ mod flush_retained_tests {
             ranges[0].priority(),
             zcash_client_backend::data_api::scanning::ScanPriority::Historic
         );
+    }
+}
+
+/// A range's graft seed continues only the buffered run that ends right before its start
+/// position, on its own frontier's leaf. Here an interrupted Historic range left shard 1's
+/// rows [k_start, k_start + 20) buffered, and the forced rescan after an account import
+/// starts inside that span, at k_start + 10: the seed resumes [k_start, k_start + 10) and
+/// leaves the rest to the rescan, so every built row sits at its own position (the leaf for
+/// position `p` is `node(p)`).
+#[cfg(test)]
+mod graft_resume_seed_tests {
+    use super::*;
+    use zcash_primitives::merkle_tree::HashSer as _;
+
+    fn node(n: u64) -> sapling::Node {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        sapling::Node::read(&b[..]).expect("small LE ints are canonical nodes")
+    }
+
+    /// (built at, belongs at) for each built row that is not at its own position; where the
+    /// first few belong is searched in `candidates`.
+    fn misplaced(
+        plan: &PoolPlan<sapling::Node>,
+        candidates: std::ops::Range<u64>,
+    ) -> Vec<(u64, u64)> {
+        let mut out = vec![];
+        for (seg_start, rows) in &plan.segments {
+            for (i, row) in rows.iter().enumerate() {
+                let at = u64::from(*seg_start) + i as u64;
+                if let Some((h, _)) = row
+                    && *h != node(at)
+                {
+                    let belongs = if out.len() < 5 {
+                        candidates
+                            .clone()
+                            .find(|p| node(*p) == *h)
+                            .unwrap_or(u64::MAX)
+                    } else {
+                        u64::MAX
+                    };
+                    out.push((at, belongs));
+                }
+            }
+        }
+        out
+    }
+
+    /// (start, row count) of every segment the plan builds.
+    fn segments(plan: &PoolPlan<sapling::Node>) -> Vec<(u64, usize)> {
+        plan.segments
+            .iter()
+            .map(|(start, rows)| (u64::from(*start), rows.len()))
+            .collect()
+    }
+
+    fn stale_rows(k_start: u64) -> Vec<crate::graft::BufferRow<sapling::Node>> {
+        (0..20)
+            .map(|i| (k_start + i, node(k_start + i), Retention::Ephemeral))
+            .collect()
+    }
+
+    fn buffer_with(
+        shard: u64,
+        rows: &[crate::graft::BufferRow<sapling::Node>],
+    ) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory conn");
+        conn.execute_batch(crate::graft::GRAFT_BUFFER_DDL)
+            .expect("buffer table");
+        crate::graft::append_rows(&conn, ShieldedPool::Sapling, shard, rows).expect("append");
+        conn
+    }
+
+    /// The eager flush (a note of the freshly imported account in that shard) builds the
+    /// resumed run and the new span as one segment from the shard's first position, whether
+    /// or not the store already holds content for the shard (absent, or the root-only leaf
+    /// the pass-start subtree-root ingest installs for every completed shard).
+    #[test]
+    fn seed_resumes_only_the_run_that_ends_at_the_start_position() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 10;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let note = start + 5;
+        let frontier_leaf = node(start - 1);
+        for store_has_content in [true, false] {
+            let conn = buffer_with(shard, &stale_rows(k_start));
+            let mut acc = None;
+            let plan = plan_pool(
+                &conn,
+                0,
+                &mut acc,
+                ShieldedPool::Sapling,
+                start,
+                Some((start - 1, &frontier_leaf)),
+                stream.clone(),
+                &[note],
+                |_| store_has_content,
+                |_| Ok(None),
+                None,
+            )
+            .expect("plan");
+            let wrong = misplaced(&plan, k_start..k_start + 100);
+            assert!(
+                wrong.is_empty(),
+                "every built row sits at its own position (store content: {store_has_content}); \
+                 {} do not, e.g. (built at, belongs at): {:?}",
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+            assert_eq!(
+                segments(&plan),
+                vec![(k_start, 40)],
+                "the resumed run and the new span build as one segment (store content: \
+                 {store_has_content})"
+            );
+            let buffered: Vec<u64> =
+                crate::graft::load_shard::<sapling::Node>(&conn, ShieldedPool::Sapling, shard)
+                    .expect("load")
+                    .iter()
+                    .map(|r| r.0)
+                    .collect();
+            assert_eq!(
+                buffered,
+                (k_start..start).collect::<Vec<_>>(),
+                "the seed deletes the buffered rows the rescan covers again"
+            );
+        }
+    }
+
+    /// The same resume when the rescan runs through the shard's close. A graft installs the
+    /// server root and builds nothing; the 1-in-N audit and the fallback (no server root)
+    /// build exactly shard 1, from its first position, every row at its own position.
+    #[test]
+    fn close_verdicts_build_resumed_rows_at_their_own_positions() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let k_end = k_start + (1 << 16) - 1;
+        let start = k_start + 10;
+        // Through the end of shard 1 and 5 rows into shard 2.
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (start..=k_end + 5)
+            .map(|p| (node(p), Retention::Ephemeral))
+            .collect();
+        let frontier_leaf = node(start - 1);
+        for (verdict, verify_sample, root, built, grafts) in [
+            ("graft", 0u32, Some(node(7)), vec![], 1),
+            ("audit", 1u32, Some(node(7)), vec![(k_start, 1 << 16)], 0),
+            ("fallback", 0u32, None, vec![(k_start, 1 << 16)], 0),
+        ] {
+            let conn = buffer_with(shard, &stale_rows(k_start));
+            let mut acc = None;
+            let plan = plan_pool(
+                &conn,
+                verify_sample,
+                &mut acc,
+                ShieldedPool::Sapling,
+                start,
+                Some((start - 1, &frontier_leaf)),
+                stream.clone(),
+                &[],
+                |_| false,
+                |s| Ok(if s == shard { root } else { None }),
+                None,
+            )
+            .expect("plan");
+            let wrong = misplaced(&plan, k_start..k_start + 100);
+            assert!(
+                wrong.is_empty(),
+                "the {verdict} verdict builds every row at its own position; {} do not, e.g. \
+                 (built at, belongs at): {:?}",
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+            assert_eq!(
+                segments(&plan),
+                built,
+                "the {verdict} verdict builds exactly shard 1"
+            );
+            assert_eq!(
+                plan.grafts.len(),
+                grafts,
+                "only the graft verdict installs a root"
+            );
+        }
     }
 }

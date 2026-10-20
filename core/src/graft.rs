@@ -28,9 +28,12 @@
 //! `(pool, shard_index, position)` with INSERT OR REPLACE:
 //! - crash between append and main-commit → the range is still unscanned →
 //!   rescan re-appends byte-identical rows onto the same keys — harmless;
-//! - crash after main-commit, before a close-verdict cleanup → stale rows for a
-//!   built shard → the accumulator's seed rule ("store already has internals →
-//!   passthrough") drops + deletes them — self-healing.
+//! - crash after main-commit, before a close-verdict cleanup → rows of a built
+//!   shard stay buffered → a range that later seeds in that shard resumes only
+//!   the contiguous run ending right before its start, on its own frontier's
+//!   leaf (`graft_accumulator::resumable_run`), and deletes every other row; a
+//!   run it resumes on a shard the store already holds content for is built
+//!   again with its first span (same leaves at the same positions) — self-healing.
 //!
 //! The invariant "block marked scanned ⇒ its commitments are in the shard store
 //! OR in this buffer" therefore holds at every crash point.
@@ -205,6 +208,27 @@ pub(crate) fn delete_shard(
     Ok(())
 }
 
+/// Drop one shard's rows outside `keep`: what a resumed range's seed leaves out
+/// once it has kept the run it continues (`graft_accumulator::resumable_run`).
+pub(crate) fn delete_shard_outside(
+    conn: &Connection,
+    pool: ShieldedPool,
+    shard_index: u64,
+    keep: std::ops::Range<u64>,
+) -> Result<(), SqliteClientError> {
+    conn.execute(
+        "DELETE FROM ext_slipstream_graft_buffer
+         WHERE pool = ?1 AND shard_index = ?2 AND (position < ?3 OR position >= ?4)",
+        params![
+            pool_code(pool),
+            shard_index as i64,
+            keep.start as i64,
+            keep.end as i64
+        ],
+    )?;
+    Ok(())
+}
+
 /// Rewind support (plan Task 9): drop every buffered row at or above `min_position`.
 ///
 /// NOT currently called from any production path — the scheduler's reorg-recovery
@@ -337,5 +361,27 @@ mod tests {
             loaded.iter().map(|r| r.0).collect::<Vec<_>>(),
             vec![100, 101]
         );
+    }
+
+    #[test]
+    fn delete_shard_outside_keeps_only_the_range_in_that_shard() {
+        let conn = mem_conn();
+        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
+        let rows: Vec<BufferRow<MerkleHashOrchard>> = (0..6u64)
+            .map(|i| (100 + i, h(0), Retention::Ephemeral))
+            .collect();
+        append_rows(&conn, ShieldedPool::Orchard, 0, &rows).expect("append o0");
+        append_rows(&conn, ShieldedPool::Sapling, 0, &rows).expect("append s0");
+        delete_shard_outside(&conn, ShieldedPool::Orchard, 0, 101..104).expect("delete");
+        let orchard: Vec<BufferRow<MerkleHashOrchard>> =
+            load_shard(&conn, ShieldedPool::Orchard, 0).expect("load o0");
+        assert_eq!(
+            orchard.iter().map(|r| r.0).collect::<Vec<_>>(),
+            vec![101, 102, 103],
+            "only the kept range survives"
+        );
+        let sapling: Vec<BufferRow<sapling::Node>> =
+            load_shard(&conn, ShieldedPool::Sapling, 0).expect("load s0");
+        assert_eq!(sapling.len(), 6, "the other pool is untouched");
     }
 }
