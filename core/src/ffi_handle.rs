@@ -18,9 +18,17 @@
 //!
 //! Lifecycle:
 //!   open  → allocates SlipstreamHandle (tokio runtime + snapshot atomics + event ring)
-//!   start → spawns sync task on the runtime; previous task cancelled first
-//!   stop  → cancels the sync task; handle stays live for snapshot/drain_events
+//!   start → spawns sync task on the runtime; previous task cancelled and waited out first
+//!   stop  → cancels the sync task and waits it out; handle stays live for snapshot/drain_events
 //!   free  → drops the handle (drops runtime → all tasks cancel)
+//!
+//! [MOB-1850] Stopping is the engine's job, so every host shares one stop: hosts call
+//! [`SlipstreamHandle::stop`] or [`SlipstreamHandle::stop_for_wallet_change`] to stop, and
+//! [`SlipstreamHandle::quiesce_before_start`] before they spawn a new session, instead of keeping
+//! their own copies of the two bounded waits ([`settle_passes`], [`drain_wallet_writers`]) and of
+//! the record of unfinished passes ([`SlipstreamHandle::unfinished_passes`]). The C (iOS) and JNI
+//! (Android) wrappers keep only their own extras around these calls: on iOS, the `last_stop_at`
+//! stamp that keeps tip freshness across a quick stop→start hop.
 //!
 //! All fields are Send + Sync; the handle is always behind a raw pointer (Box::into_raw),
 //! accessed from Swift/Obj-C single-threaded callers serialised by the actor.
@@ -28,7 +36,10 @@
 //! BINDING: SlipstreamHandle is NOT exposed in the C header (opaque pointer). Its fields
 //! are internal. The C header only sees `typedef struct SlipstreamHandle SlipstreamHandle;`.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::{runtime::Runtime, task::AbortHandle};
 
 use crate::{config::Endpoint, events::Progress};
@@ -159,10 +170,20 @@ pub struct SlipstreamHandle {
     /// it and converts a panic (`JoinError::is_panic`) into `SyncState::Error` + a
     /// tag=4 event — a panicking pass can no longer die silently leaving the state
     /// stuck at "Syncing" forever (field failure 2, 2026-06-12). `stop()` / `free()` /
-    /// restart only need to CANCEL the task, so they hold this `AbortHandle` instead
-    /// of the `JoinHandle` (the abort is observed by the supervisor as a cancellation
-    /// and deliberately ignored — `stop()` already set the state to Idle).
+    /// restart only need to CANCEL the task, and the stops to watch it finish
+    /// ([`settle_passes`] polls `AbortHandle::is_finished`), so they hold this `AbortHandle`
+    /// instead of the `JoinHandle` (the abort is observed by the supervisor as a
+    /// cancellation and deliberately ignored — the stop sets the state to Idle itself).
+    /// The stop or start that aborts the task TAKES it out of this slot and keeps it in
+    /// [`Self::unfinished_passes`] until it has finished.
     pub task: Option<AbortHandle>,
+    /// [MOB-1850] Aborted passes that had not finished when a stop or start gave up waiting; a
+    /// later stop reports quiescence only once this is empty. The only other handle the engine
+    /// keeps on a pass is [`Self::task`], and the stop that aborts a pass TAKES it — so without
+    /// this record the next stop would find an empty slot and report a pass quiescent that it
+    /// never watched finish, while that pass is still inside a synchronous wallet write.
+    /// Construct it empty; [`settle_passes`] keeps it.
+    pub unfinished_passes: Vec<AbortHandle>,
     /// Serializes overlapping sync passes on this handle. `session::run_session` holds this for
     /// the WHOLE pass (acquired as its outermost local). On a `start()`-while-running restart the
     /// host aborts the previous task (`zcashlc_slipstream_start`), but tokio's `abort()` is
@@ -243,6 +264,120 @@ where
     abort_handle
 }
 
+/// Aborts the running pass (if any), keeps every pass that has not finished yet on record, and
+/// waits within `budget` for all of them to finish. Returns whether the engine is quiescent with
+/// respect to its passes. A pass that outlives the budget STAYS on record in `unfinished`, so a
+/// later stop cannot claim quiescence merely because the most recent handle has already been
+/// taken out of `task`.
+///
+/// [B4-16 drain] `abort()` is ASYNCHRONOUS — the task keeps running until its next await
+/// point, so a synchronous in-flight wallet write (an enhance `decrypt_and_store`, a
+/// chain-tip or subtree-roots update — field evidence: a `deleteAccount` landing in that
+/// window failed its read→write lock upgrade, "error + try again") can land AFTER
+/// `abort()` returns. Wait (bounded) for the task to finish unwinding. Combined with
+/// [`drain_wallet_writers`] (the persist lane's `spawn_blocking` commit — the engine's ONLY
+/// detached writer), a stop or start whose two waits both return `true` means the wallet
+/// file is FULLY quiescent; `false` means it could not be proved so within the budget.
+///
+/// The handle's stops call this with [`SlipstreamHandle::task`] and
+/// [`SlipstreamHandle::unfinished_passes`]. It blocks the calling thread for up to `budget`,
+/// polling every 10 ms: call it from a host thread (Swift hops the C stop off its cooperative
+/// pool), never from a task on the runtime the passes run on, whose worker the unwinding pass
+/// may need.
+pub fn settle_passes(
+    task: &mut Option<AbortHandle>,
+    unfinished: &mut Vec<AbortHandle>,
+    budget: Duration,
+) -> bool {
+    if let Some(pass) = task.take() {
+        pass.abort();
+        unfinished.push(pass);
+    }
+    let deadline = Instant::now() + budget;
+    loop {
+        unfinished.retain(|pass| !pass.is_finished());
+        if unfinished.is_empty() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "slipstream stop/start: {} aborted pass(es) still unwinding at the deadline — reporting a non-quiescent stop",
+                unfinished.len()
+            );
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// [B4-16 drain] Bounded wait for the engine's in-flight wallet-file writer — the
+/// write-behind lane's deferred commit, a `spawn_blocking` closure `task.abort()` cannot
+/// cancel. Field evidence (2026-07-04): an orphan commit outlived an `importAccount`
+/// restart, collided with the new pass's first writes ("database is locked" →
+/// non-transient failure, absorbed by the revival loop) and — worse — landed its
+/// Scanned-mark AFTER the import's force-rescan re-queue, silently shrinking the new
+/// account's scan scope. The handle's stops and its start call this right after
+/// settling the passes ([`settle_passes`]); the hosts' budget of ten seconds is far
+/// above the worst observed device commit (a few seconds, A10).
+///
+/// [MOB-1850] A timeout is REPORTED (`false`) rather than logged away: a caller that is about
+/// to mutate the wallet needs to know the file was never proved quiescent, and can refuse
+/// instead of writing on top of a live writer. The busy_timeouts remain the backstop for the
+/// callers that proceed anyway.
+///
+/// Blocks the calling thread for up to `budget`, polling every 10 ms, under the same rule as
+/// [`settle_passes`].
+pub fn drain_wallet_writers(progress: &Progress, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    let mut waited = false;
+    while progress.wallet_writers() > 0 {
+        if Instant::now() >= deadline {
+            tracing::warn!(
+                "slipstream stop/start: in-flight wallet commit still running at the deadline — reporting a non-quiescent stop"
+            );
+            return false;
+        }
+        waited = true;
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if waited {
+        tracing::info!("slipstream stop/start: drained in-flight wallet commit");
+    }
+    true
+}
+
+/// What a stop found: whether each of its two bounded waits finished within the budget, and how
+/// long each took. Returned by [`SlipstreamHandle::stop`],
+/// [`SlipstreamHandle::stop_for_wallet_change`] and [`SlipstreamHandle::quiesce_before_start`].
+///
+/// [MOB-1850] The verdict a caller acts on is [`Self::quiescent`], the `bool` the C stop answers
+/// with. The rest is the detail behind it: a bare `false` cannot say WHICH wait ran out or after
+/// how long, and the device log of a refused account import could not say it either. With the
+/// report, a host can tell the user, or its own log, exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StopReport {
+    /// Every aborted pass on record finished unwinding within the budget ([`settle_passes`]).
+    pub settled: bool,
+    /// No engine wallet writer was still running within the budget ([`drain_wallet_writers`]).
+    pub drained: bool,
+    /// How long the wait for the aborted passes took: at least the budget when it ran out, close
+    /// to zero when there was no pass left to wait for.
+    pub settle_wait: Duration,
+    /// How long the wait for the engine's wallet writers took, measured the same way.
+    pub drain_wait: Duration,
+}
+
+impl StopReport {
+    /// Whether the stop PROVED the wallet file quiescent: every aborted pass finished
+    /// ([`Self::settled`]) AND no engine wallet writer was left running ([`Self::drained`]).
+    /// A caller about to change the wallet file (import, delete, rewind, wipe) refuses on
+    /// `false` rather than writing on top of an engine writer. `false` does not mean the stop
+    /// failed: a stop leaves the engine Idle either way.
+    pub fn quiescent(&self) -> bool {
+        self.settled && self.drained
+    }
+}
+
 impl SlipstreamHandle {
     /// Push one event onto the ring (v2 bounded policy: overflow evicts the oldest
     /// started/progress event first; done/error/found-transactions survive; loss is logged).
@@ -255,6 +390,102 @@ impl SlipstreamHandle {
     pub fn snapshot(&self) -> FfiSlipstreamSnapshot {
         let state = *self.state.lock().unwrap_or_else(|p| p.into_inner());
         derive_snapshot(&self.progress, state)
+    }
+
+    /// Stops the sync task and waits, bounded, for the wallet file to fall quiet. The handle
+    /// stays live: snapshot and event drain still work, and a later start restarts it.
+    ///
+    /// Settles, then drains, then goes Idle. [`settle_passes`] aborts the running pass and waits
+    /// for every pass on record to finish unwinding; [`drain_wallet_writers`] then waits for the
+    /// engine's detached wallet commit. The order matters: the persist lane takes its writer gate
+    /// BEFORE it spawns a commit, so once every pass has finished no new commit can start, and
+    /// every commit already handed off is counted by the drain. Each wait gets the whole `budget`
+    /// on its own (the hosts pass ten seconds, for the passes and for the commit each), so a stop
+    /// blocks for at most twice `budget`. The state then goes `Idle`, whatever the waits found.
+    ///
+    /// [MOB-1850] The pass is stopped either way. What the report says
+    /// ([`StopReport::quiescent`]) is whether the wallet file was PROVED quiescent, which is the
+    /// only thing a caller about to mutate that file can act on. One info line logs how long each
+    /// wait took and what it found: `settle_ms`, `drain_ms`, `settled`, `drained` and
+    /// `for_wallet_change`.
+    ///
+    /// This is the plain stop (backgrounding, shutdown): a scan in the middle of a chunk runs to
+    /// the end of that chunk before the abort reaches it. Right before changing the wallet, stop
+    /// with [`Self::stop_for_wallet_change`] instead.
+    ///
+    /// Hosts call this instead of keeping their own copy of the waits; the C and JNI wrappers add
+    /// only their own extras around it (on iOS, the `last_stop_at` stamp for tip freshness). It
+    /// blocks the calling thread, so call it from a host thread, never from a task on this
+    /// handle's runtime (see [`settle_passes`]).
+    pub fn stop(&mut self, budget: Duration) -> StopReport {
+        self.stop_and_report(budget, false)
+    }
+
+    /// Asks the running session to stop at its next block, then stops exactly as [`Self::stop`]
+    /// does. The host calls this right before it changes the wallet (adding or removing an
+    /// account, a rewind, a wipe) and refuses the change when the report is not
+    /// [`StopReport::quiescent`].
+    ///
+    /// The request ([`Progress::request_stop_for_wallet_change`]) goes out BEFORE the abort, and
+    /// that order is the point: the scan runs synchronously inside `block_in_place`, where an
+    /// abort cannot reach it until the whole chunk is scanned, which can outlast the budget when
+    /// accounts are added in quick succession. The scan checks the request between blocks
+    /// instead, so the pass ends at its next block, without writing anything for the interrupted
+    /// chunk, and the settle can see it finish within the budget. The next session scans that
+    /// chunk again. The request is armed per session, so it never stops a session that starts
+    /// after it.
+    pub fn stop_for_wallet_change(&mut self, budget: Duration) -> StopReport {
+        self.progress.request_stop_for_wallet_change();
+        self.stop_and_report(budget, true)
+    }
+
+    /// Settles and drains before the host spawns a new session: aborts the previous pass (a
+    /// start while running), waits it out, and waits for the engine's wallet commit, exactly as a
+    /// stop does. [B4-16 drain] The aborted pass's write-behind commit may still be running
+    /// (`spawn_blocking`, uncancellable); once the drain has waited it out, BEFORE the new
+    /// session spawns, the new pass's first writes cannot collide with that orphan ("database is
+    /// locked" at pass start), and no orphan Scanned-mark can land after this point.
+    ///
+    /// [MOB-1850] A start proceeds whatever the report says, as it always has: the new session
+    /// waits for [`Self::pass_lock`] before it touches the wallet, so two passes never overlap,
+    /// and only the stop-then-mutate callers act on a verdict, which they get from a stop. But a
+    /// pass this could not wait out STAYS on record ([`Self::unfinished_passes`]), so the next
+    /// stop still answers for it. The state is left alone: the host sets `Syncing` itself, as
+    /// before. Blocks the calling thread, like a stop.
+    pub fn quiesce_before_start(&mut self, budget: Duration) -> StopReport {
+        self.settle_then_drain(budget)
+    }
+
+    /// The two bounded waits every stop and start makes, in order, each one timed.
+    fn settle_then_drain(&mut self, budget: Duration) -> StopReport {
+        let settle_started = Instant::now();
+        let settled = settle_passes(&mut self.task, &mut self.unfinished_passes, budget);
+        let settle_wait = settle_started.elapsed();
+        let drain_started = Instant::now();
+        let drained = drain_wallet_writers(&self.progress, budget);
+        let drain_wait = drain_started.elapsed();
+        StopReport {
+            settled,
+            drained,
+            settle_wait,
+            drain_wait,
+        }
+    }
+
+    /// The body [`Self::stop`] and [`Self::stop_for_wallet_change`] share: the two waits, the
+    /// Idle state, and the one info line.
+    fn stop_and_report(&mut self, budget: Duration, for_wallet_change: bool) -> StopReport {
+        let report = self.settle_then_drain(budget);
+        *self.state.lock().unwrap_or_else(|p| p.into_inner()) = SyncState::Idle;
+        tracing::info!(
+            settle_ms = report.settle_wait.as_millis(),
+            drain_ms = report.drain_wait.as_millis(),
+            settled = report.settled,
+            drained = report.drained,
+            for_wallet_change,
+            "slipstream stop: engine idle"
+        );
+        report
     }
 }
 
@@ -362,7 +593,10 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
+    use crate::events::WalletWriterGate;
 
     /// [API v2 §4.5] Overflow evicts the oldest DROPPABLE (started/progress) event, so a critical
     /// event pushed into a full ring never displaces another critical while pacing events remain.
@@ -474,6 +708,7 @@ mod tests {
             state: std::sync::Arc::new(Mutex::new(state)),
             events: std::sync::Arc::new(Mutex::new(Vec::new())),
             task: None,
+            unfinished_passes: Vec::new(),
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
             endpoint: Endpoint {
                 host: "localhost".into(),
@@ -637,6 +872,7 @@ mod tests {
             state: std::sync::Arc::new(Mutex::new(SyncState::Syncing)),
             events: std::sync::Arc::new(Mutex::new(Vec::new())),
             task: None,
+            unfinished_passes: Vec::new(),
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
             endpoint: Endpoint {
                 host: "localhost".into(),
@@ -693,6 +929,7 @@ mod tests {
             state: std::sync::Arc::new(Mutex::new(SyncState::Idle)),
             events: std::sync::Arc::new(Mutex::new(Vec::new())),
             task: None,
+            unfinished_passes: Vec::new(),
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
             endpoint: Endpoint {
                 host: "localhost".into(),
@@ -738,6 +975,7 @@ mod tests {
             state: Arc::new(Mutex::new(SyncState::Idle)),
             events: Arc::new(Mutex::new(Vec::new())),
             task: None,
+            unfinished_passes: Vec::new(),
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
             endpoint: Endpoint {
                 host: "localhost".into(),
@@ -899,6 +1137,7 @@ mod tests {
             state: Arc::new(Mutex::new(SyncState::Idle)),
             events: Arc::new(Mutex::new(Vec::new())),
             task: None,
+            unfinished_passes: Vec::new(),
             pass_lock: Arc::new(tokio::sync::Mutex::new(())),
             endpoint: Endpoint {
                 host: "localhost".into(),
@@ -945,5 +1184,261 @@ mod tests {
         );
         let done = handle_in(SyncState::Done, p).snapshot();
         assert_eq!(done.stalled_seconds, 0, "only Syncing reports a stall");
+    }
+
+    // ── [MOB-1850] the shared quiescent stop ──────────────────────────────────
+
+    /// [MOB-1850] A wallet writer still holding the gate when the drain's budget runs out is a
+    /// NON-QUIESCENT stop, and the drain must say so. Logging the timeout away and answering
+    /// "quiescent" is what let the host mutate the wallet on top of a live engine writer.
+    #[test]
+    fn drain_reports_a_writer_that_outlives_the_deadline() {
+        let progress = crate::events::ProgressArc::default();
+        // The RAII gate is the engine's own way of holding the counter up for the life of a
+        // commit, so the test raises it exactly as the persist lane does.
+        let gate = WalletWriterGate::hold(progress.clone());
+        let quiescent = drain_wallet_writers(&progress, Duration::from_millis(50));
+        assert!(
+            !quiescent,
+            "a writer still running at the deadline must be reported, not logged away"
+        );
+        drop(gate);
+        assert!(drain_wallet_writers(&progress, Duration::from_millis(50)));
+    }
+
+    /// Releases a `spawn_gated_pass` loop, explicitly via `release()` or implicitly when this
+    /// guard is dropped. A failing assertion panics and unwinds BEFORE a test reaches its explicit
+    /// release, and local variables are dropped in reverse declaration order during unwinding, so a
+    /// guard declared after the runtime is always dropped — and so releases its worker thread —
+    /// before the runtime itself is. Without that, `Runtime::drop` would block forever joining a
+    /// worker still parked in the gated loop, turning a failing assertion into a hang. A handle
+    /// owns its runtime, so the same goes for a handle: declare it first and the guard after it.
+    struct PassRelease(Arc<AtomicBool>);
+
+    impl PassRelease {
+        fn release(&self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    impl Drop for PassRelease {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Spawns a pass parked in a synchronous loop (no await point, so `abort()` cannot take it
+    /// down) and returns its join handle plus the guard that releases it.
+    fn spawn_gated_pass(runtime: &Runtime) -> (tokio::task::JoinHandle<()>, PassRelease) {
+        let release = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(AtomicBool::new(false));
+        let (held, running) = (release.clone(), started.clone());
+        let task = runtime.spawn(async move {
+            running.store(true, Ordering::SeqCst);
+            while !held.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        (task, PassRelease(release))
+    }
+
+    /// [MOB-1850] The pass half of the same contract, and the reason a pass has to STAY on record.
+    /// `abort()` cannot interrupt a task that is inside a synchronous stretch, so one that is still
+    /// there when the budget runs out must be reported — and it must go on being reported by every
+    /// later stop, because taking the handle out of the slot is not the same as the pass finishing.
+    #[test]
+    fn a_repeated_stop_stays_non_quiescent_while_the_original_pass_is_unfinished() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let budget = Duration::from_millis(50);
+        let (first, release_first) = spawn_gated_pass(&runtime);
+        let observer = first.abort_handle();
+        let mut slot = Some(first.abort_handle());
+        let mut unfinished: Vec<AbortHandle> = Vec::new();
+
+        assert!(
+            !settle_passes(&mut slot, &mut unfinished, budget),
+            "first stop: the pass outlives the budget"
+        );
+        assert!(
+            !settle_passes(&mut slot, &mut unfinished, budget),
+            "second stop must not claim quiescence while the first pass still runs"
+        );
+        assert!(!observer.is_finished());
+
+        // A start-style replacement installs a new pass while the old one is still unfinished.
+        let (second, release_second) = spawn_gated_pass(&runtime);
+        let _ = settle_passes(&mut slot, &mut unfinished, budget);
+        slot = Some(second.abort_handle());
+        assert!(
+            !settle_passes(&mut slot, &mut unfinished, budget),
+            "a stop after a replacement must still see the original unfinished pass"
+        );
+        assert_eq!(
+            unfinished.len(),
+            2,
+            "both unfinished passes stay on record after the replacement"
+        );
+
+        release_first.release();
+        release_second.release();
+        assert!(
+            settle_passes(&mut slot, &mut unfinished, Duration::from_secs(5)),
+            "quiescence once every pass has actually finished"
+        );
+        assert!(unfinished.is_empty());
+    }
+
+    /// A host about to change the wallet acts on the AND of the two verdicts: one wait that ran
+    /// out is enough to leave the wallet file unproved.
+    #[test]
+    fn a_report_is_quiescent_only_when_settled_and_drained() {
+        for (settled, drained) in [(false, false), (false, true), (true, false), (true, true)] {
+            let report = StopReport {
+                settled,
+                drained,
+                settle_wait: Duration::ZERO,
+                drain_wait: Duration::ZERO,
+            };
+            assert_eq!(report.quiescent(), settled && drained, "{report:?}");
+        }
+    }
+
+    /// Only the stop a host makes right before it changes the wallet asks the running session to
+    /// end at its next block. A plain stop (backgrounding, shutdown) must leave that request
+    /// alone, so every other stop behaves exactly as it did before the wallet-change stop.
+    #[test]
+    fn only_a_stop_for_a_wallet_change_asks_the_scan_to_stop() {
+        let progress = Arc::new(Progress::default());
+        let mut handle = handle_in(SyncState::Syncing, progress.clone());
+        let budget = Duration::from_millis(50);
+
+        let report = handle.stop(budget);
+        assert!(report.quiescent(), "nothing was running: {report:?}");
+        assert!(
+            !progress.stop_requested(),
+            "a plain stop must not ask the scan to stop early"
+        );
+
+        let report = handle.stop_for_wallet_change(budget);
+        assert!(report.quiescent(), "nothing was running: {report:?}");
+        assert!(
+            progress.stop_requested(),
+            "a stop for a wallet change must ask the running session to stop at its next block"
+        );
+    }
+
+    /// Both stops leave the handle Idle, and they do so also when they could not prove the wallet
+    /// file quiescent: the pass is stopped either way, and the report is what says whether the
+    /// file is safe to change.
+    #[test]
+    fn a_stop_sets_the_state_to_idle() {
+        let budget = Duration::from_millis(50);
+        for for_wallet_change in [false, true] {
+            for writer_outlives_the_budget in [false, true] {
+                let progress = Arc::new(Progress::default());
+                let mut handle = handle_in(SyncState::Syncing, progress.clone());
+                let gate =
+                    writer_outlives_the_budget.then(|| WalletWriterGate::hold(progress.clone()));
+                let report = if for_wallet_change {
+                    handle.stop_for_wallet_change(budget)
+                } else {
+                    handle.stop(budget)
+                };
+                assert_eq!(
+                    report.quiescent(),
+                    !writer_outlives_the_budget,
+                    "{report:?}"
+                );
+                assert_eq!(
+                    *handle.state.lock().unwrap(),
+                    SyncState::Idle,
+                    "for_wallet_change={for_wallet_change}, quiescent={}",
+                    report.quiescent()
+                );
+                drop(gate);
+            }
+        }
+    }
+
+    /// A stop measures each of its two waits, so a host can tell the user WHICH one ran out and
+    /// after how long. A wait that ran into its budget took at least that budget.
+    #[test]
+    fn a_stop_measures_the_wait_that_ran_out() {
+        let progress = Arc::new(Progress::default());
+        let mut handle = handle_in(SyncState::Syncing, progress.clone());
+        let budget = Duration::from_millis(50);
+
+        // The drain's wait: a wallet writer that outlives the budget.
+        let gate = WalletWriterGate::hold(progress.clone());
+        let report = handle.stop(budget);
+        assert!(report.settled && !report.drained, "{report:?}");
+        assert!(
+            report.drain_wait >= budget,
+            "the drain waited out its whole budget: {report:?}"
+        );
+        drop(gate);
+
+        // The settle's wait: a pass that outlives the budget. Declared after the handle, so the
+        // guard releases the runtime's only worker before the handle's runtime is dropped.
+        let (pass, release) = spawn_gated_pass(&handle.runtime);
+        handle.task = Some(pass.abort_handle());
+        let report = handle.stop(budget);
+        assert!(!report.settled && report.drained, "{report:?}");
+        assert!(
+            report.settle_wait >= budget,
+            "the settle waited out its whole budget: {report:?}"
+        );
+
+        release.release();
+        let report = handle.stop(Duration::from_secs(5));
+        assert!(report.quiescent(), "the pass has finished: {report:?}");
+    }
+
+    /// [MOB-1850] The start's half: `quiesce_before_start` aborts and waits out the previous pass
+    /// as a stop does, but leaves the state to the start that follows (the host sets `Syncing`
+    /// itself). A pass it could not wait out STAYS on record, so the next stop still answers for
+    /// it instead of reporting it quiescent.
+    #[test]
+    fn quiesce_before_start_leaves_the_state_alone_and_keeps_an_unfinished_pass_on_record() {
+        let mut handle = handle_in(SyncState::Done, Arc::new(Progress::default()));
+        let budget = Duration::from_millis(50);
+        let (pass, release) = spawn_gated_pass(&handle.runtime);
+        handle.task = Some(pass.abort_handle());
+
+        let report = handle.quiesce_before_start(budget);
+        assert!(!report.settled && report.drained, "{report:?}");
+        assert!(report.settle_wait >= budget, "{report:?}");
+        assert_eq!(
+            *handle.state.lock().unwrap(),
+            SyncState::Done,
+            "the start that follows owns the state change"
+        );
+        assert!(handle.task.is_none(), "the aborted pass left the slot");
+        assert_eq!(
+            handle.unfinished_passes.len(),
+            1,
+            "the pass the start could not wait out stays on record"
+        );
+
+        let report = handle.stop(budget);
+        assert!(
+            !report.settled,
+            "the next stop still answers for that pass: {report:?}"
+        );
+
+        release.release();
+        let report = handle.stop(Duration::from_secs(5));
+        assert!(
+            report.quiescent(),
+            "quiescent once the pass has actually finished: {report:?}"
+        );
+        assert!(handle.unfinished_passes.is_empty());
     }
 }
