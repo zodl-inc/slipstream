@@ -1977,13 +1977,14 @@ mod tests {
 
         use incrementalmerkletree::Position;
         use incrementalmerkletree::frontier::Frontier;
+        use orchard::tree::MerkleHashOrchard;
         use shardtree::error::ShardTreeError;
         use zcash_client_backend::data_api::chain::{ChainState, scan_cached_blocks};
         use zcash_client_backend::data_api::{
             AccountBirthday, AccountPurpose, WalletCommitmentTrees as _, WalletWrite as _,
         };
         use zcash_client_backend::proto::compact_formats::{
-            ChainMetadata, CompactBlock, CompactSaplingOutput, CompactTx,
+            ChainMetadata, CompactBlock, CompactOrchardAction, CompactSaplingOutput, CompactTx,
         };
         use zcash_primitives::block::BlockHash;
         use zcash_primitives::merkle_tree::HashSer;
@@ -2116,11 +2117,16 @@ mod tests {
             blocks: &[CompactBlock],
             tip: u64,
         ) {
+            open_wallet_at(dir, state_after(base, blocks, 0), tip);
+        }
+
+        /// [`open_wallet`] with the birthday's chain state given.
+        fn open_wallet_at(dir: &Path, birthday: ChainState, tip: u64) {
             std::fs::create_dir_all(dir).expect("wallet dir");
             let mut s = session(dir);
             let ufvk = zcash_keys::keys::UnifiedFullViewingKey::decode(&s.network, TEST_UFVK)
                 .expect("ufvk");
-            let birthday = AccountBirthday::from_parts(state_after(base, blocks, 0), None);
+            let birthday = AccountBirthday::from_parts(birthday, None);
             s.db_mut()
                 .import_account_ufvk("gap", &ufvk, &birthday, AccountPurpose::ViewOnly, None)
                 .expect("import the restored account");
@@ -3667,6 +3673,240 @@ mod tests {
                     "the root at block {idx} is the chain's"
                 );
             }
+        }
+
+        // ── The same on the Orchard pool ─────────────────────────────────────────────────
+        //
+        // Orchard chains start above NU5 (`SYNTH_ORCHARD_START`); the Sapling tree stays
+        // empty.
+
+        const ORCHARD_START: u64 = super::super::testkit::SYNTH_ORCHARD_START;
+
+        /// Little-endian small integers are canonical Pallas base-field elements.
+        fn orchard_node(n: u64) -> MerkleHashOrchard {
+            Option::from(MerkleHashOrchard::from_bytes(&le(n)))
+                .expect("small LE ints are canonical nodes")
+        }
+
+        /// The Orchard pre-history: a tree of `size` leaves, as a frontier of arbitrary
+        /// (valid) nodes.
+        fn orchard_base_frontier(size: u64) -> Frontier<MerkleHashOrchard, 32> {
+            let pos = size - 1;
+            let ommers = (0..u64::from(pos.count_ones()))
+                .map(|i| orchard_node(900_000 + i))
+                .collect();
+            Frontier::from_parts(Position::from(pos), orchard_node(800_000), ommers)
+                .expect("frontier parts are consistent")
+        }
+
+        /// `count` linked blocks from ORCHARD_START, ONE foreign Orchard action each, on top
+        /// of the `base_size`-leaf Orchard pre-history: block `i` holds Orchard position
+        /// `base_size + i`.
+        fn orchard_chain(base_size: u64, count: u64) -> Vec<CompactBlock> {
+            (0..count)
+                .map(|i| {
+                    let height = ORCHARD_START + i;
+                    CompactBlock {
+                        height,
+                        hash: h32(0xBB, height).to_vec(),
+                        prev_hash: if i == 0 {
+                            vec![0u8; 32]
+                        } else {
+                            h32(0xBB, height - 1).to_vec()
+                        },
+                        time: height as u32,
+                        header: vec![],
+                        vtx: vec![CompactTx {
+                            index: 0,
+                            txid: h32(0x77, height).to_vec(),
+                            fee: 0,
+                            spends: vec![],
+                            outputs: vec![],
+                            actions: vec![CompactOrchardAction {
+                                nullifier: le(3_000_000 + i).to_vec(),
+                                cmx: le(1_000_000 + i).to_vec(),
+                                ephemeral_key: h32(0xEE, i).to_vec(),
+                                ciphertext: vec![0xC7; 52],
+                            }],
+                            ..Default::default()
+                        }],
+                        chain_metadata: Some(ChainMetadata {
+                            sapling_commitment_tree_size: 0,
+                            orchard_commitment_tree_size: u32::try_from(base_size + i + 1)
+                                .expect("fits"),
+                            ironwood_commitment_tree_size: 0,
+                        }),
+                    }
+                })
+                .collect()
+        }
+
+        /// The chain state after `blocks[..idx]` of an Orchard chain (the birthday state at
+        /// ORCHARD_START - 1 for 0).
+        fn orchard_state_after(
+            base: &Frontier<MerkleHashOrchard, 32>,
+            blocks: &[CompactBlock],
+            idx: usize,
+        ) -> ChainState {
+            let mut frontier = base.clone();
+            for action in blocks[..idx]
+                .iter()
+                .flat_map(|b| b.vtx.iter())
+                .flat_map(|t| t.actions.iter())
+            {
+                let cmx: [u8; 32] = action.cmx[..].try_into().expect("32-byte cmx");
+                frontier.append(
+                    Option::from(MerkleHashOrchard::from_bytes(&cmx)).expect("canonical cmx"),
+                );
+            }
+            let (height, hash) = match idx {
+                0 => (ORCHARD_START - 1, [0u8; 32]),
+                _ => (blocks[idx - 1].height, h32(0xBB, blocks[idx - 1].height)),
+            };
+            ChainState::new(
+                BlockHeight::from(u32::try_from(height).expect("fits")),
+                BlockHash(hash),
+                Frontier::empty(),
+                frontier,
+                Frontier::empty(),
+            )
+        }
+
+        /// The units of an Orchard range `blocks[start..start + Σlens]`, each with its
+        /// `from_state`, for [`scan_units`].
+        fn orchard_units<'a>(
+            base: &Frontier<MerkleHashOrchard, 32>,
+            blocks: &'a [CompactBlock],
+            start: usize,
+            lens: &[usize],
+        ) -> Vec<(ChainState, &'a [CompactBlock])> {
+            let mut units = vec![];
+            let mut offset = start;
+            for len in lens {
+                units.push((
+                    orchard_state_after(base, blocks, offset),
+                    &blocks[offset..offset + len],
+                ));
+                offset += len;
+            }
+            units
+        }
+
+        /// The Orchard checkpoint ids present among `heights`.
+        fn orchard_checkpoints_among(dir: &Path, heights: &[u64]) -> Vec<u64> {
+            let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+            heights
+                .iter()
+                .copied()
+                .filter(|h| {
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM orchard_tree_checkpoints WHERE checkpoint_id = ?1",
+                        [*h as i64],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .expect("count")
+                        > 0
+                })
+                .collect()
+        }
+
+        /// The wallet's Orchard root at the checkpoint for `height` (upstream's own reader).
+        fn orchard_root_at(dir: &Path, height: u64) -> Result<Option<MerkleHashOrchard>, String> {
+            let mut s = session(dir);
+            s.db_mut()
+                .with_orchard_tree_mut::<_, _, ShardTreeError<
+                    zcash_client_sqlite::wallet::commitment_tree::Error,
+                >>(|tree| {
+                    tree.root_at_checkpoint_id(&BlockHeight::from(
+                        u32::try_from(height).expect("fits"),
+                    ))
+                })
+                .map_err(|e| format!("{e:?}"))
+        }
+
+        /// The Orchard tail-shard scenario: the ChainTip stand-in [110, 200), never grafted,
+        /// then the Historic range R = [20, 110) in two units, on a 50-block anchor grid and
+        /// deep below the tip, crossing into Orchard shard 1 at block 40. An abort in R's
+        /// final drain leaves its 70 shard-1 rows buffered; the next pass's sweep builds them
+        /// on the Orchard pool's tree, checked by the leaf the ChainTip range's frontier holds
+        /// at their last position, and the wallet ends exactly like the twin whose R finished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_builds_an_orchard_tail_shard_an_abort_left_buffered() {
+            let base_size = SHARD - 40;
+            let base = orchard_base_frontier(base_size);
+            let blocks = orchard_chain(base_size, 200);
+            let tip = blocks.last().expect("blocks").height + 20_000;
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(ORCHARD_START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            let r_anchors = [ORCHARD_START + 50, ORCHARD_START + 100];
+            let root = tempfile::tempdir().expect("tempdir");
+            let mut dirs = vec![];
+            for (name, r_end, buffered) in [("twin", End::Finish, 0), ("aborted", End::Abort, 70)] {
+                let dir = root.path().join(name);
+                open_wallet_at(&dir, orchard_state_after(&base, &blocks, 0), tip);
+                let units = orchard_units(&base, &blocks, 110, &[90]);
+                scan_units(&dir, &units, false, Some(anchors.clone()), End::Finish)
+                    .await
+                    .expect("tip range");
+                let units = orchard_units(&base, &blocks, 20, &[45, 45]);
+                scan_units(&dir, &units, true, Some(anchors.clone()), r_end)
+                    .await
+                    .expect("historic range R");
+                let rows = buffer_rows(&dir);
+                assert_eq!(
+                    rows.len(),
+                    buffered,
+                    "[{name}] R's Orchard shard-1 rows stay buffered only after the abort"
+                );
+                assert!(
+                    rows.iter().all(|row| row.0 == 3 && row.1 == 1),
+                    "[{name}] every buffered row is an Orchard row of shard 1: {}",
+                    summarize(&rows)
+                );
+                assert_eq!(
+                    start_next_pass(&dir, Some(&anchors)),
+                    crate::persist::GraftSweep {
+                        built_rows: buffered as u64,
+                        ..Default::default()
+                    },
+                    "[{name}] the sweep builds the stranded Orchard rows and queues no rescan"
+                );
+                // The next pass goes on with the next Historic range down, [0, 20).
+                let units = orchard_units(&base, &blocks, 0, &[20]);
+                scan_units(&dir, &units, true, Some(anchors.clone()), End::Finish)
+                    .await
+                    .expect("historic range below R");
+                assert!(
+                    buffer_rows(&dir).is_empty(),
+                    "[{name}] the graft buffer is drained"
+                );
+                assert_eq!(
+                    orchard_checkpoints_among(&dir, &r_anchors),
+                    r_anchors,
+                    "[{name}] the wallet holds R's anchors"
+                );
+                for (anchor, idx) in r_anchors.iter().zip([50, 100]) {
+                    assert_eq!(
+                        orchard_root_at(&dir, *anchor),
+                        Ok(Some(
+                            orchard_state_after(&base, &blocks, idx + 1)
+                                .final_orchard_tree()
+                                .root()
+                        )),
+                        "[{name}] the Orchard root at R's anchor {anchor} is the chain's"
+                    );
+                }
+                dirs.push(dir);
+            }
+            let report = semantic_diff(&dirs[0].join("data.db"), &dirs[1].join("data.db"))
+                .expect("semantic diff");
+            assert!(
+                report.is_clean(),
+                "the aborted wallet ends as the twin did, checkpoints and retained marks included:\n{}",
+                report.render()
+            );
         }
     }
 }

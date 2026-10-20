@@ -2418,6 +2418,9 @@ impl GraftSweep {
 /// the chain tip now ([`doom_deep_rows`]). Rows buffered before the graft stream got the
 /// per-call doom carry every per-block checkpoint, and the deferred build's budget cutoff
 /// alone would keep some that graft off never creates.
+///
+/// Blocking: the scheduler runs it in `block_in_place`. A build's rayon work runs on the
+/// persist lane's pool ([`persist_pool`]), as every build in `sparse_put_blocks` does.
 pub(crate) fn sweep_stranded_graft_rows(
     db: &mut Db,
     wallet_db_path: &std::path::Path,
@@ -2709,9 +2712,12 @@ impl SweepInputs<'_> {
 
     /// Build one stranded run of `shard` when data the wallet already holds checks where it
     /// ends ([`crate::graft::end_check`]), and otherwise, or when the tree refuses it, delete
-    /// it after queueing a rescan of the scanned blocks holding it. `tree` is the pool's tree
-    /// as the wallet holds it, and stays so: a refused build, or one whose transaction fails,
-    /// is undone in memory as well. An error leaves the run's rows buffered.
+    /// it after queueing a rescan of the scanned blocks holding it. `rows` must be the run's
+    /// own, one per position ([`crate::graft::rows_cover_run`]); any other read of them is
+    /// treated as unchecked, since a build lays rows out from the first row's position.
+    /// `tree` is the pool's tree as the wallet holds it, and stays so: a refused build, or
+    /// one whose transaction fails, is undone in memory as well. An error leaves the run's
+    /// rows buffered.
     #[allow(clippy::too_many_arguments)]
     fn run<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
         &self,
@@ -2729,6 +2735,17 @@ impl SweepInputs<'_> {
         ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>: SweptTree<Node = H>,
     {
         let span = *run.start()..*run.end() + 1;
+        let covered = crate::graft::rows_cover_run(&rows, run);
+        if !covered {
+            tracing::warn!(
+                ?pool,
+                shard,
+                first = *run.start(),
+                last = *run.end(),
+                rows = rows.len(),
+                "graft sweep: the rows read for a stranded run are not one per position; rescanning its blocks instead"
+            );
+        }
         let last_leaf_matches = tree
             .store()
             .get_shard(Address::from_parts(tree.store().shard_level, shard))
@@ -2737,10 +2754,23 @@ impl SweepInputs<'_> {
             .and_then(|t| t.value_at_position(Position::from(*run.end())))
             .zip(rows.last())
             .is_some_and(|((leaf, _), (_, row, _))| leaf == row);
-        if let Some(check) = crate::graft::end_check(run, last_leaf_matches, stored_root) {
+        let check = covered
+            .then(|| crate::graft::end_check(run, last_leaf_matches, stored_root))
+            .flatten();
+        if let Some(check) = check {
             let built_rows = rows.len() as u64;
             let before = tree.store().snapshot();
-            match self.insert_checked(tree, pool, shard, rows, check) {
+            let (chain_tip, anchor_retention) = (self.chain_tip, self.anchor_retention);
+            let insert =
+                || insert_checked(tree, pool, shard, rows, check, chain_tip, anchor_retention);
+            // The build's rayon work (`build_subtrees`) runs on the persist lane's pool, as
+            // every tree build in `sparse_put_blocks` does, rather than on the global pool
+            // behind any trial decryption a stopped pass left queued there.
+            let inserted = match persist_pool() {
+                Some(workers) => workers.install(insert),
+                None => insert(),
+            };
+            match inserted {
                 Ok(()) => {
                     let flushed =
                         db.transactionally::<_, _, SqliteClientError>(|wdb| tree.flush(wdb));
@@ -2855,42 +2885,44 @@ impl SweepInputs<'_> {
             ),
         }
     }
+}
 
-    /// The in-memory half of a stranded run's build: the deep-history doom by each row's
-    /// own block ([`doom_deep_rows`]), the range-end finish's insert
-    /// ([`insert_deferred_rows`]), then the root check `check` asks for. An error is the tree
-    /// refusing the run.
-    fn insert_checked<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
-        &self,
-        tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
-        pool: ShieldedPool,
-        shard: u64,
-        mut rows: Vec<crate::graft_accumulator::AccRow<H>>,
-        check: crate::graft::EndCheck<H>,
-    ) -> Result<(), SqliteClientError>
-    where
-        H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
-    {
-        let label = format!("graft sweep {pool:?}");
-        doom_deep_rows(&mut rows, self.chain_tip, self.anchor_retention);
-        insert_deferred_rows(tree, rows, self.anchor_retention, &label)?;
-        if let crate::graft::EndCheck::ShardRoot(stored) = check {
-            match shard_content_root(tree.store(), shard) {
-                Some(root) if root == stored => {}
-                Some(_) => {
-                    return Err(SqliteClientError::CorruptedData(format!(
-                        "{label}: shard {shard}'s root is not the root the wallet stores"
-                    )));
-                }
-                None => {
-                    return Err(SqliteClientError::CorruptedData(format!(
-                        "{label}: shard {shard}'s root cannot be computed from the tree"
-                    )));
-                }
+/// The in-memory half of a stranded run's build ([`SweepInputs::run`]): the deep-history
+/// doom by each row's own block below `chain_tip` ([`doom_deep_rows`]), the range-end
+/// finish's insert ([`insert_deferred_rows`]), then the root check `check` asks for. An
+/// error is the tree refusing the run.
+#[allow(clippy::too_many_arguments)]
+fn insert_checked<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
+    pool: ShieldedPool,
+    shard: u64,
+    mut rows: Vec<crate::graft_accumulator::AccRow<H>>,
+    check: crate::graft::EndCheck<H>,
+    chain_tip: BlockHeight,
+    anchor_retention: Option<&AnchorRetention>,
+) -> Result<(), SqliteClientError>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+{
+    let label = format!("graft sweep {pool:?}");
+    doom_deep_rows(&mut rows, chain_tip, anchor_retention);
+    insert_deferred_rows(tree, rows, anchor_retention, &label)?;
+    if let crate::graft::EndCheck::ShardRoot(stored) = check {
+        match shard_content_root(tree.store(), shard) {
+            Some(root) if root == stored => {}
+            Some(_) => {
+                return Err(SqliteClientError::CorruptedData(format!(
+                    "{label}: shard {shard}'s root is not the root the wallet stores"
+                )));
+            }
+            None => {
+                return Err(SqliteClientError::CorruptedData(format!(
+                    "{label}: shard {shard}'s root cannot be computed from the tree"
+                )));
             }
         }
-        Ok(())
     }
+    Ok(())
 }
 
 /// One pool's commitment-tree size at the end of block `height`, when the wallet holds
@@ -2923,35 +2955,8 @@ fn range_start_position(
     }
 }
 
-/// The lowest height in `stretch` whose block ends with more than `position` commitments
-/// in `pool`: the block holding `position`, or the stretch's first block when `position`
-/// lies below the stretch. `None` when the stretch's metadata does not decide it (a block
-/// without metadata, or `position` at or past the stretch's end).
-fn first_block_past(
-    db: &Db,
-    pool: ShieldedPool,
-    position: u64,
-    stretch: &Range<BlockHeight>,
-) -> Result<Option<BlockHeight>, SqliteClientError> {
-    let (mut lo, mut hi) = (u32::from(stretch.start), u32::from(stretch.end) - 1);
-    if tree_size_at(db, pool, BlockHeight::from(hi))?.is_none_or(|size| size <= position) {
-        return Ok(None);
-    }
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        match tree_size_at(db, pool, BlockHeight::from(mid))? {
-            Some(size) if size > position => hi = mid,
-            Some(_) => lo = mid + 1,
-            None => return Ok(None),
-        }
-    }
-    Ok(Some(BlockHeight::from(lo)))
-}
-
 /// The ranges to rescan so that every scanned block holding a position of `run` is
-/// scanned again: in each scanned stretch the run reaches, from the block holding its
-/// first position (or the stretch's first block) to the block holding its last (or the
-/// stretch's last block). Positions in blocks a pending range covers need nothing.
+/// scanned again ([`crate::graft::rescans_for`], over this pool's block metadata).
 /// `None` when the wallet's block metadata cannot place the run.
 fn rescans_for(
     db: &Db,
@@ -2959,32 +2964,7 @@ fn rescans_for(
     run: &RangeInclusive<u64>,
     stretches: &[Range<BlockHeight>],
 ) -> Result<Option<Vec<Range<BlockHeight>>>, SqliteClientError> {
-    let (first, last) = (*run.start(), *run.end());
-    let mut rescans = vec![];
-    for stretch in stretches {
-        let Some(end_size) = tree_size_at(db, pool, stretch.end - 1)? else {
-            return Ok(None);
-        };
-        if end_size <= first {
-            continue;
-        }
-        let Some(from) = first_block_past(db, pool, first, stretch)? else {
-            return Ok(None);
-        };
-        let to = if end_size > last {
-            match first_block_past(db, pool, last, stretch)? {
-                Some(to) => to,
-                None => return Ok(None),
-            }
-        } else {
-            stretch.end - 1
-        };
-        rescans.push(from..to + 1);
-        if end_size > last {
-            break;
-        }
-    }
-    Ok(Some(rescans))
+    crate::graft::rescans_for(|height| tree_size_at(db, pool, height), run, stretches)
 }
 
 // ── WalletWrite facade ─────────────────────────────────────────────────────────

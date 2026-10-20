@@ -395,6 +395,17 @@ pub(crate) fn end_check<H>(
     }
 }
 
+/// Whether `rows` are exactly the rows of `run`: one per position, ascending and
+/// contiguous from its first position to its last. A build lays rows out from the
+/// first row's position, so rows that miss a position or hold one twice would put
+/// every later leaf at the wrong position; the pass-start sweep then treats the run
+/// as one nothing checks, and rescans its blocks.
+pub(crate) fn rows_cover_run<H>(rows: &[BufferRow<H>], run: &RangeInclusive<u64>) -> bool {
+    rows.len() as u64 == *run.end() - *run.start() + 1
+        && rows.first().is_some_and(|row| row.0 == *run.start())
+        && rows.windows(2).all(|pair| pair[0].0 + 1 == pair[1].0)
+}
+
 /// The stretches of `floor..end` that no `pending` range covers, ascending: the
 /// heights the scan queue counts as scanned.
 pub(crate) fn scanned_stretches(
@@ -420,6 +431,86 @@ pub(crate) fn scanned_stretches(
     }
     stretches.retain(|stretch| !stretch.is_empty());
     stretches
+}
+
+/// The block ranges to rescan so that every scanned block holding a position of `run`
+/// is scanned again: in each scanned stretch the run reaches, from the block holding its
+/// first position (or the stretch's first block) to the block holding its last (or the
+/// stretch's last block). Positions in blocks a pending range covers need nothing.
+/// `size_at(height)` is the pool's tree size at the end of block `height`, when the
+/// wallet holds that block's metadata; `None` (the result) when the metadata cannot
+/// place the run.
+///
+/// The `stretches` (ascending, as [`scanned_stretches`] returns them) are walked from
+/// the newest down, and the walk stops at the first one that ends at or before the
+/// run's first position, or as soon as the run is seen to begin inside a stretch:
+/// positions only grow with heights, so no older stretch holds any of it. An older
+/// stretch is read only when the run may begin in the first block of the one above it,
+/// which nothing but the older stretch's end can tell. So the blocks of old stretches
+/// without a pool's tree sizes (scanned before the wallet recorded them) never stop a
+/// run above them from being placed.
+pub(crate) fn rescans_for<E>(
+    mut size_at: impl FnMut(BlockHeight) -> Result<Option<u64>, E>,
+    run: &RangeInclusive<u64>,
+    stretches: &[Range<BlockHeight>],
+) -> Result<Option<Vec<Range<BlockHeight>>>, E> {
+    let (first, last) = (*run.start(), *run.end());
+    let mut rescans = vec![];
+    // The rescan in the lowest stretch seen so far that ends past the run: of the
+    // stretches that do, only the lowest can hold any of it.
+    let mut past_last = None;
+    for stretch in stretches.iter().rev() {
+        let Some(end_size) = size_at(stretch.end - 1)? else {
+            return Ok(None);
+        };
+        if end_size <= first {
+            break;
+        }
+        let Some(from) = first_block_past(&mut size_at, first, stretch)? else {
+            return Ok(None);
+        };
+        if end_size > last {
+            let Some(to) = first_block_past(&mut size_at, last, stretch)? else {
+                return Ok(None);
+            };
+            past_last = Some(from..to + 1);
+        } else {
+            rescans.extend(past_last.take());
+            rescans.push(from..stretch.end);
+        }
+        // The block before `from` ends at or before the run's first position: the run
+        // begins in this stretch.
+        if from > stretch.start {
+            break;
+        }
+    }
+    rescans.extend(past_last);
+    rescans.reverse();
+    Ok(Some(rescans))
+}
+
+/// The lowest height in `stretch` whose block ends with more than `position`
+/// commitments: the block holding `position`, or the stretch's first block when
+/// `position` lies below the stretch. `None` when the stretch's metadata does not decide
+/// it (a block without metadata, or `position` at or past the stretch's end).
+fn first_block_past<E>(
+    size_at: &mut impl FnMut(BlockHeight) -> Result<Option<u64>, E>,
+    position: u64,
+    stretch: &Range<BlockHeight>,
+) -> Result<Option<BlockHeight>, E> {
+    let (mut lo, mut hi) = (u32::from(stretch.start), u32::from(stretch.end) - 1);
+    if size_at(BlockHeight::from(hi))?.is_none_or(|size| size <= position) {
+        return Ok(None);
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match size_at(BlockHeight::from(mid))? {
+            Some(size) if size > position => hi = mid,
+            Some(_) => lo = mid + 1,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(BlockHeight::from(lo)))
 }
 
 /// Rewind support (plan Task 9): drop every buffered row at or above `min_position`.
@@ -671,5 +762,148 @@ mod tests {
             vec![h(15)..h(20), h(30)..h(50), h(60)..h(90)]
         );
         assert_eq!(scanned_stretches([], h(10), h(100)), vec![h(10)..h(100)]);
+    }
+
+    #[test]
+    fn rows_cover_run_only_with_one_row_per_position() {
+        let rows = |positions: &[u64]| -> Vec<BufferRow<MerkleHashOrchard>> {
+            positions
+                .iter()
+                .map(|&p| (p, h(0), Retention::Ephemeral))
+                .collect()
+        };
+        assert!(rows_cover_run(&rows(&[10, 11, 12]), &(10..=12)));
+        assert!(
+            !rows_cover_run(&rows(&[10, 12]), &(10..=12)),
+            "a position is missing"
+        );
+        assert!(
+            !rows_cover_run(&rows(&[10, 11, 11]), &(10..=12)),
+            "a position is held twice"
+        );
+        assert!(
+            !rows_cover_run(&rows(&[11, 12, 13]), &(10..=12)),
+            "the rows start past the run"
+        );
+        assert!(
+            !rows_cover_run(&rows(&[10, 11, 12, 13]), &(10..=12)),
+            "a row lies past the run"
+        );
+        assert!(!rows_cover_run(&rows(&[]), &(10..=12)), "no rows");
+    }
+
+    /// One commitment per block, at the block's own height, except in `missing`, whose
+    /// blocks carry no tree size: `size_at(h) = h + 1`.
+    fn sizes(missing: Range<u32>) -> impl FnMut(BlockHeight) -> Result<Option<u64>, ()> {
+        move |height| {
+            let height = u32::from(height);
+            Ok((!missing.contains(&height)).then_some(u64::from(height) + 1))
+        }
+    }
+
+    /// The walk this module replaced (oldest stretch first), kept as the reference the
+    /// newest-first walk must agree with wherever every block has its tree size.
+    fn rescans_oldest_first(
+        mut size_at: impl FnMut(BlockHeight) -> Result<Option<u64>, ()>,
+        run: &RangeInclusive<u64>,
+        stretches: &[Range<BlockHeight>],
+    ) -> Option<Vec<Range<BlockHeight>>> {
+        let (first, last) = (*run.start(), *run.end());
+        let mut rescans = vec![];
+        for stretch in stretches {
+            let end_size = size_at(stretch.end - 1).ok()??;
+            if end_size <= first {
+                continue;
+            }
+            let from = first_block_past(&mut size_at, first, stretch).ok()??;
+            let to = if end_size > last {
+                first_block_past(&mut size_at, last, stretch).ok()??
+            } else {
+                stretch.end - 1
+            };
+            rescans.push(from..to + 1);
+            if end_size > last {
+                break;
+            }
+        }
+        Some(rescans)
+    }
+
+    #[test]
+    fn rescans_for_finds_the_scanned_blocks_holding_a_run() {
+        let h = BlockHeight::from;
+        let stretches = [h(10)..h(20), h(30)..h(40), h(50)..h(60)];
+        let rescans =
+            |run: RangeInclusive<u64>| rescans_for(sizes(0..0), &run, &stretches).expect("sizes");
+        assert_eq!(
+            rescans(32..=35),
+            Some(vec![h(32)..h(36)]),
+            "a run inside one stretch"
+        );
+        assert_eq!(
+            rescans(15..=55),
+            Some(vec![h(15)..h(20), h(30)..h(40), h(50)..h(56)]),
+            "a run across stretches"
+        );
+        assert_eq!(
+            rescans(70..=75),
+            Some(vec![]),
+            "positions of pending blocks need nothing"
+        );
+        assert_eq!(
+            rescans(22..=25),
+            Some(vec![h(30)..h(31)]),
+            "a run below a stretch's first block: nothing tells whether that block holds it"
+        );
+        // Wherever every block has its tree size, the walk agrees with the oldest-first one.
+        for first in 0..70u64 {
+            for last in first..70 {
+                assert_eq!(
+                    rescans(first..=last),
+                    rescans_oldest_first(sizes(0..0), &(first..=last), &stretches),
+                    "run {first}..={last}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rescans_for_never_reads_the_stretches_below_a_run() {
+        let h = BlockHeight::from;
+        let stretches = [h(10)..h(20), h(30)..h(40), h(50)..h(60)];
+        // The oldest stretch's blocks carry no tree size (scanned before the wallet
+        // recorded the pool's sizes); the oldest-first walk could place no run at all.
+        let old_gap = || sizes(10..20);
+        assert_eq!(
+            rescans_oldest_first(old_gap(), &(32..=35), &stretches),
+            None,
+            "the oldest-first walk stops at the old stretch"
+        );
+        assert_eq!(
+            rescans_for(old_gap(), &(32..=35), &stretches),
+            Ok(Some(vec![h(32)..h(36)])),
+            "a run beginning inside a newer stretch is placed"
+        );
+        assert_eq!(
+            rescans_for(old_gap(), &(45..=55), &stretches),
+            Ok(Some(vec![h(50)..h(56)])),
+            "the stretch ending below the run ends the walk"
+        );
+        assert_eq!(
+            rescans_for(sizes(30..40), &(52..=55), &stretches),
+            Ok(Some(vec![h(52)..h(56)])),
+            "a run beginning inside the newest stretch reads nothing older"
+        );
+        assert_eq!(
+            rescans_for(sizes(30..40), &(32..=35), &stretches),
+            Ok(None),
+            "a run in blocks without sizes still cannot be placed"
+        );
+        assert_eq!(
+            rescans_for(old_gap(), &(30..=35), &stretches),
+            Ok(None),
+            "nor one that may begin below its stretch's first block, where only the old \
+             stretch's end could tell"
+        );
     }
 }

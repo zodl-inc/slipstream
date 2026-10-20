@@ -391,12 +391,21 @@ pub async fn run_to_completion(
     // With the buffer empty it costs a connection open and two queries. Warn-and-continue,
     // as the open-time heals: a sweep that fails leaves the rows buffered (no range deletes
     // rows at positions it does not feed) for the next pass's sweep, and the pass runs.
-    if let Err(e) = crate::persist::sweep_stranded_graft_rows(
-        session.db_mut(),
-        &config.wallet_db_path,
-        config.graft_subtree,
-        config.anchor_retention.as_ref(),
-    ) {
+    // Its SQLite and tree work blocks, so it runs off the async worker, as the range-end
+    // finish does (`block_in_place`, which a current-thread runtime does not offer).
+    let mut sweep = || {
+        crate::persist::sweep_stranded_graft_rows(
+            session.db_mut(),
+            &config.wallet_db_path,
+            config.graft_subtree,
+            config.anchor_retention.as_ref(),
+        )
+    };
+    let swept = match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::CurrentThread => sweep(),
+        _ => tokio::task::block_in_place(sweep),
+    };
+    if let Err(e) = swept {
         warn!(%e, "graft sweep failed (non-fatal) — continuing");
     }
     // Counter for back-to-back ScanContinuity recoveries without a successful range.
