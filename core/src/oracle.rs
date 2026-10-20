@@ -1992,6 +1992,7 @@ mod tests {
         use crate::block_source::MemBlockSource;
         use crate::chunk::Chunk;
         use crate::error::SlipstreamError;
+        use crate::oracle::semantic_diff;
         use crate::persist::{PersistLane, WriteBehindFacade};
         use crate::wallet_session::{TEST_UFVK, WalletSession};
         use crate::{AnchorRetention, AnchorRetentionInterval};
@@ -2448,6 +2449,118 @@ mod tests {
                     "[{name}] the graft buffer is drained"
                 );
             }
+        }
+
+        /// R's durable anchors on the 50-block grid: blocks 50 and 100, both in its
+        /// range-end shard.
+        const R_ANCHORS: [u64; 2] = [START + 50, START + 100];
+
+        /// The ChainTip stand-in [150, 300), never grafted, then the Historic range
+        /// R = [20, 150) in two units, on a 50-block anchor grid from START. R crosses into
+        /// shard 1 at block 40, so the range-end finish builds its shard-1 rows. Scans one
+        /// wallet with graft off and one with graft on, the chain tip `tip_lead` blocks
+        /// above the last block, and returns them in that order.
+        async fn tip_range_then_r(
+            root: &Path,
+            tip_lead: u64,
+        ) -> (std::path::PathBuf, std::path::PathBuf) {
+            let base_size = SHARD - 40;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 300);
+            let tip = blocks.last().expect("blocks").height + tip_lead;
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            let mut dirs = vec![];
+            for (name, graft) in [("graft-off", false), ("graft-on", true)] {
+                let dir = root.join(name);
+                open_wallet(&dir, &base, &blocks, tip);
+                scan_range(
+                    &dir,
+                    &base,
+                    &blocks,
+                    150,
+                    &[150],
+                    false,
+                    Some(anchors.clone()),
+                    End::Finish,
+                )
+                .await
+                .expect("tip range");
+                scan_range(
+                    &dir,
+                    &base,
+                    &blocks,
+                    20,
+                    &[65, 65],
+                    graft,
+                    Some(anchors.clone()),
+                    End::Finish,
+                )
+                .await
+                .expect("historic range R");
+                assert_eq!(
+                    sapling_checkpoints_among(&dir, &R_ANCHORS),
+                    R_ANCHORS,
+                    "[{name}] the wallet keeps R's anchors"
+                );
+                dirs.push(dir);
+            }
+            let on = dirs.pop().expect("graft-on wallet");
+            let off = dirs.pop().expect("graft-off wallet");
+            (off, on)
+        }
+
+        /// Graft on leaves the same wallet as graft off, checkpoint rows and retained marks
+        /// included, in every pool. The one documented exception is the shard blobs, which
+        /// may differ in retention-flag placement (a deferred build is one `from_iter`, the
+        /// incremental path several); their count still matches.
+        fn assert_matches_graft_off(off: &Path, on: &Path) {
+            let report =
+                semantic_diff(&off.join("data.db"), &on.join("data.db")).expect("semantic diff");
+            for t in &report.tables {
+                if t.table.ends_with("_tree_shards") {
+                    assert_eq!(
+                        t.rows_a, t.rows_b,
+                        "graft on leaves as many {} as graft off",
+                        t.table
+                    );
+                    continue;
+                }
+                assert!(
+                    t.is_clean(),
+                    "graft on leaves the same {} as graft off:\n{}",
+                    t.table,
+                    report.render()
+                );
+            }
+        }
+
+        /// `finish_graft_blocking` builds the range-end shard's rows after the fact, so it
+        /// registers their anchors as retained before inserting them, as every build in
+        /// `sparse_put_blocks` does ([B6]): with the store at its 100-checkpoint budget (the
+        /// ChainTip range's window, scanned first), shardtree's prune inside `insert_tree`
+        /// would otherwise evict the anchors it just added, and the retained marks would
+        /// never be written.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn finish_keeps_anchors_when_the_checkpoint_budget_is_full() {
+            let root = tempfile::tempdir().expect("tempdir");
+            // Not deep: the ChainTip stand-in fills the 100-checkpoint window.
+            let (off, on) = tip_range_then_r(root.path(), 0).await;
+            assert_matches_graft_off(&off, &on);
+        }
+
+        /// Buffered rows are built in a later call than the one that scanned them, so they
+        /// carry the retentions that call gives its own commitments. Here every range lies
+        /// deep below the tip (see `DEEP_HISTORY_CHECKPOINT_MARGIN`), so R's builds (its
+        /// shard-0 close and the range-end finish) keep no per-block checkpoint but the
+        /// durable anchors, with graft on as with graft off.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn deferred_builds_keep_no_deep_history_checkpoints_but_the_anchors() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let (off, on) = tip_range_then_r(root.path(), 20_000).await;
+            assert_matches_graft_off(&off, &on);
         }
     }
 }

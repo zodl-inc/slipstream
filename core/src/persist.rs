@@ -1220,6 +1220,18 @@ pub fn sparse_put_blocks(
                 );
             }
         }
+        // [B6] The rows fed here may be built in a LATER call (an eager flush, a shard
+        // close, the range-end finish), so they must carry the retentions this call's own
+        // build gives its commitments: the deep-history doom is decided per call, from
+        // the same inputs the transaction below decides it from.
+        let chain_tip = inner.chain_height()?;
+        if blocks
+            .last()
+            .is_some_and(|last| is_deep_history(chain_tip, last.height()))
+        {
+            doom_deep_history_stream(&mut sap_stream, anchor_floor);
+            doom_deep_history_stream(&mut orch_stream, anchor_floor);
+        }
         let sp = plan_pool(
             &ctx.conn,
             ctx.verify_sample,
@@ -1335,9 +1347,7 @@ pub fn sparse_put_blocks(
             // empty maps → ensure_checkpoints adds nothing → no store
             // checkpoints → nothing for prune_excess_checkpoints to evict
             // into an unmaterialized (buffered/root-only) shard.
-            let deep_history = wdb.chain_height()?.is_some_and(|tip| {
-                last_scanned_height + DEEP_HISTORY_CHECKPOINT_MARGIN < tip
-            });
+            let deep_history = is_deep_history(wdb.chain_height()?, last_scanned_height);
             if deep_history {
                 let doom_all = BlockHeight::from(u32::MAX);
                 downgrade_doomed_checkpoints(&mut sapling_commitments, doom_all, anchor_floor);
@@ -2151,18 +2161,52 @@ fn downgrade_doomed_checkpoints<H>(
 ) -> u64 {
     let mut downgraded = 0u64;
     for slot in commitments.iter_mut().flatten() {
-        if let Retention::Checkpoint { id, marking } = &slot.1
-            && *id < cutoff
-            && !should_retain_anchor(anchor_retention, *id)
-        {
-            slot.1 = match marking {
-                Marking::Marked => Retention::Marked,
-                _ => Retention::Ephemeral,
-            };
+        if downgrade_if_doomed(&mut slot.1, cutoff, anchor_retention) {
             downgraded += 1;
         }
     }
     downgraded
+}
+
+/// The rule [`downgrade_doomed_checkpoints`] applies to each retention: a checkpoint below
+/// `cutoff` that is not a durable anchor becomes the residue upstream's prune leaves on its
+/// leaf. Returns whether `retention` was such a checkpoint.
+fn downgrade_if_doomed(
+    retention: &mut Retention<BlockHeight>,
+    cutoff: BlockHeight,
+    anchor_retention: Option<&AnchorRetention>,
+) -> bool {
+    if let Retention::Checkpoint { id, marking } = *retention
+        && id < cutoff
+        && !should_retain_anchor(anchor_retention, id)
+    {
+        *retention = match marking {
+            Marking::Marked => Retention::Marked,
+            _ => Retention::Ephemeral,
+        };
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether a `sparse_put_blocks` call whose last block is `last_scanned_height` lies deep
+/// enough below `chain_tip` to keep no per-block checkpoints but the durable anchors (see
+/// `DEEP_HISTORY_CHECKPOINT_MARGIN`).
+fn is_deep_history(chain_tip: Option<BlockHeight>, last_scanned_height: BlockHeight) -> bool {
+    chain_tip.is_some_and(|tip| last_scanned_height + DEEP_HISTORY_CHECKPOINT_MARGIN < tip)
+}
+
+/// The deep-history doom on a graft accumulator's input stream: every checkpoint but the
+/// durable anchors is downgraded, as the transaction dooms the call's own commitments.
+fn doom_deep_history_stream<H>(
+    stream: &mut [(H, Retention<BlockHeight>)],
+    anchor_retention: Option<&AnchorRetention>,
+) {
+    let doom_all = BlockHeight::from(u32::MAX);
+    for (_, retention) in stream.iter_mut() {
+        downgrade_if_doomed(retention, doom_all, anchor_retention);
+    }
 }
 
 // ── WalletWrite facade ─────────────────────────────────────────────────────────
@@ -3522,18 +3566,35 @@ impl PersistLane {
             });
             doomed_checkpoint_cutoff(existing.iter().copied(), frontier_id, new_ids)
         }
+        // [B6] The anchors are PRE-registered before each insert, as in every build
+        // `sparse_put_blocks` runs: shardtree's excess-checkpoint prune runs INSIDE
+        // insert_tree, so with the store at its budget (the ChainTip range's window) an
+        // anchor retained only afterwards is already gone, and flush_* writes retained
+        // marks only for ids the store retains.
+        let anchor_floor = anchor_floor.as_ref();
         db.transactionally::<_, _, SqliteClientError>(|wdb| {
             if let Some((seg_start, mut rows)) = rows_to_segment(sap_rows) {
                 if let Some(cutoff) =
                     finish_cutoff(sap_tree.store().checkpoints.keys().copied(), &rows)
                 {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
+                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor);
                 }
                 for (subtree, checkpoints) in build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
                     seg_start,
                     &mut rows,
                     BUILD_CHUNK_SIZE,
                 ) {
+                    for h in checkpoints
+                        .keys()
+                        .copied()
+                        .filter(|h| should_retain_anchor(anchor_floor, *h))
+                    {
+                        sap_tree.ensure_retained(h).map_err(|e| {
+                            SqliteClientError::CorruptedData(format!(
+                                "finish sapling retain: {e:?}"
+                            ))
+                        })?;
+                    }
                     sap_tree.insert_tree(subtree, checkpoints).map_err(|e| {
                         SqliteClientError::CorruptedData(format!("finish sapling insert: {e:?}"))
                     })?;
@@ -3544,13 +3605,24 @@ impl PersistLane {
                 if let Some(cutoff) =
                     finish_cutoff(orch_tree.store().checkpoints.keys().copied(), &rows)
                 {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
+                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor);
                 }
                 for (subtree, checkpoints) in build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
                     seg_start,
                     &mut rows,
                     BUILD_CHUNK_SIZE,
                 ) {
+                    for h in checkpoints
+                        .keys()
+                        .copied()
+                        .filter(|h| should_retain_anchor(anchor_floor, *h))
+                    {
+                        orch_tree.ensure_retained(h).map_err(|e| {
+                            SqliteClientError::CorruptedData(format!(
+                                "finish orchard retain: {e:?}"
+                            ))
+                        })?;
+                    }
                     orch_tree.insert_tree(subtree, checkpoints).map_err(|e| {
                         SqliteClientError::CorruptedData(format!("finish orchard insert: {e:?}"))
                     })?;
