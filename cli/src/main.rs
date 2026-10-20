@@ -1088,9 +1088,10 @@ fn cmd_sync(
         // --follow: run the FULL autonomous engine session (import if --ufvk, resilient initial
         // pass, then tip-following + mempool) via zodl_slipstream::session::run_session — the
         // SAME orchestration the FFI uses. Observability = the ticker above + the engine's own
-        // tracing (the "sync stage split" lines). Runs until Ctrl-C; returns only on a
-        // non-transient initial error. Replaces the old bespoke loop (which exited on any
-        // follow-pass blip — the exact resilience hazard the lift removes).
+        // tracing (the "sync stage split" lines). Runs until Ctrl-C: `run_session` returns
+        // only when a host stops it for a wallet change, which the CLI never does. Replaces
+        // the old bespoke loop (which exited on any follow-pass blip — the exact resilience
+        // hazard the lift removes).
         if follow {
             let scfg = zodl_slipstream::SessionConfig {
                 engine: cfg.clone(),
