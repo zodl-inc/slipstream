@@ -10,6 +10,15 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `wallet_session::WalletSession::truncate_to_height`: upstream's
+  `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
+  it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
+  the height the wallet was truncated to. The scheduler's reorg recovery calls it.
+
+### Changed
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
   whatever the graft buffer held for its first shard, and a build lays rows out from the
@@ -63,11 +72,9 @@ workspace.
   itself, the first range to seed in the shard resumes only the run that ends right
   before its start, as above.
 
+## [0.4.0-pre.2] - 2026-10-20
+
 ### Added
-- `wallet_session::WalletSession::truncate_to_height`: upstream's
-  `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
-  it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
-  the height the wallet was truncated to. The scheduler's reorg recovery calls it.
 - `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
   host calls the first right before it changes the wallet (adding or removing an account,
   a rewind, a wipe), and the running session's scan ends at its next block instead of
@@ -104,7 +111,7 @@ workspace.
   fetch of the first chunk, and one cut short by an abort leaves it owed.
 - `ffi_handle::SlipstreamHandle` has a new public field, `unfinished_passes`: code that
   builds the handle with a struct literal must set it (to `Vec::new()`).
-- `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.15-stop-for-wallet-change`.
 
 ## [0.4.0-pre.1] - 2026-10-06
 
