@@ -182,6 +182,12 @@ pub(crate) fn should_retry(err: &SlipstreamError, attempt: u32) -> Option<Durati
 /// Run `sync_once` with the T6.8-H2 bounded retry ladder and return the first successful
 /// `SyncOutcome` or the last error.
 ///
+/// A pass the host stopped for a wallet change ([`SlipstreamError::StoppedForWalletChange`]) is
+/// returned at once: never retried, and not counted as a failed attempt (no
+/// [`Progress::note_attempt_failed`]). Nothing failed — the host asked for it — and a retry would
+/// open a new pass that writes to the wallet (subtree roots, chain tip, UTXOs) while the host is
+/// changing it.
+///
 /// `SyncState` is NOT modified by this function — the caller sets Syncing before calling and
 /// transitions Done/Error based on the result. SyncStarted is NOT emitted here — it is the
 /// caller's responsibility (emitted once per session).
@@ -202,6 +208,9 @@ pub(crate) async fn run_pass_with_retry(
                 crate::report::log_pass_summary(&outcome, cfg);
                 return Ok(outcome);
             }
+            // The host stopped the pass for a wallet change: hand it straight back, ahead of
+            // the failed-attempt bookkeeping and the retry below (see the doc above).
+            Err(err) if err.is_stop_for_wallet_change() => return Err(err),
             Err(err) => {
                 // A failed attempt that did not give up its download ends every
                 // download-failure run (see `Progress::note_attempt_failed`).
@@ -255,15 +264,26 @@ impl SessionReporter {
 /// Run a full sync session: resilient Tor bootstrap (never falls back to direct) → resilient
 /// initial pass (T8.7, with [B4-16] non-transient revival) → tip-following loop with mempool
 /// monitoring, until the future is dropped or aborted by the host (via the `AbortHandle`
-/// returned by `ffi_handle::spawn_supervised`).
+/// returned by `ffi_handle::spawn_supervised`), or until the host stops it for a wallet change.
 ///
-/// NEVER returns. A non-transient initial-pass error surfaces `Error` + the tag-4 event to the
-/// reporter (exactly the pre-revival behaviour — hosts still see every failure), then the
-/// session REVIVES with a capped backoff (`wedge_revival_backoff`) instead of dying: before
-/// [B4-16] `run_session` returned here and nothing engine- or host-side ever restarted the
-/// task, so one wallet-class error bricked sync until app relaunch. Panics are still converted
-/// to `Error` by the supervisor and are NOT revived (a deterministic panic loop is worse than a
-/// dead pass — panics are bugs to fix, not weather to ride out).
+/// Returns ONLY when the host stops the session for a wallet change: it calls
+/// [`Progress::request_stop_for_wallet_change`] right before adding or removing an account, a
+/// rewind or a wipe, and the scan answers at its next block with
+/// [`SlipstreamError::StoppedForWalletChange`]. That is a request honoured, not a failure, so
+/// the session ends QUIETLY wherever it lands, in the initial pass or in a follow catch-up pass:
+/// `SyncState::Idle`, one info line, and a return — no `Error` state, no tag-4 event, no
+/// revival, no retry, no backoff. The interrupted chunk was not written (upstream writes only
+/// in its final `put_blocks`), so the next session scans it again. The stop is armed per
+/// session ([`Progress::begin_session`], called right after the pass lock is taken), so a
+/// request aimed at an earlier session never ends this one.
+///
+/// Otherwise it never returns. A non-transient initial-pass error surfaces `Error` + the tag-4
+/// event to the reporter (exactly the pre-revival behaviour — hosts still see every failure),
+/// then the session REVIVES with a capped backoff (`wedge_revival_backoff`) instead of dying:
+/// before [B4-16] `run_session` returned here and nothing engine- or host-side ever restarted
+/// the task, so one wallet-class error bricked sync until app relaunch. Panics are still
+/// converted to `Error` by the supervisor and are NOT revived (a deterministic panic loop is
+/// worse than a dead pass — panics are bugs to fix, not weather to ride out).
 pub async fn run_session(
     config: SessionConfig,
     reporter: SessionReporter,
@@ -332,7 +352,8 @@ pub async fn run_session(
     // (transient/transport) failure. On a transient error we retry with a capped backoff,
     // surfacing Disconnected (Swift maps state 0 → .disconnected) between attempts; a
     // NON-transient error (config/logic) surfaces Error and then REVIVES with the [B4-16]
-    // capped backoff. Panics → the supervisor → Error(2), NOT revived.
+    // capped backoff. Panics → the supervisor → Error(2), NOT revived. A stop the host asked
+    // for before a wallet change is neither: the session ends quietly (see the doc above).
     let mut initial_failures: u32 = 0;
     let mut revivals: u32 = 0;
     let outcome = loop {
@@ -346,6 +367,18 @@ pub async fn run_session(
         .await
         {
             Ok(outcome) => break outcome,
+            // The host stopped the session for a wallet change. Matched BEFORE the transient
+            // and non-transient arms below, so none of their handling runs: no backoff, no
+            // `Error(1)`, no tag-4 event, no revival. Idle is the state a host's own stop
+            // leaves too.
+            Err(err) if err.is_stop_for_wallet_change() => {
+                reporter.set_state(SyncState::Idle);
+                tracing::info!(
+                    stopped_at_utc = %wall_clock_utc(),
+                    "initial sync pass stopped for a wallet change — session ends"
+                );
+                return;
+            }
             Err(err) if err.is_transient() => {
                 initial_failures += 1;
                 let backoff = sync_retry_backoff(initial_failures);
@@ -392,13 +425,16 @@ pub async fn run_session(
         value: outcome.enhance.txs_stored,
     });
 
+    // Returns only when a catch-up pass is stopped for a wallet change; the session ends with it.
     follow_loop(&config, &reporter, tor_conn.as_ref(), outcome.chain_tip).await;
 }
 
 /// ── T8.1 follow loop: track the chain while the host keeps the task alive ────
 /// Extracted verbatim from `run_session`'s success arm ([B4-16] revival refactor) —
-/// behaviour unchanged. Never returns; the host aborts the task on stop()/free()/restart
-/// (tokio sleeps/awaits are abort-safe).
+/// behaviour unchanged. Returns only when the host stops a catch-up pass for a wallet change
+/// (state set to `Idle` first, the same quiet end as the initial pass — see [`run_session`]),
+/// and `run_session` then returns too. Otherwise it never returns; the host aborts the task on
+/// stop()/free()/restart (tokio sleeps/awaits are abort-safe).
 ///
 /// State contract (Deviation D3): Done between passes, Syncing during real catch-up
 /// passes. Jitter (uniform [MIN, MAX] per cycle) defeats the timing fingerprint a fixed
@@ -541,6 +577,19 @@ async fn follow_loop(
                     value: o.enhance.txs_stored,
                 });
             }
+            // The host stopped the catch-up pass for a wallet change: end the session, ahead
+            // of the failure arm below (which would revert to Done and poll again). Idle, not
+            // Done: the host is about to change the wallet, so it is no longer known to be
+            // synced to `last_tip`.
+            Err(err) if err.is_stop_for_wallet_change() => {
+                reporter.set_state(SyncState::Idle);
+                tracing::info!(
+                    last_tip,
+                    stopped_at_utc = %wall_clock_utc(),
+                    "follow catch-up pass stopped for a wallet change — session ends"
+                );
+                return;
+            }
             Err(err) => {
                 consecutive_failures += 1;
                 // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
@@ -593,6 +642,10 @@ mod tests {
         assert!(should_retry(&cont, 1).is_none());
         let misbehaving = SlipstreamError::MisbehavingServer;
         assert!(should_retry(&misbehaving, 1).is_none());
+        // `run_pass_with_retry` returns a wallet-change stop before it ever asks; even if it
+        // did ask, the answer is no.
+        let stop = SlipstreamError::StoppedForWalletChange;
+        assert!(should_retry(&stop, 1).is_none());
     }
 
     #[test]

@@ -46,7 +46,7 @@ use zcash_primitives::block::BlockHash;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
-    block_source::MemBlockSource,
+    block_source::{MemBlockSource, StoppedForWalletChange},
     chunk::ChunkQueueReceiver,
     config::{Endpoint, EngineConfig},
     connector::TorConn,
@@ -155,17 +155,30 @@ pub fn should_interleave_enhancement(chunks_done: u64, every: u32) -> bool {
 
 /// Convert a `scan_cached_blocks` error into a [`SlipstreamError`].
 ///
-/// If the error is a continuity break (reorg), returns the structured
-/// [`SlipstreamError::ScanContinuity`] variant so the scheduler can
+/// If the block source refused a block because the host asked for a stop
+/// before changing the wallet ([`MemBlockSource::with_stop`]), returns
+/// [`SlipstreamError::StoppedForWalletChange`], which the session ends
+/// quietly on. If the error is a continuity break (reorg), returns the
+/// structured [`SlipstreamError::ScanContinuity`] variant so the scheduler can
 /// recover via truncate + re-suggest. All other errors are stringified
 /// into [`SlipstreamError::Wallet`].
+///
+/// The block-source error type is [`MemBlockSource`]'s, the one source the
+/// engine scans with, rather than a generic: that is what proves
+/// `ChainError::BlockSource` can only ever be the wallet-change stop. A new
+/// source error would no longer compile here, instead of being mistaken for
+/// the stop (or stringified into `Wallet`, which surfaces `Error` and
+/// revives the session).
 ///
 /// Mirrors the discriminant from upstream sync.rs:404:
 ///   `Err(ChainError::Scan(err)) if err.is_continuity_error()`
 ///   (zcash_client_backend-0.22.0/src/sync.rs:404-413)
-fn map_scan_error<WE: std::fmt::Display, BE: std::fmt::Display>(
-    e: ChainError<WE, BE>,
+fn map_scan_error<WE: std::fmt::Display>(
+    e: ChainError<WE, StoppedForWalletChange>,
 ) -> SlipstreamError {
+    if let ChainError::BlockSource(StoppedForWalletChange) = e {
+        return SlipstreamError::StoppedForWalletChange;
+    }
     if let ChainError::Scan(ref scan_err) = e
         && scan_err.is_continuity_error()
     {
@@ -260,6 +273,11 @@ struct WriteBehind {
 /// range_start equals the first chunk's start height.
 ///
 /// `progress` — if `Some`, bumps `scanned_blocks` per chunk after a successful scan.
+/// It also carries the host's stop for a wallet change
+/// ([`Progress::request_stop_for_wallet_change`]): the scan then ends at its
+/// next block, or before the write-behind range-end tree build if every block
+/// is already scanned, with [`SlipstreamError::StoppedForWalletChange`]. The
+/// interrupted scan call wrote nothing; what earlier calls committed stays.
 ///
 /// ## Adaptive sub-batching (T5.2)
 ///
@@ -363,6 +381,18 @@ pub async fn scan_chunks(
         let final_drain_elapsed = final_drain_started.elapsed();
         return match (result, drain_result) {
             (Ok(mut stats), Ok(())) => {
+                // A host's stop for a wallet change that came after the last
+                // block was scanned must still not start another wallet write,
+                // and the build below is one: a transaction run synchronously in
+                // block_in_place, where the host's abort cannot reach it. Refuse
+                // it as the block source refuses a block. Every submitted unit
+                // is committed (the drain above), and the shard the
+                // accumulators still hold stays in the graft buffer, which the
+                // next pass resumes, as on any error exit. This also returns
+                // before the scheduler's per-range enhancement writes.
+                if progress.as_deref().is_some_and(Progress::stop_requested) {
+                    return Err(SlipstreamError::StoppedForWalletChange);
+                }
                 // v0.4 Plan A: build the range-end/tip shard the accumulators still
                 // hold (success path only — on errors the buffer resumes the shard).
                 tokio::task::block_in_place(|| wb.lane.finish_graft_blocking())?;
@@ -601,7 +631,13 @@ async fn scan_chunks_inner(
             // v0.6 P6: source lives OUTSIDE the closure so its two-walk split
             // (pass 1 = feed runners, pass 2 = wallet-side processing) can be
             // read back after the call.
-            let source = MemBlockSource::new(&chunk);
+            // The session's progress rides along so that a host's stop for a
+            // wallet change ends this call at the next block instead of after
+            // the whole sub-batch (one relaxed check per block; with no
+            // request it changes nothing). The refusal comes back as
+            // ChainError::BlockSource, which map_scan_error below turns into
+            // StoppedForWalletChange; the call has written nothing by then.
+            let source = MemBlockSource::new(&chunk).with_stop(progress.as_deref());
             let scan_result = tokio::task::block_in_place(|| {
                 if let Some(wb) = wb.as_mut() {
                     // T6.9 write-behind: virtualized reads + stash (no DB work
@@ -1167,6 +1203,26 @@ mod tests {
         assert_eq!(s.chunks, 0);
         assert_eq!(s.sapling_received, 0);
         assert_eq!(s.orchard_received, 0);
+    }
+
+    // ── map_scan_error: the stop for a wallet change ─────────────────────────
+
+    /// The block source's stop becomes the variant the session ends quietly on, and nothing
+    /// else does: a wallet error still maps to `Wallet`, exactly as before.
+    #[test]
+    fn only_the_block_source_stop_maps_to_the_wallet_change_stop() {
+        let stop = map_scan_error(ChainError::<String, StoppedForWalletChange>::BlockSource(
+            StoppedForWalletChange,
+        ));
+        assert!(stop.is_stop_for_wallet_change(), "got: {stop}");
+
+        let wallet = map_scan_error(ChainError::<String, StoppedForWalletChange>::Wallet(
+            "database is locked".into(),
+        ));
+        assert!(
+            matches!(wallet, SlipstreamError::Wallet(_)),
+            "got: {wallet}"
+        );
     }
 
     // ── Controller unit tests (T5.2) ──────────────────────────────────────────

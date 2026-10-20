@@ -36,8 +36,29 @@ pub enum SlipstreamError {
     #[error("misbehaving server (invalid or out-of-range data in response)")]
     MisbehavingServer,
 
+    /// A channel inside the engine closed under a sender: the fetch side's chunk queue lost its
+    /// scanner (`chunk.rs`), typically because the scan already ended with an error of its own,
+    /// which takes precedence (`scheduler.rs`). Engine lifecycle, not a request from the host:
+    /// NOT the stop a host asks for before changing the wallet, which is
+    /// [`Self::StoppedForWalletChange`] and the only one the session ends quietly on.
     #[error("engine is stopped")]
     Stopped,
+
+    /// The host asked the running session to stop because it is about to change the wallet
+    /// (adding or removing an account, a rewind, a wipe; see
+    /// [`crate::events::Progress::request_stop_for_wallet_change`]), and the scan stopped at its
+    /// next block. Raised from the session's block source
+    /// ([`crate::block_source::StoppedForWalletChange`]) and before the range-end tree build.
+    ///
+    /// It is not a failure. The session ends quietly: `run_session` sets `SyncState::Idle` and
+    /// returns, with no `Error` state, no tag-4 event, no revival and no retry
+    /// ([`Self::is_stop_for_wallet_change`] is what the session checks). Nothing was written for
+    /// the interrupted chunk, because upstream `scan_cached_blocks` writes only in its final
+    /// `put_blocks`, so the next pass scans that chunk again.
+    ///
+    /// Not to be confused with [`Self::Stopped`], an engine channel that closed.
+    #[error("sync stopped for a wallet change")]
+    StoppedForWalletChange,
 
     /// Scan detected a chain continuity break (reorg) at the given height.
     /// The scheduler's recovery arm truncates the wallet DB and re-suggests ranges.
@@ -71,10 +92,27 @@ impl SlipstreamError {
     /// - `Discontinuity`   → false     (fetch continuity bug; retry would loop)
     /// - `MisbehavingServer` → false   (bad proto / decode error; not a transport transient)
     /// - `Stopped`         → false     (engine lifecycle; not retryable)
+    /// - `StoppedForWalletChange` → false (the host asked for it; a retry would scan the wallet
+    ///   the host is about to change — the session ends quietly instead, see
+    ///   [`Self::is_stop_for_wallet_change`])
     /// - `WireCollapse`    → false     (handled by the v0.7 failover loop — the generic
     ///   transient-reconnect path would dial the SAME collapsed server again)
     pub fn is_transient(&self) -> bool {
         matches!(self, SlipstreamError::Transport(_))
+    }
+
+    /// Returns `true` only for [`SlipstreamError::StoppedForWalletChange`]: the host asked the
+    /// running session to stop because it is about to change the wallet.
+    ///
+    /// The session checks this before anything else it does with a failed pass. The retry loop
+    /// returns the stop at once (no retry, and not counted as a failed attempt), and the initial
+    /// pass and every follow catch-up pass end the session quietly on it, ahead of the transient
+    /// and non-transient handling that would otherwise back off, surface `Error` or revive.
+    ///
+    /// [`SlipstreamError::Stopped`], a closed engine channel, is a different thing: `false` here,
+    /// like every other variant, so it keeps its existing handling.
+    pub fn is_stop_for_wallet_change(&self) -> bool {
+        matches!(self, SlipstreamError::StoppedForWalletChange)
     }
 }
 
@@ -146,5 +184,49 @@ mod tests {
     #[test]
     fn stopped_is_not_transient() {
         assert!(!SlipstreamError::Stopped.is_transient());
+    }
+
+    // ── stop for a wallet change ─────────────────────────────────────────────
+
+    #[test]
+    fn stopped_for_wallet_change_displays_its_cause() {
+        assert_eq!(
+            SlipstreamError::StoppedForWalletChange.to_string(),
+            "sync stopped for a wallet change"
+        );
+    }
+
+    /// A retry would scan the wallet the host is about to change: the stop is never transient.
+    #[test]
+    fn stopped_for_wallet_change_is_not_transient() {
+        assert!(!SlipstreamError::StoppedForWalletChange.is_transient());
+    }
+
+    /// Only the host's wallet-change stop ends a session quietly. Every other error keeps its own
+    /// handling, and the closed-channel `Stopped` in particular is a different thing.
+    #[test]
+    fn only_the_wallet_change_stop_is_a_stop_for_wallet_change() {
+        assert!(SlipstreamError::StoppedForWalletChange.is_stop_for_wallet_change());
+        assert!(
+            !SlipstreamError::Stopped.is_stop_for_wallet_change(),
+            "a closed chunk channel is not a stop the host asked for"
+        );
+        for other in [
+            SlipstreamError::Config("bad birthday".into()),
+            SlipstreamError::Transport("timeout".into()),
+            SlipstreamError::Discontinuity {
+                at: 1_000_000,
+                detail: "prev-hash mismatch".into(),
+            },
+            SlipstreamError::Wallet("scan_cached_blocks: ...".into()),
+            SlipstreamError::MisbehavingServer,
+            SlipstreamError::ScanContinuity { at: 663_195 },
+            SlipstreamError::WireCollapse {
+                measured_mbps: 0.0,
+                floor_mbps: 1.0,
+            },
+        ] {
+            assert!(!other.is_stop_for_wallet_change(), "{other}");
+        }
     }
 }
