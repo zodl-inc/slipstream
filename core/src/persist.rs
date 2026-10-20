@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::time::SystemTime;
 
 use incrementalmerkletree::{Address, Level, Marking, Position, Retention};
@@ -50,7 +50,7 @@ use zcash_client_backend::data_api::{
     chain::ChainState,
     error::{FindAccountForAddressError, LockError},
     ll::{LowLevelWalletWrite, wallet::PutBlocksError},
-    scanning::ScanRange,
+    scanning::{ScanPriority, ScanRange},
     wallet::{ConfirmationsPolicy, TargetHeight},
 };
 use zcash_client_backend::wallet::{
@@ -823,7 +823,6 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
 
 fn seed_sapling(
     db: &mut Db,
-    _from_state: &ChainState,
     anchor_floor: Option<&AnchorRetention>,
 ) -> Result<SaplingSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
@@ -867,7 +866,6 @@ fn seed_sapling(
 
 fn seed_orchard(
     db: &mut Db,
-    _from_state: &ChainState,
     anchor_floor: Option<&AnchorRetention>,
 ) -> Result<OrchardSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
@@ -911,7 +909,6 @@ fn seed_orchard(
 // fork's `with_ironwood_tree_mut` is the SQLite bridge.
 fn seed_ironwood(
     db: &mut Db,
-    _from_state: &ChainState,
     anchor_floor: Option<&AnchorRetention>,
 ) -> Result<IronwoodSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
@@ -1151,25 +1148,13 @@ pub fn sparse_put_blocks(
     // Seed per-range trees lazily (first chunk of the range), then destructure
     // once — disjoint &mut borrows for the transactionally closure, no expect().
     if sparse.sapling.is_none() {
-        sparse.sapling = Some(seed_sapling(
-            inner,
-            from_state,
-            sparse.anchor_retention.as_ref(),
-        )?);
+        sparse.sapling = Some(seed_sapling(inner, sparse.anchor_retention.as_ref())?);
     }
     if sparse.orchard.is_none() {
-        sparse.orchard = Some(seed_orchard(
-            inner,
-            from_state,
-            sparse.anchor_retention.as_ref(),
-        )?);
+        sparse.orchard = Some(seed_orchard(inner, sparse.anchor_retention.as_ref())?);
     }
     if sparse.ironwood.is_none() {
-        sparse.ironwood = Some(seed_ironwood(
-            inner,
-            from_state,
-            sparse.anchor_retention.as_ref(),
-        )?);
+        sparse.ironwood = Some(seed_ironwood(inner, sparse.anchor_retention.as_ref())?);
     }
     let gpu_on = sparse.gpu_subtree;
     let batch_on = sparse.batch_combine;
@@ -2207,6 +2192,482 @@ fn doom_deep_history_stream<H>(
     for (_, retention) in stream.iter_mut() {
         downgrade_if_doomed(retention, doom_all, anchor_retention);
     }
+}
+
+/// The deep-history doom on rows built long after they were scanned (the pass-start
+/// sweep's stranded runs): each checkpoint row is doomed when its own block lies deep
+/// below `chain_tip` now, the durable anchors excepted. Rows the graft stream doomed
+/// when they were buffered are unchanged; rows an older build buffered undoomed, or that
+/// were near the tip then, end as graft off ends them (deep checkpoints pruned).
+fn doom_deep_rows<H>(
+    rows: &mut [crate::graft_accumulator::AccRow<H>],
+    chain_tip: BlockHeight,
+    anchor_retention: Option<&AnchorRetention>,
+) {
+    let doom_all = BlockHeight::from(u32::MAX);
+    for (_, _, retention) in rows.iter_mut() {
+        if let Retention::Checkpoint { id, .. } = *retention
+            && is_deep_history(Some(chain_tip), id)
+        {
+            downgrade_if_doomed(retention, doom_all, anchor_retention);
+        }
+    }
+}
+
+/// The doomed-checkpoint cutoff of a deferred build: the one every build applies
+/// (fixture-proven, rev 2.1), computed from the store's existing ids ∪ the build's own
+/// checkpoint ids, with no new frontier (a deferred build inserts none). It downgrades
+/// exactly what upstream's per-chunk pruning would have.
+fn deferred_build_cutoff<H>(
+    existing: impl Iterator<Item = BlockHeight>,
+    rows: &[Option<(H, Retention<BlockHeight>)>],
+) -> Option<BlockHeight> {
+    let existing: Vec<BlockHeight> = existing.collect();
+    let frontier_id = existing.iter().max().copied()?;
+    let new_ids = rows.iter().flatten().filter_map(|(_, r)| match r {
+        Retention::Checkpoint { id, .. } => Some(*id),
+        _ => None,
+    });
+    doomed_checkpoint_cutoff(existing.iter().copied(), frontier_id, new_ids)
+}
+
+/// Insert rows whose build was deferred (the range-end finish's, or a stranded run the
+/// pass-start sweep builds) into `tree`, as every build in `sparse_put_blocks` inserts:
+/// the doomed-checkpoint downgrade ([`deferred_build_cutoff`]), then each subtree with its
+/// anchors PRE-registered. Shardtree's excess-checkpoint prune runs INSIDE insert_tree, so
+/// with the store at its budget (the ChainTip range's window) an anchor retained only
+/// afterwards is already gone, and flush_* writes retained marks only for ids the store
+/// retains (\[B6\]). `rows` must be one contiguous run; they are laid out from the first
+/// row's position. Returns whether anything was inserted (the caller then flushes);
+/// `label` prefixes the errors.
+fn insert_deferred_rows<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
+    rows: Vec<crate::graft_accumulator::AccRow<H>>,
+    anchor_floor: Option<&AnchorRetention>,
+    label: &str,
+) -> Result<bool, SqliteClientError>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+{
+    let Some((seg_start, mut rows)) = rows_to_segment(rows) else {
+        return Ok(false);
+    };
+    if let Some(cutoff) = deferred_build_cutoff(tree.store().checkpoints.keys().copied(), &rows) {
+        downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor);
+    }
+    for (subtree, checkpoints) in
+        build_subtrees::<_, SHARD_HEIGHT>(seg_start, &mut rows, BUILD_CHUNK_SIZE)
+    {
+        for h in checkpoints
+            .keys()
+            .copied()
+            .filter(|h| should_retain_anchor(anchor_floor, *h))
+        {
+            tree.ensure_retained(h)
+                .map_err(|e| SqliteClientError::CorruptedData(format!("{label} retain: {e:?}")))?;
+        }
+        tree.insert_tree(subtree, checkpoints)
+            .map_err(|e| SqliteClientError::CorruptedData(format!("{label} insert: {e:?}")))?;
+    }
+    Ok(true)
+}
+
+// ── v0.4 Plan A: the pass-start sweep of stranded graft rows ───────────────────
+
+/// What [`sweep_stranded_graft_rows`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GraftSweep {
+    /// Buffered rows built into the commitment trees.
+    pub(crate) built_rows: u64,
+    /// Buffered rows deleted because they could not be built as they were; the scanned
+    /// blocks holding them are queued for a rescan.
+    pub(crate) discarded_rows: u64,
+    /// The block ranges queued for a rescan.
+    pub(crate) rescans: Vec<Range<BlockHeight>>,
+}
+
+impl GraftSweep {
+    /// Whether the sweep changed nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.built_rows == 0 && self.discarded_rows == 0 && self.rescans.is_empty()
+    }
+}
+
+/// Build or discard the graft-buffer runs nothing will resume, before any range of the
+/// pass plans (`scheduler::run_to_completion` calls it before its first range). It does
+/// nothing when the buffer is empty, as it is between ranges on every path that ends a
+/// range normally.
+///
+/// A range's rows stay buffered when it stops after its last commit and before its
+/// range-end build, as when a host abort lands in the final drain (`scan.rs`). The range
+/// is scanned, and Historic ranges run newest first, so no later range resumes that
+/// shard's rows: their leaves, and the checkpoints and durable anchors among them, never
+/// reach the tree. Worse, a later range that seeds in the same shard deletes them
+/// (`graft_accumulator::resumable_run` keeps only the run it continues), and so does the
+/// close or finish cleanup of a range that builds in that shard. So this runs first:
+///
+/// - the first pending Historic range to seed in a shard resumes the run that ends right
+///   before its start ([`crate::graft::first_seeders`], [`crate::graft::stranded_runs`]);
+///   that run is left in place, as is every row when `graft_resumes` is false (no range
+///   buffers, so none resumes);
+/// - a stranded run whose end is known ([`crate::graft::can_build`]) is built as the
+///   range-end finish builds ([`insert_deferred_rows`], one transaction per pool, then its
+///   rows are deleted); the build itself refuses rows that disagree with content the tree
+///   already holds;
+/// - any other stranded run, or one whose build fails, is deleted after the scanned
+///   blocks holding it are queued for a rescan (in that order, so a crash in between
+///   leaves the rows for the next sweep).
+///
+/// Deep history: each built row's checkpoint is doomed when its own block lies deep below
+/// the chain tip now ([`doom_deep_rows`]). Rows buffered before the graft stream got the
+/// per-call doom carry every per-block checkpoint, and the deferred build's budget cutoff
+/// alone would keep some that graft off never creates.
+pub(crate) fn sweep_stranded_graft_rows(
+    db: &mut Db,
+    wallet_db_path: &std::path::Path,
+    graft_resumes: bool,
+    anchor_retention: Option<&AnchorRetention>,
+) -> Result<GraftSweep, crate::error::SlipstreamError> {
+    let werr =
+        |e: SqliteClientError| crate::error::SlipstreamError::Wallet(format!("graft sweep: {e}"));
+    let ctx = GraftCtx::open(wallet_db_path, 0)?;
+    let sapling_shards =
+        crate::graft::buffered_shards(&ctx.conn, ShieldedPool::Sapling).map_err(werr)?;
+    let orchard_shards =
+        crate::graft::buffered_shards(&ctx.conn, ShieldedPool::Orchard).map_err(werr)?;
+    if sapling_shards.is_empty() && orchard_shards.is_empty() {
+        return Ok(GraftSweep::default());
+    }
+    let (Some(chain_tip), Some(floor)) = (
+        db.chain_height().map_err(werr)?,
+        db.get_wallet_birthday().map_err(werr)?,
+    ) else {
+        return Ok(GraftSweep::default());
+    };
+    let pending = db.suggest_scan_ranges().map_err(werr)?;
+    let stretches = crate::graft::scanned_stretches(
+        pending.iter().map(|range| range.block_range().clone()),
+        floor,
+        chain_tip + 1,
+    );
+    let sweep = SweepInputs {
+        conn: &ctx.conn,
+        pending: &pending,
+        stretches: &stretches,
+        chain_tip,
+        graft_resumes,
+        anchor_retention,
+    };
+    let mut done = GraftSweep::default();
+    sweep
+        .pool::<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }, SAPLING_SHARD_HEIGHT>(
+            db,
+            ShieldedPool::Sapling,
+            &sapling_shards,
+            &mut done,
+        )
+        .map_err(werr)?;
+    sweep
+        .pool::<
+            orchard::tree::MerkleHashOrchard,
+            { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+            ORCHARD_SHARD_HEIGHT,
+        >(db, ShieldedPool::Orchard, &orchard_shards, &mut done)
+        .map_err(werr)?;
+    if !done.is_empty() {
+        info!(
+            built_rows = done.built_rows,
+            discarded_rows = done.discarded_rows,
+            rescans = ?done.rescans,
+            "graft sweep: stranded buffer rows built or queued for a rescan"
+        );
+    }
+    Ok(done)
+}
+
+/// What every pool's sweep reads ([`sweep_stranded_graft_rows`]).
+struct SweepInputs<'a> {
+    conn: &'a rusqlite::Connection,
+    /// The pending ranges, in the order the scheduler scans them.
+    pending: &'a [ScanRange],
+    /// The heights no pending range covers ([`crate::graft::scanned_stretches`]).
+    stretches: &'a [Range<BlockHeight>],
+    chain_tip: BlockHeight,
+    graft_resumes: bool,
+    anchor_retention: Option<&'a AnchorRetention>,
+}
+
+/// A pool's in-memory tree as the pass-start sweep uses it: seeded and flushed as
+/// `sparse_put_blocks` seeds and flushes it.
+trait SweptTree: Sized {
+    fn seed(db: &mut Db, anchor_floor: Option<&AnchorRetention>)
+    -> Result<Self, SqliteClientError>;
+    fn flush<P: zcash_protocol::consensus::Parameters, CL, R>(
+        &mut self,
+        wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
+    ) -> Result<(), SqliteClientError>;
+}
+
+impl SweptTree for SaplingSparseTree {
+    fn seed(
+        db: &mut Db,
+        anchor_floor: Option<&AnchorRetention>,
+    ) -> Result<Self, SqliteClientError> {
+        seed_sapling(db, anchor_floor)
+    }
+    fn flush<P: zcash_protocol::consensus::Parameters, CL, R>(
+        &mut self,
+        wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
+    ) -> Result<(), SqliteClientError> {
+        flush_sapling(wdb, self)
+    }
+}
+
+impl SweptTree for OrchardSparseTree {
+    fn seed(
+        db: &mut Db,
+        anchor_floor: Option<&AnchorRetention>,
+    ) -> Result<Self, SqliteClientError> {
+        seed_orchard(db, anchor_floor)
+    }
+    fn flush<P: zcash_protocol::consensus::Parameters, CL, R>(
+        &mut self,
+        wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
+    ) -> Result<(), SqliteClientError> {
+        flush_orchard(wdb, self)
+    }
+}
+
+impl SweepInputs<'_> {
+    /// One pool's sweep over its buffered `shards`.
+    fn pool<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+        &self,
+        db: &mut Db,
+        pool: ShieldedPool,
+        shards: &[u64],
+        done: &mut GraftSweep,
+    ) -> Result<(), SqliteClientError>
+    where
+        H: zcash_primitives::merkle_tree::HashSer
+            + incrementalmerkletree::Hashable
+            + Clone
+            + PartialEq
+            + Send
+            + Sync,
+        ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>: SweptTree,
+    {
+        if shards.is_empty() {
+            return Ok(());
+        }
+        // The pending ranges' start positions in this pool, and the first range to seed in
+        // each shard.
+        let mut pending_starts = BTreeSet::new();
+        let mut historic_starts = vec![];
+        for range in self.pending {
+            let start = range_start_position(db, pool, range)?;
+            pending_starts.extend(start);
+            if range.priority() == ScanPriority::Historic {
+                historic_starts.push(start);
+            }
+        }
+        let seeders = if self.graft_resumes {
+            crate::graft::first_seeders(historic_starts)
+        } else {
+            BTreeMap::new()
+        };
+
+        // Positions decide which runs are stranded; a restart's resumable rows are only
+        // counted, never decoded or built.
+        let mut stranded = vec![];
+        for &shard in shards {
+            let positions = crate::graft::buffered_positions(self.conn, pool, shard)?;
+            let runs = crate::graft::stranded_runs(&positions, seeders.get(&shard).copied());
+            if !runs.is_empty() {
+                stranded.push((shard, runs));
+            }
+        }
+        if stranded.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree =
+            ShardTree::<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>::seed(db, self.anchor_retention)?;
+        let mut build: Vec<(u64, Vec<crate::graft_accumulator::AccRow<H>>)> = vec![];
+        let mut discard: Vec<(u64, RangeInclusive<u64>)> = vec![];
+        for (shard, runs) in stranded {
+            let rows = crate::graft::load_shard::<H>(self.conn, pool, shard)?;
+            let shard_tree = tree
+                .store()
+                .get_shard(Address::from_parts(tree.store().shard_level, shard))
+                .map_err(|e| SqliteClientError::CorruptedData(format!("shard {shard}: {e}")))?;
+            for run in runs {
+                let from = rows.partition_point(|row| row.0 < *run.start());
+                let to = rows.partition_point(|row| row.0 <= *run.end());
+                let run_rows = &rows[from..to];
+                let last_leaf_in_tree = shard_tree
+                    .as_ref()
+                    .and_then(|t| t.value_at_position(Position::from(*run.end())))
+                    .zip(run_rows.last())
+                    .is_some_and(|((leaf, _), (_, row, _))| leaf == row);
+                if crate::graft::can_build(&run, last_leaf_in_tree, &pending_starts) {
+                    build.push((shard, run_rows.to_vec()));
+                } else {
+                    discard.push((shard, run));
+                }
+            }
+        }
+
+        if !build.is_empty() {
+            let runs: Vec<(u64, RangeInclusive<u64>)> = build
+                .iter()
+                .filter_map(|(shard, rows)| Some((*shard, rows.first()?.0..=rows.last()?.0)))
+                .collect();
+            let built_rows: u64 = build.iter().map(|(_, rows)| rows.len() as u64).sum();
+            let label = format!("graft sweep {pool:?}");
+            let built = db.transactionally::<_, _, SqliteClientError>(|wdb| {
+                for (_, mut rows) in build {
+                    doom_deep_rows(&mut rows, self.chain_tip, self.anchor_retention);
+                    insert_deferred_rows(&mut tree, rows, self.anchor_retention, &label)?;
+                }
+                tree.flush(wdb)
+            });
+            match built {
+                Ok(()) => {
+                    for (shard, run) in &runs {
+                        crate::graft::delete_rows_in(
+                            self.conn,
+                            pool,
+                            *shard,
+                            *run.start()..*run.end() + 1,
+                        )?;
+                    }
+                    done.built_rows += built_rows;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %e,
+                        ?pool,
+                        "graft sweep: stranded runs did not build; rescanning their blocks instead"
+                    );
+                    discard.extend(runs);
+                }
+            }
+        }
+
+        for (shard, run) in discard {
+            let Some(rescans) = rescans_for(db, pool, &run, self.stretches)? else {
+                tracing::warn!(
+                    ?pool,
+                    shard,
+                    first = *run.start(),
+                    last = *run.end(),
+                    "graft sweep: the wallet's block metadata does not place a stranded run; left buffered"
+                );
+                continue;
+            };
+            for rescan in &rescans {
+                db.queue_rescan(rescan.clone())?;
+            }
+            crate::graft::delete_rows_in(self.conn, pool, shard, *run.start()..*run.end() + 1)?;
+            done.discarded_rows += *run.end() - *run.start() + 1;
+            done.rescans.extend(rescans);
+        }
+        Ok(())
+    }
+}
+
+/// One pool's commitment-tree size at the end of block `height`, when the wallet holds
+/// that block's metadata.
+fn tree_size_at(
+    db: &Db,
+    pool: ShieldedPool,
+    height: BlockHeight,
+) -> Result<Option<u64>, SqliteClientError> {
+    Ok(db
+        .block_metadata(height)?
+        .and_then(|block| match pool {
+            ShieldedPool::Sapling => block.sapling_tree_size(),
+            ShieldedPool::Orchard => block.orchard_tree_size(),
+            ShieldedPool::Ironwood => block.ironwood_tree_size(),
+        })
+        .map(u64::from))
+}
+
+/// The position `range` starts at in `pool`: the tree size at the end of the block below
+/// it, when the wallet holds that block's metadata.
+fn range_start_position(
+    db: &Db,
+    pool: ShieldedPool,
+    range: &ScanRange,
+) -> Result<Option<u64>, SqliteClientError> {
+    match u32::from(range.block_range().start).checked_sub(1) {
+        Some(below) => tree_size_at(db, pool, BlockHeight::from(below)),
+        None => Ok(None),
+    }
+}
+
+/// The lowest height in `stretch` whose block ends with more than `position` commitments
+/// in `pool`: the block holding `position`, or the stretch's first block when `position`
+/// lies below the stretch. `None` when the stretch's metadata does not decide it (a block
+/// without metadata, or `position` at or past the stretch's end).
+fn first_block_past(
+    db: &Db,
+    pool: ShieldedPool,
+    position: u64,
+    stretch: &Range<BlockHeight>,
+) -> Result<Option<BlockHeight>, SqliteClientError> {
+    let (mut lo, mut hi) = (u32::from(stretch.start), u32::from(stretch.end) - 1);
+    if tree_size_at(db, pool, BlockHeight::from(hi))?.is_none_or(|size| size <= position) {
+        return Ok(None);
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        match tree_size_at(db, pool, BlockHeight::from(mid))? {
+            Some(size) if size > position => hi = mid,
+            Some(_) => lo = mid + 1,
+            None => return Ok(None),
+        }
+    }
+    Ok(Some(BlockHeight::from(lo)))
+}
+
+/// The ranges to rescan so that every scanned block holding a position of `run` is
+/// scanned again: in each scanned stretch the run reaches, from the block holding its
+/// first position (or the stretch's first block) to the block holding its last (or the
+/// stretch's last block). Positions in blocks a pending range covers need nothing.
+/// `None` when the wallet's block metadata cannot place the run.
+fn rescans_for(
+    db: &Db,
+    pool: ShieldedPool,
+    run: &RangeInclusive<u64>,
+    stretches: &[Range<BlockHeight>],
+) -> Result<Option<Vec<Range<BlockHeight>>>, SqliteClientError> {
+    let (first, last) = (*run.start(), *run.end());
+    let mut rescans = vec![];
+    for stretch in stretches {
+        let Some(end_size) = tree_size_at(db, pool, stretch.end - 1)? else {
+            return Ok(None);
+        };
+        if end_size <= first {
+            continue;
+        }
+        let Some(from) = first_block_past(db, pool, first, stretch)? else {
+            return Ok(None);
+        };
+        let to = if end_size > last {
+            match first_block_past(db, pool, last, stretch)? {
+                Some(to) => to,
+                None => return Ok(None),
+            }
+        } else {
+            stretch.end - 1
+        };
+        rescans.push(from..to + 1);
+        if end_size > last {
+            break;
+        }
+    }
+    Ok(Some(rescans))
 }
 
 // ── WalletWrite facade ─────────────────────────────────────────────────────────
@@ -3502,7 +3963,9 @@ impl PersistLane {
     /// hold — the range-end / tip shard, which NEVER grafts (accumulator rule 1)
     /// — inside one small transaction, then drop its buffer rows. Call after
     /// `drain()` on the success path only (on error exits the buffered rows stay
-    /// for the restart-resume path). Blocking — wrap in `block_in_place`.
+    /// for the restart-resume path; an abort that skips this call leaves them to
+    /// the next pass's `sweep_stranded_graft_rows`). Blocking — wrap in
+    /// `block_in_place`.
     pub fn finish_graft_blocking(&mut self) -> Result<(), crate::error::SlipstreamError> {
         use crate::graft_accumulator::FeedAction;
         let werr = |c: &str, e: String| {
@@ -3550,83 +4013,12 @@ impl PersistLane {
             .as_mut()
             .ok_or_else(|| werr("db", "lane connection lost (prior commit panic)".into()))?;
 
-        // Same doomed-checkpoint policy as every build (fixture-proven, rev 2.1):
-        // retentions travel verbatim; the cutoff — computed from existing ids ∪
-        // this build's own checkpoint ids (no NEW frontier at finish) — downgrades
-        // exactly what upstream's per-chunk pruning would have.
-        fn finish_cutoff<H>(
-            existing: impl Iterator<Item = BlockHeight>,
-            rows: &[Option<(H, Retention<BlockHeight>)>],
-        ) -> Option<BlockHeight> {
-            let existing: Vec<BlockHeight> = existing.collect();
-            let frontier_id = existing.iter().max().copied()?;
-            let new_ids = rows.iter().flatten().filter_map(|(_, r)| match r {
-                Retention::Checkpoint { id, .. } => Some(*id),
-                _ => None,
-            });
-            doomed_checkpoint_cutoff(existing.iter().copied(), frontier_id, new_ids)
-        }
-        // [B6] The anchors are PRE-registered before each insert, as in every build
-        // `sparse_put_blocks` runs: shardtree's excess-checkpoint prune runs INSIDE
-        // insert_tree, so with the store at its budget (the ChainTip range's window) an
-        // anchor retained only afterwards is already gone, and flush_* writes retained
-        // marks only for ids the store retains.
         let anchor_floor = anchor_floor.as_ref();
         db.transactionally::<_, _, SqliteClientError>(|wdb| {
-            if let Some((seg_start, mut rows)) = rows_to_segment(sap_rows) {
-                if let Some(cutoff) =
-                    finish_cutoff(sap_tree.store().checkpoints.keys().copied(), &rows)
-                {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor);
-                }
-                for (subtree, checkpoints) in build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
-                    seg_start,
-                    &mut rows,
-                    BUILD_CHUNK_SIZE,
-                ) {
-                    for h in checkpoints
-                        .keys()
-                        .copied()
-                        .filter(|h| should_retain_anchor(anchor_floor, *h))
-                    {
-                        sap_tree.ensure_retained(h).map_err(|e| {
-                            SqliteClientError::CorruptedData(format!(
-                                "finish sapling retain: {e:?}"
-                            ))
-                        })?;
-                    }
-                    sap_tree.insert_tree(subtree, checkpoints).map_err(|e| {
-                        SqliteClientError::CorruptedData(format!("finish sapling insert: {e:?}"))
-                    })?;
-                }
+            if insert_deferred_rows(sap_tree, sap_rows, anchor_floor, "finish sapling")? {
                 flush_sapling(wdb, sap_tree)?;
             }
-            if let Some((seg_start, mut rows)) = rows_to_segment(orch_rows) {
-                if let Some(cutoff) =
-                    finish_cutoff(orch_tree.store().checkpoints.keys().copied(), &rows)
-                {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor);
-                }
-                for (subtree, checkpoints) in build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
-                    seg_start,
-                    &mut rows,
-                    BUILD_CHUNK_SIZE,
-                ) {
-                    for h in checkpoints
-                        .keys()
-                        .copied()
-                        .filter(|h| should_retain_anchor(anchor_floor, *h))
-                    {
-                        orch_tree.ensure_retained(h).map_err(|e| {
-                            SqliteClientError::CorruptedData(format!(
-                                "finish orchard retain: {e:?}"
-                            ))
-                        })?;
-                    }
-                    orch_tree.insert_tree(subtree, checkpoints).map_err(|e| {
-                        SqliteClientError::CorruptedData(format!("finish orchard insert: {e:?}"))
-                    })?;
-                }
+            if insert_deferred_rows(orch_tree, orch_rows, anchor_floor, "finish orchard")? {
                 flush_orchard(wdb, orch_tree)?;
             }
             Ok(())

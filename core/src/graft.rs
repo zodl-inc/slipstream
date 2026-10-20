@@ -33,16 +33,30 @@
 //!   the contiguous run ending right before its start, on its own frontier's
 //!   leaf (`graft_accumulator::resumable_run`), and deletes every other row; a
 //!   run it resumes on a shard the store already holds content for is built
-//!   again with its first span (same leaves at the same positions) — self-healing.
+//!   again with its first span (same leaves at the same positions) — self-healing;
+//! - stop after a range's last commit, before its range-end build (a host abort
+//!   landing in the final drain) → the range is scanned, but its range-end shard's
+//!   rows stay buffered and no later range resumes them (Historic ranges run newest
+//!   first) → the next pass's start sweep (`persist::sweep_stranded_graft_rows`)
+//!   builds them, or deletes them and queues a rescan of their blocks.
 //!
 //! The invariant "block marked scanned ⇒ its commitments are in the shard store
-//! OR in this buffer" therefore holds at every crash point.
+//! OR in this buffer" therefore holds at every crash point. After a pass's start
+//! sweep, a buffered run of scanned blocks is one the first range to seed in its
+//! shard resumes, unless the wallet's block metadata cannot place it (the sweep
+//! then leaves it, with a warning).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Range, RangeInclusive};
 
 use incrementalmerkletree::{Marking, Retention};
 use rusqlite::{Connection, params};
 use zcash_client_sqlite::error::SqliteClientError;
 use zcash_primitives::merkle_tree::HashSer;
 use zcash_protocol::{ShieldedPool, consensus::BlockHeight};
+
+/// log2 of the shard size both pools share (`graft_accumulator::SHARD_BITS`).
+const SHARD_BITS: u32 = 16;
 
 /// One buffered commitment row.
 pub(crate) type BufferRow<H> = (u64, H, Retention<BlockHeight>);
@@ -229,6 +243,167 @@ pub(crate) fn delete_shard_outside(
     Ok(())
 }
 
+/// The shards of `pool` the buffer holds rows for, ascending.
+pub(crate) fn buffered_shards(
+    conn: &Connection,
+    pool: ShieldedPool,
+) -> Result<Vec<u64>, SqliteClientError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT shard_index FROM ext_slipstream_graft_buffer
+         WHERE pool = ?1 ORDER BY shard_index",
+    )?;
+    let shards = stmt
+        .query_map(params![pool_code(pool)], |row| row.get::<_, i64>(0))?
+        .map(|shard| shard.map(|s| s as u64))
+        .collect::<Result<_, _>>()?;
+    Ok(shards)
+}
+
+/// One shard's buffered positions, ascending, without decoding the rows.
+pub(crate) fn buffered_positions(
+    conn: &Connection,
+    pool: ShieldedPool,
+    shard_index: u64,
+) -> Result<Vec<u64>, SqliteClientError> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT position FROM ext_slipstream_graft_buffer
+         WHERE pool = ?1 AND shard_index = ?2 ORDER BY position ASC",
+    )?;
+    let positions = stmt
+        .query_map(params![pool_code(pool), shard_index as i64], |row| {
+            row.get::<_, i64>(0)
+        })?
+        .map(|position| position.map(|p| p as u64))
+        .collect::<Result<_, _>>()?;
+    Ok(positions)
+}
+
+/// Drop one shard's rows inside `run`: a stranded run the pass-start sweep has built
+/// or queued for a rescan.
+pub(crate) fn delete_rows_in(
+    conn: &Connection,
+    pool: ShieldedPool,
+    shard_index: u64,
+    run: Range<u64>,
+) -> Result<(), SqliteClientError> {
+    conn.execute(
+        "DELETE FROM ext_slipstream_graft_buffer
+         WHERE pool = ?1 AND shard_index = ?2 AND position >= ?3 AND position < ?4",
+        params![
+            pool_code(pool),
+            shard_index as i64,
+            run.start as i64,
+            run.end as i64
+        ],
+    )?;
+    Ok(())
+}
+
+// ── The pass-start sweep's decisions (`persist::sweep_stranded_graft_rows`) ──────
+
+/// The contiguous runs of `positions`, which must be ascending (as `load_shard`
+/// returns them).
+pub(crate) fn contiguous_runs(positions: &[u64]) -> Vec<RangeInclusive<u64>> {
+    let mut runs: Vec<RangeInclusive<u64>> = vec![];
+    for &p in positions {
+        match runs.last_mut() {
+            Some(run) if *run.end() + 1 == p => *run = *run.start()..=p,
+            _ => runs.push(p..=p),
+        }
+    }
+    runs
+}
+
+/// The start position of the first range to seed in each shard, from the start
+/// positions of the pending Historic ranges in the order the scheduler scans them
+/// (`None` where a start is unknown: the wallet holds no metadata for the block
+/// below the range).
+///
+/// A range seeds in the shard its start position falls in, and that seed deletes
+/// the shard's rows outside the run it continues
+/// (`graft_accumulator::resumable_run`), so only the first range to seed in a
+/// shard can resume one of its runs. A shard first claimed after a range whose
+/// start is unknown is left out: that range may seed in the same shard first.
+pub(crate) fn first_seeders(starts: impl IntoIterator<Item = Option<u64>>) -> BTreeMap<u64, u64> {
+    let mut claimed: BTreeMap<u64, Option<u64>> = BTreeMap::new();
+    let mut unknown_start_before = false;
+    for start in starts {
+        match start {
+            Some(position) => {
+                claimed
+                    .entry(position >> SHARD_BITS)
+                    .or_insert((!unknown_start_before).then_some(position));
+            }
+            None => unknown_start_before = true,
+        }
+    }
+    claimed
+        .into_iter()
+        .filter_map(|(shard, start)| Some((shard, start?)))
+        .collect()
+}
+
+/// The runs of one shard's rows (ascending `positions`) that nothing will resume.
+///
+/// `resume_at` is the start position of the shard's first seeder
+/// ([`first_seeders`]). The run holding `resume_at - 1` is the one that seed
+/// continues; its rows at or above `resume_at` lie in the seeding range's own
+/// blocks, which it scans again, so that run is left whole. Every other run is
+/// stranded.
+pub(crate) fn stranded_runs(positions: &[u64], resume_at: Option<u64>) -> Vec<RangeInclusive<u64>> {
+    let resumed = resume_at.and_then(|start| start.checked_sub(1));
+    contiguous_runs(positions)
+        .into_iter()
+        .filter(|run| resumed.is_none_or(|last| !run.contains(&last)))
+        .collect()
+}
+
+/// Whether a stranded run can be built as it is, because where it ends is known.
+///
+/// - `last_leaf_in_tree`: the commitment tree already holds a leaf at the run's last
+///   position, and it is the run's last row. A range scanned above the run inserted
+///   it, as its `from_state` frontier: the next commitment on the chain is that
+///   range's.
+/// - `pending_starts`: the start positions of the pending ranges, from the metadata
+///   of the block below each. A run that ends right below one is a committed prefix
+///   whose remainder is still queued.
+/// - A run that reaches the end of its shard has nothing in the shard after it.
+pub(crate) fn can_build(
+    run: &RangeInclusive<u64>,
+    last_leaf_in_tree: bool,
+    pending_starts: &BTreeSet<u64>,
+) -> bool {
+    let next = *run.end() + 1;
+    last_leaf_in_tree || pending_starts.contains(&next) || next.is_multiple_of(1 << SHARD_BITS)
+}
+
+/// The stretches of `floor..end` that no `pending` range covers, ascending: the
+/// heights the scan queue counts as scanned.
+pub(crate) fn scanned_stretches(
+    pending: impl IntoIterator<Item = Range<BlockHeight>>,
+    floor: BlockHeight,
+    end: BlockHeight,
+) -> Vec<Range<BlockHeight>> {
+    let mut pending: Vec<Range<BlockHeight>> = pending.into_iter().collect();
+    pending.sort_by_key(|range| range.start);
+    let mut stretches = vec![];
+    let mut next = floor;
+    for range in pending {
+        if range.start > next {
+            stretches.push(next..range.start.min(end));
+        }
+        next = next.max(range.end);
+        if next >= end {
+            break;
+        }
+    }
+    if next < end {
+        stretches.push(next..end);
+    }
+    stretches.retain(|stretch| !stretch.is_empty());
+    stretches
+}
+
 /// Rewind support (plan Task 9): drop every buffered row at or above `min_position`.
 ///
 /// NOT currently called from any production path — the scheduler's reorg-recovery
@@ -361,6 +536,114 @@ mod tests {
             loaded.iter().map(|r| r.0).collect::<Vec<_>>(),
             vec![100, 101]
         );
+    }
+
+    #[test]
+    fn buffered_shards_positions_and_run_deletes_are_scoped() {
+        let conn = mem_conn();
+        conn.execute_batch(GRAFT_BUFFER_DDL).expect("table");
+        let rows = |positions: Range<u64>| -> Vec<BufferRow<MerkleHashOrchard>> {
+            positions.map(|p| (p, h(0), Retention::Ephemeral)).collect()
+        };
+        append_rows(&conn, ShieldedPool::Orchard, 1, &rows(65_536..65_546)).expect("o1");
+        append_rows(&conn, ShieldedPool::Orchard, 3, &rows(196_608..196_610)).expect("o3");
+        append_rows(&conn, ShieldedPool::Sapling, 1, &rows(65_536..65_540)).expect("s1");
+        assert_eq!(
+            buffered_shards(&conn, ShieldedPool::Orchard).expect("shards"),
+            vec![1, 3]
+        );
+        delete_rows_in(&conn, ShieldedPool::Orchard, 1, 65_538..65_541).expect("delete");
+        assert_eq!(
+            buffered_positions(&conn, ShieldedPool::Orchard, 1).expect("positions"),
+            [65_536, 65_537]
+                .into_iter()
+                .chain(65_541..65_546)
+                .collect::<Vec<_>>(),
+            "only the run's rows are deleted"
+        );
+        assert_eq!(
+            buffered_positions(&conn, ShieldedPool::Orchard, 3).expect("positions"),
+            vec![196_608, 196_609],
+            "another shard is untouched"
+        );
+        assert_eq!(
+            buffered_positions(&conn, ShieldedPool::Sapling, 1)
+                .expect("positions")
+                .len(),
+            4,
+            "the other pool is untouched"
+        );
+    }
+
+    #[test]
+    fn contiguous_runs_split_at_gaps() {
+        assert_eq!(
+            contiguous_runs(&[1, 2, 3, 7, 8, 10]),
+            vec![1..=3, 7..=8, 10..=10]
+        );
+        assert!(contiguous_runs(&[]).is_empty());
+    }
+
+    #[test]
+    fn first_seeders_trusts_the_first_range_to_seed_a_shard_before_any_unknown_start() {
+        const S: u64 = 1 << SHARD_BITS;
+        // In scan order: shard 2, shard 1, shard 2 again, a range with an unknown start,
+        // shard 0.
+        let seeders = first_seeders([Some(2 * S + 5), Some(S + 9), Some(2 * S + 1), None, Some(7)]);
+        assert_eq!(
+            seeders,
+            BTreeMap::from([(1, S + 9), (2, 2 * S + 5)]),
+            "only the first range seeds a shard, and shard 0 is first claimed after an unknown start"
+        );
+    }
+
+    #[test]
+    fn stranded_runs_leave_the_run_the_first_seeder_continues() {
+        let positions: Vec<u64> = (10..20).chain(30..45).collect();
+        assert_eq!(stranded_runs(&positions, Some(45)), vec![10..=19]);
+        assert_eq!(
+            stranded_runs(&positions, Some(40)),
+            vec![10..=19],
+            "the seed trims the run's rows from its own start on; the run is still its own"
+        );
+        assert_eq!(
+            stranded_runs(&positions, Some(50)),
+            vec![10..=19, 30..=44],
+            "a start that continues no run strands every run"
+        );
+        assert_eq!(stranded_runs(&positions, None), vec![10..=19, 30..=44]);
+    }
+
+    #[test]
+    fn can_build_needs_a_known_end() {
+        let pending_starts = BTreeSet::from([100]);
+        assert!(
+            can_build(&(10..=50), true, &pending_starts),
+            "the tree's leaf at the run's end is its last row"
+        );
+        assert!(
+            can_build(&(10..=99), false, &pending_starts),
+            "a pending range starts right after it"
+        );
+        assert!(
+            can_build(&(65_000..=65_535), false, &pending_starts),
+            "it reaches the end of its shard"
+        );
+        assert!(!can_build(&(10..=50), false, &pending_starts));
+    }
+
+    #[test]
+    fn scanned_stretches_are_the_heights_no_pending_range_covers() {
+        let h = BlockHeight::from;
+        assert_eq!(
+            scanned_stretches(
+                [h(50)..h(60), h(20)..h(30), h(0)..h(15), h(90)..h(200)],
+                h(10),
+                h(100)
+            ),
+            vec![h(15)..h(20), h(30)..h(50), h(60)..h(90)]
+        );
+        assert_eq!(scanned_stretches([], h(10), h(100)), vec![h(10)..h(100)]);
     }
 
     #[test]

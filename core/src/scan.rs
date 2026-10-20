@@ -416,9 +416,10 @@ struct WriteBehind {
 /// interrupted scan call wrote nothing; what earlier calls committed stays.
 /// A stop that comes after the range's last block still lets the write-behind
 /// range-end tree build run: it is one bounded transaction the host's settle
-/// waits for, and skipping it would strand the range's tail shard in the graft
-/// buffer, which only a later range starting inside that shard resumes (and
-/// Historic ranges are scanned newest-first, so none does).
+/// waits for, and skipping it would leave the range's tail shard in the graft
+/// buffer, which no later range resumes (only one starting inside that shard
+/// could, and Historic ranges are scanned newest-first) until the next pass's
+/// start sweep (`persist::sweep_stranded_graft_rows`) builds it.
 ///
 /// Right before its first scan call, it waits until rayon has taken the trial
 /// decryption a wallet-change stop left queued on its global pool, when that

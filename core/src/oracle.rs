@@ -2562,5 +2562,445 @@ mod tests {
             let (off, on) = tip_range_then_r(root.path(), 20_000).await;
             assert_matches_graft_off(&off, &on);
         }
+
+        fn summarize(rows: &[(i64, i64, i64)]) -> String {
+            match (rows.first(), rows.last()) {
+                (Some(f), Some(l)) => format!(
+                    "{} rows, pool {} shard {}, positions {}..={}",
+                    rows.len(),
+                    f.0,
+                    f.1,
+                    f.2,
+                    l.2
+                ),
+                _ => "empty".into(),
+            }
+        }
+
+        /// The start of the next pass with graft on, as `run_to_completion` begins it: the
+        /// sweep of the graft buffer's stranded runs.
+        fn start_next_pass(
+            dir: &Path,
+            anchors: Option<&AnchorRetention>,
+        ) -> crate::persist::GraftSweep {
+            let mut s = session(dir);
+            crate::persist::sweep_stranded_graft_rows(
+                s.db_mut(),
+                &dir.join("data.db"),
+                true,
+                anchors,
+            )
+            .expect("the pass-start sweep")
+        }
+
+        /// The chain's sapling root after `blocks[..=idx]`, the root at block `START + idx`.
+        fn chain_root_at(
+            base: &Frontier<sapling::Node, 32>,
+            blocks: &[CompactBlock],
+            idx: usize,
+        ) -> sapling::Node {
+            state_after(base, blocks, idx + 1)
+                .final_sapling_tree()
+                .root()
+        }
+
+        /// The tail-shard scenario: the ChainTip stand-in [110, 200), never grafted, then the
+        /// Historic range R = [20, 110) in two units, ended as `r_end` says, on a 50-block
+        /// anchor grid from START and deep below the tip. R crosses into shard 1 at block 40,
+        /// so its range-end finish builds its shard-1 rows [40, 110) (positions
+        /// 65,536..=65,605) and their anchors at blocks 50 and 100.
+        async fn tip_range_then_r_ending(dir: &Path, r_end: End) -> TailShard {
+            let base_size = SHARD - 40;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 200);
+            let tip = blocks.last().expect("blocks").height + 20_000;
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            open_wallet(dir, &base, &blocks, tip);
+            scan_range(
+                dir,
+                &base,
+                &blocks,
+                110,
+                &[90],
+                false,
+                Some(anchors.clone()),
+                End::Finish,
+            )
+            .await
+            .expect("tip range");
+            scan_range(
+                dir,
+                &base,
+                &blocks,
+                20,
+                &[45, 45],
+                true,
+                Some(anchors.clone()),
+                r_end,
+            )
+            .await
+            .expect("historic range R");
+            assert_eq!(
+                suggested(dir),
+                ["Historic(1500200..1520200)", "Historic(1500000..1500020)"],
+                "R is scanned, whether its finish ran or not"
+            );
+            TailShard {
+                base,
+                blocks,
+                anchors,
+            }
+        }
+
+        struct TailShard {
+            base: Frontier<sapling::Node, 32>,
+            blocks: Vec<CompactBlock>,
+            anchors: AnchorRetention,
+        }
+
+        /// R's durable anchors, blocks 50 and 100, in its tail shard.
+        const TAIL_ANCHORS: [u64; 2] = [START + 50, START + 100];
+
+        /// An abort that lands in a Historic range's final drain (or in `rx.recv()` after its
+        /// last submit) skips the range-end finish: every unit commits and R is marked
+        /// Scanned, but its tail-shard rows stay buffered, and no later range resumes them
+        /// (the next Historic range down starts below R; the ranges above were scanned first,
+        /// and the newest pending one seeds in shard 1 above the rows). The next pass's start
+        /// sweep builds them as the finish would have, so the aborted wallet ends exactly like
+        /// the twin whose R finished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_builds_the_tail_shard_an_abort_left_buffered() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let mut dirs = vec![];
+            for (name, r_end, buffered) in [("twin", End::Finish, 0), ("aborted", End::Abort, 70)] {
+                let dir = root.path().join(name);
+                let t = tip_range_then_r_ending(&dir, r_end).await;
+                assert_eq!(
+                    buffer_rows(&dir).len(),
+                    buffered,
+                    "[{name}] R's shard-1 rows stay buffered only after the abort"
+                );
+                // The next pass: its start sweep, then the next Historic range down, [0, 20).
+                let sweep = start_next_pass(&dir, Some(&t.anchors));
+                assert_eq!(
+                    sweep,
+                    crate::persist::GraftSweep {
+                        built_rows: buffered as u64,
+                        ..Default::default()
+                    },
+                    "[{name}] the sweep builds the stranded rows and queues no rescan"
+                );
+                scan_range(
+                    &dir,
+                    &t.base,
+                    &t.blocks,
+                    0,
+                    &[20],
+                    true,
+                    Some(t.anchors.clone()),
+                    End::Finish,
+                )
+                .await
+                .expect("historic range below R");
+                let rows = buffer_rows(&dir);
+                assert!(
+                    rows.is_empty(),
+                    "[{name}] the graft buffer is drained: {}",
+                    summarize(&rows)
+                );
+                assert_eq!(
+                    sapling_checkpoints_among(&dir, &TAIL_ANCHORS),
+                    TAIL_ANCHORS,
+                    "[{name}] the wallet holds R's anchors"
+                );
+                for (anchor, idx) in TAIL_ANCHORS.iter().zip([50, 100]) {
+                    assert_eq!(
+                        sapling_root_at(&dir, *anchor),
+                        Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                        "[{name}] the root at R's anchor {anchor} is the chain's"
+                    );
+                }
+                dirs.push(dir);
+            }
+            let report = semantic_diff(&dirs[0].join("data.db"), &dirs[1].join("data.db"))
+                .expect("semantic diff");
+            assert!(
+                report.is_clean(),
+                "the aborted wallet ends as the twin did, checkpoints and retained marks included:\n{}",
+                report.render()
+            );
+        }
+
+        /// Rows an engine buffered before the graft stream got the per-call deep-history doom
+        /// carry every block's checkpoint. Built as they are, the deferred build's budget
+        /// cutoff keeps them all (the store holds fewer than 100 checkpoints): checkpoints
+        /// graft off never creates. The sweep dooms each by its own block's depth below the
+        /// tip, so the wallet ends as the twin whose R finished.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_dooms_deep_checkpoints_in_rows_buffered_undoomed() {
+            let root = tempfile::tempdir().expect("tempdir");
+            let twin = root.path().join("twin");
+            let t = tip_range_then_r_ending(&twin, End::Finish).await;
+            let legacy = root.path().join("legacy");
+            tip_range_then_r_ending(&legacy, End::Abort).await;
+            // Each block holds one commitment (block i at position SHARD - 40 + i), so an
+            // undoomed stream gave every row its block's checkpoint.
+            let conn = rusqlite::Connection::open(legacy.join("data.db")).expect("side conn");
+            let undoomed = conn
+                .execute(
+                    "UPDATE ext_slipstream_graft_buffer
+                     SET retention_kind = 2, checkpoint_height = ?1 + position - ?2, marking = 0",
+                    rusqlite::params![START as i64, (SHARD - 40) as i64],
+                )
+                .expect("give every buffered row its block's checkpoint");
+            assert_eq!(undoomed, 70, "all of R's shard-1 rows are buffered");
+            for dir in [&twin, &legacy] {
+                start_next_pass(dir, Some(&t.anchors));
+                scan_range(
+                    dir,
+                    &t.base,
+                    &t.blocks,
+                    0,
+                    &[20],
+                    true,
+                    Some(t.anchors.clone()),
+                    End::Finish,
+                )
+                .await
+                .expect("historic range below R");
+            }
+            let report = semantic_diff(&twin.join("data.db"), &legacy.join("data.db"))
+                .expect("semantic diff");
+            assert!(
+                report.is_clean(),
+                "the wallet keeps no deep checkpoint but R's anchors, as the twin:\n{}",
+                report.render()
+            );
+        }
+
+        /// A stranded run the sweep cannot build as it is: its last row is not the leaf the
+        /// tree holds there (the ChainTip range inserted it as its frontier), or a row inside
+        /// it disagrees with the leaf R's second unit inserted as its frontier, so the build
+        /// is refused. The sweep deletes the run and queues the scanned blocks holding it,
+        /// R's [40, 110); the rescan puts the chain's leaves and R's anchors in the tree.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_rescans_a_stranded_run_it_cannot_build() {
+            let root = tempfile::tempdir().expect("tempdir");
+            // (case, the buffered row replaced): the run's last position, and the position of
+            // R's second unit's frontier (its first unit ends at block 64).
+            for (case, position) in [
+                ("unverifiable end", 65_605i64),
+                ("conflicting interior", 65_560),
+            ] {
+                let dir = root.path().join(case.replace(' ', "-"));
+                let t = tip_range_then_r_ending(&dir, End::Abort).await;
+                let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+                let changed = conn
+                    .execute(
+                        "UPDATE ext_slipstream_graft_buffer SET commitment = ?1 WHERE position = ?2",
+                        rusqlite::params![le(7).to_vec(), position],
+                    )
+                    .expect("replace a buffered row");
+                assert_eq!(changed, 1, "[{case}] the row is buffered");
+                let sweep = start_next_pass(&dir, Some(&t.anchors));
+                assert_eq!(
+                    sweep,
+                    crate::persist::GraftSweep {
+                        discarded_rows: 70,
+                        rescans: vec![
+                            BlockHeight::from(u32::try_from(START + 40).expect("fits"))
+                                ..BlockHeight::from(u32::try_from(START + 110).expect("fits"))
+                        ],
+                        ..Default::default()
+                    },
+                    "[{case}] the sweep deletes the run and queues R's blocks holding it"
+                );
+                let rows = buffer_rows(&dir);
+                assert!(
+                    rows.is_empty(),
+                    "[{case}] the run is deleted: {}",
+                    summarize(&rows)
+                );
+                assert_eq!(
+                    suggested(&dir),
+                    [
+                        "Historic(1500200..1520200)",
+                        "Historic(1500040..1500110)",
+                        "Historic(1500000..1500020)"
+                    ],
+                    "[{case}] the rescan is queued"
+                );
+                scan_range(
+                    &dir,
+                    &t.base,
+                    &t.blocks,
+                    40,
+                    &[70],
+                    true,
+                    Some(t.anchors.clone()),
+                    End::Finish,
+                )
+                .await
+                .expect("the queued rescan");
+                assert_eq!(
+                    sapling_checkpoints_among(&dir, &TAIL_ANCHORS),
+                    TAIL_ANCHORS,
+                    "[{case}] the wallet holds R's anchors"
+                );
+                for (anchor, idx) in TAIL_ANCHORS.iter().zip([50, 100]) {
+                    assert_eq!(
+                        sapling_root_at(&dir, *anchor),
+                        Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                        "[{case}] the root at R's anchor {anchor} is the chain's"
+                    );
+                }
+            }
+        }
+
+        /// R = [20, 110) is interrupted after its first unit, so its rows [40, 65) in shard 1
+        /// end right before its still-queued remainder. A newer pending Historic range also
+        /// seeds in shard 1, above them, and is scanned first: its seed would delete them, so
+        /// the next pass's start sweep builds them. The remainder then continues them, and the
+        /// wallet ends with the chain's tree, R's anchors included.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_builds_a_committed_prefix_a_newer_range_would_delete() {
+            let base_size = SHARD - 40;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 200);
+            let tip = blocks.last().expect("blocks").height + 20_000;
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("interrupted");
+            open_wallet(&dir, &base, &blocks, tip);
+            scan_range(
+                &dir,
+                &base,
+                &blocks,
+                110,
+                &[90],
+                false,
+                Some(anchors.clone()),
+                End::Finish,
+            )
+            .await
+            .expect("tip range");
+            scan_range(
+                &dir,
+                &base,
+                &blocks,
+                20,
+                &[45],
+                true,
+                Some(anchors.clone()),
+                End::Abort,
+            )
+            .await
+            .expect("R's first unit");
+            assert_eq!(
+                buffer_rows(&dir).len(),
+                25,
+                "shard 1's rows [40, 65) are buffered"
+            );
+            assert_eq!(
+                suggested(&dir),
+                [
+                    "Historic(1500200..1520200)",
+                    "Historic(1500065..1500110)",
+                    "Historic(1500000..1500020)"
+                ],
+                "the newer range comes before R's remainder"
+            );
+            assert_eq!(
+                start_next_pass(&dir, Some(&anchors)),
+                crate::persist::GraftSweep {
+                    built_rows: 25,
+                    ..Default::default()
+                },
+                "the sweep builds the prefix the newer range's seed would delete"
+            );
+            let rows = buffer_rows(&dir);
+            assert!(rows.is_empty(), "the prefix is built: {}", summarize(&rows));
+            scan_range(
+                &dir,
+                &base,
+                &blocks,
+                65,
+                &[45],
+                true,
+                Some(anchors.clone()),
+                End::Finish,
+            )
+            .await
+            .expect("R's remainder");
+            assert_eq!(
+                sapling_checkpoints_among(&dir, &TAIL_ANCHORS),
+                TAIL_ANCHORS,
+                "the wallet holds R's anchors"
+            );
+            for (anchor, idx) in TAIL_ANCHORS.iter().zip([50, 100]) {
+                assert_eq!(
+                    sapling_root_at(&dir, *anchor),
+                    Ok(Some(chain_root_at(&base, &blocks, idx))),
+                    "the root at R's anchor {anchor} is the chain's"
+                );
+            }
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+        }
+
+        /// An account import whose birthday lies ABOVE an interrupted range's committed
+        /// prefix: the forced Historic rescan [b, tip] coalesces with R's still-Historic
+        /// remainder, so the next pass's first range starts right after the buffered rows.
+        /// The pass-start sweep leaves them to it (that range is the first to seed in their
+        /// shard), and the resumed range ends with the chain's sapling tree.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn import_above_the_committed_prefix_resumes_contiguously() {
+            let base_size = SHARD - 30;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 80);
+            let tip = blocks.last().expect("blocks").height;
+            let true_root = state_after(&base, &blocks, blocks.len())
+                .final_sapling_tree()
+                .root();
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("interrupted");
+            open_wallet(&dir, &base, &blocks, tip);
+            // R, Historic: blocks [0, 80). Only its first unit [0, 50) commits, so shard 1's
+            // rows [30, 50) stay buffered.
+            scan_range(&dir, &base, &blocks, 0, &[50], true, None, End::Abort)
+                .await
+                .expect("historic range R, first unit");
+            assert_eq!(
+                buffer_rows(&dir).len(),
+                20,
+                "shard 1's rows [30, 50) are buffered"
+            );
+            import_account_at(&dir, &base, &blocks, 60);
+            assert_eq!(
+                suggested(&dir),
+                ["Historic(1500050..1500080)"],
+                "the import's rescan coalesces with R's remainder"
+            );
+            assert_eq!(
+                start_next_pass(&dir, None),
+                crate::persist::GraftSweep::default(),
+                "the sweep leaves the rows R's remainder resumes"
+            );
+            assert_eq!(buffer_rows(&dir).len(), 20, "the rows are still buffered");
+            scan_range(&dir, &base, &blocks, 50, &[30], true, None, End::Finish)
+                .await
+                .expect("R's remainder");
+            assert_eq!(
+                sapling_root_at(&dir, tip),
+                Ok(Some(true_root)),
+                "the resumed wallet's sapling root at the tip is the chain's"
+            );
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+        }
     }
 }
