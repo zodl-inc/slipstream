@@ -22,7 +22,7 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::{WalletWrite, scanning::ScanPriority};
 use zcash_protocol::consensus::BlockHeight;
 
@@ -639,7 +639,17 @@ pub async fn run_to_completion(
             (Err(scan_err), fetch_outcome) => {
                 // Scan failed — fetch's secondary error (Stopped, send-error) is demoted.
                 if let Err(ref fetch_err) = fetch_outcome {
-                    warn!(%fetch_err, "fetch task also errored (secondary, scan error takes precedence)");
+                    if scan_err.is_stop_for_wallet_change() {
+                        // A wallet-change stop ends the scan on purpose and drops its chunk
+                        // receiver, so a fetch task that is still sending fails with the
+                        // closed-channel `Stopped`: the usual outcome of every such stop. That
+                        // echo of a stop the host asked for is no fault, and at `warn!` it would
+                        // send whoever reads the device logs chasing a failure that never
+                        // happened, so it stays at `debug!`.
+                        debug!(%fetch_err, "fetch task also errored after a wallet-change stop (expected: the stopped scan closed its channel)");
+                    } else {
+                        warn!(%fetch_err, "fetch task also errored (secondary, scan error takes precedence)");
+                    }
                 }
                 return Err(scan_err);
             }
