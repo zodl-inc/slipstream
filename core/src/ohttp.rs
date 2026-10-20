@@ -1339,8 +1339,9 @@ impl OhttpClient {
         let _relay_target = parse_https(&self.relay_url)?;
 
         // Validate signed config URL is https
-        let signed_config_url_str = signed_config_url(&self.relay_url, self.profile.signed_config_url)
-            .map_err(|e| e.to_string())?;
+        let signed_config_url_str =
+            signed_config_url(&self.relay_url, self.profile.signed_config_url)
+                .map_err(|e| e.to_string())?;
         let signed_config_target = parse_https(&signed_config_url_str)?;
 
         // Validate gateway is known (has a network/DNS source) for potential DNS fallback
