@@ -78,6 +78,10 @@ struct OpenShard<H> {
 /// from the frontier's. A row set is laid out from its FIRST row's position when it is
 /// built, so resuming any of those rows would shift every later leaf.
 ///
+/// Only the run's last row is checked against the frontier, and every row contiguous
+/// below it is taken, so rows of another origin must never be buffered right after a run
+/// this rejects: `persist::plan_pool` builds that shard instead of buffering it.
+///
 /// `rows` must be ascending by position, as `graft::load_shard` returns them.
 pub(crate) fn resumable_run<H: PartialEq>(
     mut rows: Vec<AccRow<H>>,

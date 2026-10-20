@@ -3287,19 +3287,19 @@ mod tests {
             }
         }
 
-        /// A shard whose rows will not decode keeps every run the wallet's block metadata
-        /// cannot place: deleting one would leave scanned blocks whose commitments are in
-        /// neither the tree nor the buffer, with no rescan to bring them back. R's tail rows
-        /// (shard 1) are stranded here, as an abort in its final drain leaves them, and
-        /// shard 1 also holds a row whose commitment is three bytes long, at a position of
-        /// the pending range above R. R's block 42 has no sapling tree size (as blocks
-        /// scanned before the wallet recorded the sizes have none), and placing R's run reads
-        /// it. So the sweep deletes only the run it places, the row that will not decode (its
-        /// position lies in the pending range, so no block needs a rescan), and keeps R's
-        /// run. The next sweep finds the shard decodable and builds R's run, checked by the
-        /// tree's leaf at its last position, and the wallet holds R's anchors.
+        /// A shard whose rows will not decode keeps a run whose rescan the sweep cannot
+        /// queue, and goes on with its other runs. R's tail rows (shard 1) are stranded here,
+        /// as an abort in its final drain leaves them, and shard 1 also holds a row whose
+        /// commitment is three bytes long, at a position of the pending range above R. R's
+        /// block 42 has neither a sapling tree size nor a legacy sapling tree, so its
+        /// metadata does not read back (upstream's `block_metadata` fails on it), and placing
+        /// R's run reads it. So the sweep keeps R's run, with a warning, and deletes the run
+        /// it places, the row that will not decode (its position lies in the pending range,
+        /// so no block needs a rescan). The next sweep finds the shard decodable and builds
+        /// R's run, checked by the tree's leaf at its last position, and the wallet holds R's
+        /// anchors. A run the metadata does not place: the Orchard test below.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn next_pass_keeps_a_run_it_cannot_place_in_a_shard_that_will_not_decode() {
+        async fn next_pass_keeps_a_run_it_cannot_rescan_in_an_undecodable_shard() {
             let root = tempfile::tempdir().expect("tempdir");
             let dir = root.path().join("unplaceable");
             let t = tip_range_then_r_ending(&dir, End::Abort).await;
@@ -3329,7 +3329,7 @@ mod tests {
             assert_eq!(
                 buffered_positions(&dir),
                 (SHARD..SHARD + 70).collect::<Vec<_>>(),
-                "R's run, which the block metadata does not place, stays buffered"
+                "R's run, whose rescan the sweep cannot queue, stays buffered"
             );
             assert_eq!(
                 start_next_pass(&dir, Some(&t.anchors)),
@@ -3797,6 +3797,211 @@ mod tests {
             }
         }
 
+        /// A wallet whose graft buffer holds another chain's rows right below a Historic
+        /// range R that starts at block 80: rows at the positions of blocks [60, 80), in
+        /// shard 1, whose commitments are no block's of this chain, as a reorg's truncation
+        /// leaves them when its buffer cleanup does not run. One sapling output per block
+        /// on a pre-history of SHARD - 40 leaves, so shard 1 starts at block 40; the chain
+        /// tip is the last block, and the anchors lie on a 50-block grid from START.
+        struct OtherChainBelowR {
+            base: Frontier<sapling::Node, 32>,
+            blocks: Vec<CompactBlock>,
+            anchors: AnchorRetention,
+            /// The other chain's buffered positions, [SHARD + 20, SHARD + 40).
+            rows: Vec<u64>,
+        }
+
+        fn other_chains_rows_below_r(dir: &Path) -> OtherChainBelowR {
+            let base_size = SHARD - 40;
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 150);
+            let tip = blocks.last().expect("blocks").height;
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            open_wallet(dir, &base, &blocks, tip);
+            let rows: Vec<u64> = (SHARD + 20..SHARD + 40).collect();
+            let other_chain: Vec<crate::graft::BufferRow<sapling::Node>> = rows
+                .iter()
+                .map(|&p| {
+                    (
+                        p,
+                        node(5_000_000 + p),
+                        incrementalmerkletree::Retention::Ephemeral,
+                    )
+                })
+                .collect();
+            let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+            crate::graft::append_rows(
+                &conn,
+                zcash_protocol::ShieldedPool::Sapling,
+                1,
+                &other_chain,
+            )
+            .expect("buffer another chain's rows");
+            OtherChainBelowR {
+                base,
+                blocks,
+                anchors,
+                rows,
+            }
+        }
+
+        /// How both tests below end: the sweep's rescan of R's first block joins the pending
+        /// range below R, [0, 80), and scanning [0, 81) puts the chain's leaves where the
+        /// other chain's rows were. The wallet holds the chain's roots, at R's anchors and at
+        /// the tip, and its graft buffer is drained.
+        async fn below_r_ends_with_the_chains_tree(dir: &Path, t: &OtherChainBelowR) {
+            assert!(
+                buffer_rows(dir).is_empty(),
+                "the other chain's rows are deleted"
+            );
+            assert_eq!(
+                suggested(dir),
+                ["Historic(1500000..1500081)"],
+                "the rescan of R's first block joins the range below R"
+            );
+            scan_range(
+                dir,
+                &t.base,
+                &t.blocks,
+                0,
+                &[81],
+                true,
+                Some(t.anchors.clone()),
+                End::Finish,
+            )
+            .await
+            .expect("the range below R");
+            assert!(buffer_rows(dir).is_empty(), "the graft buffer is drained");
+            for idx in [50, 100, 149] {
+                assert_eq!(
+                    sapling_root_at(dir, START + idx as u64),
+                    Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                    "the root at block {idx} is the chain's"
+                );
+            }
+        }
+
+        /// R = [80, 150) seeds right after another chain's rows, which end at its start
+        /// position - 1 on another leaf than its frontier's: R does not continue them, and it
+        /// builds what it scans in their shard instead of buffering it next to them. R stops
+        /// after its first unit commits, and its remainder resumes nothing (no buffered row
+        /// ends right before it), so no leaf of the other chain reaches the tree. The next
+        /// pass's sweep deletes those rows, which nothing checks (the tree's leaf where they
+        /// end is R's frontier, the chain's), and queues R's first block for a rescan, since
+        /// nothing tells that this block holds none of them.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_remainder_resumes_no_other_chains_rows_below_its_range() {
+            let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("remainder");
+            let t = other_chains_rows_below_r(&dir);
+            scan_range(
+                &dir,
+                &t.base,
+                &t.blocks,
+                80,
+                &[30],
+                true,
+                Some(t.anchors.clone()),
+                End::Abort,
+            )
+            .await
+            .expect("R's first unit");
+            assert_eq!(
+                buffered_positions(&dir),
+                t.rows,
+                "R buffers no row next to the other chain's rows"
+            );
+            let remainder = scan_range(
+                &dir,
+                &t.base,
+                &t.blocks,
+                110,
+                &[40],
+                true,
+                Some(t.anchors.clone()),
+                End::Finish,
+            )
+            .await;
+            assert!(
+                remainder.is_ok(),
+                "R's remainder resumes no row of the other chain: {remainder:?}"
+            );
+            assert_eq!(
+                buffered_positions(&dir),
+                t.rows,
+                "the other chain's rows wait for the next pass's sweep"
+            );
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep {
+                    discarded_rows: 20,
+                    rescans: vec![height(80)..height(81)],
+                    ..Default::default()
+                },
+                "the sweep deletes the other chain's rows"
+            );
+            below_r_ends_with_the_chains_tree(&dir, &t).await;
+        }
+
+        /// The same rows below R = [80, 110), which runs to its end and stops after its last
+        /// commit, before its range-end build. R builds what it scans in their shard, so no
+        /// row of its own waits next to them. A range above R is then scanned (a ChainTip
+        /// stand-in, never grafted), and its frontier gives the tree the chain's leaf at R's
+        /// last position: the sweep's last-leaf check would build whole any run that ends
+        /// there. The next pass's sweep finds only the other chain's rows, whose last row is
+        /// not the leaf the tree holds where they end (R's frontier), so it builds nothing,
+        /// deletes them and queues R's first block for a rescan.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_sweep_builds_no_other_chains_rows_with_a_ranges_own() {
+            let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("swept");
+            let t = other_chains_rows_below_r(&dir);
+            scan_range(
+                &dir,
+                &t.base,
+                &t.blocks,
+                80,
+                &[15, 15],
+                true,
+                Some(t.anchors.clone()),
+                End::Abort,
+            )
+            .await
+            .expect("R, stopped after its last commit");
+            assert_eq!(
+                buffered_positions(&dir),
+                t.rows,
+                "R leaves no row of its own next to the other chain's rows"
+            );
+            scan_range(
+                &dir,
+                &t.base,
+                &t.blocks,
+                110,
+                &[40],
+                false,
+                Some(t.anchors.clone()),
+                End::Finish,
+            )
+            .await
+            .expect("a range above R");
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep {
+                    discarded_rows: 20,
+                    rescans: vec![height(80)..height(81)],
+                    ..Default::default()
+                },
+                "the sweep builds nothing and deletes only the other chain's rows"
+            );
+            below_r_ends_with_the_chains_tree(&dir, &t).await;
+        }
+
         // ── The same on the Orchard pool ─────────────────────────────────────────────────
         //
         // Orchard chains start above NU5 (`SYNTH_ORCHARD_START`); the Sapling tree stays
@@ -4029,6 +4234,97 @@ mod tests {
                 "the aborted wallet ends as the twin did, checkpoints and retained marks included:\n{}",
                 report.render()
             );
+        }
+
+        /// A shard whose rows will not decode keeps every run the wallet's block metadata
+        /// does not place: deleting one would leave scanned blocks whose commitments are in
+        /// neither the tree nor the buffer, with no rescan to bring them back. On the Orchard
+        /// pool a block above NU5 can lack its tree size (blocks scanned before the wallet
+        /// recorded the Orchard sizes), and the metadata then places no run that needs it.
+        /// R's Orchard tail rows (shard 1) are stranded, as an abort in its final drain
+        /// leaves them, and shard 1 also holds a row whose commitment is three bytes long,
+        /// at a position of the pending range above R. R's block 42 has no Orchard tree
+        /// size, and placing R's run reads it. So the sweep deletes only the run it places,
+        /// the row that will not decode (its position lies in the pending range, so no block
+        /// needs a rescan), and keeps R's run. The next sweep finds the shard decodable and
+        /// builds R's run, checked by the tree's leaf at its last position.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn next_pass_keeps_an_orchard_run_it_cannot_place_in_an_undecodable_shard() {
+            let base_size = SHARD - 40;
+            let base = orchard_base_frontier(base_size);
+            let blocks = orchard_chain(base_size, 200);
+            let tip = blocks.last().expect("blocks").height + 20_000;
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(ORCHARD_START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            let r_anchors = [ORCHARD_START + 50, ORCHARD_START + 100];
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("unplaced");
+            open_wallet_at(&dir, orchard_state_after(&base, &blocks, 0), tip);
+            let units = orchard_units(&base, &blocks, 110, &[90]);
+            scan_units(&dir, &units, false, Some(anchors.clone()), End::Finish)
+                .await
+                .expect("tip range");
+            let units = orchard_units(&base, &blocks, 20, &[45, 45]);
+            scan_units(&dir, &units, true, Some(anchors.clone()), End::Abort)
+                .await
+                .expect("historic range R");
+            let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+            conn.execute(
+                "INSERT INTO ext_slipstream_graft_buffer
+                 (pool, shard_index, position, commitment, retention_kind)
+                 VALUES (3, 1, 65700, ?1, 0)",
+                [vec![0xC7u8; 3]],
+            )
+            .expect("buffer an Orchard row that will not decode");
+            let cleared = conn
+                .execute(
+                    "UPDATE blocks SET orchard_commitment_tree_size = NULL WHERE height = ?1",
+                    [i64::try_from(ORCHARD_START + 42).expect("fits")],
+                )
+                .expect("clear a block's Orchard tree size");
+            assert_eq!(cleared, 1, "R's block 42 is in the wallet");
+            assert_eq!(
+                start_next_pass(&dir, Some(&anchors)),
+                crate::persist::GraftSweep {
+                    discarded_rows: 1,
+                    ..Default::default()
+                },
+                "the sweep deletes only the run whose blocks it places: the row that will not decode"
+            );
+            assert_eq!(
+                buffer_rows(&dir),
+                (SHARD..SHARD + 70)
+                    .map(|p| (3, 1, i64::try_from(p).expect("fits")))
+                    .collect::<Vec<_>>(),
+                "R's Orchard run, which the block metadata does not place, stays buffered"
+            );
+            assert_eq!(
+                start_next_pass(&dir, Some(&anchors)),
+                crate::persist::GraftSweep {
+                    built_rows: 70,
+                    ..Default::default()
+                },
+                "the next sweep builds R's run, checked by the tree's leaf where it ends"
+            );
+            assert!(buffer_rows(&dir).is_empty(), "the graft buffer is drained");
+            assert_eq!(
+                orchard_checkpoints_among(&dir, &r_anchors),
+                r_anchors,
+                "the wallet holds R's anchors"
+            );
+            for (anchor, idx) in r_anchors.iter().zip([50, 100]) {
+                assert_eq!(
+                    orchard_root_at(&dir, *anchor),
+                    Ok(Some(
+                        orchard_state_after(&base, &blocks, idx + 1)
+                            .final_orchard_tree()
+                            .root()
+                    )),
+                    "the Orchard root at R's anchor {anchor} is the chain's"
+                );
+            }
         }
     }
 }

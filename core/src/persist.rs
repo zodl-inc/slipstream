@@ -740,8 +740,11 @@ fn fed_span<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Option<(u64, Ran
 ///
 /// `frontier_leaf`: the leaf of this call's `from_state` frontier for the pool,
 /// with its position (`start_position - 1`). The seed resumes only the buffered
-/// run that ends on it (`graft_accumulator::resumable_run`). It deletes only the
-/// shard's rows at the positions this call feeds, which the range scans again;
+/// run that ends on it (`graft_accumulator::resumable_run`). A run that ends at
+/// `start_position - 1` on another leaf is never continued, and the range then
+/// builds what it scans in that shard, so none of its rows is buffered next to
+/// that run. The seed deletes only the shard's rows at the positions this call
+/// feeds, which the range scans again;
 /// every other row of the shard stays buffered, for a later range that continues
 /// it or for the next pass's sweep, which verifies or rescans it. A shard whose
 /// buffered rows will not decode ([`crate::graft::will_not_decode`]) seeds
@@ -800,16 +803,35 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
             // about the rows: the range fails this pass and is retried, the rows untouched.
             Err(e) => return Err(e),
         };
-        // Passthrough: the range builds what it scans in this shard instead of buffering
-        // it, when the store already holds content for the shard or its rows will not
-        // decode.
-        let passthrough = store_has_shard(shard) || will_not_decode;
         // Only a run that ends right before the start, on this range's own frontier
         // leaf, can be continued. Rows an interrupted range left behind elsewhere in
         // the shard, or rows from another chain, would be laid out from the wrong
         // position.
         let below_start = resume.partition_point(|(p, ..)| *p < start_position);
+        let ends_at_start = resume[..below_start]
+            .last()
+            .is_some_and(|(p, ..)| *p + 1 == start_position);
         let (resume, _) = resumable_run(resume, start_position, frontier_leaf);
+        // A run that ends right before the start on another leaf than this range's
+        // frontier holds is not this chain's there (another chain's rows, as a reorg's
+        // truncation can leave them). Rows this range buffered right after it would join
+        // it into one contiguous run, which a later seed takes whole (`resumable_run`
+        // walks back while positions are contiguous) and the sweep's last-leaf check
+        // builds whole. So the range builds what it scans in this shard instead: the store
+        // then holds the chain's frontier at start - 1 and the range's rows above it,
+        // every later seed in the shard builds too (the store has content for it), and
+        // the run waits for the next pass's sweep. Its last-leaf check reads the chain's
+        // leaf at start - 1, which is not the run's, so the sweep rescans the run's
+        // blocks, or keeps the run, with nothing next to it, when it cannot place them.
+        let rejected_at_start = ends_at_start && resume.is_empty();
+        if rejected_at_start {
+            tracing::warn!(
+                ?pool,
+                shard,
+                start_position,
+                "graft seed: the buffered run ending right before the start is not on this range's frontier leaf; building this shard as it is scanned, and leaving the run to the next pass's sweep"
+            );
+        }
         if below_start > resume.len() {
             tracing::debug!(
                 ?pool,
@@ -818,6 +840,10 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
                 "graft seed: buffered rows below the start that this range does not continue stay for the next pass's sweep"
             );
         }
+        // Passthrough: the range builds what it scans in this shard instead of buffering
+        // it, when the store already holds content for the shard, its rows will not
+        // decode, or they end right before the start on another leaf.
+        let passthrough = store_has_shard(shard) || will_not_decode || rejected_at_start;
         *acc = Some(ShardAccumulator::seed(start_position, resume, passthrough));
     }
     let acc = acc.as_mut().unwrap_or_else(|| unreachable!("seeded above"));
@@ -5822,6 +5848,56 @@ mod graft_resume_seed_tests {
                 .expect("positions"),
             (k_start..k_start + 20).collect::<Vec<_>>(),
             "the shard's rows stay as they are"
+        );
+    }
+
+    /// A run that ends right before the start on another leaf than the range's frontier
+    /// (another chain's rows, as a reorg's truncation can leave them) is never continued,
+    /// and the range builds what it scans in that shard instead of buffering it: rows
+    /// buffered right after the run would join it, and a later seed (which takes every row
+    /// contiguous below its start) or the sweep's last-leaf check would take both as one.
+    /// Here the buffer holds [k_start, k_start + 20) and the range starting at
+    /// k_start + 20 holds another leaf at k_start + 19; no note flushes the shard and the
+    /// store holds no content for it, so a seed that buffered would build nothing.
+    #[test]
+    fn seed_builds_instead_of_buffering_next_to_a_run_its_frontier_rejects() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let frontier_leaf = node(7_000_000);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |_| Ok(None),
+            None,
+        )
+        .expect("plan");
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans in the shard, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the rejected run stays for the next pass's sweep, with nothing buffered next to it"
         );
     }
 }

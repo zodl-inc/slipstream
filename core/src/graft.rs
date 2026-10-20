@@ -62,6 +62,13 @@
 //! goes stale during a pass (it did not run, or the queue changed and another
 //! range seeds in a shard first), the runs no range continues stay buffered for
 //! the next pass's sweep, which builds them or rescans their blocks.
+//!
+//! No range buffers a row right after a run it rejects: when the run that ends
+//! right before a seed's start is not on that range's frontier leaf (another
+//! chain's rows, as a reorg's truncation can leave them), the range builds what
+//! it scans in that shard instead. A resume takes every row contiguous below the
+//! start, and the sweep's last-leaf check reads only a run's last row, so either
+//! would otherwise take the rejected run with the range's own rows.
 
 use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
