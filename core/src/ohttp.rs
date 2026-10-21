@@ -278,7 +278,7 @@ pub enum Dialer {
     Direct,
     /// Through Tor: the relay sees a Tor exit IP. Streams opened from this handle share its
     /// isolation group; callers hand in an `isolated_client()` when they want a fresh one.
-    Tor(Box<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>),
+    Tor(Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>),
 }
 
 impl Dialer {
@@ -309,7 +309,7 @@ impl Dialer {
                 let mut last_err = String::new();
                 for attempt in 1..=TOR_DIAL_ATTEMPTS {
                     let c = if attempt == 1 {
-                        (**client).clone()
+                        Arc::clone(client)
                     } else {
                         client.isolated_client()
                     };
@@ -3318,11 +3318,11 @@ mod tests {
         let tor_client = get_or_create_client(
             "test-gateway-tor-privacy.zodl.com",
             "https://relay.example/relay",
-            Dialer::Tor(Box::new(
+            Dialer::Tor(
                 arti_client::TorClient::builder()
                     .create_unbootstrapped()
                     .expect("unbootstrapped tor client"),
-            )),
+            ),
             None,
             ClientProfile::SLIPSTREAM_HTTP,
         )
@@ -3349,11 +3349,11 @@ mod tests {
         let tor_client2 = get_or_create_client(
             "test-gateway-tor-privacy.zodl.com",
             "https://relay.example/relay",
-            Dialer::Tor(Box::new(
+            Dialer::Tor(
                 arti_client::TorClient::builder()
                     .create_unbootstrapped()
                     .expect("unbootstrapped tor client"),
-            )),
+            ),
             None,
             ClientProfile::SLIPSTREAM_HTTP,
         )
@@ -4080,11 +4080,11 @@ mod tests {
         let tor = OhttpClient::new(
             "ohttp-gateway-testnet.example",
             relay,
-            Dialer::Tor(Box::new(
+            Dialer::Tor(
                 arti_client::TorClient::builder()
                     .create_unbootstrapped()
                     .expect("unbootstrapped tor client"),
-            )),
+            ),
             None,
             ClientProfile::SLIPSTREAM,
         )

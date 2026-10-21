@@ -1,7 +1,7 @@
 [package]
 name = "zodl-slipstream"
 description = "A high-performance zcash light wallet sync engine"
-version = "0.4.0-pre.1"
+version = "0.4.0"
 authors = [
     "Lukas Korba <lukas.korba@seznam.cz>",
     "Kris Nuttycombe <kris@electriccoin.co>"
@@ -56,8 +56,8 @@ futures-util = { workspace = true }
 
 
 # Tor and OHTTP transport dependencies
-arti-client = { version = "0.35", default-features = false, features = ["compression", "rustls", "tokio", "onion-service-client"] }
-tor-rtcompat = "0.35"
+arti-client = { version = "0.43", default-features = false, features = ["compression", "rustls", "tokio", "onion-service-client"] }
+tor-rtcompat = "0.43"
 bytes = "1"
 http = "1"
 http-body = "1"

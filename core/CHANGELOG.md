@@ -10,6 +10,179 @@ workspace.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-27
+
+### Added
+- `wallet_session::WalletSession::truncate_to_height`: upstream's
+  `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
+  it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
+  the height the wallet was truncated to. The scheduler's reorg recovery calls it.
+- `grpc::net_stats`: process-wide counts of the lightwalletd channels the engine opens,
+  direct and over Tor, and of the RPCs it issues, by kind (`net_stats::totals`,
+  `net_stats::Totals::delta_since`).
+- `fetch::FetchPlan::worker_count`: the number of workers a fetch of the plan starts.
+- `connector::LazyConnection`: a lightwalletd connection opened on first use.
+- `grpc::SubtreeRootStart` and `grpc::get_subtree_roots_from`, which request each pool's
+  subtree roots from a given index, and `wallet_session::WalletSession::next_subtree_root_start`
+  and `WalletSession::put_subtree_roots_at`, which pick those indices for a wallet and store
+  the roots at them.
+- `wallet_session::WalletSession::has_historic_scan_ranges`, which reports whether the scan
+  queue holds a `Historic` range: a restore under way, or the rescan an account import queues.
+- `mempool::MEMPOOL_SESSION_IDLE_NU7` and `mempool::mempool_session_idle`, which pick a
+  mempool session's idle bound from the network upgrade active at the block after the tip.
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::set_account_name`, the method `zcash_client_backend` adds to the trait.
+  The sparse facade forwards it to the wallet db; the write-behind facade, which holds no
+  connection, refuses it like every other write outside `put_blocks`.
+
+### Changed
+- Migrated to `zcash_address 0.14.0`, `zcash_client_backend 0.25.0`,
+  `zcash_client_sqlite 0.23.0`, `zcash_keys 0.17.0`, `zcash_primitives 0.31.0`,
+  `zcash_protocol 0.11.0`, and `zcash_transparent 0.11.0`.
+- `EngineConfig::anchor_retention` holds upstream's `AnchorRetention`, whose constructors,
+  `AnchorRetention::new` and `AnchorRetention::union`, now take a
+  `zcash_protocol::zip318::BlockSpacing` as their second argument. A host that sets the
+  field passes `BlockSpacing::for_network(&network)`, with the network the wallet runs on.
+  The interval counts reference blocks, so from NU7 activation it spans three times as many
+  blocks.
+- The `anchor_grid` field of the `sparse put_blocks` log line is now
+  `anchor_grid_reference_blocks`. It counts ZIP 318 reference blocks, which from NU7 activation
+  span three blocks each.
+- `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
+  `report::log_pass_summary` logs them as a `pass network split` line.
+- A block fetch starts one worker per plan chunk, up to `EngineConfig::fetch_streams`,
+  instead of always `fetch_streams`. A range of one chunk, such as the new block of a
+  follow pass, opens one block-download connection instead of four.
+- `scan::scan_chunks` no longer takes a `client`. Its interleaved enhancement opens a
+  connection at its first request that needs the server, so a range that runs no
+  interleave — such as the single block of a follow pass — opens no connection for it
+  (with Tor on, no isolated circuit). A failed connect there is now non-fatal, like the
+  rest of the interleaved enhancement; before, it failed the range before the scan
+  started.
+- The per-range enhancement opens its connection only at the first transaction data
+  request that needs the server; before, it connected after every range. Requests
+  skipped without asking the server — among them the ephemeral-address checks every
+  account with a transparent receiver is due — open none, so a range with nothing to
+  fetch, such as the block of a follow pass on a quiet wallet, opens no connection for
+  its enhancement (with Tor on, no isolated circuit).
+- `chunk::BoundaryFetcher` returns `Option<BoundaryHandle>`: a fetcher may decline a
+  boundary, and that chunk then carries no fetch.
+- `scan::scan_chunks` takes the range's last height, `range_end`, after `range_start`,
+  and returns an error for a chunk that runs past it.
+- With `EngineConfig::local_treestate` off (the default), a range no longer fetches the
+  tree state at its last block, which the scan never reads: one `GetTreeState` and one
+  connection fewer per range, so a follow pass fetches one tree state instead of two.
+  With `local_treestate` on, that boundary is still fetched, since it may be audited.
+- A sync pass with no `Historic` scan work, such as a follow pass, requests each pool's
+  subtree roots from the wallet's second-to-last stored shard instead of from index 0, so it
+  downloads a few roots rather than every root of every pool. It still downloads every root
+  of a pool whose stored shards are not a complete range from index 0 — nothing stored, or a
+  pool seeded only near the tip — which keeps Ironwood's shard indices a complete range (see
+  0.3.0, Fixed). A pass with `Historic` scan work, a restore under way or an account
+  imported below the tip, downloads every root of every pool, as before, so that its scan
+  finds the stored root of every shard it can graft.
+- From NU7 activation, the follow loop's mempool session reconnects after 40 s without a
+  message instead of 60 s; before NU7 it stays 60 s. Both stay above the 30 s stream stall
+  timeout, and 40 s is below the Tor client's default 60 s response-header timeout.
+- The follow loop no longer gives up on mempool monitoring for the rest of a session after
+  five consecutive failed mempool sessions. It turns monitoring off, tries again no sooner
+  than 60 s later, doubles the wait after each failed retry up to 10 minutes, and turns it
+  back on with the first session that ends without error. Tip polling continues throughout.
+- `CustomActivations` has two new fields, `nu6_3` (Ironwood) and `nu7`, reported as a custom
+  chain's NU6.3 and NU7 activation heights. `CustomActivations::all_from_genesis` sets
+  `nu6_3` to 1 and leaves `nu7` unset. Code that builds a `CustomActivations` with a struct
+  literal must set the new fields. A schedule that used `nu6_2` as a stand-in for NU6.3 now
+  sets `nu6_3` instead: the CLI's `--custom-heights genesis,nu6_2=5000` becomes
+  `--custom-heights genesis,nu6_3=5000`. The old form now activates NU6.3 from height 1,
+  before the stand-in NU6.2 height of 5000.
+- On mainnet, the behaviours these entries describe from NU7 activation, such as the mempool
+  session's 40 s idle bound, apply from height 3,543,405, the activation height
+  `zcash_protocol 0.11.0` sets.
+- `engine::ENGINE_BUILD` is `2026-10-22.v0.18-restore-anchor-height-bound`.
+
+### Fixed
+- With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
+  whatever the graft buffer held for its first shard, and a build lays rows out from the
+  first row's position. Rows that did not end right before the range's start, as after an
+  account import whose rescan starts inside an interrupted range's shard, put every later
+  leaf of the commitment tree at the wrong position. A range now resumes only the run of
+  rows that ends right before its start, on its own `from_state` frontier's leaf, and only
+  when the commitment tree takes that run. The frontier's leaf vouches for the run's last
+  row alone: a run with an earlier row that is not the chain's can conflict with the tree
+  when it is built, and a range that resumed it would fail on every pass. So the seed
+  first inserts the run into a copy of its shard as the wallet holds it, with the range's
+  frontier inserted; nothing is written. A run that ends there on another leaf, such as
+  another chain's rows a reorg's truncation can leave, or that the tree refuses, is not
+  continued, and the range builds what it scans in that shard instead of buffering it next
+  to the run, so neither the range's remainder nor the next pass's sweep takes the run up
+  with the range's own rows. The next pass's sweep queues the run's blocks for a rescan
+  and then deletes it (below), or keeps it, with a warning, when the wallet's block
+  metadata cannot place its blocks; no seed resumes it. The resumed run is no longer
+  deleted when the wallet already holds content for the shard (after a second committed
+  unit of the interrupted range), which lost its leaves and anchors. A range also no
+  longer deletes the rest of the shard's rows, rows of blocks that may stay scanned: its
+  seed deletes only the rows at the positions it scans again, and a build or graft only
+  the rows it built, so the others wait for the next pass's sweep (below).
+- The range-end graft build, and every other build of buffered rows, inserted the rows
+  without first registering their durable anchors as retained. With the wallet at its
+  100-checkpoint budget (the ChainTip range's window), the build evicted the anchors it
+  had just added, and the anchors it kept were never recorded as retained. Buffered rows
+  also kept every per-block checkpoint when they were scanned deep below the chain tip,
+  so a later build created checkpoints that graft off never creates. Graft on now leaves
+  the same checkpoints and retained anchors as graft off.
+- A pass stopped or aborted after a Historic range's last commit, such as a host abort
+  that lands in the range's final drain, skipped the range-end build: the range's last
+  shard stayed only in the graft buffer, so its leaves, checkpoints and durable anchors
+  never reached the tree, and a later range that seeded in that shard deleted them. Each
+  pass now starts with a sweep of the buffer for the runs no pending range will resume. A
+  run is built when data the wallet already holds checks where it ends (the tree's leaf at
+  its last position, or the stored server root of the shard it completes); any other run
+  is deleted and its blocks are queued for a rescan. A wallet whose stranded rows are
+  still buffered heals on its next pass. This change neither detects nor repairs what an
+  earlier version already did: rows it deleted (their checkpoints and durable anchors are
+  missing), or leaves it built at the wrong positions. A buffered row that will not decode
+  no longer fails every pass: for each run of its shard, the sweep queues a rescan of the
+  blocks holding it, by position, and then deletes it; a run the wallet's block metadata
+  cannot place keeps its rows, with a warning. A range that still meets such a row seeds
+  without the shard's rows and builds what it scans in that shard, with a warning. Only a
+  row that will not decode counts: any other error reading the buffer (a busy database,
+  an I/O error) fails the range for the pass, as before, and the sweep leaves that
+  shard's rows as they are. Any other run the sweep cannot read, build or rescan gets a
+  warning and keeps its rows; a sweep that fails only warns, and the pass goes on. A run
+  whose end checks but whose build the tree refuses is deleted once its blocks are queued
+  for a rescan, as any other.
+- A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
+  of the blocks they queue again, though after a reorg those may be another chain's
+  commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own
+  account import (`WalletSession::import_account`) now drop every buffered row at or
+  above their rewind point. The truncation drops them in upstream's own truncation
+  transaction, so a crash or an error never leaves the wallet truncated with those rows
+  still buffered; a pool whose tree size the highest remaining block does not record
+  keeps its rows, with a warning. For an account a host imports into the wallet database
+  itself, the first range to seed in the shard resumes only the run that ends right
+  before its start, as above.
+- A custom chain (`SlipstreamNetwork::Custom`) now activates NU6.3 (Ironwood) at its
+  `CustomActivations::nu6_3` height. Before, it never activated NU6.3, whatever heights
+  were given. So a custom chain built from `CustomActivations::all_from_genesis`, or from the
+  CLI's `genesis` shorthand, now activates NU6.3 from height 1. This is deliberate and affects
+  custom chains only; the stock main and test networks are unchanged. A custom-chain wallet
+  database created before this change should be re-created, for example in a fresh wallet
+  directory: `zcash_client_sqlite`'s Ironwood migration bakes the network's NU6.3 height into
+  the `v_ironwood_shard_scan_ranges` view when it runs (as `NULL` when unset) and requeues
+  already-scanned NU6.3-era blocks only in that step, which ran for these databases with no
+  NU6.3 height.
+- `anchor::restore_anchor` treats a server that reports a chain tip or tree-state height
+  above `i32::MAX` as unreachable: a restore gets the offline `recover_until` fallback,
+  `max(fallback_checkpoint, birthday + 1)`, and a new wallet gets no anchor. It used to
+  return such a height as reported, which a host that bounds server heights at `i32::MAX`
+  cannot use, leaving a restore without a `recover_until`, so that it looked like a new
+  wallet.
+- `anchor::restore_anchor` now rejects a new-wallet tree state whose height differs from the
+  requested reorg-safe height, falling back to no anchor rather than returning a mismatched
+  state.
+
+## [0.4.0-pre.2] - 2026-10-20
+
 ### Added
 - `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
   endpoint whose host has a relay (`ohttp::relay_for`) is never dialled

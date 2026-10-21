@@ -37,6 +37,7 @@ use std::{
     future::Future,
     path::Path,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::Duration,
 };
@@ -129,7 +130,7 @@ const TOR_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 /// A bootstrapped arti Tor client, owned by the engine and driven on its own runtime.
 #[derive(Clone)]
 pub struct TorConn {
-    client: TorClient<PreferredRuntime>,
+    client: Arc<TorClient<PreferredRuntime>>,
     client_trace_prefix: Option<String>,
 }
 
@@ -178,7 +179,7 @@ impl TorConn {
 
     /// Wrap an already-bootstrapped arti client (e.g. one shared with another component).
     pub fn from_client(
-        client: TorClient<PreferredRuntime>,
+        client: Arc<TorClient<PreferredRuntime>>,
         client_trace_prefix: Option<String>,
     ) -> Self {
         Self {
@@ -188,7 +189,7 @@ impl TorConn {
     }
 
     /// The underlying arti handle.
-    pub fn client(&self) -> &TorClient<PreferredRuntime> {
+    pub fn client(&self) -> &Arc<TorClient<PreferredRuntime>> {
         &self.client
     }
 
@@ -252,7 +253,10 @@ impl TorConn {
                 }
             };
             match tokio::time::timeout(per_attempt, attempt_fut).await {
-                Ok(Ok(c)) => return Ok(c),
+                Ok(Ok(c)) => {
+                    grpc::net_stats::record(grpc::net_stats::NetEvent::TorChannel);
+                    return Ok(c);
+                }
                 Ok(Err(e)) => {
                     tracing::warn!(attempt, err = %e, "tor connect failed — retrying on a fresh circuit");
                     last_err = Some(format!("tor connect: {e}"));
@@ -282,7 +286,7 @@ impl TorConn {
     /// the caller's per-attempt timeout, so a stuck circuit is retried instead of eating the first
     /// RPC's deadline.
     async fn connect_ohttp(
-        client: TorClient<PreferredRuntime>,
+        client: Arc<TorClient<PreferredRuntime>>,
         endpoint: &Endpoint,
         relay: &str,
         client_trace_prefix: Option<String>,
@@ -295,7 +299,7 @@ impl TorConn {
         let connector = OhttpConnector::with_dialer(
             &endpoint.host,
             relay,
-            Dialer::Tor(Box::new(client)),
+            Dialer::Tor(client),
             client_trace_prefix,
         )
         .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
@@ -321,7 +325,7 @@ impl TorConn {
     /// `zcash_client_backend::tor::Client::connect_to_lightwalletd` (same tonic timeouts and
     /// keep-alives, webpki roots, `.onion` allowed when the host is one).
     async fn connect_direct_over_tor(
-        client: TorClient<PreferredRuntime>,
+        client: Arc<TorClient<PreferredRuntime>>,
         endpoint: &Endpoint,
     ) -> Result<LwdClient, SlipstreamError> {
         let uri: Uri = endpoint
@@ -359,7 +363,7 @@ impl TorConn {
 /// `tower::Service<Uri>` that opens the gRPC transport as an arti stream (the host is resolved at
 /// the Tor exit, never locally).
 struct TorTcpConnector {
-    client: TorClient<PreferredRuntime>,
+    client: Arc<TorClient<PreferredRuntime>>,
     prefs: StreamPrefs,
 }
 
@@ -516,6 +520,40 @@ pub async fn connect_direct_with_retry(endpoint: &Endpoint) -> Result<LwdClient,
         direct_connect_backoff,
     )
     .await
+}
+
+/// A lightwalletd connection opened on first use and reused after that.
+///
+/// For connections a range often never needs: opened up front, each one costs a TLS
+/// handshake and, with Tor on, an isolated circuit, whether or not anything is ever sent
+/// over it. `connect` runs on the first [`get`](Self::get), and again only if that attempt
+/// failed.
+pub struct LazyConnection<C, F> {
+    connect: F,
+    client: Option<C>,
+}
+
+impl<C, F, Fut> LazyConnection<C, F>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<C, SlipstreamError>>,
+{
+    /// A connection `connect` opens when it is first needed.
+    pub fn new(connect: F) -> Self {
+        Self {
+            connect,
+            client: None,
+        }
+    }
+
+    /// The client, connecting first if this is the first use or the last connect failed.
+    pub async fn get(&mut self) -> Result<&mut C, SlipstreamError> {
+        let client = match self.client.take() {
+            Some(client) => client,
+            None => (self.connect)().await?,
+        };
+        Ok(self.client.insert(client))
+    }
 }
 
 #[cfg(test)]
@@ -703,5 +741,54 @@ mod tests {
                 "need at least one retry to absorb a blip"
             )
         };
+    }
+
+    // ── LazyConnection ───────────────────────────────────────────────────────
+
+    /// A connection that is never asked for is never opened.
+    #[test]
+    fn lazy_connection_unused_never_connects() {
+        let calls = std::cell::Cell::new(0u32);
+        {
+            let _unused = LazyConnection::new(|| {
+                calls.set(calls.get() + 1);
+                async { Ok::<u32, SlipstreamError>(7) }
+            });
+        }
+        assert_eq!(calls.get(), 0, "an unused lazy connection opens nothing");
+    }
+
+    /// The first use connects; later uses reuse that client.
+    #[tokio::test]
+    async fn lazy_connection_connects_on_first_use_and_reuses_the_client() {
+        let calls = std::cell::Cell::new(0u32);
+        let mut lazy = LazyConnection::new(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move { Ok::<u32, SlipstreamError>(n) }
+        });
+        assert_eq!(*lazy.get().await.expect("the first use connects"), 1);
+        assert_eq!(*lazy.get().await.expect("later uses reuse it"), 1);
+        assert_eq!(calls.get(), 1, "connected exactly once");
+    }
+
+    /// A failed connect leaves nothing behind; the next use connects again.
+    #[tokio::test]
+    async fn lazy_connection_retries_after_a_failed_connect() {
+        let calls = std::cell::Cell::new(0u32);
+        let mut lazy = LazyConnection::new(|| {
+            let n = calls.get() + 1;
+            calls.set(n);
+            async move {
+                if n == 1 {
+                    Err(SlipstreamError::Transport("server down".into()))
+                } else {
+                    Ok::<u32, SlipstreamError>(n)
+                }
+            }
+        });
+        assert!(lazy.get().await.is_err(), "the failed connect surfaces");
+        assert_eq!(*lazy.get().await.expect("the next use connects again"), 2);
+        assert_eq!(calls.get(), 2);
     }
 }
