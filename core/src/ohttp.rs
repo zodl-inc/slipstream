@@ -73,10 +73,10 @@ use tower_service::Service;
 pub use zcash_protocol::consensus::NetworkType;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseDecoder, ClientProfile,
-    ClientTrace, DOH_RESOLVERS, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, KeyConfig, Network,
-    NetworkRule, RelayBackoff, ResponseEvent, SizeGuard, check_size, doh_query_url,
-    encapsulate_chunked_request, envelope_from_doh_json, key_config_dns_name, signed_config_url,
-    verify_signed_config,
+    ClientTrace, DOH_RESOLVERS, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
+    GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfig, Network, NetworkRule, RelayBackoff,
+    ResponseEvent, SizeGuard, check_size, doh_query_url, encapsulate_chunked_request,
+    envelope_from_doh_json, key_config_dns_name, signed_config_url, verify_signed_config,
 };
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
@@ -717,17 +717,22 @@ enum HttpsError {
     /// The pooled h2 connection was not ready: nothing reached the far end, so the caller may
     /// try again (a relay POST is sealed afresh first).
     PreSend(String),
-    /// Anything else (connect, TLS, send, read, size cap): the request may have been delivered,
-    /// so not retried to avoid repeating a request with side effects.
+    /// Anything else (connect, TLS, send, read): not retried here, to avoid repeating a request
+    /// with side effects. Only a failure after `on_send` ran may have reached the far end.
     Other(String),
     /// Not sent: the relay's `Retry-After` pause began while this request was being prepared.
     RelayPaused(String),
+    /// A size guard refused the answer, by the length it declared or by the bytes read so far.
+    TooLarge(String),
 }
 
 impl HttpsError {
     fn into_message(self) -> String {
         match self {
-            HttpsError::PreSend(m) | HttpsError::Other(m) | HttpsError::RelayPaused(m) => m,
+            HttpsError::PreSend(m)
+            | HttpsError::Other(m)
+            | HttpsError::RelayPaused(m)
+            | HttpsError::TooLarge(m) => m,
         }
     }
 
@@ -739,6 +744,51 @@ impl HttpsError {
     fn classify_send_error(e: impl std::fmt::Display, target_host: &str) -> Self {
         HttpsError::Other(format!("h2 send {target_host}: {e}"))
     }
+}
+
+/// Reads `body` to its end into memory, within `guard`. `declared_len` is the length the peer
+/// announced (`Content-Length`): a length past the guard's limit is refused before a frame is
+/// pulled. Each data frame is counted with `guard` before it is buffered, so the read stops at
+/// the first one that goes past the limit and the frames behind it are never pulled from the
+/// peer. Both refusals are [`HttpsError::TooLarge`]. A read error, or [`CHUNK_IDLE_TIMEOUT`]
+/// without a frame, is [`HttpsError::Other`]. `host` names the peer in the messages.
+async fn read_body_capped<B>(
+    mut body: B,
+    declared_len: Option<u64>,
+    mut guard: SizeGuard,
+    host: &str,
+) -> Result<Vec<u8>, HttpsError>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    if let Some(declared) = declared_len {
+        guard
+            .check_declared(declared)
+            .map_err(|e| HttpsError::TooLarge(format!("read {host}: {e}")))?;
+    }
+    let mut bytes = Vec::new();
+    loop {
+        let Some(frame) = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body.frame())
+            .await
+            .map_err(|_| {
+                HttpsError::Other(format!(
+                    "read {host}: idle timeout ({}s without data)",
+                    CHUNK_IDLE_TIMEOUT.as_secs()
+                ))
+            })?
+        else {
+            break;
+        };
+        let frame = frame.map_err(|e| HttpsError::Other(format!("read {host}: {e}")))?;
+        if let Ok(data) = frame.into_data() {
+            guard
+                .push(data.len())
+                .map_err(|e| HttpsError::TooLarge(format!("read {host}: {e}")))?;
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(bytes)
 }
 
 /// Why a whole OHTTP round trip failed; the gRPC bridge maps each differently.
@@ -757,6 +807,10 @@ enum RoundTripError {
     /// An outer 413, or a sealed request over 10 MiB refused before it was sent (gRPC
     /// `RESOURCE_EXHAUSTED`, not retried).
     TooLarge(String),
+    /// The answer is past the size ceiling of the request: the sealed answer stopped being read
+    /// at it, or its opened body is longer than the caller allowed (gRPC `RESOURCE_EXHAUSTED`,
+    /// not retried). The request had been sent.
+    ResponseTooLarge(String),
 }
 
 impl RoundTripError {
@@ -782,7 +836,9 @@ impl RoundTripError {
 impl std::fmt::Display for RoundTripError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RoundTripError::Transport(e) | RoundTripError::TooLarge(e) => f.write_str(e),
+            RoundTripError::Transport(e)
+            | RoundTripError::TooLarge(e)
+            | RoundTripError::ResponseTooLarge(e) => f.write_str(e),
             RoundTripError::Decode(e) => write!(f, "bhttp decode: {e}"),
             RoundTripError::RateLimited { detail, .. } => f.write_str(detail),
         }
@@ -818,7 +874,9 @@ where
     attempt().await
 }
 
-/// `on_dispatch` wrapped so that it runs at most once, across the attempts of one request.
+/// `on_dispatch` wrapped so that it runs at most once, across the attempts of one request: the
+/// first send marks the request as possibly delivered, and a later post of it (after a key
+/// refresh, or when the gateway refused it as stale) does not call the hook again.
 fn once_dispatch<D: Fn()>(on_dispatch: D) -> impl Fn() {
     let done = std::sync::atomic::AtomicBool::new(false);
     move || {
@@ -828,16 +886,65 @@ fn once_dispatch<D: Fn()>(on_dispatch: D) -> impl Fn() {
     }
 }
 
+/// The most sealed bytes read of an answer whose body the caller allows `max_response_bytes`:
+/// the body, one 256th more for the chunk tags and length prefixes, and 64 KiB for the header
+/// fields and the framing; never more than the gateway's own sealed cap. The opened body is
+/// then checked against `max_response_bytes` itself, see [`check_response_body`].
+fn sealed_response_ceiling(max_response_bytes: usize) -> usize {
+    max_response_bytes
+        .saturating_add(max_response_bytes / 256)
+        .saturating_add(64 * 1024)
+        .min(GATEWAY_MAX_SEALED_RESPONSE_BYTES)
+}
+
+/// Refuses an opened answer body of `len` bytes when it is longer than `max`, the ceiling the
+/// caller set (`None`: the caller set none).
+fn check_response_body(len: usize, max: Option<usize>) -> Result<(), RoundTripError> {
+    match max {
+        Some(max) if len > max => Err(RoundTripError::ResponseTooLarge(format!(
+            "response body too large: {len} > {max} bytes"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The opened answer as the [`BhttpResponse`] a round trip returns (header fields as bytes), once
+/// its body is checked against `max_response_bytes`, the ceiling the caller set.
+fn bhttp_response_within(
+    response: zodl_ohttp_client::Response,
+    max_response_bytes: Option<usize>,
+) -> Result<BhttpResponse, RoundTripError> {
+    check_response_body(response.body.len(), max_response_bytes)?;
+
+    // Convert Response to BhttpResponse (headers as bytes)
+    Ok(BhttpResponse {
+        status: response.status,
+        informational: Vec::new(),
+        headers: response
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
+            .collect(),
+        body: response.body,
+        trailers: Vec::new(),
+    })
+}
+
 /// The relay POST loop for chunked OHTTP. Returns the decoder and the relay's answer (buffered
 /// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
 /// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
-/// is retried once; an outer 400 or 422 refetches the key and retries once.
-async fn run_exchange_chunked<A, P, PF, R, RF, D>(
+/// is retried once; an outer 400 or 422 refetches the key and retries once. An answer that a
+/// size guard refused ([`HttpsError::TooLarge`]) is final: [`RoundTripError::ResponseTooLarge`],
+/// not posted again.
+///
+/// The caller's dispatch hook is not called here but inside `post`, at the moment the sealed
+/// request is handed to the relay connection: until then a post may still fail without having
+/// sent anything.
+async fn run_exchange_chunked<A, P, PF, R, RF>(
     mut key: KeyConfig,
     request: &BhttpRequest,
     mut post: P,
     mut refetch: R,
-    on_dispatch: D,
 ) -> Result<(ChunkedResponseDecoder, A), RoundTripError>
 where
     A: OuterAnswer,
@@ -845,10 +952,8 @@ where
     PF: Future<Output = Result<A, HttpsError>>,
     R: FnMut() -> RF,
     RF: Future<Output = Result<KeyConfig, RoundTripError>>,
-    D: Fn(),
 {
     let mut attempt = 0u32;
-    let mut dispatched = false;
     loop {
         let mut resent = false;
         let (opener, answer) = loop {
@@ -859,11 +964,6 @@ where
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
             check_size(sealed.len(), Some(GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES))
                 .map_err(|e| RoundTripError::TooLarge(format!("sealed request not sent: {e}")))?;
-            // Signal dispatch right before posting the sealed request to the relay
-            if !dispatched {
-                on_dispatch();
-                dispatched = true;
-            }
             match post(sealed).await {
                 Ok(answer) => break (opener, answer),
                 Err(HttpsError::PreSend(e)) if !resent => {
@@ -875,6 +975,9 @@ where
                         detail,
                         retry_after: None,
                     });
+                }
+                Err(HttpsError::TooLarge(detail)) => {
+                    return Err(RoundTripError::ResponseTooLarge(detail));
                 }
                 Err(e) => return Err(RoundTripError::Transport(e.into_message())),
             }
@@ -1165,15 +1268,22 @@ impl OhttpClient {
     /// otherwise a fresh HTTP/1.1 connection. A failure before anything was sent on a pooled h2
     /// connection is [`HttpsError::PreSend`] (and drops that connection from the pool); it is
     /// never retried here, because resending a relay POST's body would repeat its ciphertext.
-    /// The caller decides, and seals afresh. The body is read through `guard`, which aborts the
-    /// read at the first byte past the size cap.
-    async fn https_once(
+    /// The caller decides, and seals afresh. The body is read by [`read_body_capped`] through
+    /// `guard`: a declared length past the size cap, or the first frame that goes past it, ends
+    /// the exchange as [`HttpsError::TooLarge`].
+    ///
+    /// `on_send` is called once, right before the request is handed to the connection: on h2
+    /// when the connection is ready, on HTTP/1.1 when TLS and the handshake are done. A failure
+    /// before that point (connect, TLS, handshake, a connection that is not ready) never calls
+    /// it, so it marks the exchanges that may have reached the far end.
+    async fn https_once<F: Fn()>(
         &self,
         target: &HttpsTarget,
         method: Method,
         headers: &[(&'static str, String)],
         body: Vec<u8>,
-        mut guard: SizeGuard,
+        guard: SizeGuard,
+        on_send: &F,
     ) -> Result<RelayAnswer, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
@@ -1188,6 +1298,7 @@ impl OhttpClient {
                         target.host
                     )));
                 }
+                on_send();
                 match sender.send_request(req).await {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
@@ -1204,6 +1315,7 @@ impl OhttpClient {
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
+                on_send();
                 sender
                     .send_request(req)
                     .await
@@ -1211,41 +1323,14 @@ impl OhttpClient {
                     .map(|b| b.boxed())
             }
         };
-        let (parts, mut body) = resp.into_parts();
+        let (parts, body) = resp.into_parts();
         self.note_retry_after(parts.status, &parts.headers);
-        if let Some(declared) = parts
+        let declared_len = parts
             .headers
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.trim().parse::<u64>().ok())
-        {
-            guard
-                .check_declared(declared)
-                .map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
-        }
-        let mut bytes = Vec::new();
-        loop {
-            let Some(frame) = tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body.frame())
-                .await
-                .map_err(|_| {
-                    HttpsError::Other(format!(
-                        "read {}: idle timeout ({}s without data)",
-                        target.host,
-                        CHUNK_IDLE_TIMEOUT.as_secs()
-                    ))
-                })?
-            else {
-                break;
-            };
-            let frame =
-                frame.map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
-            if let Ok(data) = frame.into_data() {
-                guard
-                    .push(data.len())
-                    .map_err(|e| HttpsError::Other(format!("read {}: {e}", target.host)))?;
-                bytes.extend_from_slice(&data);
-            }
-        }
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        let bytes = read_body_capped(body, declared_len, guard, &target.host).await?;
         Ok(RelayAnswer {
             status: parts.status,
             content_type: parts
@@ -1258,38 +1343,46 @@ impl OhttpClient {
         })
     }
 
-    /// POST one sealed chunked request body to the relay. Returns buffered response.
-    async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
+    /// POST one sealed chunked request body to the relay. Returns buffered response, read
+    /// through `guard` (the caller's choice, so a request that allows only a small answer does
+    /// not buffer a large one). `on_send` is called as [`Self::https_once`] describes, so not
+    /// when the relay's pause stops the post or the connection cannot be made ready.
+    async fn post_sealed<F: Fn()>(
+        &self,
+        body: Vec<u8>,
+        guard: SizeGuard,
+        on_send: &F,
+    ) -> Result<RelayAnswer, HttpsError> {
         self.relay_pause_before_post()?;
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let headers = self.profile.headers.relay_post(trace.as_deref());
-        self.https_once(
-            &self.relay,
-            Method::POST,
-            &headers,
-            body,
-            self.profile.limits.response_guard(),
-        )
-        .await
-    }
-
-    /// POST one sealed chunked request body to the relay. Returns the response with its body
-    /// unread.
-    async fn post_sealed_stream(&self, body: Vec<u8>) -> Result<RelayStream, HttpsError> {
-        self.relay_pause_before_post()?;
-        let trace = self.client_trace.as_ref().map(|t| t.next());
-        let headers = self.profile.headers.relay_post(trace.as_deref());
-        self.https_once_stream(&self.relay, Method::POST, &headers, body)
+        self.https_once(&self.relay, Method::POST, &headers, body, guard, on_send)
             .await
     }
 
-    /// Like https_once but returns the response stream instead of buffering the body.
-    async fn https_once_stream(
+    /// POST one sealed chunked request body to the relay. Returns the response with its body
+    /// unread. `on_send` is called as for [`Self::post_sealed`].
+    async fn post_sealed_stream<F: Fn()>(
+        &self,
+        body: Vec<u8>,
+        on_send: &F,
+    ) -> Result<RelayStream, HttpsError> {
+        self.relay_pause_before_post()?;
+        let trace = self.client_trace.as_ref().map(|t| t.next());
+        let headers = self.profile.headers.relay_post(trace.as_deref());
+        self.https_once_stream(&self.relay, Method::POST, &headers, body, on_send)
+            .await
+    }
+
+    /// Like https_once but returns the response stream instead of buffering the body. `on_send`
+    /// is called under the same rule.
+    async fn https_once_stream<F: Fn()>(
         &self,
         target: &HttpsTarget,
         method: Method,
         headers: &[(&'static str, String)],
         body: Vec<u8>,
+        on_send: &F,
     ) -> Result<RelayStream, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
@@ -1304,6 +1397,7 @@ impl OhttpClient {
                         target.host
                     )));
                 }
+                on_send();
                 match sender.send_request(req).await {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
@@ -1320,6 +1414,7 @@ impl OhttpClient {
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
+                on_send();
                 sender
                     .send_request(req)
                     .await
@@ -1405,6 +1500,7 @@ impl OhttpClient {
                         &headers,
                         Vec::new(),
                         self.profile.limits.key_config_guard(),
+                        &|| {},
                     )
                     .await
                 {
@@ -1509,6 +1605,7 @@ impl OhttpClient {
                 &headers,
                 Vec::new(),
                 self.profile.limits.key_config_guard(),
+                &|| {},
             )
             .await
             .map_err(|e| e.into_message())?;
@@ -1577,6 +1674,7 @@ impl OhttpClient {
     async fn round_trip<D>(
         &self,
         request: &BhttpRequest,
+        max_response_bytes: Option<usize>,
         on_dispatch: D,
     ) -> Result<BhttpResponse, RoundTripError>
     where
@@ -1584,7 +1682,7 @@ impl OhttpClient {
     {
         let dispatch = once_dispatch(on_dispatch);
         with_freshness_retry(
-            || self.round_trip_once(request, &dispatch),
+            || self.round_trip_once(request, max_response_bytes, &dispatch),
             |r: &BhttpResponse| zodl_ohttp_client::freshness::is_rejection(r.status, &r.headers),
         )
         .await
@@ -1593,23 +1691,38 @@ impl OhttpClient {
     /// Encapsulate + relay + decapsulate with chunked OHTTP. The key configuration is
     /// fetched again, and the request sealed again, when the gateway rejects the request (outer
     /// 400 or 422). Decodes the chunked response and returns the inner message.
+    ///
+    /// `max_response_bytes` is the largest answer body the caller accepts. The sealed answer is
+    /// read through a guard of [`sealed_response_ceiling`] bytes, so one that goes past it is
+    /// not buffered further or opened ([`RoundTripError::ResponseTooLarge`]); the body it opens
+    /// to is then checked against `max_response_bytes` itself. `None` leaves only the general
+    /// cap of the client's profile.
+    ///
+    /// `on_dispatch` is called right before the sealed request is written to the relay
+    /// connection, after the relay-pause check and the connection setup (see
+    /// [`Self::https_once`]). So a relay pause, a relay that cannot be reached and a connection
+    /// that is not ready leave it uncalled, while a failure after it may have reached the relay.
     async fn round_trip_once<D>(
         &self,
         request: &BhttpRequest,
-        on_dispatch: D,
+        max_response_bytes: Option<usize>,
+        on_dispatch: &D,
     ) -> Result<BhttpResponse, RoundTripError>
     where
         D: Fn(),
     {
         self.check_relay_pause()?;
         let key = self.key_config(false).await?;
+        let guard = match max_response_bytes {
+            Some(max) => SizeGuard::new(Some(sealed_response_ceiling(max))),
+            None => self.profile.limits.response_guard(),
+        };
         let this = self;
         let (mut decoder, answer) = run_exchange_chunked(
             key,
             request,
-            move |body| this.post_sealed(body),
+            move |body| this.post_sealed(body, guard, on_dispatch),
             move || this.key_config(true),
-            on_dispatch,
         )
         .await?;
 
@@ -1625,19 +1738,7 @@ impl OhttpClient {
         // Collect events into a Response and convert to BhttpResponse
         let response = zodl_ohttp_client::collect_response(events)
             .map_err(|e| RoundTripError::Decode(e.to_string()))?;
-
-        // Convert Response to BhttpResponse (headers as bytes)
-        Ok(BhttpResponse {
-            status: response.status,
-            informational: Vec::new(),
-            headers: response
-                .headers
-                .into_iter()
-                .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
-                .collect(),
-            body: response.body,
-            trailers: Vec::new(),
-        })
+        bhttp_response_within(response, max_response_bytes)
     }
 
     /// [`Self::round_trip_stream_once`] with the same single retry as [`Self::round_trip`] when
@@ -1671,10 +1772,11 @@ impl OhttpClient {
     /// as they are decoded chunk by chunk: the first gRPC message is available before the
     /// response has been received in full. Same exchange loop as [`Self::round_trip`]: every
     /// post is sealed afresh, an outer 400 or 422 refetches the key and retries once.
+    /// `on_dispatch` is called as [`Self::round_trip_once`] describes.
     async fn round_trip_stream_once<D>(
         &self,
         request: BhttpRequest,
-        on_dispatch: D,
+        on_dispatch: &D,
     ) -> Result<(u16, HeaderMap, EventStream), RoundTripError>
     where
         D: Fn(),
@@ -1688,9 +1790,8 @@ impl OhttpClient {
         let (decoder, answer) = run_exchange_chunked(
             key,
             &request,
-            move |body| this.post_sealed_stream(body),
+            move |body| this.post_sealed_stream(body, on_dispatch),
             move || this.key_config(true),
-            on_dispatch,
         )
         .await?;
 
@@ -1789,8 +1890,8 @@ impl OhttpClient {
                         Some(OUTCOME_RATE_LIMITED),
                     );
                 }
-                Ok(Err(RoundTripError::TooLarge(e))) => {
-                    tracing::warn!(path = %path, err = %e, "ohttp: request too large");
+                Ok(Err(RoundTripError::TooLarge(e) | RoundTripError::ResponseTooLarge(e))) => {
+                    tracing::warn!(path = %path, err = %e, "ohttp: request or response too large");
                     return grpc_error_with(
                         GRPC_RESOURCE_EXHAUSTED,
                         &format!("ohttp: {e}"),
@@ -1921,7 +2022,7 @@ fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
 /// with automatic key rotation retry on gateway 400/422.
 ///
 /// # Response size cap
-/// A sealed response larger than the gateway's own 256 MiB cap (plus 64 KiB of framing) is
+/// A sealed response larger than the gateway's own 256 MiB cap (plus 1 MiB of framing) is
 /// rejected while it is being read, before it is buffered or decrypted.
 ///
 /// # Caching
@@ -1936,23 +2037,60 @@ pub async fn http_round_trip(
     headers: &[(String, String)],
     body: &[u8],
 ) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
-    http_round_trip_with_dispatch(
+    let (target, relay_url) = http_target_and_relay(gateway_host, network, url)?;
+    http_round_trip_via(
+        relay_url,
         gateway_host,
-        network,
         dialer,
         method,
-        url,
+        target,
         headers,
         body,
+        None,
         || {},
     )
     .await
+    .map_err(|e| e.to_string())
 }
 
-/// Like [`http_round_trip`], but calls `on_dispatch` right before the sealed request is posted
-/// to the relay (after key config fetch and encapsulation). This lets the caller distinguish
-/// failures that never sent ciphertext (key fetch, encapsulation) from those that did (relay
-/// transport, gateway processing).
+/// Why [`http_round_trip_with_dispatch`] failed. Its `Display` is the message alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HttpRoundTripError {
+    /// The answer is past the `max_response_bytes` the caller allowed: the sealed answer stopped
+    /// being read at its ceiling, or the body it opened to is longer than that. The request had
+    /// been sent: `on_dispatch` has run.
+    ResponseTooLarge(String),
+    /// Any other failure: a gateway of another network, a URL that does not parse, no relay for
+    /// the gateway, the key configuration, the relay, the gateway, the 100 s bound. `on_dispatch`
+    /// tells whether the request may have been sent.
+    Failed(String),
+}
+
+impl std::fmt::Display for HttpRoundTripError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpRoundTripError::ResponseTooLarge(m) | HttpRoundTripError::Failed(m) => {
+                f.write_str(m)
+            }
+        }
+    }
+}
+
+impl std::error::Error for HttpRoundTripError {}
+
+/// Like [`http_round_trip`], but with a ceiling on the answer and a hook for the send.
+///
+/// The answer is read only up to `max_response_bytes` plus room for its sealed framing (see the
+/// argument below). A service that answers with much more fails as
+/// [`HttpRoundTripError::ResponseTooLarge`] while the answer is being read, before it is
+/// buffered in full or opened. One only a little past the ceiling, within that room, is read and
+/// opened first, and then refused by the exact check on its body: the same error.
+///
+/// `on_dispatch` is called right before the sealed request is written to the relay connection:
+/// after the key config fetch, the encapsulation, the relay-pause check and the connection setup.
+/// This lets the caller distinguish failures that never sent ciphertext (key fetch,
+/// encapsulation, a relay pause, a relay that cannot be reached, a connection that is not ready)
+/// from those that may have (a failed write, relay transport, gateway processing).
 ///
 /// # Arguments
 /// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
@@ -1963,16 +2101,26 @@ pub async fn http_round_trip(
 /// * `url` - Full target URL (e.g., "<https://voting.valargroup.dev/api/vote>")
 /// * `headers` - Request headers as (name, value) pairs
 /// * `body` - Request body bytes
-/// * `on_dispatch` - Called once, right before the sealed request is sent to the relay
+/// * `max_response_bytes` - The largest answer body read. A larger answer stops being read there
+///   and fails as [`HttpRoundTripError::ResponseTooLarge`]. The sealed answer gets a little more
+///   room for its framing (a 256th of this and 64 KiB); the body it opens to must then fit in
+///   `max_response_bytes` itself.
+/// * `on_dispatch` - Called at most once, right before the sealed request is written to the
+///   relay connection, after the relay-pause check and the connection setup. So a pause, a
+///   relay that cannot be reached, or a connection that is not ready leaves it uncalled. A
+///   failure after it may have reached the relay.
 ///
 /// # Returns
-/// `Ok((status, headers, body))` on success, or `Err(msg)` on failure.
+/// `Ok((status, headers, body))` on success, or an [`HttpRoundTripError`] on failure:
+/// `ResponseTooLarge` when the answer is past `max_response_bytes`, `Failed` for anything else.
 ///
 /// # Example
 /// ```no_run
 /// # async fn demo() -> Result<(), String> {
 /// use std::sync::atomic::{AtomicBool, Ordering};
-/// use zodl_slipstream::ohttp::{Dialer, NetworkType, http_round_trip_with_dispatch};
+/// use zodl_slipstream::ohttp::{
+///     Dialer, HttpRoundTripError, NetworkType, http_round_trip_with_dispatch,
+/// };
 ///
 /// let dispatched = AtomicBool::new(false);
 /// match http_round_trip_with_dispatch(
@@ -1983,23 +2131,28 @@ pub async fn http_round_trip(
 ///     "https://voting.example/api/vote",
 ///     &[("content-type".to_string(), "application/json".to_string())],
 ///     b"{\"vote\": 1}",
+///     256 * 1024,
 ///     || dispatched.store(true, Ordering::SeqCst),
 /// )
 /// .await
 /// {
 ///     Ok(response) => println!("Vote sent: {}", response.0),
+///     Err(HttpRoundTripError::ResponseTooLarge(e)) => {
+///         // Answered, but too large: the request was sent
+///         println!("Answer past the ceiling: {e}");
+///     }
 ///     Err(e) if !dispatched.load(Ordering::SeqCst) => {
 ///         // Safe to retry: request never left the device
 ///         println!("Pre-dispatch failure: {e}");
 ///     }
 ///     Err(e) => {
-///         // Request was sent; do not retry (possible duplicate)
+///         // Request may have been sent; do not retry (possible duplicate)
 ///         println!("Post-dispatch failure: {e}");
 ///     }
 /// }
 /// # Ok(()) }
 /// ```
-#[allow(clippy::too_many_arguments)] // the public shape of http_round_trip plus the hook
+#[allow(clippy::too_many_arguments)] // http_round_trip's shape plus the ceiling and the hook
 pub async fn http_round_trip_with_dispatch<D>(
     gateway_host: &str,
     network: NetworkType,
@@ -2008,11 +2161,35 @@ pub async fn http_round_trip_with_dispatch<D>(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
+    max_response_bytes: usize,
     on_dispatch: D,
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String>
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), HttpRoundTripError>
 where
     D: Fn() + Send + Sync,
 {
+    let (target, relay_url) =
+        http_target_and_relay(gateway_host, network, url).map_err(HttpRoundTripError::Failed)?;
+    http_round_trip_via(
+        relay_url,
+        gateway_host,
+        dialer,
+        method,
+        target,
+        headers,
+        body,
+        Some(max_response_bytes),
+        on_dispatch,
+    )
+    .await
+}
+
+/// What a plain HTTP round trip settles before anything is sent: the gateway serves the wallet's
+/// network, `url` parses, and the gateway has a relay.
+fn http_target_and_relay(
+    gateway_host: &str,
+    network: NetworkType,
+    url: &str,
+) -> Result<(HttpTarget, &'static str), String> {
     check_gateway_network(gateway_host, network)?;
 
     // Parse URL to extract scheme, host, path for BHTTP encoding
@@ -2022,22 +2199,25 @@ where
     let relay_url = relay_for(gateway_host)
         .ok_or_else(|| format!("no relay configured for gateway {}", gateway_host))?;
 
-    http_round_trip_via(
-        relay_url,
-        gateway_host,
-        dialer,
-        method,
-        target,
-        headers,
-        body,
-        on_dispatch,
-    )
-    .await
+    Ok((target, relay_url))
+}
+
+/// A round trip's error as the caller of [`http_round_trip_with_dispatch`] sees it: an answer
+/// past its ceiling is told apart, every other failure keeps its message.
+fn http_error(error: RoundTripError) -> HttpRoundTripError {
+    match error {
+        RoundTripError::ResponseTooLarge(message) => HttpRoundTripError::ResponseTooLarge(message),
+        other => HttpRoundTripError::Failed(other.to_string()),
+    }
 }
 
 /// [`http_round_trip`] against an explicit relay URL (the body of the public function, so a
 /// test can point it at a local relay without touching the process-wide relay table).
-/// `on_dispatch` is called right before the sealed request is posted to the relay.
+/// `max_response_bytes` is the ceiling [`http_round_trip_with_dispatch`] describes; `None` sets
+/// none of the caller's, which leaves the general cap of [`http_round_trip`]. `on_dispatch` is
+/// called right before the sealed request is written to the relay connection, after the
+/// relay-pause check and the connection setup, as [`http_round_trip_with_dispatch`] describes.
+/// Setup errors and the 100 s bound are [`HttpRoundTripError::Failed`].
 #[allow(clippy::too_many_arguments)] // one seam over the limit; bundling would hide the borrows
 async fn http_round_trip_via<D>(
     relay_url: &str,
@@ -2047,8 +2227,9 @@ async fn http_round_trip_via<D>(
     target: HttpTarget,
     headers: &[(String, String)],
     body: &[u8],
+    max_response_bytes: Option<usize>,
     on_dispatch: D,
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String>
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), HttpRoundTripError>
 where
     D: Fn(),
 {
@@ -2060,7 +2241,8 @@ where
         get_default_client_trace_prefix(),
         ClientProfile::SLIPSTREAM_HTTP,
     )
-    .await?;
+    .await
+    .map_err(HttpRoundTripError::Failed)?;
 
     // HTTP request as Binary HTTP (RFC 9292): the URL's scheme, header names as given
     let mut request = BhttpRequest::new(method, target.host, target.path)
@@ -2071,16 +2253,18 @@ where
     }
 
     // Send through OHTTP relay (encapsulate, POST, decapsulate), the whole exchange bounded
-    let response =
-        tokio::time::timeout(ROUND_TRIP_TIMEOUT, client.round_trip(&request, on_dispatch))
-            .await
-            .map_err(|_| {
-                format!(
-                    "ohttp: round trip timed out after {}s",
-                    ROUND_TRIP_TIMEOUT.as_secs()
-                )
-            })?
-            .map_err(RoundTripError::into_message)?;
+    let response = tokio::time::timeout(
+        ROUND_TRIP_TIMEOUT,
+        client.round_trip(&request, max_response_bytes, on_dispatch),
+    )
+    .await
+    .map_err(|_| {
+        HttpRoundTripError::Failed(format!(
+            "ohttp: round trip timed out after {}s",
+            ROUND_TRIP_TIMEOUT.as_secs()
+        ))
+    })?
+    .map_err(http_error)?;
 
     // Headers as lossy UTF-8 text; the trailer section is not read
     let response_headers = response.headers_utf8_lossy();
@@ -2165,6 +2349,7 @@ mod tests {
     use base64::Engine;
     use std::cell::Cell;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use zodl_ohttp_client::encode_bhttp_request;
 
     /// `http_round_trip` refuses a gateway of another network before anything is sent.
@@ -2179,11 +2364,15 @@ mod tests {
             "https://vote.example/api",
             &[],
             b"",
+            256 * 1024,
             || dispatched.store(true, std::sync::atomic::Ordering::SeqCst),
         )
         .await
         .expect_err("refused");
-        assert!(err.contains("mainnet"), "{err}");
+        assert!(
+            matches!(&err, HttpRoundTripError::Failed(m) if m.contains("mainnet")),
+            "{err:?}"
+        );
         assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
         assert!(check_gateway_network("ohttp-gateway.example", NetworkType::Main).is_ok());
         assert!(check_gateway_network("ohttp-gateway-testnet.example", NetworkType::Test).is_ok());
@@ -2248,23 +2437,20 @@ mod tests {
 
     /// Test helper: wraps run_exchange_chunked for backward compatibility with existing tests.
     /// Decodes the buffered response and returns a BhttpResponse.
-    async fn run_exchange<P, PF, R, RF, D>(
+    async fn run_exchange<P, PF, R, RF>(
         _profile: &ClientProfile,
         key: KeyConfig,
         request: &BhttpRequest,
         post: P,
         refetch: R,
-        on_dispatch: D,
     ) -> Result<BhttpResponse, RoundTripError>
     where
         P: FnMut(Vec<u8>) -> PF,
         PF: Future<Output = Result<RelayAnswer, HttpsError>>,
         R: FnMut() -> RF,
         RF: Future<Output = Result<KeyConfig, RoundTripError>>,
-        D: Fn(),
     {
-        let (mut decoder, answer) =
-            run_exchange_chunked(key, request, post, refetch, on_dispatch).await?;
+        let (mut decoder, answer) = run_exchange_chunked(key, request, post, refetch).await?;
 
         // Decode the buffered response
         let mut events = decoder
@@ -2449,7 +2635,6 @@ mod tests {
                 async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 ready: closed".into())) }
             },
             || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {},
         )
         .await;
         let Err(RoundTripError::Transport(message)) = result else {
@@ -2484,7 +2669,6 @@ mod tests {
                 }
             },
             || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {},
         )
         .await;
         let Err(RoundTripError::Transport(message)) = result else {
@@ -2515,7 +2699,6 @@ mod tests {
                     refetches.set(refetches.get() + 1);
                     async { Ok::<KeyConfig, RoundTripError>(test_key()) }
                 },
-                || {},
             )
             .await;
             let Err(RoundTripError::Transport(message)) = result else {
@@ -2546,7 +2729,6 @@ mod tests {
                     async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
                 },
                 || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-                || {},
             )
             .await;
             let message = match result {
@@ -2579,7 +2761,6 @@ mod tests {
                 })
             },
             || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {},
         )
         .await;
         // Labelled as a chunked response, so it reaches the decoder, which refuses to open it.
@@ -2627,6 +2808,7 @@ mod tests {
                 parse_http_target("https://origin.invalid/api/vote").expect("target"),
                 &[("content-type".to_string(), "application/json".to_string())],
                 b"{\"vote\": 1}",
+                None,
                 || {},
             ),
         )
@@ -2643,7 +2825,9 @@ mod tests {
             "relay must receive a TLS ClientHello, got {first_bytes:02x?}"
         );
         // The relay hung up without a TLS answer, so the call fails - at the relay.
-        let err = result.expect_err("a fake relay cannot complete the exchange");
+        let err = result
+            .expect_err("a fake relay cannot complete the exchange")
+            .to_string();
         assert!(
             err.contains("127.0.0.1"),
             "error must name the relay: {err}"
@@ -2893,7 +3077,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(stream_answer(503, CONTENT_TYPE_CHUNKED_RES)) },
             || async { unreachable!("no refetch on 503") },
-            || {},
         )
         .await
         .err()
@@ -2908,7 +3091,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(stream_answer(200, "text/html")) },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .err()
@@ -2923,7 +3105,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(stream_answer(200, CONTENT_TYPE_CHUNKED_RES)) },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .expect("a chunked 200 is handed back unread");
@@ -3511,7 +3692,6 @@ mod tests {
                 *count += 1;
                 async { Ok::<KeyConfig, RoundTripError>(test_key()) }
             },
-            || {}, // no-op dispatch
         )
         .await;
 
@@ -3529,7 +3709,7 @@ mod tests {
         );
     }
 
-    /// Dispatch callback is invoked exactly once, before the first POST attempt.
+    /// A request the gateway refused as stale is sent once more, and never more than once.
     #[tokio::test]
     async fn a_freshness_refusal_is_sent_once_more_and_only_once() {
         // Answers in order; `true` = the gateway's freshness refusal.
@@ -3594,74 +3774,608 @@ mod tests {
         assert_eq!(n.get(), 1);
     }
 
-    #[tokio::test]
-    async fn dispatch_callback_fires_once_before_post() {
-        let dispatch_count = StdMutex::new(0u32);
-        let post_count = StdMutex::new(0u32);
-        let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
-            test_key(),
-            &test_request(),
-            |_body| {
-                let mut count = post_count.lock().unwrap();
-                *count += 1;
-                async { Err::<RelayAnswer, HttpsError>(HttpsError::PreSend("closed".into())) }
-            },
-            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {
-                let mut count = dispatch_count.lock().unwrap();
-                *count += 1;
-            },
-        )
-        .await;
-
-        assert_eq!(
-            *dispatch_count.lock().unwrap(),
-            1,
-            "dispatch callback must be called exactly once"
-        );
-        assert_eq!(
-            *post_count.lock().unwrap(),
-            2,
-            "post should be attempted twice (initial + pre-send retry)"
-        );
-        assert!(matches!(result, Err(RoundTripError::Transport(_))));
+    /// Gives `client` a key that is good for another hour, so that a round trip goes straight to
+    /// the relay post.
+    async fn cache_a_key(client: &OhttpClient) {
+        *client.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: unix_now().expect("time") + 3600,
+        });
     }
 
-    /// Dispatch callback fires before the first POST, even if the first attempt fails pre-send
-    /// and is retried.
+    /// A client of the `SLIPSTREAM_HTTP` profile for the relay at `relay_url`, with a key (see
+    /// [`cache_a_key`]).
+    async fn client_with_a_key(relay_url: &str) -> OhttpClient {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay_url,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .expect("client");
+        cache_a_key(&client).await;
+        client
+    }
+
+    /// [`client_with_a_key`] for a relay on loopback port `port`.
+    async fn client_with_a_key_for_a_relay_on(port: u16) -> OhttpClient {
+        client_with_a_key(&format!("https://127.0.0.1:{port}/relay")).await
+    }
+
+    /// Puts an in-process relay behind the pooled h2 connection of `client` to its relay, where
+    /// `h2_sender` finds it before it dials anything (so no TLS). `handler` is called for each
+    /// request the client sends the relay, and answers it.
+    async fn serve_in_process_relay<H, Fut>(client: &OhttpClient, handler: H)
+    where
+        H: Fn(Request<Incoming>) -> Fut + Send + 'static,
+        Fut: Future<Output = Response<BoxBody<Bytes, Infallible>>> + Send + 'static,
+    {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let relay = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let answer = handler(req);
+            async move { Ok::<_, Infallible>(answer.await) }
+        });
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(server_io), relay)
+                .await;
+        });
+        let (sender, conn) =
+            http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(client_io))
+                .await
+                .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client.h2_pool.lock().await.insert(
+            format!("{}:{}", client.relay.host, client.relay.port),
+            (sender, std::time::Instant::now()),
+        );
+    }
+
+    /// A relay's answer of `len` bytes of filler under the sealed-response media type, in 8 KiB
+    /// frames and without a content length.
+    fn filler_answer(len: usize) -> Response<BoxBody<Bytes, Infallible>> {
+        let frames: Vec<Result<Frame<Bytes>, Infallible>> = (0..len)
+            .step_by(8 * 1024)
+            .map(|start| {
+                let size = (len - start).min(8 * 1024);
+                Ok(Frame::data(Bytes::from(vec![7u8; size])))
+            })
+            .collect();
+        let mut answer = Response::new(BodyExt::boxed(StreamBody::new(
+            futures_util::stream::iter(frames),
+        )));
+        answer.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(CONTENT_TYPE_CHUNKED_RES),
+        );
+        answer
+    }
+
+    /// The hook marks a request that may have reached the relay. A relay that cannot be
+    /// connected to has seen nothing, so the hook stays uncalled and the caller may retry.
     #[tokio::test]
-    async fn dispatch_fires_before_pre_send_retry() {
-        let events = StdMutex::new(Vec::<&str>::new());
-        let post_attempt = Cell::new(0u32);
-        let _result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
+    async fn a_relay_post_that_cannot_connect_is_not_dispatched() {
+        use tokio::net::TcpListener;
+
+        // A port nothing listens on: bound to learn a free one, then released.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let client = client_with_a_key_for_a_relay_on(port).await;
+        let dispatched = AtomicBool::new(false);
+        let err = client
+            .round_trip(&test_request(), None, || {
+                dispatched.store(true, Ordering::SeqCst)
+            })
+            .await
+            .expect_err("nothing listens on the relay port");
+        assert!(matches!(err, RoundTripError::Transport(_)), "{err:?}");
+        assert!(!dispatched.load(Ordering::SeqCst), "nothing was sent");
+    }
+
+    /// A relay that hangs up while the TLS handshake is going on has not seen the request either.
+    #[tokio::test]
+    async fn a_relay_that_hangs_up_during_tls_is_not_dispatched() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake relay");
+        let port = listener.local_addr().expect("relay addr").port();
+        // Fake relay: takes every connection, reads what the client sends first and hangs up.
+        // The client may open more than one (an h2 attempt, then HTTP/1.1).
+        let relay_task = tokio::spawn(async move {
+            while let Ok((mut socket, _peer)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+            }
+        });
+
+        let client = client_with_a_key_for_a_relay_on(port).await;
+        let dispatched = AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.round_trip(&test_request(), None, || {
+                dispatched.store(true, Ordering::SeqCst)
+            }),
+        )
+        .await;
+        relay_task.abort();
+
+        let err = result
+            .expect("the round trip must finish")
+            .expect_err("a relay that hangs up cannot answer");
+        assert!(matches!(err, RoundTripError::Transport(_)), "{err:?}");
+        assert!(!dispatched.load(Ordering::SeqCst), "nothing was sent");
+    }
+
+    /// A pause that began while the request was prepared stops the post before anything is
+    /// written, so the hook stays uncalled.
+    #[tokio::test]
+    async fn a_pause_noticed_at_the_post_is_not_dispatched() {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-pause-at-post-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+
+        let dispatched = AtomicBool::new(false);
+        let err = client
+            .post_sealed(vec![0u8; 32], SizeGuard::new(None), &|| {
+                dispatched.store(true, Ordering::SeqCst)
+            })
+            .await
+            .err()
+            .expect("held by the relay's pause");
+        assert!(matches!(err, HttpsError::RelayPaused(_)), "{err:?}");
+        assert!(!dispatched.load(Ordering::SeqCst), "nothing was sent");
+    }
+
+    /// The other side of the tests above: a post that reaches the relay calls the hook, once,
+    /// before the relay gets the request, buffered and streamed alike. The relay is in-process
+    /// behind a pooled h2 connection, which is looked up before anything is dialled (no TLS).
+    #[tokio::test]
+    async fn a_post_calls_the_hook_right_before_the_relay_gets_the_request() {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-hook-at-send-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        // How many times the hook had run when each request reached the relay.
+        let seen_by_relay = Arc::new(StdMutex::new(Vec::<usize>::new()));
+        serve_in_process_relay(&client, {
+            let hook_calls = Arc::clone(&hook_calls);
+            let seen_by_relay = Arc::clone(&seen_by_relay);
+            move |_req| {
+                seen_by_relay
+                    .lock()
+                    .unwrap()
+                    .push(hook_calls.load(Ordering::SeqCst));
+                async { Response::new(Full::new(Bytes::from_static(b"x")).boxed()) }
+            }
+        })
+        .await;
+
+        let hook = || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+        };
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.post_sealed(vec![0u8; 32], SizeGuard::new(None), &hook),
+        )
+        .await
+        .expect("the post must finish")
+        .expect("the relay answers");
+        assert_eq!(answer.status, StatusCode::OK);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1, "a buffered post");
+
+        let streamed = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.post_sealed_stream(vec![0u8; 32], &hook),
+        )
+        .await
+        .expect("the post must finish")
+        .expect("the relay answers");
+        assert_eq!(streamed.status, StatusCode::OK);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2, "a streamed post");
+
+        assert_eq!(
+            *seen_by_relay.lock().unwrap(),
+            vec![1, 2],
+            "each request reached the relay after its hook call"
+        );
+    }
+
+    /// The caller's hook runs on whichever thread drives the call, so the future of
+    /// `http_round_trip_with_dispatch` has to stay `Send` whenever its hook is `Send + Sync`.
+    #[test]
+    fn http_round_trip_with_dispatch_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let fut = http_round_trip_with_dispatch(
+            "ohttp-gateway-testnet.example",
+            NetworkType::Test,
+            Dialer::Direct,
+            "GET",
+            "https://example.invalid/",
+            &[],
+            b"",
+            256 * 1024,
+            move || flag.store(true, Ordering::SeqCst),
+        );
+        assert_send(&fut);
+    }
+
+    /// What the ceiling a caller sets becomes on the sealed answer: its body, one 256th more for
+    /// the chunk tags and length prefixes, and 64 KiB for the header fields and the framing,
+    /// never more than the gateway's own sealed cap.
+    #[test]
+    fn sealed_response_ceiling_leaves_room_for_the_framing() {
+        assert_eq!(sealed_response_ceiling(262_144), 328_704);
+        assert_eq!(sealed_response_ceiling(0), 65_536);
+        assert_eq!(sealed_response_ceiling(67_108_864), 67_436_544);
+        assert_eq!(
+            sealed_response_ceiling(usize::MAX),
+            GATEWAY_MAX_SEALED_RESPONSE_BYTES
+        );
+    }
+
+    /// A relay body of data frames of the given sizes, and the count of frames pulled from it.
+    fn counted_body(sizes: &[usize]) -> (BoxBody<Bytes, Infallible>, Arc<AtomicUsize>) {
+        use futures_util::stream::StreamExt as _;
+
+        let pulled = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&pulled);
+        let frames: Vec<Result<Frame<Bytes>, Infallible>> = sizes
+            .iter()
+            .map(|&size| Ok(Frame::data(Bytes::from(vec![0u8; size]))))
+            .collect();
+        let stream = futures_util::stream::iter(frames).inspect(move |_| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        (BodyExt::boxed(StreamBody::new(stream)), pulled)
+    }
+
+    /// An answer that announces a length past the ceiling is refused before its first frame.
+    #[tokio::test]
+    async fn a_declared_length_past_the_ceiling_is_refused_before_reading() {
+        let (body, pulled) = counted_body(&[100, 100, 51]);
+        let err = read_body_capped(body, Some(251), SizeGuard::new(Some(250)), "relay.test")
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, HttpsError::TooLarge(_)), "{err:?}");
+        assert_eq!(pulled.load(Ordering::SeqCst), 0, "no frame was pulled");
+    }
+
+    /// Without a declared length the count decides, at the first frame that goes past the
+    /// ceiling: the frames after it are never pulled from the relay.
+    #[tokio::test]
+    async fn the_read_stops_at_the_first_frame_past_the_ceiling() {
+        let (body, pulled) = counted_body(&[100, 100, 100, 100]);
+        let err = read_body_capped(body, None, SizeGuard::new(Some(250)), "relay.test")
+            .await
+            .expect_err("refused");
+        assert!(matches!(err, HttpsError::TooLarge(_)), "{err:?}");
+        assert_eq!(
+            pulled.load(Ordering::SeqCst),
+            3,
+            "the fourth frame was not pulled"
+        );
+    }
+
+    /// The ceiling itself is allowed, announced or counted.
+    #[tokio::test]
+    async fn a_body_at_the_ceiling_is_read_whole() {
+        let (body, pulled) = counted_body(&[100, 100, 50]);
+        let bytes = read_body_capped(body, Some(250), SizeGuard::new(Some(250)), "relay.test")
+            .await
+            .expect("at the ceiling");
+        assert_eq!(bytes.len(), 250);
+        assert_eq!(pulled.load(Ordering::SeqCst), 3);
+    }
+
+    /// An answer cut at the ceiling is final: `ResponseTooLarge`, sent once, not posted again.
+    #[tokio::test]
+    async fn a_response_cut_at_the_ceiling_is_response_too_large() {
+        let posts = Cell::new(0u32);
+        let err = run_exchange_chunked(
             test_key(),
             &test_request(),
-            |_body| {
-                let n = post_attempt.get();
-                post_attempt.set(n + 1);
-                events.lock().unwrap().push("post");
-                async move {
-                    if n == 0 {
-                        Err(HttpsError::PreSend("closed".into()))
-                    } else {
-                        Ok(outer_answer(200)) // Pretend success on retry
-                    }
+            |_sealed| {
+                posts.set(posts.get() + 1);
+                async {
+                    Err::<RelayAnswer, _>(HttpsError::TooLarge("read relay.test: too large".into()))
                 }
             },
-            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {
-                events.lock().unwrap().push("dispatch");
-            },
+            || async { unreachable!("no refetch") },
+        )
+        .await
+        .err()
+        .expect("refused");
+        assert!(
+            matches!(&err, RoundTripError::ResponseTooLarge(m) if m == "read relay.test: too large"),
+            "{err:?}"
+        );
+        assert_eq!(posts.get(), 1, "not tried again");
+    }
+
+    #[test]
+    fn check_response_body_allows_the_limit_and_refuses_one_byte_more() {
+        assert!(check_response_body(10, Some(10)).is_ok());
+        let err = check_response_body(11, Some(10)).expect_err("one byte more");
+        assert!(
+            matches!(&err, RoundTripError::ResponseTooLarge(m) if m.contains("11 > 10")),
+            "{err:?}"
+        );
+        assert!(check_response_body(usize::MAX, None).is_ok());
+    }
+
+    /// Only an answer past the caller's ceiling is told apart; every other failure keeps its
+    /// message.
+    #[test]
+    fn round_trip_errors_map_to_http_errors() {
+        assert_eq!(
+            http_error(RoundTripError::ResponseTooLarge("a".into())),
+            HttpRoundTripError::ResponseTooLarge("a".into())
+        );
+        assert_eq!(
+            http_error(RoundTripError::Transport("b".into())),
+            HttpRoundTripError::Failed("b".into())
+        );
+        assert_eq!(
+            http_error(RoundTripError::Decode("c".into())),
+            HttpRoundTripError::Failed("bhttp decode: c".into())
+        );
+        assert_eq!(
+            http_error(RoundTripError::TooLarge("d".into())),
+            HttpRoundTripError::Failed("d".into())
+        );
+        assert_eq!(
+            http_error(RoundTripError::RateLimited {
+                detail: "e".into(),
+                retry_after: None
+            }),
+            HttpRoundTripError::Failed("e".into())
+        );
+    }
+
+    /// Both error types show their message alone, as a caller hands it on.
+    #[test]
+    fn round_trip_errors_display_their_message_alone() {
+        assert_eq!(
+            HttpRoundTripError::ResponseTooLarge("a".into()).to_string(),
+            "a"
+        );
+        assert_eq!(HttpRoundTripError::Failed("b".into()).to_string(), "b");
+        assert_eq!(
+            RoundTripError::ResponseTooLarge("c".into()).to_string(),
+            "c"
+        );
+        let boxed: Box<dyn std::error::Error> = Box::new(HttpRoundTripError::Failed("d".into()));
+        assert_eq!(boxed.to_string(), "d");
+    }
+
+    /// One `round_trip` of a `SLIPSTREAM_HTTP` client with a key, whose relay is in-process (see
+    /// [`serve_in_process_relay`]) and answers with `answer_len` bytes of filler (see
+    /// [`filler_answer`]).
+    async fn round_trip_to_a_relay_answering(
+        answer_len: usize,
+        max_response_bytes: Option<usize>,
+    ) -> Result<BhttpResponse, RoundTripError> {
+        let client = client_with_a_key("https://relay-answer-ceiling-test.invalid/relay").await;
+        serve_in_process_relay(
+            &client,
+            move |_req| async move { filler_answer(answer_len) },
         )
         .await;
 
-        let log = events.lock().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            client.round_trip(&test_request(), max_response_bytes, || {}),
+        )
+        .await
+        .expect("the round trip must finish")
+    }
+
+    /// The caller's ceiling reaches the read of the relay's answer. A sealed answer one byte past
+    /// `sealed_response_ceiling` is refused as `ResponseTooLarge`. One at the ceiling is read whole
+    /// (and then does not open, being filler), and so is the first one when the caller sets no
+    /// ceiling: the general cap applies then.
+    #[tokio::test]
+    async fn a_round_trip_reads_the_answer_only_up_to_the_callers_ceiling() {
+        let ceiling = sealed_response_ceiling(0);
+
+        let err = round_trip_to_a_relay_answering(ceiling + 1, Some(0))
+            .await
+            .expect_err("past the ceiling");
+        assert!(
+            matches!(err, RoundTripError::ResponseTooLarge(_)),
+            "{err:?}"
+        );
+
+        let err = round_trip_to_a_relay_answering(ceiling, Some(0))
+            .await
+            .expect_err("filler does not open");
+        assert!(matches!(err, RoundTripError::Decode(_)), "{err:?}");
+
+        let err = round_trip_to_a_relay_answering(ceiling + 1, None)
+            .await
+            .expect_err("filler does not open");
+        assert!(matches!(err, RoundTripError::Decode(_)), "{err:?}");
+    }
+
+    /// The exact bound on an answer: its opened body is checked against the caller's ceiling
+    /// before the answer is returned, and exactly the ceiling is let through. (The sealed
+    /// ceiling has room to spare, so only this check refuses a body just past the ceiling.)
+    #[test]
+    fn an_opened_answer_is_returned_up_to_the_ceiling_and_refused_past_it() {
+        let answer = |len: usize| zodl_ohttp_client::Response {
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: vec![0u8; len],
+        };
+
+        let returned = bhttp_response_within(answer(10), Some(10)).expect("exactly the ceiling");
+        assert_eq!(returned.status, 200);
+        assert_eq!(returned.body.len(), 10);
         assert_eq!(
-            &log[..],
-            &["dispatch", "post", "post"],
-            "dispatch must fire before the first post, even if that post fails pre-send"
+            returned.headers,
+            vec![(b"content-type".to_vec(), b"text/plain".to_vec())]
+        );
+
+        let err =
+            bhttp_response_within(answer(11), Some(10)).expect_err("one byte past the ceiling");
+        assert!(
+            matches!(&err, RoundTripError::ResponseTooLarge(m) if m.contains("11 > 10")),
+            "{err:?}"
+        );
+
+        let returned = bhttp_response_within(answer(11), None).expect("no ceiling of the caller's");
+        assert_eq!(returned.body.len(), 11);
+    }
+
+    /// An answer that announces a length past the guard is refused as soon as its head arrives,
+    /// without waiting for a body. This relay never sends one, which is what tells the announced
+    /// length from the count of the bytes read: a body that does arrive is refused the same
+    /// way by either.
+    #[tokio::test]
+    async fn an_announced_length_past_the_guard_is_refused_without_waiting_for_the_body() {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-announced-length-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        serve_in_process_relay(&client, |_req| async {
+            let no_body = futures_util::stream::pending::<Result<Frame<Bytes>, Infallible>>();
+            let mut answer = Response::new(BodyExt::boxed(StreamBody::new(no_body)));
+            answer
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(101u64));
+            answer
+        })
+        .await;
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.post_sealed(vec![0u8; 32], SizeGuard::new(Some(100)), &|| {}),
+        )
+        .await
+        .expect("refused from the head alone, not after a body that never comes")
+        .err()
+        .expect("past the guard");
+        assert!(matches!(err, HttpsError::TooLarge(_)), "{err:?}");
+    }
+
+    /// The public functions carry the caller's ceiling down to the read of the answer, and tell
+    /// its refusal apart. They use the client the cache holds for the gateway and its relay,
+    /// which this test gives a key and an in-process relay: from `http_round_trip_with_dispatch`
+    /// and `http_round_trip` to the read, the code is the production code. The relay answers
+    /// with filler one byte past the sealed ceiling of a caller that allows no body, and far
+    /// inside the general cap.
+    #[tokio::test]
+    async fn the_public_functions_carry_the_ceiling_to_the_read() {
+        let gateway = "ohttp-gateway-testnet.example";
+        let relay_url = relay_for(gateway).expect("a relay for the testnet gateway");
+        let client = get_or_create_client(
+            gateway,
+            relay_url,
+            Dialer::Direct,
+            get_default_client_trace_prefix(),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("client");
+        cache_a_key(&client).await;
+        let answer_len = sealed_response_ceiling(0) + 1;
+        serve_in_process_relay(
+            &client,
+            move |_req| async move { filler_answer(answer_len) },
+        )
+        .await;
+
+        // A caller that allows no body: the answer is refused as it is read, and the request
+        // had gone out by then.
+        let dispatched = AtomicBool::new(false);
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            http_round_trip_with_dispatch(
+                gateway,
+                NetworkType::Test,
+                Dialer::Direct,
+                "POST",
+                "https://origin.invalid/api",
+                &[],
+                b"{}",
+                0,
+                || dispatched.store(true, Ordering::SeqCst),
+            ),
+        )
+        .await
+        .expect("the round trip must finish")
+        .expect_err("past the ceiling");
+        assert!(
+            matches!(err, HttpRoundTripError::ResponseTooLarge(_)),
+            "{err:?}"
+        );
+        assert!(
+            dispatched.load(Ordering::SeqCst),
+            "the request had gone out"
+        );
+
+        // Without a ceiling of the caller's the same answer is read, and fails to open.
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            http_round_trip(
+                gateway,
+                NetworkType::Test,
+                Dialer::Direct,
+                "POST",
+                "https://origin.invalid/api",
+                &[],
+                b"{}",
+            ),
+        )
+        .await
+        .expect("the round trip must finish")
+        .expect_err("filler does not open");
+        assert!(err.starts_with("bhttp decode:"), "{err}");
+
+        // The cache is process-wide: forget the client that was given the in-process relay.
+        let key = ClientCacheKey::new(
+            gateway,
+            relay_url,
+            get_default_client_trace_prefix(),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .expect("a cache key");
+        let removed = CLIENT_CACHE
+            .get()
+            .expect("the cache exists")
+            .lock()
+            .await
+            .remove(&key);
+        assert!(
+            removed.is_some(),
+            "the client was cached under the key the public functions use"
         );
     }
 
@@ -3734,7 +4448,6 @@ mod tests {
                 })
             },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .expect("a chunked 200 is handed back unread");
@@ -3792,7 +4505,6 @@ mod tests {
                 })
             },
             || async { unreachable!("no refetch on 429") },
-            || {},
         )
         .await
         .err()
@@ -3828,7 +4540,6 @@ mod tests {
                 async { Ok(outer_answer(200)) }
             },
             || async { unreachable!("no refetch") },
-            || {},
         )
         .await
         .err()
@@ -3841,7 +4552,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(outer_answer(413)) },
             || async { unreachable!("no refetch on 413") },
-            || {},
         )
         .await
         .err()
@@ -3880,7 +4590,7 @@ mod tests {
         .expect("client");
         let dispatched = Cell::new(false);
         let err = other
-            .round_trip(&test_request(), || dispatched.set(true))
+            .round_trip(&test_request(), None, || dispatched.set(true))
             .await
             .expect_err("held");
         assert!(
@@ -4034,7 +4744,6 @@ mod tests {
                 }
             },
             || async { unreachable!("no refetch") },
-            || {},
         )
         .await
         .err()
@@ -4070,7 +4779,6 @@ mod tests {
                 })
             },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .expect("a chunked 200 is handed back unread");
