@@ -689,6 +689,28 @@ impl OuterAnswer for RelayStream {
     }
 }
 
+/// Whether a failed relay fetch of the key configuration goes on to the DNS fallback. A 429, or
+/// the relay's running pause, is the relay's back-off signal, not a relay that could not deliver:
+/// the client waits instead of asking the resolvers.
+fn relay_failure_has_dns_fallback(err: &RoundTripError) -> bool {
+    !matches!(err, RoundTripError::RateLimited { .. })
+}
+
+/// The headers of a DoH query: the client's fixed key-fetch headers (`Accept-Encoding`,
+/// `User-Agent`), with the DoH JSON `Accept` in place of the relay fetch's, so that the resolver
+/// sees the same fixed headers as the relay does.
+fn doh_headers(profile: &ClientProfile) -> Vec<(&'static str, String)> {
+    let mut headers = vec![(header::ACCEPT.as_str(), "application/dns-json".to_string())];
+    headers.extend(
+        profile
+            .headers
+            .key_fetch(None)
+            .into_iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("accept")),
+    );
+    headers
+}
+
 /// Why one HTTPS exchange failed.
 #[derive(Debug)]
 enum HttpsError {
@@ -1322,7 +1344,8 @@ impl OhttpClient {
 
     /// The gateway's key configuration: the cached one while it is fresh, else fetched through
     /// the relay, with the DNS fallback of [`Self::key_config_from_dns`] when the relay fetch or
-    /// its verification fails. A relay 429 is [`RoundTripError::RateLimited`], as on a post.
+    /// its verification fails. A relay 429, or the relay's running pause, is
+    /// [`RoundTripError::RateLimited`] as on a post, without the DNS fallback.
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, RoundTripError> {
         let shared_key = (self.gateway_host.clone(), self.backoff_key());
         {
@@ -1357,9 +1380,11 @@ impl OhttpClient {
             }
         }
 
-        // A relay or signed config URL that is not https fails closed, before any request and
-        // without the DNS fallback. The gateway host is only looked up when the relay has
-        // failed: a host outside the static configuration keeps the relay error.
+        // The relay's running pause, and a relay or signed config URL that is not https, fail
+        // closed before any request and without the DNS fallback. The gateway host is only looked
+        // up when the relay has failed: a host outside the static configuration keeps the relay
+        // error.
+        self.check_relay_pause()?;
         parse_https(&self.relay_url).map_err(RoundTripError::Transport)?;
         let signed_config_url_str =
             signed_config_url(&self.relay_url, self.profile.signed_config_url)
@@ -1428,11 +1453,15 @@ impl OhttpClient {
     /// The DNS-over-HTTPS fallback after the relay fetch or its verification failed with
     /// `relay_err`: each resolver of [`DOH_RESOLVERS`] in order, its answer parsed and verified
     /// like the relay's; the first that verifies wins. When none does, or the gateway host is
-    /// outside the static configuration (no DNS record to fall back to), `relay_err` is returned.
+    /// outside the static configuration (no DNS record to fall back to), or `relay_err` has no
+    /// fallback ([`relay_failure_has_dns_fallback`]), `relay_err` is returned.
     async fn key_config_from_dns(
         &self,
         relay_err: RoundTripError,
     ) -> Result<CachedKey, RoundTripError> {
+        if !relay_failure_has_dns_fallback(&relay_err) {
+            return Err(relay_err);
+        }
         let Ok(network) = gateway_network(&self.gateway_host) else {
             return Err(relay_err);
         };
@@ -1469,18 +1498,7 @@ impl OhttpClient {
     /// over Tor if the client uses Tor, exactly like the relay fetch.
     async fn fetch_dns_key_config(&self, doh_url: &str) -> Result<Vec<u8>, String> {
         let target = parse_https(doh_url)?;
-        let mut headers = vec![(header::ACCEPT.as_str(), "application/dns-json".to_string())];
-        // Add DoH-specific headers if the profile wants them
-        if let Some(encoding) = self
-            .profile
-            .headers
-            .key_fetch(None)
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("accept-encoding"))
-            .map(|(_, val)| val.clone())
-        {
-            headers.push((header::ACCEPT_ENCODING.as_str(), encoding));
-        }
+        let headers = doh_headers(&self.profile);
 
         let answer = self
             .https_once(
@@ -3874,6 +3892,96 @@ mod tests {
             "{err:?}"
         );
         assert!(!dispatched.get(), "nothing was sent");
+    }
+
+    /// While the relay's pause runs the key configuration is fetched neither from the relay nor
+    /// from DNS: the pause is a back-off signal, not a relay that could not deliver.
+    #[tokio::test]
+    async fn a_relay_pause_holds_the_key_fetch_without_the_dns_fallback() {
+        let relay = "https://relay-pause-key-test.invalid/relay";
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+
+        let err = client.key_config(false).await.err().expect("held");
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        assert!(
+            client.key_config.lock().await.is_none(),
+            "nothing was fetched"
+        );
+    }
+
+    /// A relay 429 on the key fetch is returned as it is, without asking the DNS resolvers; the
+    /// other relay failures go on to DNS.
+    #[tokio::test]
+    async fn a_rate_limited_key_fetch_has_no_dns_fallback() {
+        let limited = RoundTripError::key_fetch_refused(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(30)),
+        );
+        assert!(!relay_failure_has_dns_fallback(&limited));
+        assert!(relay_failure_has_dns_fallback(
+            &RoundTripError::key_fetch_refused(StatusCode::SERVICE_UNAVAILABLE, None)
+        ));
+        assert!(relay_failure_has_dns_fallback(&RoundTripError::Transport(
+            "relay envelope verification failed".into()
+        )));
+
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-429-key-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let err = client
+            .key_config_from_dns(limited)
+            .await
+            .err()
+            .expect("no DNS");
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited { detail, retry_after: Some(d) }
+                    if detail.contains("429") && *d == Duration::from_secs(30)
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// A DoH query carries the relay fetch's fixed headers, with the DoH `Accept` in place of the
+    /// relay's: `Accept-Encoding` and the fixed `User-Agent`, nothing of the platform.
+    #[test]
+    fn a_doh_query_carries_the_relay_fetch_headers_with_the_dns_accept() {
+        assert_eq!(
+            doh_headers(&ClientProfile::SLIPSTREAM),
+            vec![
+                ("accept", "application/dns-json".to_string()),
+                ("Accept-Encoding", "identity".to_string()),
+                ("User-Agent", "zodl-slipstream-ohttp/0.1".to_string()),
+            ]
+        );
+        let relay_fetch = ClientProfile::SLIPSTREAM.headers.key_fetch(None);
+        assert!(relay_fetch.contains(&("Accept-Encoding", "identity".to_string())));
+        assert!(relay_fetch.contains(&("User-Agent", "zodl-slipstream-ohttp/0.1".to_string())));
     }
 
     /// A pause that began while the request was prepared stops the post: rate limited, no retry.
