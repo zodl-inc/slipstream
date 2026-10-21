@@ -388,7 +388,10 @@ impl OhttpConnector {
     /// relay, so that the caller can bound (and retry on a fresh circuit) the slow part of a Tor
     /// connect instead of paying it inside the first RPC's deadline. Idempotent.
     pub async fn warm_up(&self) -> Result<(), String> {
-        self.client.key_config(false).await?;
+        self.client
+            .key_config(false)
+            .await
+            .map_err(RoundTripError::into_message)?;
         if self.client.h2_sender(&self.client.relay).await?.is_none() {
             tracing::debug!("ohttp: relay did not negotiate h2; will use HTTP/1.1 per request");
         }
@@ -736,10 +739,30 @@ enum RoundTripError {
 
 impl RoundTripError {
     fn into_message(self) -> String {
+        self.to_string()
+    }
+
+    /// A key configuration fetch the relay answered with a status other than success: a 429 is
+    /// the relay's back-off signal, as on a post, not an unreachable gateway.
+    fn key_fetch_refused(status: StatusCode, retry_after: Option<Duration>) -> Self {
+        let detail = format!("signed config fetch from relay: HTTP {status}");
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            RoundTripError::RateLimited {
+                detail,
+                retry_after,
+            }
+        } else {
+            RoundTripError::Transport(detail)
+        }
+    }
+}
+
+impl std::fmt::Display for RoundTripError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RoundTripError::Transport(e) | RoundTripError::TooLarge(e) => e,
-            RoundTripError::Decode(e) => format!("bhttp decode: {e}"),
-            RoundTripError::RateLimited { detail, .. } => detail,
+            RoundTripError::Transport(e) | RoundTripError::TooLarge(e) => f.write_str(e),
+            RoundTripError::Decode(e) => write!(f, "bhttp decode: {e}"),
+            RoundTripError::RateLimited { detail, .. } => f.write_str(detail),
         }
     }
 }
@@ -799,7 +822,7 @@ where
     P: FnMut(Vec<u8>) -> PF,
     PF: Future<Output = Result<A, HttpsError>>,
     R: FnMut() -> RF,
-    RF: Future<Output = Result<KeyConfig, String>>,
+    RF: Future<Output = Result<KeyConfig, RoundTripError>>,
     D: Fn(),
 {
     let mut attempt = 0u32;
@@ -842,7 +865,7 @@ where
                 status = status.as_u16(),
                 "ohttp: gateway rejected request; refreshing key config"
             );
-            key = refetch().await.map_err(RoundTripError::Transport)?;
+            key = refetch().await?;
             attempt += 1;
             continue;
         }
@@ -1297,12 +1320,15 @@ impl OhttpClient {
         })
     }
 
-    async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
+    /// The gateway's key configuration: the cached one while it is fresh, else fetched through
+    /// the relay, with the DNS fallback of [`Self::key_config_from_dns`] when the relay fetch or
+    /// its verification fails. A relay 429 is [`RoundTripError::RateLimited`], as on a post.
+    async fn key_config(&self, refresh: bool) -> Result<KeyConfig, RoundTripError> {
         let shared_key = (self.gateway_host.clone(), self.backoff_key());
         {
             let mut cached = self.key_config.lock().await;
             if !refresh {
-                let now = unix_now()?;
+                let now = unix_now().map_err(RoundTripError::Transport)?;
                 if let Some(k) = cached.as_ref() {
                     if self.profile.cache.is_fresh(Some(k.not_after), now) {
                         return Ok(k.config);
@@ -1331,19 +1357,16 @@ impl OhttpClient {
             }
         }
 
-        // Configuration validation: check relay URL, gateway network, and signed config URL
-        // BEFORE any network call. Configuration errors fail closed without DNS fallback.
-
-        // Validate relay URL is https
-        parse_https(&self.relay_url)?;
-
-        // Validate signed config URL is https
+        // A relay or signed config URL that is not https fails closed, before any request and
+        // without the DNS fallback. The gateway host is only looked up when the relay has
+        // failed: a host outside the static configuration keeps the relay error.
+        parse_https(&self.relay_url).map_err(RoundTripError::Transport)?;
         let signed_config_url_str =
             signed_config_url(&self.relay_url, self.profile.signed_config_url)
-                .map_err(|e| e.to_string())?;
-        let signed_config_target = parse_https(&signed_config_url_str)?;
+                .map_err(|e| RoundTripError::Transport(e.to_string()))?;
+        let signed_config_target =
+            parse_https(&signed_config_url_str).map_err(RoundTripError::Transport)?;
 
-        // Try relay: fetch and verify
         let relay_fetch_and_verify = async {
             let headers = self.profile.headers.key_fetch(None);
 
@@ -1365,63 +1388,29 @@ impl OhttpClient {
                         resent = true;
                         tracing::debug!(err = %e, "ohttp: key config fetch failed before send; retrying");
                     }
-                    Err(e) => return Err(e.into_message()),
+                    Err(e) => return Err(RoundTripError::Transport(e.into_message())),
                 }
             };
             if !self.profile.outer.success.accepts(answer.status.as_u16()) {
-                return Err(format!("signed config fetch from relay: HTTP {}", answer.status));
+                return Err(RoundTripError::key_fetch_refused(
+                    answer.status,
+                    answer.retry_after,
+                ));
             }
 
-            // Verify the relay envelope
-            let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, unix_now()?)
-                .map_err(|e| format!("relay envelope verification failed: {}", e))?;
+            let now = unix_now().map_err(RoundTripError::Transport)?;
+            let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, now)
+                .map_err(|e| {
+                    RoundTripError::Transport(format!("relay envelope verification failed: {e}"))
+                })?;
             tracing::debug!("ohttp: key config fetched and verified from relay");
             Ok(cfg)
         }
         .await;
 
-        // If relay failed (fetch OR verification), try DNS resolvers
         let cfg = match relay_fetch_and_verify {
-            Ok(verified_cfg) => verified_cfg,
-            Err(relay_err) => {
-                // A gateway outside the static configuration has no DNS record to fall back to.
-                let Ok(network) = gateway_network(&self.gateway_host) else {
-                    return Err(relay_err);
-                };
-                tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
-
-                let dns_name = key_config_dns_name(network);
-                let mut verified_cfg = None;
-
-                for resolver in DOH_RESOLVERS {
-                    let doh_url = doh_query_url(resolver, network);
-                    tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
-
-                    // For DNS, we fetch, parse, AND verify. If any step fails, try next resolver.
-                    let dns_result = async {
-                        let doh_body = self.fetch_dns_key_config(&doh_url).await?;
-                        let envelope = envelope_from_doh_json(&doh_body, network)
-                            .map_err(|e| format!("parse error: {}", e))?;
-                        open_signed_keys(&self.profile, &envelope, &self.gateway_host, unix_now()?)
-                            .map_err(|e| format!("verification failed: {}", e))
-                    }
-                    .await;
-
-                    match dns_result {
-                        Ok(cfg) => {
-                            tracing::info!(resolver = %resolver, "ohttp: key config fetched and verified from DNS");
-                            verified_cfg = Some(cfg);
-                            break;
-                        }
-                        Err(e) => {
-                            tracing::debug!(resolver = %resolver, err = %e, "ohttp: DNS resolver failed");
-                        }
-                    }
-                }
-
-                // All DNS resolvers failed: return original relay error
-                verified_cfg.ok_or(relay_err)?
-            }
+            Ok(cfg) => cfg,
+            Err(relay_err) => self.key_config_from_dns(relay_err).await?,
         };
 
         tracing::info!(
@@ -1434,6 +1423,46 @@ impl OhttpClient {
         *self.key_config.lock().await = Some(cfg);
         shared_keys().insert(shared_key, cfg);
         Ok(cfg.config)
+    }
+
+    /// The DNS-over-HTTPS fallback after the relay fetch or its verification failed with
+    /// `relay_err`: each resolver of [`DOH_RESOLVERS`] in order, its answer parsed and verified
+    /// like the relay's; the first that verifies wins. When none does, or the gateway host is
+    /// outside the static configuration (no DNS record to fall back to), `relay_err` is returned.
+    async fn key_config_from_dns(
+        &self,
+        relay_err: RoundTripError,
+    ) -> Result<CachedKey, RoundTripError> {
+        let Ok(network) = gateway_network(&self.gateway_host) else {
+            return Err(relay_err);
+        };
+        tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
+
+        let dns_name = key_config_dns_name(network);
+        for resolver in DOH_RESOLVERS {
+            let doh_url = doh_query_url(resolver, network);
+            tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
+
+            let dns_result = async {
+                let doh_body = self.fetch_dns_key_config(&doh_url).await?;
+                let envelope = envelope_from_doh_json(&doh_body, network)
+                    .map_err(|e| format!("parse error: {}", e))?;
+                open_signed_keys(&self.profile, &envelope, &self.gateway_host, unix_now()?)
+                    .map_err(|e| format!("verification failed: {}", e))
+            }
+            .await;
+
+            match dns_result {
+                Ok(cfg) => {
+                    tracing::info!(resolver = %resolver, "ohttp: key config fetched and verified from DNS");
+                    return Ok(cfg);
+                }
+                Err(e) => {
+                    tracing::debug!(resolver = %resolver, err = %e, "ohttp: DNS resolver failed");
+                }
+            }
+        }
+        Err(relay_err)
     }
 
     /// Fetch a DoH JSON response for the signed key configuration TXT record. The DoH query goes
@@ -1553,10 +1582,7 @@ impl OhttpClient {
         D: Fn(),
     {
         self.check_relay_pause()?;
-        let key = self
-            .key_config(false)
-            .await
-            .map_err(RoundTripError::Transport)?;
+        let key = self.key_config(false).await?;
         let this = self;
         let (mut decoder, answer) = run_exchange_chunked(
             key,
@@ -1637,10 +1663,7 @@ impl OhttpClient {
         use tokio::sync::mpsc;
 
         self.check_relay_pause()?;
-        let key = self
-            .key_config(false)
-            .await
-            .map_err(RoundTripError::Transport)?;
+        let key = self.key_config(false).await?;
         let this = self;
         let (decoder, answer) = run_exchange_chunked(
             key,
@@ -2217,7 +2240,7 @@ mod tests {
         P: FnMut(Vec<u8>) -> PF,
         PF: Future<Output = Result<RelayAnswer, HttpsError>>,
         R: FnMut() -> RF,
-        RF: Future<Output = Result<KeyConfig, String>>,
+        RF: Future<Output = Result<KeyConfig, RoundTripError>>,
         D: Fn(),
     {
         let (mut decoder, answer) =
@@ -2405,7 +2428,7 @@ mod tests {
                 bodies.lock().unwrap().push(body);
                 async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 ready: closed".into())) }
             },
-            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
             || {},
         )
         .await;
@@ -2440,7 +2463,7 @@ mod tests {
                     }
                 }
             },
-            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
             || {},
         )
         .await;
@@ -2470,7 +2493,7 @@ mod tests {
                 },
                 || {
                     refetches.set(refetches.get() + 1);
-                    async { Ok::<KeyConfig, String>(test_key()) }
+                    async { Ok::<KeyConfig, RoundTripError>(test_key()) }
                 },
                 || {},
             )
@@ -2502,7 +2525,7 @@ mod tests {
                     posts.set(posts.get() + 1);
                     async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
                 },
-                || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+                || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
                 || {},
             )
             .await;
@@ -2535,7 +2558,7 @@ mod tests {
                     body: vec![7; 64],
                 })
             },
-            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
             || {},
         )
         .await;
@@ -3466,7 +3489,7 @@ mod tests {
             || {
                 let mut count = refetch_count.lock().unwrap();
                 *count += 1;
-                async { Ok::<KeyConfig, String>(test_key()) }
+                async { Ok::<KeyConfig, RoundTripError>(test_key()) }
             },
             || {}, // no-op dispatch
         )
@@ -3564,7 +3587,7 @@ mod tests {
                 *count += 1;
                 async { Err::<RelayAnswer, HttpsError>(HttpsError::PreSend("closed".into())) }
             },
-            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
             || {
                 let mut count = dispatch_count.lock().unwrap();
                 *count += 1;
@@ -3607,7 +3630,7 @@ mod tests {
                     }
                 }
             },
-            || async { Err::<KeyConfig, String>("unexpected refetch".into()) },
+            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
             || {
                 events.lock().unwrap().push("dispatch");
             },
@@ -3992,5 +4015,103 @@ mod tests {
         let url1 = doh_query_url(resolvers[1], network);
         assert!(url1.contains("dns.google"));
         assert!(url1.contains("edns_client_subnet=0.0.0.0/0"));
+    }
+
+    /// A key fetch the relay answers 429 is rate limited with its pause, like a post; another
+    /// refused status is a transport failure.
+    #[test]
+    fn a_key_fetch_answered_429_is_rate_limited() {
+        let err = RoundTripError::key_fetch_refused(
+            StatusCode::TOO_MANY_REQUESTS,
+            Some(Duration::from_secs(30)),
+        );
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited { detail, retry_after: Some(d) }
+                    if detail.contains("429") && *d == Duration::from_secs(30)
+            ),
+            "{err:?}"
+        );
+        let err = RoundTripError::key_fetch_refused(StatusCode::SERVICE_UNAVAILABLE, None);
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m.contains("503")),
+            "{err:?}"
+        );
+    }
+
+    /// A gateway outside the static configuration has no DNS record: the relay error is kept
+    /// and no resolver is queried.
+    #[tokio::test]
+    async fn an_unknown_gateway_keeps_the_relay_error_without_dns() {
+        let client = OhttpClient::new(
+            "gateway.example",
+            "https://relay-unknown-gateway.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let started = std::time::Instant::now();
+        let err = client
+            .key_config_from_dns(RoundTripError::Transport("relay down".into()))
+            .await
+            .expect_err("no DNS record to fall back to");
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m == "relay down"),
+            "{err:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(1), "no request");
+    }
+
+    /// Fetches over Tor and outside Tor keep separate key cache and relay pause entries, so that
+    /// a pause noted on one path never holds, nor links, the other.
+    #[tokio::test]
+    async fn tor_and_direct_fetches_keep_separate_cache_and_pause_keys() {
+        let relay = "https://relay-tor-separation.invalid/relay";
+        let direct = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("direct client");
+        let tor = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Tor(Box::new(
+                arti_client::TorClient::builder()
+                    .create_unbootstrapped()
+                    .expect("unbootstrapped tor client"),
+            )),
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("tor client");
+        assert_eq!(direct.backoff_key(), relay);
+        assert_eq!(tor.backoff_key(), format!("tor {relay}"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        tor.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+        assert!(
+            RelayBackoff::global()
+                .remaining(&tor.backoff_key())
+                .is_some()
+        );
+        assert!(
+            RelayBackoff::global()
+                .remaining(&direct.backoff_key())
+                .is_none()
+        );
+        assert!(
+            direct.check_relay_pause().is_ok(),
+            "the direct path is not paused"
+        );
+        assert!(matches!(
+            tor.check_relay_pause(),
+            Err(RoundTripError::RateLimited { .. })
+        ));
     }
 }
