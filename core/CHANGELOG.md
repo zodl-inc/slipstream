@@ -10,6 +10,139 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
+  endpoint whose host has a relay (`ohttp::relay_for`) is never dialled
+  directly: every RPC is sealed to the gateway's signed key configuration and
+  posted to the relay, over Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08,
+  `message/ohttp-chunked-req` / `message/ohttp-chunked-res`), so the gateway
+  can stream `GetBlockRange` responses as blocks arrive. The protocol core is
+  the shared `zodl-ohttp-client` crate.
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` send a
+  plain HTTP request to a service behind the gateway through the relay, with
+  `ohttp::Dialer` choosing a direct or Tor leg to the relay.
+  `http_round_trip_with_dispatch` takes a `max_response_bytes` ceiling and stops
+  reading an answer past it (`ohttp::HttpRoundTripError::ResponseTooLarge`). Its
+  hook runs right before the sealed request is written to the relay connection,
+  so a relay pause, an unreachable relay and a connection that is not ready
+  leave it uncalled.
+- `ohttp::HttpRoundTripError`, the error of
+  `ohttp::http_round_trip_with_dispatch`: `ResponseTooLarge` when the answer is
+  past the ceiling, `Failed` for any other failure.
+- `ohttp::set_default_client_trace_prefix` sets an optional
+  `X-Client-Trace-Id` prefix for end-to-end debug tracing. Gating it to debug
+  builds is the caller's job.
+- `connector::TorConn::from_client`, `TorConn::client`,
+  `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
+- `SlipstreamError::EndpointUnreachable`.
+- `SlipstreamError::{RateLimited, RequestTooLarge}` and
+  `SlipstreamError::counts_as_unreachable`: an OHTTP relay rate limit (outer
+  429, or a request held back while its `Retry-After` pause runs; transient),
+  an oversized request (outer 413, or a sealed request over 10 MiB, which is
+  not sent) and an inner 403 (`PolicyDenied`) never count towards
+  `EndpointUnreachable`.
+- `enhance::run_enhancement_isolated`: with Tor on, each `GetTransaction` and
+  `GetTaddressTxids` of the enhancement step opens its own isolated circuit;
+  `GetAddressUtxos` does too.
+- `wallet_session::WalletSession::truncate_to_height`: upstream's
+  `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
+  it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
+  the height the wallet was truncated to. The scheduler's reorg recovery calls it.
+
+### Changed
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` take the
+  wallet's network (`ohttp::NetworkType`, re-exported from `zcash_protocol`)
+  as their second argument and refuse a gateway that serves another network
+  before anything is sent.
+- `EngineConfig::validate` refuses an OHTTP gateway (endpoint or alternate)
+  that serves a network other than the wallet's; the signed key configuration
+  is checked against the network of the gateway's exact host name.
+- OHTTP: an outer 429's `Retry-After` holds every request through that relay
+  until it has run (no sleep inside the call); an outer 413 and a local size
+  refusal are `RESOURCE_EXHAUSTED`; a response that ends before its final chunk
+  is `UNAVAILABLE`; an inner status other than 200 or a non-gRPC content type
+  is `INTERNAL`; the gRPC status is delivered only once the final chunk has
+  opened; the verified key configuration is shared by every connection to the
+  same gateway and relay until its `not_after`; `http_round_trip` is bounded
+  (100 s overall, 30 s idle body read, 15 s direct dial); a pooled relay
+  connection is replaced after 10 minutes with Tor off; a `GetBlockRange` the
+  gateway refuses with `INVALID_ARGUMENT` is split into smaller windows.
+- `connector::TorConn::bootstrap` takes the client trace prefix as a third
+  argument, and `TorConn` wraps an `arti_client::TorClient` directly (same
+  `arti-data` / `arti-cache` directory layout as
+  `zcash_client_backend::tor::Client`).
+- `fetch::run_fetch` takes the session's `Option<TorConn>` as its second
+  argument.
+- With Tor on, the bulk block fetch rides the default Tor circuit instead of
+  going direct, and an OHTTP gateway is reached with the relay leg dialled
+  through Tor.
+- The follow loop surfaces `SyncState::Error(3)` (event tag 4, value 3) after
+  5 consecutive tip-probe or catch-up failures, so a host can switch servers.
+  Follow-phase failures previously never surfaced an error.
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+
+### Fixed
+- With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
+  whatever the graft buffer held for its first shard, and a build lays rows out from the
+  first row's position. Rows that did not end right before the range's start, as after an
+  account import whose rescan starts inside an interrupted range's shard, put every later
+  leaf of the commitment tree at the wrong position. A range now resumes only the run of
+  rows that ends right before its start, on its own `from_state` frontier's leaf, and only
+  when the commitment tree takes that run. The frontier's leaf vouches for the run's last
+  row alone: a run with an earlier row that is not the chain's can conflict with the tree
+  when it is built, and a range that resumed it would fail on every pass. So the seed
+  first inserts the run into a copy of its shard as the wallet holds it, with the range's
+  frontier inserted; nothing is written. A run that ends there on another leaf, such as
+  another chain's rows a reorg's truncation can leave, or that the tree refuses, is not
+  continued, and the range builds what it scans in that shard instead of buffering it next
+  to the run, so neither the range's remainder nor the next pass's sweep takes the run up
+  with the range's own rows. The next pass's sweep queues the run's blocks for a rescan
+  and then deletes it (below), or keeps it, with a warning, when the wallet's block
+  metadata cannot place its blocks; no seed resumes it. The resumed run is no longer
+  deleted when the wallet already holds content for the shard (after a second committed
+  unit of the interrupted range), which lost its leaves and anchors. A range also no
+  longer deletes the rest of the shard's rows, rows of blocks that may stay scanned: its
+  seed deletes only the rows at the positions it scans again, and a build or graft only
+  the rows it built, so the others wait for the next pass's sweep (below).
+- The range-end graft build, and every other build of buffered rows, inserted the rows
+  without first registering their durable anchors as retained. With the wallet at its
+  100-checkpoint budget (the ChainTip range's window), the build evicted the anchors it
+  had just added, and the anchors it kept were never recorded as retained. Buffered rows
+  also kept every per-block checkpoint when they were scanned deep below the chain tip,
+  so a later build created checkpoints that graft off never creates. Graft on now leaves
+  the same checkpoints and retained anchors as graft off.
+- A pass stopped or aborted after a Historic range's last commit, such as a host abort
+  that lands in the range's final drain, skipped the range-end build: the range's last
+  shard stayed only in the graft buffer, so its leaves, checkpoints and durable anchors
+  never reached the tree, and a later range that seeded in that shard deleted them. Each
+  pass now starts with a sweep of the buffer for the runs no pending range will resume. A
+  run is built when data the wallet already holds checks where it ends (the tree's leaf at
+  its last position, or the stored server root of the shard it completes); any other run
+  is deleted and its blocks are queued for a rescan. A wallet whose stranded rows are
+  still buffered heals on its next pass. This change neither detects nor repairs what an
+  earlier version already did: rows it deleted (their checkpoints and durable anchors are
+  missing), or leaves it built at the wrong positions. A buffered row that will not decode
+  no longer fails every pass: for each run of its shard, the sweep queues a rescan of the
+  blocks holding it, by position, and then deletes it; a run the wallet's block metadata
+  cannot place keeps its rows, with a warning. A range that still meets such a row seeds
+  without the shard's rows and builds what it scans in that shard, with a warning. Only a
+  row that will not decode counts: any other error reading the buffer (a busy database,
+  an I/O error) fails the range for the pass, as before, and the sweep leaves that
+  shard's rows as they are. Any other run the sweep cannot read, build or rescan gets a
+  warning and keeps its rows; a sweep that fails only warns, and the pass goes on. A run
+  whose end checks but whose build the tree refuses is deleted once its blocks are queued
+  for a rescan, as any other.
+- A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
+  of the blocks they queue again, though after a reorg those may be another chain's
+  commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own
+  account import (`WalletSession::import_account`) now drop every buffered row at or
+  above their rewind point. The truncation drops them in upstream's own truncation
+  transaction, so a crash or an error never leaves the wallet truncated with those rows
+  still buffered; a pool whose tree size the highest remaining block does not record
+  keeps its rows, with a warning. For an account a host imports into the wallet database
+  itself, the first range to seed in the shard resumes only the run that ends right
+  before its start, as above.
+
 ## [0.4.0] - 2026-10-27
 
 ### Added
@@ -184,31 +317,6 @@ workspace.
 ## [0.4.0-pre.2] - 2026-10-20
 
 ### Added
-- `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
-  endpoint whose host has a relay (`ohttp::relay_for`) is never dialled
-  directly: every RPC is sealed to the gateway's signed key configuration and
-  posted to the relay, over Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08,
-  `message/ohttp-chunked-req` / `message/ohttp-chunked-res`), so the gateway
-  can stream `GetBlockRange` responses as blocks arrive. The protocol core is
-  the shared `zodl-ohttp-client` crate.
-- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` send a
-  plain HTTP request to a service behind the gateway through the relay, with
-  `ohttp::Dialer` choosing a direct or Tor leg to the relay.
-- `ohttp::set_default_client_trace_prefix` sets an optional
-  `X-Client-Trace-Id` prefix for end-to-end debug tracing. Gating it to debug
-  builds is the caller's job.
-- `connector::TorConn::from_client`, `TorConn::client`,
-  `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
-- `SlipstreamError::EndpointUnreachable`.
-- `SlipstreamError::{RateLimited, RequestTooLarge}` and
-  `SlipstreamError::counts_as_unreachable`: an OHTTP relay rate limit (outer
-  429, or a request held back while its `Retry-After` pause runs; transient),
-  an oversized request (outer 413, or a sealed request over 10 MiB, which is
-  not sent) and an inner 403 (`PolicyDenied`) never count towards
-  `EndpointUnreachable`.
-- `enhance::run_enhancement_isolated`: with Tor on, each `GetTransaction` and
-  `GetTaddressTxids` of the enhancement step opens its own isolated circuit;
-  `GetAddressUtxos` does too.
 - `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
   host calls the first right before it changes the wallet (adding or removing an account,
   a rewind, a wipe), and the running session's scan ends at its next block instead of
@@ -233,35 +341,6 @@ workspace.
   cbindgen re-declaration of the struct must keep its field order.
 
 ### Changed
-- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` take the
-  wallet's network (`ohttp::NetworkType`, re-exported from `zcash_protocol`)
-  as their second argument and refuse a gateway that serves another network
-  before anything is sent.
-- `EngineConfig::validate` refuses an OHTTP gateway (endpoint or alternate)
-  that serves a network other than the wallet's; the signed key configuration
-  is checked against the network of the gateway's exact host name.
-- OHTTP: an outer 429's `Retry-After` holds every request through that relay
-  until it has run (no sleep inside the call); an outer 413 and a local size
-  refusal are `RESOURCE_EXHAUSTED`; a response that ends before its final chunk
-  is `UNAVAILABLE`; an inner status other than 200 or a non-gRPC content type
-  is `INTERNAL`; the gRPC status is delivered only once the final chunk has
-  opened; the verified key configuration is shared by every connection to the
-  same gateway and relay until its `not_after`; `http_round_trip` is bounded
-  (100 s overall, 30 s idle body read, 15 s direct dial); a pooled relay
-  connection is replaced after 10 minutes with Tor off; a `GetBlockRange` the
-  gateway refuses with `INVALID_ARGUMENT` is split into smaller windows.
-- `connector::TorConn::bootstrap` takes the client trace prefix as a third
-  argument, and `TorConn` wraps an `arti_client::TorClient` directly (same
-  `arti-data` / `arti-cache` directory layout as
-  `zcash_client_backend::tor::Client`).
-- `fetch::run_fetch` takes the session's `Option<TorConn>` as its second
-  argument.
-- With Tor on, the bulk block fetch rides the default Tor circuit instead of
-  going direct, and an OHTTP gateway is reached with the relay leg dialled
-  through Tor.
-- The follow loop surfaces `SyncState::Error(3)` (event tag 4, value 3) after
-  5 consecutive tip-probe or catch-up failures, so a host can switch servers.
-  Follow-phase failures previously never surfaced an error.
 - `block_source::MemBlockSource`'s `BlockSource::Error` is `StoppedForWalletChange` (was
   `Infallible`). A source built without `with_stop` never returns it.
 - `session::run_session` returns when the host stops it for a wallet change, leaving
