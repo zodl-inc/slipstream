@@ -10,6 +10,12 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::set_account_name`, the method `zcash_client_backend` adds to the trait.
+  The sparse facade forwards it to the wallet db; the write-behind facade, which holds no
+  connection, refuses it like every other write outside `put_blocks`.
+
 ## [0.4.0-pre.1] - 2026-10-06
 
 ### Changed
