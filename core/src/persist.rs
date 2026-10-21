@@ -837,7 +837,7 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
         }
         // The frontier's leaf vouches only for the run's last row. A row below it that is
         // not the chain's (a stale row the buffer kept) gives every node above it another
-        // root, so the run's build, whenever the range makes it, conflicts with what the
+        // root, so the run's build, whenever the range makes it, can conflict with what the
         // tree holds there: the transaction rolls back, the rows stay buffered, the range
         // keeps its start, and it would fail the same way on every pass. So the tree is
         // asked first ([`resume_refusal`]), and a run it refuses is not continued either:

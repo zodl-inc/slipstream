@@ -27,7 +27,7 @@ workspace.
   leaf of the commitment tree at the wrong position. A range now resumes only the run of
   rows that ends right before its start, on its own `from_state` frontier's leaf, and only
   when the commitment tree takes that run. The frontier's leaf vouches for the run's last
-  row alone: a run with an earlier row that is not the chain's conflicts with the tree
+  row alone: a run with an earlier row that is not the chain's can conflict with the tree
   when it is built, and a range that resumed it would fail on every pass. So the seed
   first inserts the run into a copy of its shard as the wallet holds it, with the range's
   frontier inserted; nothing is written. A run that ends there on another leaf, such as
