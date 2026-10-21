@@ -22,6 +22,11 @@ workspace.
 
 ### Changed
 - `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+- The workspace patches the librustzcash crates to
+  zcash/librustzcash@68b2cf1f22d03a82271e0a3072350cfce9761532, the
+  `zcash_client_sqlite-0.23.0-pre.1` generation with `WalletWrite::set_account_name`
+  (zcash/librustzcash#3139) backported, until a release carries the method. This crate
+  cannot be published while the patch is in place.
 
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed

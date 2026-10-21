@@ -75,3 +75,24 @@ sinsemilla = "0.2"
 group = "0.14"
 pasta_curves = "0.6"
 ff = "0.14"
+
+# `WalletWrite::set_account_name` (zcash/librustzcash#3139), which
+# zodl-slipstream implements, is in no librustzcash release yet. This pins the
+# family to that change backported onto the `zcash_client_sqlite-0.23.0-pre.1`
+# generation the workspace requires. Remove the block once a librustzcash
+# release carries the method; zodl-slipstream must not be published to
+# crates.io while it exists.
+[patch.crates-io]
+equihash = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+pczt = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_pool_migration = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
+zip321 = { git = "https://github.com/zcash/librustzcash", rev = "68b2cf1f22d03a82271e0a3072350cfce9761532" }
