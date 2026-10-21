@@ -31,11 +31,12 @@
 //! - crash after main-commit, before a close-verdict cleanup → rows of a built
 //!   shard stay buffered → a range that later seeds in that shard resumes only
 //!   the contiguous run ending right before its start, on its own frontier's
-//!   leaf (`graft_accumulator::resumable_run`), and deletes only the rows at the
-//!   positions it scans again; a run it resumes on a shard the store already
-//!   holds content for is built again with its first span (same leaves at the
-//!   same positions) — self-healing; any other row of the shard is left to the
-//!   next pass's start sweep;
+//!   leaf (`graft_accumulator::resumable_run`), that the commitment tree takes
+//!   (`persist::resume_refusal`), and deletes only the rows at the positions it
+//!   scans again; a run it resumes on a shard the store already holds content
+//!   for is built again with its first span (same leaves at the same positions)
+//!   — self-healing; any other row of the shard is left to the next pass's start
+//!   sweep;
 //! - stop after a range's last commit, before its range-end build (a host abort
 //!   landing in the final drain) → the range is scanned, but its range-end shard's
 //!   rows stay buffered and no later range resumes them (Historic ranges run newest
@@ -47,14 +48,15 @@
 //! The invariant "block marked scanned ⇒ its commitments are in the shard store
 //! OR in this buffer" therefore holds at every crash point. After a pass's start
 //! sweep, a buffered run of scanned blocks is one the first range to seed in its
-//! shard resumes, unless the sweep could not read its shard or the wallet's block
-//! metadata cannot place it (the sweep then leaves it, with a warning). A shard
-//! whose rows will not decode is swept by position: each run whose blocks the
-//! metadata places is queued for a rescan and then deleted, and any other run
-//! stays, with a warning. A seed that still meets such a shard seeds without a
-//! resume and builds what its range scans there, instead of failing. Only a
-//! decode failure counts ([`will_not_decode`]): any other error reading a shard
-//! fails the seed's range for the pass, and the sweep leaves that shard's rows.
+//! shard resumes (or leaves to the next sweep, when the tree refuses it), unless
+//! the sweep could not read its shard or the wallet's block metadata cannot place
+//! it (the sweep then leaves it, with a warning). A shard whose rows will not
+//! decode is swept by position: each run whose blocks the metadata places is
+//! queued for a rescan and then deleted, and any other run stays, with a warning.
+//! A seed that still meets such a shard seeds without a resume and builds what
+//! its range scans there, instead of failing. Only a decode failure counts
+//! ([`will_not_decode`]): any other error reading a shard fails the seed's range
+//! for the pass, and the sweep leaves that shard's rows.
 //!
 //! No seed or cleanup deletes a row at a position its own range does not feed:
 //! a seed deletes the rows at the positions its call feeds again, and a build or
@@ -65,10 +67,17 @@
 //!
 //! No range buffers a row right after a run it rejects: when the run that ends
 //! right before a seed's start is not on that range's frontier leaf (another
-//! chain's rows, as a reorg's truncation can leave them), the range builds what
-//! it scans in that shard instead. A resume takes every row contiguous below the
-//! start, and the sweep's last-leaf check reads only a run's last row, so either
-//! would otherwise take the rejected run with the range's own rows.
+//! chain's rows, as a reorg's truncation can leave them), or the commitment tree
+//! refuses it (a row below its last is not the chain's: the last leaf vouches for
+//! no other row), the range builds what it scans in that shard instead. A resume
+//! takes every row contiguous below the start, and the sweep's last-leaf check
+//! reads only a run's last row, so either would otherwise take the rejected run
+//! with the range's own rows. The rejected run waits for the next pass's sweep,
+//! which rescans its blocks (or keeps it, with a warning, when it cannot place
+//! them): the tree then holds the range's frontier where the run ends, and either
+//! that leaf is not the run's last row, or the sweep's build of the run meets the
+//! same refusal. No attempt resumes a run the tree refuses, so no range fails on
+//! every pass for it.
 
 use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};

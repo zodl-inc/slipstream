@@ -4082,6 +4082,267 @@ mod tests {
             below_r_ends_with_the_chains_tree(&dir, &t).await;
         }
 
+        /// A Historic range R stopped after two committed units: one sapling output per block
+        /// on a pre-history of `base_size` leaves, the chain tip at block 149, anchors on a
+        /// 50-block grid from START. R's rows in shard 1 stay buffered as one run that ends
+        /// right before R's queued remainder, so the next pass's sweep leaves the run to it.
+        struct StoppedR {
+            base: Frontier<sapling::Node, 32>,
+            blocks: Vec<CompactBlock>,
+            anchors: AnchorRetention,
+            /// The first block of R's remainder, which runs to block 149.
+            remainder: usize,
+            /// The buffered run's positions.
+            run: std::ops::Range<u64>,
+        }
+
+        /// The chain tip: the last block of [`StoppedR`]'s chain.
+        const STOPPED_R_TIP: u64 = START + 149;
+
+        /// R's durable anchors on the 50-block grid, blocks 50 and 100.
+        const STOPPED_R_ANCHORS: [u64; 2] = [START + 50, START + 100];
+
+        /// R = [`r_start`, 150) scans its `units` and stops (`End::Abort`). With `replaced`,
+        /// the buffered row at that position (relative to the pre-history) then holds another
+        /// valid commitment, `le(7)`, while the run's last row stays the chain's.
+        async fn stopped_r(
+            dir: &Path,
+            base_size: u64,
+            r_start: usize,
+            units: &[usize],
+            replaced: Option<u64>,
+        ) -> StoppedR {
+            let base = base_frontier(base_size);
+            let blocks = chain(base_size, 150);
+            let anchors = AnchorRetention::new(
+                BlockHeight::from(u32::try_from(START).expect("fits")),
+                AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
+            );
+            open_wallet(dir, &base, &blocks, STOPPED_R_TIP);
+            scan_range(
+                dir,
+                &base,
+                &blocks,
+                r_start,
+                units,
+                true,
+                Some(anchors.clone()),
+                End::Abort,
+            )
+            .await
+            .expect("R up to its stop");
+            let remainder = r_start + units.iter().sum::<usize>();
+            let end = base_size + remainder as u64;
+            let run = SHARD.max(base_size + r_start as u64)..end;
+            assert_eq!(
+                buffered_positions(dir),
+                run.clone().collect::<Vec<_>>(),
+                "R's rows in shard 1 are buffered right before its remainder"
+            );
+            if let Some(offset) = replaced {
+                let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+                let changed = conn
+                    .execute(
+                        "UPDATE ext_slipstream_graft_buffer SET commitment = ?1 WHERE position = ?2",
+                        rusqlite::params![le(7).to_vec(), (base_size + offset) as i64],
+                    )
+                    .expect("replace a buffered row");
+                assert_eq!(changed, 1, "the replaced row is buffered");
+            }
+            StoppedR {
+                base,
+                blocks,
+                anchors,
+                remainder,
+                run,
+            }
+        }
+
+        /// The next two passes after R stopped, each its start sweep and then what it scans,
+        /// and the wallet they leave. The first pass scans R's remainder, which continues the
+        /// buffered run, or, when the tree refuses the run, builds what it scans in shard 1
+        /// and leaves the run to the next pass's sweep. That sweep deletes such a run once the
+        /// blocks holding it, `rescan`, are queued; the second pass scans what is then queued,
+        /// `queued_then`. Both passes advance, and the wallet ends with the chain's tree, R's
+        /// anchors included, its graft buffer drained.
+        async fn next_two_passes(
+            dir: &Path,
+            t: &StoppedR,
+            rescan: Option<std::ops::Range<usize>>,
+            queued_then: Option<std::ops::Range<usize>>,
+        ) {
+            let height =
+                |i: usize| BlockHeight::from(u32::try_from(START + i as u64).expect("fits"));
+            let refused = rescan.is_some();
+            assert_eq!(
+                start_next_pass(dir, Some(&t.anchors)),
+                crate::persist::GraftSweep::default(),
+                "the first pass's sweep leaves the run to R's remainder"
+            );
+            let resumed = scan_range(
+                dir,
+                &t.base,
+                &t.blocks,
+                t.remainder,
+                &[t.blocks.len() - t.remainder],
+                true,
+                Some(t.anchors.clone()),
+                End::Finish,
+            )
+            .await;
+            assert!(
+                resumed.is_ok(),
+                "the first pass scans R's remainder: {resumed:?}"
+            );
+            assert_eq!(
+                buffered_positions(dir),
+                if refused {
+                    t.run.clone().collect::<Vec<_>>()
+                } else {
+                    vec![]
+                },
+                "R's remainder continues the run, or leaves a run the tree refuses buffered"
+            );
+            let swept = start_next_pass(dir, Some(&t.anchors));
+            match &rescan {
+                Some(blocks) => assert_eq!(
+                    swept,
+                    crate::persist::GraftSweep {
+                        discarded_rows: t.run.end - t.run.start,
+                        rescans: vec![height(blocks.start)..height(blocks.end)],
+                        ..Default::default()
+                    },
+                    "the second pass's sweep deletes the refused run once its blocks are queued"
+                ),
+                None => assert_eq!(
+                    swept,
+                    crate::persist::GraftSweep::default(),
+                    "the second pass's sweep finds nothing"
+                ),
+            }
+            assert!(buffer_rows(dir).is_empty(), "the graft buffer is drained");
+            assert_eq!(
+                suggested(dir),
+                queued_then
+                    .iter()
+                    .map(|blocks| format!(
+                        "Historic({}..{})",
+                        START + blocks.start as u64,
+                        START + blocks.end as u64
+                    ))
+                    .collect::<Vec<_>>(),
+                "what the second pass scans is queued"
+            );
+            if let Some(blocks) = queued_then {
+                let rescanned = scan_range(
+                    dir,
+                    &t.base,
+                    &t.blocks,
+                    blocks.start,
+                    &[blocks.end - blocks.start],
+                    true,
+                    Some(t.anchors.clone()),
+                    End::Finish,
+                )
+                .await;
+                assert!(
+                    rescanned.is_ok(),
+                    "the second pass scans what is queued: {rescanned:?}"
+                );
+            }
+            assert!(suggested(dir).is_empty(), "every block is scanned");
+            assert!(buffer_rows(dir).is_empty(), "the graft buffer is drained");
+            assert_eq!(
+                sapling_checkpoints_among(dir, &STOPPED_R_ANCHORS),
+                STOPPED_R_ANCHORS,
+                "the wallet holds R's anchors"
+            );
+            for idx in [50, 100, 149] {
+                assert_eq!(
+                    sapling_root_at(dir, START + idx as u64),
+                    Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                    "the root at block {idx} is the chain's"
+                );
+            }
+            let last_position = t.base.tree_size() + t.blocks.len() as u64 - 1;
+            assert_eq!(
+                sapling_positions(dir, STOPPED_R_TIP),
+                (Some(last_position as i64), Some(last_position)),
+                "the tip checkpoint and the last leaf sit at the chain's last position"
+            );
+        }
+
+        /// R's remainder resumes a buffered run only when the commitment tree takes it. The
+        /// run ends right before the remainder on the leaf of the remainder's frontier, but a
+        /// row below it is not the chain's. Every build of the run conflicts with the tree, so
+        /// resuming it rolled the remainder back on every pass, its rows still buffered and
+        /// its start unchanged, while each pass's sweep left the run to it. The remainder now
+        /// asks the tree first and does not continue a run it refuses: it builds what it scans
+        /// in shard 1, and the next pass's sweep, whose build of the run is refused against the
+        /// remainder's frontier in the tree, deletes the run once its blocks are queued for a
+        /// rescan, which ends the wallet with the chain's tree as the twin's.
+        ///
+        /// R = [0, 150) on a pre-history of SHARD - 20 leaves, so shard 1 starts at block 20,
+        /// stops after its units [0, 40) and [40, 80); its rows [20, 80) end right before its
+        /// remainder [80, 150), whose frontier (block 79) holds the run's last leaf. The second
+        /// unit's frontier (block 39) is in the store, inside the run. The replaced row is:
+        ///
+        /// - none (the twin: the remainder continues the run);
+        /// - block 39's, where the store holds the second unit's frontier leaf, inside the
+        ///   32-leaf subtree the remainder's frontier holds the root of (the reviewer's
+        ///   reproduction: the tree refused the run at that subtree, `Level(5)`, index 2048);
+        /// - block 60's, in the middle of the run, inside the 16-leaf subtree [SHARD + 32,
+        ///   SHARD + 48) that the run covers whole: no content the store holds reaches it, and
+        ///   only the root the remainder's frontier holds for it checks it.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_resumed_run_the_tree_refuses_is_rescanned_instead() {
+            let root = tempfile::tempdir().expect("tempdir");
+            for (case, replaced) in [
+                ("twin", None),
+                ("the second unit's frontier leaf", Some(39)),
+                ("an aligned subtree only the frontier checks", Some(60)),
+            ] {
+                let dir = root.path().join(case.replace(' ', "-"));
+                let t = stopped_r(&dir, SHARD - 20, 0, &[40, 40], replaced).await;
+                assert_eq!(
+                    suggested(&dir),
+                    ["Historic(1500080..1500150)"],
+                    "[{case}] R's remainder is queued"
+                );
+                let rescan = replaced.map(|_| 20..80);
+                next_two_passes(&dir, &t, rescan.clone(), rescan).await;
+            }
+        }
+
+        /// The same for a run that starts inside its shard, where the remainder's frontier
+        /// holds the root of a subtree the run covers only in part: the content the store holds
+        /// below the run completes that subtree with it. R = [60, 150) on a pre-history of
+        /// SHARD - 40 leaves, so shard 1 starts at block 40 and no block below R is scanned:
+        /// R's first seed meets no content in shard 1 and buffers its rows [60, 140) (positions
+        /// SHARD + 20 to SHARD + 99), and its first unit inserts its frontier (block 59) in
+        /// shard 1. The replaced row is block 70's, inside the 32-leaf subtree [SHARD,
+        /// SHARD + 32) whose root R's second unit's frontier (block 99) holds: R's frontier
+        /// completes it with the run. The rescan of the run's blocks joins the range below R.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_resumed_run_inside_its_shard_the_tree_refuses_is_rescanned_instead() {
+            let root = tempfile::tempdir().expect("tempdir");
+            for (case, replaced) in [
+                ("twin", None),
+                ("a subtree the run covers in part", Some(70)),
+            ] {
+                let dir = root.path().join(case.replace(' ', "-"));
+                let t = stopped_r(&dir, SHARD - 40, 60, &[40, 40], replaced).await;
+                assert_eq!(
+                    suggested(&dir),
+                    ["Historic(1500140..1500150)", "Historic(1500000..1500060)"],
+                    "[{case}] R's remainder is queued, above the range below R"
+                );
+                let rescan = replaced.map(|_| 60..140);
+                let queued_then = if replaced.is_some() { 0..140 } else { 0..60 };
+                next_two_passes(&dir, &t, rescan, Some(queued_then)).await;
+            }
+        }
+
         // ── The same on the Orchard pool ─────────────────────────────────────────────────
         //
         // Orchard chains start above NU5 (`SYNTH_ORCHARD_START`); the Sapling tree stays

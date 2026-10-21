@@ -80,7 +80,9 @@ struct OpenShard<H> {
 ///
 /// Only the run's last row is checked against the frontier, and every row contiguous
 /// below it is taken, so rows of another origin must never be buffered right after a run
-/// this rejects: `persist::plan_pool` builds that shard instead of buffering it.
+/// this rejects: `persist::plan_pool` builds that shard instead of buffering it. The rows
+/// below the last are checked there before the run is resumed: the commitment tree must
+/// take the run (`persist::resume_refusal`), or that shard is built the same way.
 ///
 /// `rows` must be ascending by position, as `graft::load_shard` returns them.
 pub(crate) fn resumable_run<H: PartialEq>(

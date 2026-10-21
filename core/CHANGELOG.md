@@ -25,16 +25,23 @@ workspace.
   first row's position. Rows that did not end right before the range's start, as after an
   account import whose rescan starts inside an interrupted range's shard, put every later
   leaf of the commitment tree at the wrong position. A range now resumes only the run of
-  rows that ends right before its start, on its own `from_state` frontier's leaf. A run
-  that ends there on another leaf, such as another chain's rows a reorg's truncation can
-  leave, is not continued, and the range builds what it scans in that shard instead of
-  buffering it next to the run, so neither the range's remainder nor the next pass's sweep
-  takes the run up with the range's own rows. The resumed run is no longer deleted when
-  the wallet already holds content for the shard (after a second committed unit of the
-  interrupted range), which lost its leaves and anchors. A range also no longer deletes
-  the rest of the shard's rows, rows of blocks that may stay scanned: its seed deletes
-  only the rows at the positions it scans again, and a build or graft only the rows it
-  built, so the others wait for the next pass's sweep (below).
+  rows that ends right before its start, on its own `from_state` frontier's leaf, and only
+  when the commitment tree takes that run. The frontier's leaf vouches for the run's last
+  row alone: a run with an earlier row that is not the chain's conflicts with the tree
+  when it is built, and a range that resumed it would fail on every pass. So the seed
+  first inserts the run into a copy of its shard as the wallet holds it, with the range's
+  frontier inserted; nothing is written. A run that ends there on another leaf, such as
+  another chain's rows a reorg's truncation can leave, or that the tree refuses, is not
+  continued, and the range builds what it scans in that shard instead of buffering it next
+  to the run, so neither the range's remainder nor the next pass's sweep takes the run up
+  with the range's own rows. The next pass's sweep queues the run's blocks for a rescan
+  and then deletes it (below), or keeps it, with a warning, when the wallet's block
+  metadata cannot place its blocks; no seed resumes it. The resumed run is no longer
+  deleted when the wallet already holds content for the shard (after a second committed
+  unit of the interrupted range), which lost its leaves and anchors. A range also no
+  longer deletes the rest of the shard's rows, rows of blocks that may stay scanned: its
+  seed deletes only the rows at the positions it scans again, and a build or graft only
+  the rows it built, so the others wait for the next pass's sweep (below).
 - The range-end graft build, and every other build of buffered rows, inserted the rows
   without first registering their durable anchors as retained. With the wallet at its
   100-checkpoint budget (the ChainTip range's window), the build evicted the anchors it
@@ -60,7 +67,9 @@ workspace.
   row that will not decode counts: any other error reading the buffer (a busy database,
   an I/O error) fails the range for the pass, as before, and the sweep leaves that
   shard's rows as they are. Any other run the sweep cannot read, build or rescan gets a
-  warning and keeps its rows; a sweep that fails only warns, and the pass goes on.
+  warning and keeps its rows; a sweep that fails only warns, and the pass goes on. A run
+  whose end checks but whose build the tree refuses is deleted once its blocks are queued
+  for a rescan, as any other.
 - A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
   of the blocks they queue again, though after a reorg those may be another chain's
   commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own

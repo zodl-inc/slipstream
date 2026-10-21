@@ -740,8 +740,10 @@ fn fed_span<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Option<(u64, Ran
 ///
 /// `frontier_leaf`: the leaf of this call's `from_state` frontier for the pool,
 /// with its position (`start_position - 1`). The seed resumes only the buffered
-/// run that ends on it (`graft_accumulator::resumable_run`). A run that ends at
-/// `start_position - 1` on another leaf is never continued, and the range then
+/// run that ends on it (`graft_accumulator::resumable_run`) and that the
+/// commitment tree takes: `tree_refuses` says why the tree would refuse the run
+/// ([`resume_refusal`]), or `None`. A run that ends at `start_position - 1` on
+/// another leaf, or that the tree refuses, is never continued, and the range then
 /// builds what it scans in that shard, so none of its rows is buffered next to
 /// that run. The seed deletes only the shard's rows at the positions this call
 /// feeds, which the range scans again;
@@ -761,6 +763,7 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
     stream: Vec<(H, Retention<BlockHeight>)>,
     note_positions: &[u64],
     store_has_shard: impl Fn(u64) -> bool,
+    tree_refuses: impl FnOnce(&[crate::graft_accumulator::AccRow<H>]) -> Option<String>,
     mut server_root: impl FnMut(u64) -> Result<Option<H>, SqliteClientError>,
     anchor_retention: Option<&AnchorRetention>,
 ) -> Result<PoolPlan<H>, SqliteClientError> {
@@ -832,6 +835,35 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
                 "graft seed: the buffered run ending right before the start is not on this range's frontier leaf; building this shard as it is scanned, and leaving the run to the next pass's sweep"
             );
         }
+        // The frontier's leaf vouches only for the run's last row. A row below it that is
+        // not the chain's (a stale row the buffer kept) gives every node above it another
+        // root, so the run's build, whenever the range makes it, conflicts with what the
+        // tree holds there: the transaction rolls back, the rows stay buffered, the range
+        // keeps its start, and it would fail the same way on every pass. So the tree is
+        // asked first ([`resume_refusal`]), and a run it refuses is not continued either:
+        // the range builds what it scans in this shard, as next to a run on another leaf,
+        // and the run waits for the next pass's sweep. By then the tree holds this range's
+        // frontier, so the sweep's build of the run meets the same refusal (or nothing
+        // checks where the run ends), and the sweep queues a rescan of the run's blocks and
+        // then deletes its rows, or keeps them, with nothing next to them, when it cannot
+        // place the blocks. A seed asks the tree on every attempt, so no attempt resumes a
+        // run the tree refuses.
+        let refusal = if resume.is_empty() {
+            None
+        } else {
+            tree_refuses(&resume)
+        };
+        if let Some(reason) = &refusal {
+            tracing::warn!(
+                ?pool,
+                shard,
+                first = resume.first().map(|row| row.0),
+                start_position,
+                %reason,
+                "graft seed: the commitment tree refuses the buffered run ending right before the start; building this shard as it is scanned, and leaving the run to the next pass's sweep"
+            );
+        }
+        let resume = if refusal.is_some() { vec![] } else { resume };
         if below_start > resume.len() {
             tracing::debug!(
                 ?pool,
@@ -842,8 +874,10 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
         }
         // Passthrough: the range builds what it scans in this shard instead of buffering
         // it, when the store already holds content for the shard, its rows will not
-        // decode, or they end right before the start on another leaf.
-        let passthrough = store_has_shard(shard) || will_not_decode || rejected_at_start;
+        // decode, or they end right before the start on another leaf or in a run the tree
+        // refuses.
+        let passthrough =
+            store_has_shard(shard) || will_not_decode || rejected_at_start || refusal.is_some();
         *acc = Some(ShardAccumulator::seed(start_position, resume, passthrough));
     }
     let acc = acc.as_mut().unwrap_or_else(|| unreachable!("seeded above"));
@@ -911,6 +945,72 @@ fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
         }
     }
     Ok(plan)
+}
+
+/// Why the commitment tree would refuse `run`, the buffered run a range's seed would
+/// resume ([`plan_pool`]), or `None` when it takes it.
+///
+/// The run ends right before the range's start on the leaf the range's `from_state`
+/// frontier holds there, but that leaf vouches only for its last row. Every build of the
+/// run (with the range's first span on a shard the store holds content for, otherwise at
+/// a shard close, an eager flush or the range-end finish) meets the frontier's subtree
+/// roots, which the call inserts before it builds anything, and the content the store
+/// holds for the shard (the frontiers of earlier units, rows built earlier). So the run
+/// is inserted here first, into a copy of its shard as `store` holds it with the frontier
+/// inserted. Every row below the last lies under one of the frontier's subtree roots: one
+/// the run covers whole must be the root of the run's rows there, and one it covers only
+/// in part is checked once the content the store holds below the run (the frontier its
+/// own range inserted where it started) completes it with them. The run is laid out as
+/// those builds lay it out ([`build_subtrees`] from its first row, with its own
+/// retentions, which no build keeps more of), so a conflict any of them would meet over
+/// the run's rows is met here. Nothing is written.
+///
+/// `None` as well when `store` cannot read the shard, or when the frontier itself
+/// conflicts with what the store holds: the call then fails whatever the run holds.
+fn resume_refusal<H, const SHARD_HEIGHT: u8>(
+    store: &SparseShardStore<H>,
+    frontier: Option<&incrementalmerkletree::frontier::NonEmptyFrontier<H>>,
+    frontier_id: BlockHeight,
+    run: &[crate::graft_accumulator::AccRow<H>],
+) -> Option<String>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+{
+    let first = Position::from(run.first()?.0);
+    let addr = Address::above_position(store.shard_level, first);
+    let mut shard = store
+        .get_shard(addr)
+        .ok()?
+        .unwrap_or_else(|| LocatedTree::empty(addr));
+    if let Some(frontier) = frontier.filter(|f| addr.position_range().contains(&f.position())) {
+        let retention = Retention::Checkpoint {
+            id: frontier_id,
+            marking: Marking::Reference,
+        };
+        shard = shard
+            .insert_frontier_nodes(frontier.clone(), &retention)
+            .ok()?
+            .0;
+    }
+    // The build's rayon work runs on the persist lane's pool, as every build does.
+    let build = || {
+        let mut rows: Vec<_> = run
+            .iter()
+            .map(|(_, hash, retention)| Some((hash.clone(), *retention)))
+            .collect();
+        build_subtrees::<_, SHARD_HEIGHT>(first, &mut rows, BUILD_CHUNK_SIZE)
+    };
+    let subtrees = match persist_pool() {
+        Some(workers) => workers.install(build),
+        None => build(),
+    };
+    for (subtree, _) in subtrees {
+        match shard.insert_subtree(subtree, false) {
+            Ok((merged, _)) => shard = merged,
+            Err(e) => return Some(e.to_string()),
+        }
+    }
+    None
 }
 
 fn seed_sapling(
@@ -1322,6 +1422,14 @@ pub fn sparse_put_blocks(
             sap_stream,
             &sap_notes,
             |s| sap_tree.store().shard_has_interior(s),
+            |run| {
+                resume_refusal::<_, SAPLING_SHARD_HEIGHT>(
+                    sap_tree.store(),
+                    from_state.final_sapling_tree().value(),
+                    from_state.block_height(),
+                    run,
+                )
+            },
             |s| {
                 inner
                     .get_sapling_subtree_root(s)
@@ -1342,6 +1450,14 @@ pub fn sparse_put_blocks(
             orch_stream,
             &orch_notes,
             |s| orch_tree.store().shard_has_interior(s),
+            |run| {
+                resume_refusal::<_, ORCHARD_SHARD_HEIGHT>(
+                    orch_tree.store(),
+                    from_state.final_orchard_tree().value(),
+                    from_state.block_height(),
+                    run,
+                )
+            },
             |s| {
                 inner
                     .get_orchard_subtree_root(s)
@@ -2416,8 +2532,10 @@ impl GraftSweep {
 ///
 /// - the first pending Historic range to seed in a shard resumes the run that ends right
 ///   before its start ([`crate::graft::first_seeders`], [`crate::graft::stranded_runs`]),
-///   and that run is left in place. With `graft_resumes` false (the kill switch: no range
-///   buffers, so none resumes) every run is stranded and swept as below;
+///   and that run is left in place. The range's seed asks the tree whether it takes the
+///   run ([`resume_refusal`]), and builds what it scans next to a run it refuses, which
+///   the next sweep then finds stranded. With `graft_resumes` false (the kill switch: no
+///   range buffers, so none resumes) every run is stranded and swept as below;
 /// - a stranded run is built only when data the wallet already holds checks where it
 ///   ends ([`crate::graft::end_check`]): the tree's leaf at its last position, or the
 ///   stored root of the shard it completes, which the shard's root computed once the run
@@ -5545,6 +5663,7 @@ mod graft_resume_seed_tests {
                 stream.clone(),
                 &[note],
                 |_| store_has_content,
+                |_| None,
                 |_| Ok(None),
                 None,
             )
@@ -5608,6 +5727,7 @@ mod graft_resume_seed_tests {
                 stream.clone(),
                 &[],
                 |_| false,
+                |_| None,
                 |s| Ok(if s == shard { root } else { None }),
                 None,
             )
@@ -5666,6 +5786,7 @@ mod graft_resume_seed_tests {
             stream,
             &[start + 5],
             |_| false,
+            |_| None,
             |_| Ok(None),
             None,
         )
@@ -5729,6 +5850,7 @@ mod graft_resume_seed_tests {
             stream,
             &[],
             |_| false,
+            |_| None,
             |_| Ok(None),
             None,
         )
@@ -5783,6 +5905,7 @@ mod graft_resume_seed_tests {
             stream,
             &[],
             |_| false,
+            |_| None,
             |_| Ok(None),
             None,
         )
@@ -5835,6 +5958,7 @@ mod graft_resume_seed_tests {
             stream,
             &[],
             |_| true,
+            |_| None,
             |_| Ok(None),
             None,
         );
@@ -5880,6 +6004,7 @@ mod graft_resume_seed_tests {
             stream,
             &[],
             |_| false,
+            |_| None,
             |_| Ok(None),
             None,
         )
@@ -5898,6 +6023,143 @@ mod graft_resume_seed_tests {
                 .expect("positions"),
             (k_start..k_start + 20).collect::<Vec<_>>(),
             "the rejected run stays for the next pass's sweep, with nothing buffered next to it"
+        );
+    }
+
+    /// A run that ends right before the start on the range's frontier leaf, but that the
+    /// commitment tree refuses (a row below its last is not the chain's), is not continued
+    /// either: the range builds what it scans in that shard instead of buffering it next to
+    /// the run, and the run stays buffered for the next pass's sweep.
+    #[test]
+    fn seed_builds_instead_of_resuming_a_run_the_tree_refuses() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let mut asked = vec![];
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |run| {
+                asked.extend(run.iter().map(|row| row.0));
+                Some("a conflict".into())
+            },
+            |_| Ok(None),
+            None,
+        )
+        .expect("plan");
+        assert_eq!(
+            asked,
+            (k_start..start).collect::<Vec<_>>(),
+            "the tree is asked about the run that ends on the frontier's leaf"
+        );
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans in the shard, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..start).collect::<Vec<_>>(),
+            "the refused run stays for the next pass's sweep, with nothing buffered next to it"
+        );
+    }
+
+    /// What `resume_refusal` checks a run against. The chain's leaf at position p is
+    /// node(p). The run is positions 20 to 59, right before a range that starts at 60, whose
+    /// frontier ends at 59: the roots of [0, 32), [32, 48), [48, 56) and [56, 58), and leaf 58.
+    /// The store holds nothing for the shard, or what the run's own range inserted when it
+    /// started at 20: its frontier at 19, the roots of [0, 16) and [16, 18), and leaves 18
+    /// and 19.
+    ///
+    /// A subtree the run covers whole must have the frontier's root there. The run covers
+    /// [0, 32) only from 20, so its rows there are checked against the frontier's root once
+    /// the store's content below the run completes that subtree with them; with nothing
+    /// stored below the run, nothing checks them, and no build of the run meets a conflict
+    /// there either.
+    #[test]
+    fn resume_refusal_checks_a_run_against_the_frontier_and_the_store() {
+        use incrementalmerkletree::frontier::NonEmptyFrontier;
+
+        let frontier_at = |last: u64| {
+            let mut frontier = NonEmptyFrontier::new(node(0));
+            for p in 1..=last {
+                frontier.append(node(p));
+            }
+            frontier
+        };
+        let empty = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
+        let mut below_the_run: SaplingSparseTree = ShardTree::new(
+            SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT),
+            MAX_CHECKPOINTS,
+        );
+        below_the_run
+            .insert_frontier_nodes(
+                frontier_at(19),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(19),
+                    marking: Marking::Reference,
+                },
+            )
+            .expect("the frontier the run's range inserted");
+        let frontier = frontier_at(59);
+        let refusal = |store: &SparseShardStore<sapling::Node>, replaced: Option<u64>| {
+            let run: Vec<crate::graft_accumulator::AccRow<sapling::Node>> = (20..60)
+                .map(|p| {
+                    let leaf = if replaced == Some(p) {
+                        node(7_000_000)
+                    } else {
+                        node(p)
+                    };
+                    (p, leaf, Retention::Ephemeral)
+                })
+                .collect();
+            resume_refusal::<_, SAPLING_SHARD_HEIGHT>(
+                store,
+                Some(&frontier),
+                BlockHeight::from(59),
+                &run,
+            )
+        };
+
+        assert_eq!(refusal(&empty, None), None, "the chain's run");
+        assert_eq!(
+            refusal(below_the_run.store(), None),
+            None,
+            "the chain's run, above what its range inserted"
+        );
+        for store in [&empty, below_the_run.store()] {
+            assert!(
+                refusal(store, Some(50)).is_some(),
+                "position 50 is under the frontier's root of [48, 56), which the run covers whole"
+            );
+        }
+        assert!(
+            refusal(below_the_run.store(), Some(25)).is_some(),
+            "position 25 is under the frontier's root of [0, 32), which the store's content \
+             below the run completes with it"
+        );
+        assert_eq!(
+            refusal(&empty, Some(25)),
+            None,
+            "with nothing stored below the run, nothing completes [0, 32) to check position 25"
         );
     }
 }
