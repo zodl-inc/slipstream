@@ -15,6 +15,10 @@ workspace.
   `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
   it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
   the height the wallet was truncated to. The scheduler's reorg recovery calls it.
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::set_account_name`, the method `zcash_client_backend` adds to the trait.
+  The sparse facade forwards it to the wallet db; the write-behind facade, which holds no
+  connection, refuses it like every other write outside `put_blocks`.
 
 ### Changed
 - `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
