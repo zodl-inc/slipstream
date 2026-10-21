@@ -3407,6 +3407,13 @@ impl WalletWrite for SparseFacade<'_> {
     ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.delete_account(account)
     }
+    fn set_account_name(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+        name: &str,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.inner.set_account_name(account, name)
+    }
     fn get_next_available_address(
         &mut self,
         account: <Self as WalletRead>::AccountId,
@@ -4132,6 +4139,13 @@ impl WalletWrite for WriteBehindFacade {
         _account: <Self as WalletRead>::AccountId,
     ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("delete_account"))
+    }
+    fn set_account_name(
+        &mut self,
+        _account: <Self as WalletRead>::AccountId,
+        _name: &str,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        Err(unvirtualized("set_account_name"))
     }
     fn get_next_available_address(
         &mut self,
@@ -5142,6 +5156,16 @@ mod write_behind_tests {
         assert!(err.to_string().contains("queue_rescan"));
     }
 
+    /// The write-behind facade holds no connection, so a rename through it is refused
+    /// like every other account mutation; renames reach the wallet db outside a scan.
+    #[test]
+    fn facade_set_account_name_fails_loudly() {
+        let mut f = WriteBehindFacade::test_new(BlockHeight::from(1u32), None);
+        let account = zcash_client_sqlite::AccountUuid::from_uuid(uuid::Uuid::nil());
+        let err = f.set_account_name(account, "renamed").unwrap_err();
+        assert!(err.to_string().contains("set_account_name"), "got: {err}");
+    }
+
     // ── PersistLane: serial order, depth-1 backpressure, errors, drain ─────────
 
     fn lane(dir: &std::path::Path) -> PersistLane {
@@ -5562,6 +5586,53 @@ mod flush_retained_tests {
         assert_eq!(
             ranges[0].priority(),
             zcash_client_backend::data_api::scanning::ScanPriority::Historic
+        );
+    }
+
+    /// `set_account_name` reaches the wallet db: the sparse facade forwards it straight to
+    /// `Db`, so the new name is what the wallet then reports, and an account the wallet does
+    /// not know is refused with upstream's error.
+    #[test]
+    fn sparse_facade_set_account_name_reaches_the_wallet_db() {
+        use zcash_client_backend::data_api::Account as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from(1_000u32), BlockHash([0; 32])),
+            None,
+        );
+        let (account, _) = db
+            .create_account("original", &SecretVec::new(vec![7u8; 32]), &birthday, None)
+            .expect("creates the account");
+
+        let mut sparse = SparseTreeState::default();
+        let mut facade = SparseFacade {
+            inner: &mut db,
+            sparse: &mut sparse,
+        };
+        facade
+            .set_account_name(account, "renamed")
+            .expect("renames");
+        assert_eq!(
+            db.get_account(account)
+                .expect("reads")
+                .expect("account exists")
+                .name(),
+            Some("renamed")
+        );
+
+        db.delete_account(account).expect("deletes the account");
+        let mut facade = SparseFacade {
+            inner: &mut db,
+            sparse: &mut sparse,
+        };
+        let err = facade
+            .set_account_name(account, "renamed again")
+            .unwrap_err();
+        assert!(
+            matches!(err, SqliteClientError::AccountUnknown),
+            "got: {err}"
         );
     }
 }
