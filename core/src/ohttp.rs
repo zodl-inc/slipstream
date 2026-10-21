@@ -1454,7 +1454,8 @@ impl OhttpClient {
     /// `relay_err`: each resolver of [`DOH_RESOLVERS`] in order, its answer parsed and verified
     /// like the relay's; the first that verifies wins. When none does, or the gateway host is
     /// outside the static configuration (no DNS record to fall back to), or `relay_err` has no
-    /// fallback ([`relay_failure_has_dns_fallback`]), `relay_err` is returned.
+    /// fallback ([`relay_failure_has_dns_fallback`]), `relay_err` is returned. A relay pause begun
+    /// meanwhile (another request's 429) holds the resolvers too.
     async fn key_config_from_dns(
         &self,
         relay_err: RoundTripError,
@@ -1469,6 +1470,7 @@ impl OhttpClient {
 
         let dns_name = key_config_dns_name(network);
         for resolver in DOH_RESOLVERS {
+            self.check_relay_pause()?;
             let doh_url = doh_query_url(resolver, network);
             tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
 
@@ -3925,6 +3927,39 @@ mod tests {
         assert!(
             client.key_config.lock().await.is_none(),
             "nothing was fetched"
+        );
+    }
+
+    /// A pause another request's 429 began while the relay fetch was in flight holds the DNS
+    /// fallback too.
+    #[tokio::test]
+    async fn a_pause_begun_during_the_relay_fetch_holds_the_dns_fallback() {
+        let relay = "https://relay-pause-dns-test.invalid/relay";
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+
+        let err = client
+            .key_config_from_dns(RoundTripError::Transport("relay down".into()))
+            .await
+            .expect_err("held");
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "{err:?}"
         );
     }
 
