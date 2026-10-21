@@ -3911,7 +3911,7 @@ mod tests {
         headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
         client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
 
-        let err = client.key_config(false).await.err().expect("held");
+        let err = client.key_config(false).await.expect_err("held");
         assert!(
             matches!(
                 &err,
@@ -3955,8 +3955,7 @@ mod tests {
         let err = client
             .key_config_from_dns(limited)
             .await
-            .err()
-            .expect("no DNS");
+            .expect_err("no DNS");
         assert!(
             matches!(
                 &err,
