@@ -1298,7 +1298,7 @@ impl OhttpClient {
     }
 
     async fn key_config(&self, refresh: bool) -> Result<KeyConfig, String> {
-        let shared_key = (self.gateway_host.clone(), self.relay_url.clone());
+        let shared_key = (self.gateway_host.clone(), self.backoff_key());
         {
             let mut cached = self.key_config.lock().await;
             if !refresh {
@@ -1333,7 +1333,6 @@ impl OhttpClient {
 
         // Configuration validation: check relay URL, gateway network, and signed config URL
         // BEFORE any network call. Configuration errors fail closed without DNS fallback.
-        let now = unix_now()?;
 
         // Validate relay URL is https
         parse_https(&self.relay_url)?;
@@ -1374,7 +1373,7 @@ impl OhttpClient {
             }
 
             // Verify the relay envelope
-            let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, now)
+            let cfg = open_signed_keys(&self.profile, &answer.body, &self.gateway_host, unix_now()?)
                 .map_err(|e| format!("relay envelope verification failed: {}", e))?;
             tracing::debug!("ohttp: key config fetched and verified from relay");
             Ok(cfg)
@@ -1403,7 +1402,7 @@ impl OhttpClient {
                         let doh_body = self.fetch_dns_key_config(&doh_url).await?;
                         let envelope = envelope_from_doh_json(&doh_body, network)
                             .map_err(|e| format!("parse error: {}", e))?;
-                        open_signed_keys(&self.profile, &envelope, &self.gateway_host, now)
+                        open_signed_keys(&self.profile, &envelope, &self.gateway_host, unix_now()?)
                             .map_err(|e| format!("verification failed: {}", e))
                     }
                     .await;
@@ -1479,9 +1478,20 @@ impl OhttpClient {
             .map_err(|e| HttpsError::RelayPaused(e.into_message()))
     }
 
+    /// Key of this relay in the shared key cache and the relay pause: fetches over Tor and outside
+    /// Tor keep separate entries, so that neither links the two ("Retrieval, caching and
+    /// rotation" in the ZIP).
+    fn backoff_key(&self) -> String {
+        if self.dialer.is_tor() {
+            format!("tor {}", self.relay_url)
+        } else {
+            self.relay_url.clone()
+        }
+    }
+
     /// Fails at once, without posting, while the relay's `Retry-After` pause runs.
     fn check_relay_pause(&self) -> Result<(), RoundTripError> {
-        match RelayBackoff::global().remaining(&self.relay_url) {
+        match RelayBackoff::global().remaining(&self.backoff_key()) {
             Some(wait) => Err(RoundTripError::RateLimited {
                 detail: format!(
                     "relay rate limit: not sent, {}s of the relay's pause left",
@@ -1506,7 +1516,7 @@ impl OhttpClient {
                 relay = %self.relay_url,
                 "ohttp: relay rate limit (429); holding requests through it"
             );
-            RelayBackoff::global().note(&self.relay_url, wait);
+            RelayBackoff::global().note(&self.backoff_key(), wait);
         }
     }
 
