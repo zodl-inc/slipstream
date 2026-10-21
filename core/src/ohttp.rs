@@ -908,6 +908,40 @@ fn check_response_body(len: usize, max: Option<usize>) -> Result<(), RoundTripEr
     }
 }
 
+/// Sealed bytes decoded per push of a buffered answer: the gateway's chunk size, so that the
+/// decoded total is checked against the caller's ceiling about once per chunk.
+const DECODE_SLICE_BYTES: usize = 16 * 1024;
+
+/// The events of an answer as it is decoded, with the running length of its body checked against
+/// `max`, the ceiling the caller set (`None`: none): the first `Data` event past it is refused,
+/// before anything behind it is decoded.
+struct AnswerEvents {
+    events: Vec<ResponseEvent>,
+    body_len: usize,
+    max: Option<usize>,
+}
+
+impl AnswerEvents {
+    fn new(max: Option<usize>) -> Self {
+        Self {
+            events: Vec::new(),
+            body_len: 0,
+            max,
+        }
+    }
+
+    fn extend(&mut self, events: Vec<ResponseEvent>) -> Result<(), RoundTripError> {
+        for event in events {
+            if let ResponseEvent::Data(data) = &event {
+                self.body_len += data.len();
+                check_response_body(self.body_len, self.max)?;
+            }
+            self.events.push(event);
+        }
+        Ok(())
+    }
+}
+
 /// The opened answer as the [`BhttpResponse`] a round trip returns (header fields as bytes), once
 /// its body is checked against `max_response_bytes`, the ceiling the caller set.
 fn bhttp_response_within(
@@ -1695,8 +1729,8 @@ impl OhttpClient {
     /// `max_response_bytes` is the largest answer body the caller accepts. The sealed answer is
     /// read through a guard of [`sealed_response_ceiling`] bytes, so one that goes past it is
     /// not buffered further or opened ([`RoundTripError::ResponseTooLarge`]); the body it opens
-    /// to is then checked against `max_response_bytes` itself. `None` leaves only the general
-    /// cap of the client's profile.
+    /// to is checked against `max_response_bytes` itself as it is decoded ([`AnswerEvents`]).
+    /// `None` leaves only the general cap of the client's profile.
     ///
     /// `on_dispatch` is called right before the sealed request is written to the relay
     /// connection, after the relay-pause check and the connection setup (see
@@ -1726,17 +1760,23 @@ impl OhttpClient {
         )
         .await?;
 
-        // Decode the buffered response body through the chunked decoder
-        let mut events = decoder
-            .push(&answer.body)
-            .map_err(|e| RoundTripError::Decode(e.to_string()))?;
+        // Decode the buffered sealed answer a slice at a time, so that a body past the caller's
+        // ceiling is refused as soon as the decoded total crosses it, not once it is decoded whole.
+        let mut events = AnswerEvents::new(max_response_bytes);
+        for slice in answer.body.chunks(DECODE_SLICE_BYTES) {
+            events.extend(
+                decoder
+                    .push(slice)
+                    .map_err(|e| RoundTripError::Decode(e.to_string()))?,
+            )?;
+        }
         events.extend(decoder.finish().map_err(|e| match e {
             zodl_ohttp_client::Error::Truncated => RoundTripError::Transport(e.to_string()),
             e => RoundTripError::Decode(e.to_string()),
-        })?);
+        })?)?;
 
         // Collect events into a Response and convert to BhttpResponse
-        let response = zodl_ohttp_client::collect_response(events)
+        let response = zodl_ohttp_client::collect_response(events.events)
             .map_err(|e| RoundTripError::Decode(e.to_string()))?;
         bhttp_response_within(response, max_response_bytes)
     }
@@ -4221,6 +4261,48 @@ mod tests {
     }
 
     /// The exact bound on an answer: its opened body is checked against the caller's ceiling
+    /// The decoded body is refused by the `Data` event that takes it past the ceiling, with
+    /// nothing behind that event kept; exactly the ceiling is let through, and without a ceiling
+    /// everything is.
+    #[test]
+    fn a_decoded_body_is_refused_as_soon_as_it_passes_the_ceiling() {
+        let head = || ResponseEvent::Head {
+            status: 200,
+            headers: Vec::new(),
+        };
+        let mut events = AnswerEvents::new(Some(10));
+        events
+            .extend(vec![head(), ResponseEvent::Data(vec![0u8; 6])])
+            .expect("under the ceiling");
+        events
+            .extend(vec![ResponseEvent::Data(vec![0u8; 4])])
+            .expect("exactly the ceiling");
+        assert_eq!(events.body_len, 10);
+        let err = events
+            .extend(vec![
+                ResponseEvent::Data(vec![0u8; 1]),
+                ResponseEvent::Trailers(Vec::new()),
+                ResponseEvent::End,
+            ])
+            .expect_err("one byte past the ceiling");
+        assert!(
+            matches!(&err, RoundTripError::ResponseTooLarge(m) if m.contains("11 > 10")),
+            "{err:?}"
+        );
+        assert_eq!(events.events.len(), 3, "nothing past the refusal is kept");
+
+        let mut unbounded = AnswerEvents::new(None);
+        unbounded
+            .extend(vec![
+                head(),
+                ResponseEvent::Data(vec![0u8; 11]),
+                ResponseEvent::End,
+            ])
+            .expect("no ceiling of the caller's");
+        assert_eq!(unbounded.body_len, 11);
+        assert_eq!(unbounded.events.len(), 3);
+    }
+
     /// before the answer is returned, and exactly the ceiling is let through. (The sealed
     /// ceiling has room to spare, so only this check refuses a body just past the ceiling.)
     #[test]
