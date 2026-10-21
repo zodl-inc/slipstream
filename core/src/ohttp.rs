@@ -914,7 +914,7 @@ const DECODE_SLICE_BYTES: usize = 16 * 1024;
 
 /// The events of an answer as it is decoded, with the running length of its body checked against
 /// `max`, the ceiling the caller set (`None`: none): the first `Data` event past it is refused,
-/// before anything behind it is decoded.
+/// so no later slice of the sealed answer is decoded and nothing past that event is kept.
 struct AnswerEvents {
     events: Vec<ResponseEvent>,
     body_len: usize,
