@@ -4343,6 +4343,101 @@ mod tests {
             }
         }
 
+        /// A run the tree refuses, whose blocks the wallet's block metadata cannot place, stays
+        /// buffered: its rows are not the chain's, but deleting them would leave scanned blocks
+        /// whose commitments are in neither the tree nor the buffer, with no rescan to restore
+        /// them, while a later sweep places and rescans the run once the metadata does (as for
+        /// any run it cannot place). No seed resumes it, so it fails no range.
+        ///
+        /// R's run holds another commitment at block 39's position, as in the reviewer's
+        /// reproduction, and R's remainder refuses it. The wallet then loses the metadata of
+        /// the run's blocks but its last (block 79, which a range starting at 80 reads): the
+        /// next pass's sweep refuses to build the run and cannot queue its blocks, so it keeps
+        /// it. A rescan of the remainder's blocks that the host queues, which starts right
+        /// after the run, refuses the run again, builds what it scans, and advances.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_refused_run_the_metadata_cannot_place_stays_buffered_and_unresumed() {
+            let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
+            let root = tempfile::tempdir().expect("tempdir");
+            let dir = root.path().join("unplaced");
+            let t = stopped_r(&dir, SHARD - 20, 0, &[40, 40], Some(39)).await;
+            let run: Vec<u64> = t.run.clone().collect();
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep::default(),
+                "the first pass's sweep leaves the run to R's remainder"
+            );
+            scan_range(
+                &dir,
+                &t.base,
+                &t.blocks,
+                80,
+                &[70],
+                true,
+                Some(t.anchors.clone()),
+                End::Finish,
+            )
+            .await
+            .expect("R's remainder, which refuses the run");
+            assert_eq!(
+                buffered_positions(&dir),
+                run,
+                "the refused run stays buffered"
+            );
+            let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
+            let dropped = conn
+                .execute(
+                    "DELETE FROM blocks WHERE height >= ?1 AND height < ?2",
+                    rusqlite::params![
+                        i64::try_from(START + 20).expect("fits"),
+                        i64::try_from(START + 79).expect("fits")
+                    ],
+                )
+                .expect("drop the metadata of the run's blocks but its last");
+            assert_eq!(dropped, 59, "the run's blocks 20 to 78 were in the wallet");
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep::default(),
+                "the sweep neither builds the run, which the tree refuses, nor places its blocks"
+            );
+            assert_eq!(buffered_positions(&dir), run, "the sweep keeps the run");
+            assert!(suggested(&dir).is_empty(), "nothing is queued");
+            session(&dir)
+                .db_mut()
+                .queue_rescan(height(80)..height(150))
+                .expect("queue a rescan of the remainder's blocks");
+            assert_eq!(
+                start_next_pass(&dir, Some(&t.anchors)),
+                crate::persist::GraftSweep::default(),
+                "the sweep leaves the run to the rescan, which starts right after it"
+            );
+            let rescanned = scan_range(
+                &dir,
+                &t.base,
+                &t.blocks,
+                80,
+                &[70],
+                true,
+                Some(t.anchors.clone()),
+                End::Finish,
+            )
+            .await;
+            assert!(rescanned.is_ok(), "the rescan advances: {rescanned:?}");
+            assert_eq!(
+                buffered_positions(&dir),
+                run,
+                "the rescan does not resume the run either"
+            );
+            assert!(suggested(&dir).is_empty(), "every block is scanned");
+            for idx in [100, 149] {
+                assert_eq!(
+                    sapling_root_at(&dir, START + idx as u64),
+                    Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                    "the root at block {idx} is the chain's"
+                );
+            }
+        }
+
         // ── The same on the Orchard pool ─────────────────────────────────────────────────
         //
         // Orchard chains start above NU5 (`SYNTH_ORCHARD_START`); the Sapling tree stays
