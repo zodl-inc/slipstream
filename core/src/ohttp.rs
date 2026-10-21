@@ -818,7 +818,9 @@ where
     attempt().await
 }
 
-/// `on_dispatch` wrapped so that it runs at most once, across the attempts of one request.
+/// `on_dispatch` wrapped so that it runs at most once, across the attempts of one request: the
+/// first send marks the request as possibly delivered, and a later post of it (after a key
+/// refresh, or when the gateway refused it as stale) does not call the hook again.
 fn once_dispatch<D: Fn()>(on_dispatch: D) -> impl Fn() {
     let done = std::sync::atomic::AtomicBool::new(false);
     move || {
@@ -832,12 +834,15 @@ fn once_dispatch<D: Fn()>(on_dispatch: D) -> impl Fn() {
 /// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
 /// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
 /// is retried once; an outer 400 or 422 refetches the key and retries once.
-async fn run_exchange_chunked<A, P, PF, R, RF, D>(
+///
+/// The caller's dispatch hook is not called here but inside `post`, at the moment the sealed
+/// request is handed to the relay connection: until then a post may still fail without having
+/// sent anything.
+async fn run_exchange_chunked<A, P, PF, R, RF>(
     mut key: KeyConfig,
     request: &BhttpRequest,
     mut post: P,
     mut refetch: R,
-    on_dispatch: D,
 ) -> Result<(ChunkedResponseDecoder, A), RoundTripError>
 where
     A: OuterAnswer,
@@ -845,10 +850,8 @@ where
     PF: Future<Output = Result<A, HttpsError>>,
     R: FnMut() -> RF,
     RF: Future<Output = Result<KeyConfig, RoundTripError>>,
-    D: Fn(),
 {
     let mut attempt = 0u32;
-    let mut dispatched = false;
     loop {
         let mut resent = false;
         let (opener, answer) = loop {
@@ -859,11 +862,6 @@ where
                 .map_err(|e| RoundTripError::Transport(e.to_string()))?;
             check_size(sealed.len(), Some(GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES))
                 .map_err(|e| RoundTripError::TooLarge(format!("sealed request not sent: {e}")))?;
-            // Signal dispatch right before posting the sealed request to the relay
-            if !dispatched {
-                on_dispatch();
-                dispatched = true;
-            }
             match post(sealed).await {
                 Ok(answer) => break (opener, answer),
                 Err(HttpsError::PreSend(e)) if !resent => {
@@ -1167,13 +1165,19 @@ impl OhttpClient {
     /// never retried here, because resending a relay POST's body would repeat its ciphertext.
     /// The caller decides, and seals afresh. The body is read through `guard`, which aborts the
     /// read at the first byte past the size cap.
-    async fn https_once(
+    ///
+    /// `on_send` is called once, right before the request is handed to the connection: on h2
+    /// when the connection is ready, on HTTP/1.1 when TLS and the handshake are done. A failure
+    /// before that point (connect, TLS, handshake, a connection that is not ready) never calls
+    /// it, so it marks the exchanges that may have reached the far end.
+    async fn https_once<F: Fn()>(
         &self,
         target: &HttpsTarget,
         method: Method,
         headers: &[(&'static str, String)],
         body: Vec<u8>,
         mut guard: SizeGuard,
+        on_send: &F,
     ) -> Result<RelayAnswer, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
@@ -1188,6 +1192,7 @@ impl OhttpClient {
                         target.host
                     )));
                 }
+                on_send();
                 match sender.send_request(req).await {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
@@ -1204,6 +1209,7 @@ impl OhttpClient {
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
+                on_send();
                 sender
                     .send_request(req)
                     .await
@@ -1258,8 +1264,14 @@ impl OhttpClient {
         })
     }
 
-    /// POST one sealed chunked request body to the relay. Returns buffered response.
-    async fn post_sealed(&self, body: Vec<u8>) -> Result<RelayAnswer, HttpsError> {
+    /// POST one sealed chunked request body to the relay. Returns buffered response. `on_send`
+    /// is called as [`Self::https_once`] describes, so not when the relay's pause stops the post
+    /// or the connection cannot be made ready.
+    async fn post_sealed<F: Fn()>(
+        &self,
+        body: Vec<u8>,
+        on_send: &F,
+    ) -> Result<RelayAnswer, HttpsError> {
         self.relay_pause_before_post()?;
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let headers = self.profile.headers.relay_post(trace.as_deref());
@@ -1269,27 +1281,34 @@ impl OhttpClient {
             &headers,
             body,
             self.profile.limits.response_guard(),
+            on_send,
         )
         .await
     }
 
     /// POST one sealed chunked request body to the relay. Returns the response with its body
-    /// unread.
-    async fn post_sealed_stream(&self, body: Vec<u8>) -> Result<RelayStream, HttpsError> {
+    /// unread. `on_send` is called as for [`Self::post_sealed`].
+    async fn post_sealed_stream<F: Fn()>(
+        &self,
+        body: Vec<u8>,
+        on_send: &F,
+    ) -> Result<RelayStream, HttpsError> {
         self.relay_pause_before_post()?;
         let trace = self.client_trace.as_ref().map(|t| t.next());
         let headers = self.profile.headers.relay_post(trace.as_deref());
-        self.https_once_stream(&self.relay, Method::POST, &headers, body)
+        self.https_once_stream(&self.relay, Method::POST, &headers, body, on_send)
             .await
     }
 
-    /// Like https_once but returns the response stream instead of buffering the body.
-    async fn https_once_stream(
+    /// Like https_once but returns the response stream instead of buffering the body. `on_send`
+    /// is called under the same rule.
+    async fn https_once_stream<F: Fn()>(
         &self,
         target: &HttpsTarget,
         method: Method,
         headers: &[(&'static str, String)],
         body: Vec<u8>,
+        on_send: &F,
     ) -> Result<RelayStream, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
@@ -1304,6 +1323,7 @@ impl OhttpClient {
                         target.host
                     )));
                 }
+                on_send();
                 match sender.send_request(req).await {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
@@ -1320,6 +1340,7 @@ impl OhttpClient {
                 tokio::spawn(async move {
                     let _ = conn.await;
                 });
+                on_send();
                 sender
                     .send_request(req)
                     .await
@@ -1405,6 +1426,7 @@ impl OhttpClient {
                         &headers,
                         Vec::new(),
                         self.profile.limits.key_config_guard(),
+                        &|| {},
                     )
                     .await
                 {
@@ -1507,6 +1529,7 @@ impl OhttpClient {
                 &headers,
                 Vec::new(),
                 self.profile.limits.key_config_guard(),
+                &|| {},
             )
             .await
             .map_err(|e| e.into_message())?;
@@ -1591,10 +1614,15 @@ impl OhttpClient {
     /// Encapsulate + relay + decapsulate with chunked OHTTP. The key configuration is
     /// fetched again, and the request sealed again, when the gateway rejects the request (outer
     /// 400 or 422). Decodes the chunked response and returns the inner message.
+    ///
+    /// `on_dispatch` is called right before the sealed request is written to the relay
+    /// connection, after the relay-pause check and the connection setup (see
+    /// [`Self::https_once`]). So a relay pause, a relay that cannot be reached and a connection
+    /// that is not ready leave it uncalled, while a failure after it may have reached the relay.
     async fn round_trip_once<D>(
         &self,
         request: &BhttpRequest,
-        on_dispatch: D,
+        on_dispatch: &D,
     ) -> Result<BhttpResponse, RoundTripError>
     where
         D: Fn(),
@@ -1605,9 +1633,8 @@ impl OhttpClient {
         let (mut decoder, answer) = run_exchange_chunked(
             key,
             request,
-            move |body| this.post_sealed(body),
+            move |body| this.post_sealed(body, on_dispatch),
             move || this.key_config(true),
-            on_dispatch,
         )
         .await?;
 
@@ -1669,10 +1696,11 @@ impl OhttpClient {
     /// as they are decoded chunk by chunk: the first gRPC message is available before the
     /// response has been received in full. Same exchange loop as [`Self::round_trip`]: every
     /// post is sealed afresh, an outer 400 or 422 refetches the key and retries once.
+    /// `on_dispatch` is called as [`Self::round_trip_once`] describes.
     async fn round_trip_stream_once<D>(
         &self,
         request: BhttpRequest,
-        on_dispatch: D,
+        on_dispatch: &D,
     ) -> Result<(u16, HeaderMap, EventStream), RoundTripError>
     where
         D: Fn(),
@@ -1686,9 +1714,8 @@ impl OhttpClient {
         let (decoder, answer) = run_exchange_chunked(
             key,
             &request,
-            move |body| this.post_sealed_stream(body),
+            move |body| this.post_sealed_stream(body, on_dispatch),
             move || this.key_config(true),
-            on_dispatch,
         )
         .await?;
 
@@ -1947,10 +1974,12 @@ pub async fn http_round_trip(
     .await
 }
 
-/// Like [`http_round_trip`], but calls `on_dispatch` right before the sealed request is posted
-/// to the relay (after key config fetch and encapsulation). This lets the caller distinguish
-/// failures that never sent ciphertext (key fetch, encapsulation) from those that did (relay
-/// transport, gateway processing).
+/// Like [`http_round_trip`], but calls `on_dispatch` right before the sealed request is written
+/// to the relay connection: after the key config fetch, the encapsulation, the relay-pause
+/// check and the connection setup. This lets the caller distinguish failures that never sent
+/// ciphertext (key fetch, encapsulation, a relay pause, a relay that cannot be reached, a
+/// connection that is not ready) from those that may have (a failed write, relay transport,
+/// gateway processing).
 ///
 /// # Arguments
 /// * `gateway_host` - OHTTP gateway hostname (e.g., "ohttp-gateway.example")
@@ -1961,7 +1990,10 @@ pub async fn http_round_trip(
 /// * `url` - Full target URL (e.g., "<https://voting.valargroup.dev/api/vote>")
 /// * `headers` - Request headers as (name, value) pairs
 /// * `body` - Request body bytes
-/// * `on_dispatch` - Called once, right before the sealed request is sent to the relay
+/// * `on_dispatch` - Called at most once, right before the sealed request is written to the
+///   relay connection, after the relay-pause check and the connection setup. So a pause, a
+///   relay that cannot be reached, or a connection that is not ready leaves it uncalled. A
+///   failure after it may have reached the relay.
 ///
 /// # Returns
 /// `Ok((status, headers, body))` on success, or `Err(msg)` on failure.
@@ -1991,7 +2023,7 @@ pub async fn http_round_trip(
 ///         println!("Pre-dispatch failure: {e}");
 ///     }
 ///     Err(e) => {
-///         // Request was sent; do not retry (possible duplicate)
+///         // Request may have been sent; do not retry (possible duplicate)
 ///         println!("Post-dispatch failure: {e}");
 ///     }
 /// }
@@ -2035,7 +2067,9 @@ where
 
 /// [`http_round_trip`] against an explicit relay URL (the body of the public function, so a
 /// test can point it at a local relay without touching the process-wide relay table).
-/// `on_dispatch` is called right before the sealed request is posted to the relay.
+/// `on_dispatch` is called right before the sealed request is written to the relay connection,
+/// after the relay-pause check and the connection setup, as [`http_round_trip_with_dispatch`]
+/// describes.
 #[allow(clippy::too_many_arguments)] // one seam over the limit; bundling would hide the borrows
 async fn http_round_trip_via<D>(
     relay_url: &str,
@@ -2163,6 +2197,7 @@ mod tests {
     use base64::Engine;
     use std::cell::Cell;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use zodl_ohttp_client::encode_bhttp_request;
 
     /// `http_round_trip` refuses a gateway of another network before anything is sent.
@@ -2246,23 +2281,20 @@ mod tests {
 
     /// Test helper: wraps run_exchange_chunked for backward compatibility with existing tests.
     /// Decodes the buffered response and returns a BhttpResponse.
-    async fn run_exchange<P, PF, R, RF, D>(
+    async fn run_exchange<P, PF, R, RF>(
         _profile: &ClientProfile,
         key: KeyConfig,
         request: &BhttpRequest,
         post: P,
         refetch: R,
-        on_dispatch: D,
     ) -> Result<BhttpResponse, RoundTripError>
     where
         P: FnMut(Vec<u8>) -> PF,
         PF: Future<Output = Result<RelayAnswer, HttpsError>>,
         R: FnMut() -> RF,
         RF: Future<Output = Result<KeyConfig, RoundTripError>>,
-        D: Fn(),
     {
-        let (mut decoder, answer) =
-            run_exchange_chunked(key, request, post, refetch, on_dispatch).await?;
+        let (mut decoder, answer) = run_exchange_chunked(key, request, post, refetch).await?;
 
         // Decode the buffered response
         let mut events = decoder
@@ -2447,7 +2479,6 @@ mod tests {
                 async { Err::<RelayAnswer, _>(HttpsError::PreSend("h2 ready: closed".into())) }
             },
             || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {},
         )
         .await;
         let Err(RoundTripError::Transport(message)) = result else {
@@ -2482,7 +2513,6 @@ mod tests {
                 }
             },
             || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {},
         )
         .await;
         let Err(RoundTripError::Transport(message)) = result else {
@@ -2513,7 +2543,6 @@ mod tests {
                     refetches.set(refetches.get() + 1);
                     async { Ok::<KeyConfig, RoundTripError>(test_key()) }
                 },
-                || {},
             )
             .await;
             let Err(RoundTripError::Transport(message)) = result else {
@@ -2544,7 +2573,6 @@ mod tests {
                     async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
                 },
                 || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-                || {},
             )
             .await;
             let message = match result {
@@ -2577,7 +2605,6 @@ mod tests {
                 })
             },
             || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {},
         )
         .await;
         // Labelled as a chunked response, so it reaches the decoder, which refuses to open it.
@@ -2891,7 +2918,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(stream_answer(503, CONTENT_TYPE_CHUNKED_RES)) },
             || async { unreachable!("no refetch on 503") },
-            || {},
         )
         .await
         .err()
@@ -2906,7 +2932,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(stream_answer(200, "text/html")) },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .err()
@@ -2921,7 +2946,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(stream_answer(200, CONTENT_TYPE_CHUNKED_RES)) },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .expect("a chunked 200 is handed back unread");
@@ -3509,7 +3533,6 @@ mod tests {
                 *count += 1;
                 async { Ok::<KeyConfig, RoundTripError>(test_key()) }
             },
-            || {}, // no-op dispatch
         )
         .await;
 
@@ -3527,7 +3550,7 @@ mod tests {
         );
     }
 
-    /// Dispatch callback is invoked exactly once, before the first POST attempt.
+    /// A request the gateway refused as stale is sent once more, and never more than once.
     #[tokio::test]
     async fn a_freshness_refusal_is_sent_once_more_and_only_once() {
         // Answers in order; `true` = the gateway's freshness refusal.
@@ -3592,75 +3615,200 @@ mod tests {
         assert_eq!(n.get(), 1);
     }
 
-    #[tokio::test]
-    async fn dispatch_callback_fires_once_before_post() {
-        let dispatch_count = StdMutex::new(0u32);
-        let post_count = StdMutex::new(0u32);
-        let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
-            test_key(),
-            &test_request(),
-            |_body| {
-                let mut count = post_count.lock().unwrap();
-                *count += 1;
-                async { Err::<RelayAnswer, HttpsError>(HttpsError::PreSend("closed".into())) }
-            },
-            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {
-                let mut count = dispatch_count.lock().unwrap();
-                *count += 1;
-            },
+    /// A client of the `SLIPSTREAM_HTTP` profile for a relay on loopback port `port`. It holds a
+    /// key that is good for another hour, so a round trip goes straight to the relay post.
+    async fn client_with_a_key_for_a_relay_on(port: u16) -> OhttpClient {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            &format!("https://127.0.0.1:{port}/relay"),
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM_HTTP,
         )
-        .await;
-
-        assert_eq!(
-            *dispatch_count.lock().unwrap(),
-            1,
-            "dispatch callback must be called exactly once"
-        );
-        assert_eq!(
-            *post_count.lock().unwrap(),
-            2,
-            "post should be attempted twice (initial + pre-send retry)"
-        );
-        assert!(matches!(result, Err(RoundTripError::Transport(_))));
+        .expect("client");
+        *client.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: unix_now().expect("time") + 3600,
+        });
+        client
     }
 
-    /// Dispatch callback fires before the first POST, even if the first attempt fails pre-send
-    /// and is retried.
+    /// The hook marks a request that may have reached the relay. A relay that cannot be
+    /// connected to has seen nothing, so the hook stays uncalled and the caller may retry.
     #[tokio::test]
-    async fn dispatch_fires_before_pre_send_retry() {
-        let events = StdMutex::new(Vec::<&str>::new());
-        let post_attempt = Cell::new(0u32);
-        let _result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
-            test_key(),
-            &test_request(),
-            |_body| {
-                let n = post_attempt.get();
-                post_attempt.set(n + 1);
-                events.lock().unwrap().push("post");
-                async move {
-                    if n == 0 {
-                        Err(HttpsError::PreSend("closed".into()))
-                    } else {
-                        Ok(outer_answer(200)) // Pretend success on retry
-                    }
-                }
-            },
-            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
-            || {
-                events.lock().unwrap().push("dispatch");
-            },
+    async fn a_relay_post_that_cannot_connect_is_not_dispatched() {
+        use tokio::net::TcpListener;
+
+        // A port nothing listens on: bound to learn a free one, then released.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+
+        let client = client_with_a_key_for_a_relay_on(port).await;
+        let dispatched = AtomicBool::new(false);
+        let err = client
+            .round_trip(&test_request(), || dispatched.store(true, Ordering::SeqCst))
+            .await
+            .expect_err("nothing listens on the relay port");
+        assert!(matches!(err, RoundTripError::Transport(_)), "{err:?}");
+        assert!(!dispatched.load(Ordering::SeqCst), "nothing was sent");
+    }
+
+    /// A relay that hangs up while the TLS handshake is going on has not seen the request either.
+    #[tokio::test]
+    async fn a_relay_that_hangs_up_during_tls_is_not_dispatched() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake relay");
+        let port = listener.local_addr().expect("relay addr").port();
+        // Fake relay: takes every connection, reads what the client sends first and hangs up.
+        // The client may open more than one (an h2 attempt, then HTTP/1.1).
+        let relay_task = tokio::spawn(async move {
+            while let Ok((mut socket, _peer)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+            }
+        });
+
+        let client = client_with_a_key_for_a_relay_on(port).await;
+        let dispatched = AtomicBool::new(false);
+        let result = tokio::time::timeout(
+            Duration::from_secs(20),
+            client.round_trip(&test_request(), || dispatched.store(true, Ordering::SeqCst)),
         )
         .await;
+        relay_task.abort();
 
-        let log = events.lock().unwrap();
-        assert_eq!(
-            &log[..],
-            &["dispatch", "post", "post"],
-            "dispatch must fire before the first post, even if that post fails pre-send"
+        let err = result
+            .expect("the round trip must finish")
+            .expect_err("a relay that hangs up cannot answer");
+        assert!(matches!(err, RoundTripError::Transport(_)), "{err:?}");
+        assert!(!dispatched.load(Ordering::SeqCst), "nothing was sent");
+    }
+
+    /// A pause that began while the request was prepared stops the post before anything is
+    /// written, so the hook stays uncalled.
+    #[tokio::test]
+    async fn a_pause_noticed_at_the_post_is_not_dispatched() {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-pause-at-post-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+
+        let dispatched = AtomicBool::new(false);
+        let err = client
+            .post_sealed(vec![0u8; 32], &|| dispatched.store(true, Ordering::SeqCst))
+            .await
+            .err()
+            .expect("held by the relay's pause");
+        assert!(matches!(err, HttpsError::RelayPaused(_)), "{err:?}");
+        assert!(!dispatched.load(Ordering::SeqCst), "nothing was sent");
+    }
+
+    /// The other side of the tests above: a post that reaches the relay calls the hook, once,
+    /// before the relay gets the request, buffered and streamed alike. The relay is in-process
+    /// behind a pooled h2 connection, which is looked up before anything is dialled (no TLS).
+    #[tokio::test]
+    async fn a_post_calls_the_hook_right_before_the_relay_gets_the_request() {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-hook-at-send-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        // How many times the hook had run when each request reached the relay.
+        let seen_by_relay = Arc::new(StdMutex::new(Vec::<usize>::new()));
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let relay = {
+            let hook_calls = Arc::clone(&hook_calls);
+            let seen_by_relay = Arc::clone(&seen_by_relay);
+            hyper::service::service_fn(move |_req: Request<Incoming>| {
+                seen_by_relay
+                    .lock()
+                    .unwrap()
+                    .push(hook_calls.load(Ordering::SeqCst));
+                async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"x")))) }
+            })
+        };
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(server_io), relay)
+                .await;
+        });
+        let (sender, conn) =
+            http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(client_io))
+                .await
+                .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client.h2_pool.lock().await.insert(
+            format!("{}:{}", client.relay.host, client.relay.port),
+            (sender, std::time::Instant::now()),
         );
+
+        let hook = || {
+            hook_calls.fetch_add(1, Ordering::SeqCst);
+        };
+        let answer = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.post_sealed(vec![0u8; 32], &hook),
+        )
+        .await
+        .expect("the post must finish")
+        .expect("the relay answers");
+        assert_eq!(answer.status, StatusCode::OK);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 1, "a buffered post");
+
+        let streamed = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.post_sealed_stream(vec![0u8; 32], &hook),
+        )
+        .await
+        .expect("the post must finish")
+        .expect("the relay answers");
+        assert_eq!(streamed.status, StatusCode::OK);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 2, "a streamed post");
+
+        assert_eq!(
+            *seen_by_relay.lock().unwrap(),
+            vec![1, 2],
+            "each request reached the relay after its hook call"
+        );
+    }
+
+    /// The caller's hook runs on whichever thread drives the call, so the future of
+    /// `http_round_trip_with_dispatch` has to stay `Send` whenever its hook is `Send + Sync`.
+    #[test]
+    fn http_round_trip_with_dispatch_future_is_send() {
+        fn assert_send<T: Send>(_: &T) {}
+
+        let flag = Arc::new(AtomicBool::new(false));
+        let fut = http_round_trip_with_dispatch(
+            "ohttp-gateway-testnet.example",
+            NetworkType::Test,
+            Dialer::Direct,
+            "GET",
+            "https://example.invalid/",
+            &[],
+            b"",
+            move || flag.store(true, Ordering::SeqCst),
+        );
+        assert_send(&fut);
     }
 
     /// Streaming decode with SizeGuard: frames beyond the limit are rejected before being pushed
@@ -3732,7 +3880,6 @@ mod tests {
                 })
             },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .expect("a chunked 200 is handed back unread");
@@ -3790,7 +3937,6 @@ mod tests {
                 })
             },
             || async { unreachable!("no refetch on 429") },
-            || {},
         )
         .await
         .err()
@@ -3826,7 +3972,6 @@ mod tests {
                 async { Ok(outer_answer(200)) }
             },
             || async { unreachable!("no refetch") },
-            || {},
         )
         .await
         .err()
@@ -3839,7 +3984,6 @@ mod tests {
             &test_request(),
             |_sealed| async { Ok(outer_answer(413)) },
             || async { unreachable!("no refetch on 413") },
-            || {},
         )
         .await
         .err()
@@ -3999,7 +4143,6 @@ mod tests {
                 }
             },
             || async { unreachable!("no refetch") },
-            || {},
         )
         .await
         .err()
@@ -4035,7 +4178,6 @@ mod tests {
                 })
             },
             || async { unreachable!("no refetch on 200") },
-            || {},
         )
         .await
         .expect("a chunked 200 is handed back unread");
