@@ -30,7 +30,7 @@ use zcash_client_backend::data_api::{
 use zcash_client_backend::proto::service::TreeState;
 use zcash_client_sqlite::WalletDb;
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::{ShieldedPool, consensus::BlockHeight};
 
 use crate::{error::SlipstreamError, grpc::SubtreeRoots};
 
@@ -218,16 +218,112 @@ impl WalletSession {
             };
             SlipstreamError::Wallet(format!("invalid birthday treestate: {detail}"))
         })?;
+        self.import_account_with_birthday(ufvk, &birthday)
+    }
+
+    /// Imports `ufvk` as a view-only account with `birthday`
+    /// ([`import_account`](Self::import_account) once the treestate is decoded).
+    ///
+    /// A new account rewinds the wallet to the chain state below its birthday and queues
+    /// every later block again (upstream `add_account` → `rewind_to_chain_state`), so the
+    /// graft-buffer rows of those blocks, every row at or above the birthday's tree sizes,
+    /// are dropped: the rescan scans them again, and a range must only resume rows of
+    /// blocks that stay scanned. An import that upgrades an existing account's viewing key
+    /// adds no account and rewinds nothing, so it leaves the buffer alone.
+    pub(crate) fn import_account_with_birthday(
+        &mut self,
+        ufvk: &UnifiedFullViewingKey,
+        birthday: &AccountBirthday,
+    ) -> Result<(), SlipstreamError> {
+        let accounts = self
+            .db
+            .get_account_ids()
+            .map_err(|e| wallet_err("get_account_ids", e))?
+            .len();
         self.db
-            .import_account_ufvk(
-                "slipstream",
-                ufvk,
-                &birthday,
-                AccountPurpose::ViewOnly,
-                None,
-            )
+            .import_account_ufvk("slipstream", ufvk, birthday, AccountPurpose::ViewOnly, None)
             .map_err(|e| wallet_err("import_account_ufvk", e))?;
         info!("account imported (view-only)");
+        let added = self
+            .db
+            .get_account_ids()
+            .map_err(|e| wallet_err("get_account_ids", e))?
+            .len()
+            > accounts;
+        if added {
+            self.drop_graft_rows_from(
+                Some(birthday.sapling_frontier().tree_size()),
+                Some(birthday.orchard_frontier().tree_size()),
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Truncates the wallet to at most `height` (upstream
+    /// [`WalletWrite::truncate_to_height`]; the scheduler's reorg recovery), and drops the
+    /// graft-buffer rows of the blocks the truncation removed: every row at or above the
+    /// tree sizes at the end of the highest block the wallet still holds. Those blocks are
+    /// queued again and may come back from another chain, so a range must not resume rows
+    /// scanned from the one the wallet left. Both run in upstream's truncation transaction
+    /// ([`WalletDb::transactionally_with_extension`]): a crash or an error undoes both, so
+    /// the wallet is never left truncated with those rows buffered. A pool whose tree size
+    /// the highest remaining block does not record keeps its rows, with a warning: no other
+    /// size bounds them (a lower block's would also drop rows of blocks the wallet keeps).
+    /// Returns the height the wallet was truncated to.
+    pub fn truncate_to_height(
+        &mut self,
+        height: BlockHeight,
+    ) -> Result<BlockHeight, SlipstreamError> {
+        self.db
+            .transactionally_with_extension(|wdb, ext| {
+                let truncated_to = wdb.truncate_to_height(height)?;
+                let (sapling, orchard) = match wdb.block_max_scanned()? {
+                    Some(highest) => (
+                        highest.sapling_tree_size().map(u64::from),
+                        highest.orchard_tree_size().map(u64::from),
+                    ),
+                    // No block left: every buffered row is a removed block's.
+                    None => (Some(0), Some(0)),
+                };
+                for (pool, from) in [
+                    (ShieldedPool::Sapling, sapling),
+                    (ShieldedPool::Orchard, orchard),
+                ] {
+                    match from {
+                        Some(from) => crate::graft::delete_from_position_in(ext, pool, from)?,
+                        None => tracing::warn!(
+                            ?pool,
+                            %truncated_to,
+                            "truncation: the highest remaining block records no tree size for this pool; its graft-buffer rows stay"
+                        ),
+                    }
+                }
+                Ok::<_, zcash_client_sqlite::error::SqliteClientError>(truncated_to)
+            })
+            .map_err(|e| wallet_err("truncate_to_height", e))
+    }
+
+    /// Drops every graft-buffer row at or above these tree sizes (Sapling, Orchard;
+    /// `None` leaves that pool's rows), over a side connection: upstream `WalletDb` never
+    /// exposes its own. An account import's rewind uses it, after the import commits.
+    fn drop_graft_rows_from(
+        &self,
+        sapling: Option<u64>,
+        orchard: Option<u64>,
+    ) -> Result<(), SlipstreamError> {
+        let conn =
+            Connection::open(&self.db_path).map_err(|e| wallet_err("graft buffer open", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(15))
+            .map_err(|e| wallet_err("graft buffer busy_timeout", e))?;
+        for (pool, from) in [
+            (ShieldedPool::Sapling, sapling),
+            (ShieldedPool::Orchard, orchard),
+        ] {
+            if let Some(from) = from {
+                crate::graft::delete_from_position(&conn, pool, from)
+                    .map_err(|e| wallet_err("graft buffer cleanup", e))?;
+            }
+        }
         Ok(())
     }
 

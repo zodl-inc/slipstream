@@ -65,6 +65,55 @@ struct OpenShard<H> {
     passthrough: bool,
 }
 
+/// The part of a shard's buffered rows that a range starting at `start_position`
+/// can resume, and whether any row was left out.
+///
+/// A resume only CONTINUES a run: the range scans `start_position..`, so the rows it
+/// takes over must be one contiguous run that ends at `start_position - 1`, and that
+/// run's last row must be the leaf the range's own `from_state` frontier holds at that
+/// position (`frontier_leaf`), so both come from the same chain. Everything else is
+/// left out: rows at or above `start_position` (the range scans those again, e.g. after
+/// an import rewound into the buffered span), rows below a gap in the positions, and
+/// all rows when the run stops short of `start_position - 1` or its last leaf differs
+/// from the frontier's. A row set is laid out from its FIRST row's position when it is
+/// built, so resuming any of those rows would shift every later leaf.
+///
+/// Only the run's last row is checked against the frontier, and every row contiguous
+/// below it is taken, so rows of another origin must never be buffered right after a run
+/// this rejects: `persist::plan_pool` builds that shard instead of buffering it. The rows
+/// below the last are checked there before the run is resumed: the commitment tree must
+/// take the run (`persist::resume_refusal`), or that shard is built the same way.
+///
+/// `rows` must be ascending by position, as `graft::load_shard` returns them.
+pub(crate) fn resumable_run<H: PartialEq>(
+    mut rows: Vec<AccRow<H>>,
+    start_position: u64,
+    frontier_leaf: Option<(u64, &H)>,
+) -> (Vec<AccRow<H>>, bool) {
+    debug_assert!(
+        rows.windows(2).all(|w| w[0].0 < w[1].0),
+        "buffered rows must be ascending by position"
+    );
+    let total = rows.len();
+    rows.truncate(rows.partition_point(|(p, ..)| *p < start_position));
+    let ends_on_the_frontier = match (rows.last(), frontier_leaf) {
+        (Some((p, hash, _)), Some((leaf_position, leaf))) => {
+            *p + 1 == start_position && *p == leaf_position && hash == leaf
+        }
+        _ => false,
+    };
+    if !ends_on_the_frontier {
+        return (vec![], total > 0);
+    }
+    let mut first = rows.len() - 1;
+    while first > 0 && rows[first - 1].0 + 1 == rows[first].0 {
+        first -= 1;
+    }
+    rows.drain(..first);
+    let left_out = rows.len() < total;
+    (rows, left_out)
+}
+
 /// Per-pool, per-range accumulator. Positions MUST arrive contiguously (they
 /// come from `from_state` tree sizes, which are contiguous by construction).
 pub(crate) struct ShardAccumulator<H> {
@@ -73,11 +122,12 @@ pub(crate) struct ShardAccumulator<H> {
 }
 
 impl<H: Clone> ShardAccumulator<H> {
-    /// `resume_rows`: buffered rows already persisted for the shard containing
-    /// `start_position` (restart-mid-shard recovery). `store_has_internals`:
-    /// the shard store already holds fragment data for that shard (⇒ it was
-    /// built before — stay passthrough; any stale buffer rows are the caller's
-    /// to delete).
+    /// `resume_rows`: the buffered run a resumed range takes over for the shard
+    /// containing `start_position` (restart-mid-shard recovery): contiguous and
+    /// ending at `start_position - 1`, as [`resumable_run`] keeps it.
+    /// `store_has_internals`: the shard store already holds fragment data for
+    /// that shard, so stay passthrough: the shard is never grafted over that
+    /// content, and a resumed run is built together with the first span fed.
     pub fn seed(
         start_position: u64,
         resume_rows: Vec<AccRow<H>>,
@@ -88,13 +138,19 @@ impl<H: Clone> ShardAccumulator<H> {
             resume_rows.iter().all(|(p, ..)| shard_of(*p) == index),
             "resume rows must belong to the seed shard"
         );
-        let passthrough = resume_rows.is_empty() && store_has_internals;
+        debug_assert!(
+            resume_rows
+                .last()
+                .is_none_or(|(p, ..)| *p + 1 == start_position)
+                && resume_rows.windows(2).all(|w| w[0].0 + 1 == w[1].0),
+            "resume rows must be one contiguous run ending right before the start position"
+        );
         Self {
             next_position: start_position,
             open: Some(OpenShard {
                 index,
                 rows: resume_rows,
-                passthrough,
+                passthrough: store_has_internals,
             }),
         }
     }
@@ -122,13 +178,17 @@ impl<H: Clone> ShardAccumulator<H> {
             match &mut self.open {
                 Some(open) if open.index != shard => {
                     let closed = self.open.take().map(|o| (o.index, o.rows, o.passthrough));
-                    if let Some((index, rows, passthrough)) = closed
-                        && !passthrough
-                    {
-                        actions.push(FeedAction::CloseCleanShard {
-                            shard_index: index,
-                            rows,
-                        });
+                    if let Some((index, rows, passthrough)) = closed {
+                        if !passthrough {
+                            actions.push(FeedAction::CloseCleanShard {
+                                shard_index: index,
+                                rows,
+                            });
+                        } else if !rows.is_empty() {
+                            // A passthrough shard's resumed run builds with the first
+                            // span fed, so it never reaches a close; build it all the same.
+                            actions.push(FeedAction::Build(rows));
+                        }
                     }
                     self.open = Some(OpenShard {
                         index: shard,
@@ -159,7 +219,15 @@ impl<H: Clone> ShardAccumulator<H> {
                 .as_mut()
                 .unwrap_or_else(|| unreachable!("opened above"));
             if open.passthrough {
-                actions.push(FeedAction::Build(span));
+                if open.rows.is_empty() {
+                    actions.push(FeedAction::Build(span));
+                } else {
+                    // The resumed run of a shard the store already holds content
+                    // for: build it with this span.
+                    let mut rows = std::mem::take(&mut open.rows);
+                    rows.extend(span);
+                    actions.push(FeedAction::Build(rows));
+                }
             } else if has_note {
                 // Eager flush: buffered prefix + this span build in THIS call —
                 // the freshly-found note's witness data exists at today's timing.
@@ -178,13 +246,15 @@ impl<H: Clone> ShardAccumulator<H> {
     }
 
     /// Range end / pass end: the open shard never grafts (rule 1). Returns the
-    /// rows to build, if any are pending.
+    /// rows to build, if any are pending: a buffering shard's rows, or a resumed
+    /// run that a passthrough shard has not built yet because no commitment was
+    /// fed after the seed.
     pub fn finish(&mut self) -> Option<FeedAction<H>> {
         let open = self.open.take()?;
-        if !open.passthrough && !open.rows.is_empty() {
-            Some(FeedAction::Build(open.rows))
-        } else {
+        if open.rows.is_empty() {
             None
+        } else {
+            Some(FeedAction::Build(open.rows))
         }
     }
 }
@@ -285,6 +355,96 @@ mod tests {
         let mut built = ShardAccumulator::<H>::seed(10, vec![], true);
         let acts = built.feed(10, items(5), &[]);
         assert!(matches!(&acts[..], [FeedAction::Build(_)]));
+    }
+
+    fn rows(positions: impl IntoIterator<Item = u64>) -> Vec<AccRow<H>> {
+        positions
+            .into_iter()
+            .map(|p| (p, p as H, Retention::Ephemeral))
+            .collect()
+    }
+
+    fn row_positions(rows: &[AccRow<H>]) -> Vec<u64> {
+        rows.iter().map(|r| r.0).collect()
+    }
+
+    #[test]
+    fn resumable_run_keeps_the_contiguous_run_ending_on_the_frontier_leaf() {
+        // The designed resume: rows 0..10, the range starts at 10, the frontier leaf at 9.
+        let (run, left_out) = resumable_run(rows(0..10), 10, Some((9, &9)));
+        assert_eq!(row_positions(&run), (0..10).collect::<Vec<_>>());
+        assert!(
+            !left_out,
+            "nothing is left out of a run that ends at the start"
+        );
+    }
+
+    #[test]
+    fn resumable_run_trims_rows_at_or_above_the_start() {
+        let (run, left_out) = resumable_run(rows(0..20), 10, Some((9, &9)));
+        assert_eq!(row_positions(&run), (0..10).collect::<Vec<_>>());
+        assert!(left_out, "the rescanned rows 10..20 are left out");
+    }
+
+    #[test]
+    fn resumable_run_drops_rows_below_a_gap() {
+        let (run, left_out) = resumable_run(rows((0..5).chain(7..10)), 10, Some((9, &9)));
+        assert_eq!(row_positions(&run), vec![7, 8, 9]);
+        assert!(left_out, "the rows below the gap are left out");
+    }
+
+    #[test]
+    fn resumable_run_drops_rows_that_stop_short_of_the_start() {
+        let (run, left_out) = resumable_run(rows(0..8), 10, Some((9, &9)));
+        assert!(run.is_empty(), "a run ending at 7 cannot continue at 10");
+        assert!(left_out);
+    }
+
+    #[test]
+    fn resumable_run_drops_a_run_whose_last_leaf_is_not_the_frontier_leaf() {
+        let (run, left_out) = resumable_run(rows(0..10), 10, Some((9, &99)));
+        assert!(run.is_empty(), "the rows come from another chain");
+        assert!(left_out);
+        let (run, left_out) = resumable_run(rows(0..10), 10, None);
+        assert!(run.is_empty(), "no frontier leaf: nothing can be continued");
+        assert!(left_out);
+    }
+
+    #[test]
+    fn resumable_run_of_an_empty_buffer_leaves_nothing_out() {
+        let (run, left_out) = resumable_run(rows(0..0), 10, Some((9, &9)));
+        assert!(run.is_empty());
+        assert!(!left_out);
+    }
+
+    #[test]
+    fn resumed_run_on_a_shard_with_store_content_builds_with_the_first_span() {
+        // The store already holds content for the shard: never graft it, build the
+        // resumed run together with the first span, then stay passthrough.
+        let mut a = ShardAccumulator::<H>::seed(10, rows(0..10), true);
+        let acts = a.feed(10, items(5), &[]);
+        match &acts[..] {
+            [FeedAction::Build(r)] => assert_eq!(row_positions(r), (0..15).collect::<Vec<_>>()),
+            other => panic!("expected one build of the run and the span, got {other:?}"),
+        }
+        let acts = a.feed(15, items(5), &[]);
+        assert!(matches!(&acts[..], [FeedAction::Build(r)] if r.len() == 5));
+        assert!(a.finish().is_none(), "nothing is left for the finish");
+    }
+
+    #[test]
+    fn resumed_run_on_a_shard_with_store_content_builds_at_finish_without_a_feed() {
+        let mut a = ShardAccumulator::<H>::seed(10, rows(0..10), true);
+        assert!(
+            a.feed(10, vec![], &[]).is_empty(),
+            "no commitment, no action"
+        );
+        match a.finish() {
+            Some(FeedAction::Build(r)) => {
+                assert_eq!(row_positions(&r), (0..10).collect::<Vec<_>>())
+            }
+            other => panic!("expected the resumed run to build at finish, got {other:?}"),
+        }
     }
 
     #[test]
