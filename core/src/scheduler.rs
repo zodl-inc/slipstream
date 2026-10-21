@@ -22,8 +22,8 @@
 
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
-use tracing::{info, warn};
-use zcash_client_backend::data_api::{WalletWrite, scanning::ScanPriority};
+use tracing::{debug, info, warn};
+use zcash_client_backend::data_api::scanning::ScanPriority;
 use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
@@ -385,6 +385,29 @@ pub async fn run_to_completion(
     tor: Option<&TorConn>,
 ) -> Result<SyncReport, SlipstreamError> {
     let mut report = SyncReport::default();
+    // v0.4 Plan A: before any range plans, build (or queue a rescan of) the graft-buffer
+    // runs no range will resume: a range stopped between its last commit and its range-end
+    // build leaves them, and Historic ranges run newest first, so none comes back for them.
+    // With the buffer empty it costs a connection open and two queries. Warn-and-continue,
+    // as the open-time heals: a sweep that fails leaves the rows buffered (no range deletes
+    // rows at positions it does not feed) for the next pass's sweep, and the pass runs.
+    // Its SQLite and tree work blocks, so it runs off the async worker, as the range-end
+    // finish does (`block_in_place`, which a current-thread runtime does not offer).
+    let mut sweep = || {
+        crate::persist::sweep_stranded_graft_rows(
+            session.db_mut(),
+            &config.wallet_db_path,
+            config.graft_subtree,
+            config.anchor_retention.as_ref(),
+        )
+    };
+    let swept = match tokio::runtime::Handle::current().runtime_flavor() {
+        tokio::runtime::RuntimeFlavor::CurrentThread => sweep(),
+        _ => tokio::task::block_in_place(sweep),
+    };
+    if let Err(e) = swept {
+        warn!(%e, "graft sweep failed (non-fatal) — continuing");
+    }
     // Counter for back-to-back ScanContinuity recoveries without a successful range.
     // Reset to 0 on any successful range completion. Capped at MAX_CONSECUTIVE_REORGS
     // to prevent infinite ping-pong (e.g. adversarial server or database corruption).
@@ -594,12 +617,10 @@ pub async fn run_to_completion(
                 "continuity break detected — truncating wallet DB and re-suggesting"
             );
 
-            // truncate_to_height returns Result<BlockHeight, WalletDb::Error>
-            // (data_api.rs:3233: `fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error>`)
-            session
-                .db_mut()
-                .truncate_to_height(BlockHeight::from(rewind_height))
-                .map_err(|e| SlipstreamError::Wallet(format!("truncate_to_height: {e}")))?;
+            // Upstream's truncate_to_height (data_api.rs:3233) and, in its transaction, the
+            // drop of the graft-buffer rows of the blocks it removed: they may be the
+            // abandoned chain's.
+            session.truncate_to_height(BlockHeight::from(rewind_height))?;
 
             // [h16-2] The truncate discards blocks above rewind_height, but the blocks
             // BELOW it (the surviving prefix of the aborted range) are still done — credit
@@ -639,7 +660,17 @@ pub async fn run_to_completion(
             (Err(scan_err), fetch_outcome) => {
                 // Scan failed — fetch's secondary error (Stopped, send-error) is demoted.
                 if let Err(ref fetch_err) = fetch_outcome {
-                    warn!(%fetch_err, "fetch task also errored (secondary, scan error takes precedence)");
+                    if scan_err.is_stop_for_wallet_change() {
+                        // A wallet-change stop ends the scan on purpose and drops its chunk
+                        // receiver, so a fetch task that is still sending fails with the
+                        // closed-channel `Stopped`: the usual outcome of every such stop. That
+                        // echo of a stop the host asked for is no fault, and at `warn!` it would
+                        // send whoever reads the device logs chasing a failure that never
+                        // happened, so it stays at `debug!`.
+                        debug!(%fetch_err, "fetch task also errored after a wallet-change stop (expected: the stopped scan closed its channel)");
+                    } else {
+                        warn!(%fetch_err, "fetch task also errored (secondary, scan error takes precedence)");
+                    }
                 }
                 return Err(scan_err);
             }
@@ -789,6 +820,7 @@ pub async fn run_to_completion(
 mod tests {
     use super::*;
     use crate::ffi_handle::{SyncState, derive_snapshot};
+    use zcash_client_backend::data_api::WalletWrite as _;
 
     #[test]
     fn sync_report_default_is_zero() {

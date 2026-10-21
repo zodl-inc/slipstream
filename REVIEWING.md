@@ -37,7 +37,7 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `lookup_build.rs` | v0.4: the shared lookup-build machinery (precompute map → verbatim `from_iter` → convert) parameterized by a batch-combine fn; routes batch > gpu > scalar. |
 | `treestate.rs` | v0.5 (parked, default OFF): local running-frontier treestate derivation + off-path server audit + process fuse — built, audited byte-identical, measured out (naive per-leaf absorb costs more than the RTT it saves); revival path = batch-affine bulk absorb. |
 | `fetch.rs` | Concurrent `GetBlockRange` (N streams); byte-budgeted sub-chunk splitting (sandblasting era); resume-on-cut; v0.7 P2: clock-free wire-collapse detector (STALL/COLLAPSE triggers) + bounded (≤ 2) mid-pass failover. |
-| `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**). |
+| `persist.rs` | Sparse in-memory `ShardTree` `put_blocks`; checkpoint-downgrade; `WriteBehindFacade` + persist lane (depth-N, **in-order, serial**); v0.4: the pass-start graft-buffer sweep (`sweep_stranded_graft_rows`) — builds the buffered runs no pending range resumes when the wallet can check where they end (the tree's leaf there, or the stored root of the shard they complete), rescans the rest. |
 | `connector.rs` | Per-call Tor policy (`ConnPurpose` → circuit); `TorConn` bootstrap; bounded circuit-build + retry-on-fresh-circuit. |
 | `grpc.rs` | lightwalletd tonic client; unary/stream helpers + deadlines; `retry_get_tree_state`. |
 | `enhance.rs` | `run_enhancement`: `GetTransaction` / `TransactionsInvolvingAddress`, dedup. |
@@ -47,16 +47,16 @@ and is oracle-gated. Note decryption, nullifier derivation, and tree hashing are
 | `reconcile.rs` | `slipstream_v_tx_reconciled` — read-side view flagging txs whose shielded spend hasn't linked yet (recent-first restore visibility; installed idempotently at `WalletSession::open`). |
 | `scan_queue.rs` | `prune_orphaned_historic_ranges` — drops Historic queue rows below every remaining account's birthday at `WalletSession::open` (an account deleted mid-restore leaves its deep ranges queued; upstream `delete_account` never touches `scan_queue`). |
 | `anchor.rs` | `restore_anchor` — wallet-provisioning primitive (restore `recover_until` with offline checkpoint fallback; reorg-safe new-wallet tree state; Tor-or-offline, never a direct de-anonymising fallback). |
-| `chunk.rs`, `block_source.rs` | In-memory chunk buffering / block-source plumbing feeding the scan kernel; v0.5: `ChunkQueueSender` boundary-fetcher hook — the per-chunk treestate fetch spawns at chunk EMIT so the RTT hides under queue+scan+submit. |
-| `events.rs` | `Progress` (poll atomics), `Event`, `Snapshot` — the host-facing progress surface. |
-| `ffi_handle.rs` | `SlipstreamHandle` (runtime + state + event ring), `SyncState`, `FfiSlipstreamSnapshot/Event`, `spawn_supervised` (panic → `Error`). |
+| `chunk.rs`, `block_source.rs` | In-memory chunk buffering / block-source plumbing feeding the scan kernel; v0.5: `ChunkQueueSender` boundary-fetcher hook — the per-chunk treestate fetch spawns at chunk EMIT so the RTT hides under queue+scan+submit. `MemBlockSource::with_stop` refuses the next block once a wallet-change stop is requested (`StoppedForWalletChange`). |
+| `events.rs` | `Progress` (poll atomics, and the wallet-change stop request armed per session), `Event`, `Snapshot` — the host-facing progress surface. |
+| `ffi_handle.rs` | `SlipstreamHandle` (runtime + state + event ring + the passes a stop gave up on), `SyncState`, `FfiSlipstreamSnapshot/Event`, `spawn_supervised` (panic → `Error`), and the shared quiescent stop every host calls (`stop`, `stop_for_wallet_change`, `quiesce_before_start` → `StopReport`). |
 | `oracle.rs` | `semantic_diff` — row/byte-level `data.db` equivalence vs the upstream path. |
 | `verify.rs` | Server / scan-continuity validation. |
 | `config.rs` | `EngineConfig` (tunables, device-memory derate, `alternate_endpoints`, `anchor_retention_height`), `Endpoint`. |
 | `probe.rs` | v0.7 P1: endpoint probing/racing across `EngineConfig.alternate_endpoints` — picks a healthy server before a pass and feeds the mid-pass failover loop. |
 | `throttle.rs` | v0.7 P0: local TCP throttle proxy (token bucket) — the test-only "weather machine" for simulating sick servers; never on a production path. |
 | `network.rs` | `SlipstreamNetwork` — custom consensus params / activation heights (CLI `--custom-heights`, `--network test`) for exercising Ironwood/NU6.3 against modified-parameter chains pre-activation. |
-| `error.rs` | `SlipstreamError` + `is_transient` (drives every retry decision). |
+| `error.rs` | `SlipstreamError` + `is_transient` (drives every retry decision); `StoppedForWalletChange` ends a session quietly. |
 
 `gpuhash/` (crate `zodl-slipstream-gpuhash`, cargo feature `gpu`, **default-off**) — wgpu Orchard Sinsemilla
 combine; byte-identical to `MerkleHashOrchard::combine` (KAT-gated). Released builds link zero wgpu.
@@ -65,6 +65,12 @@ combine; byte-identical to `MerkleHashOrchard::combine` (KAT-gated). Released bu
 **Preflight** (`sync_once`): import account if the DB has none (UFVK + birthday treestate) →
 `get_subtree_roots` / `put_subtree_roots` → chain tip → **transparent UTXO refresh** (before shielded)
 → `run_to_completion`:
+- **graft-buffer sweep** (`persist::sweep_stranded_graft_rows`), before any range plans: buffered graft
+  rows that no pending range will resume (a range stopped after its last commit, before its range-end
+  build) are built when the wallet can check where they end, against the tree or the subtree roots just
+  ingested, and otherwise deleted once their blocks are queued for a rescan (kept, with a warning, when
+  the wallet's block metadata cannot place them). A connection open and two queries when the buffer is
+  empty; a failure only warns, and the rows wait for the next pass's sweep.
 - `suggest_scan_ranges` → **ChainTip priority, then Historic** (Spend-before-Sync; non-linear order, so
   spendable notes surface first).
 - per range: **fetch** (≤ N concurrent streams; each plan-chunk split into ≤ `chunk_split_bytes`
