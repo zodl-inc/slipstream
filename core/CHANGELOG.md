@@ -10,6 +10,118 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `wallet_session::WalletSession::truncate_to_height`: upstream's
+  `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
+  it removed, in one transaction (`WalletDb::transactionally_with_extension`). It returns
+  the height the wallet was truncated to. The scheduler's reorg recovery calls it.
+
+### Changed
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+
+### Fixed
+- With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed
+  whatever the graft buffer held for its first shard, and a build lays rows out from the
+  first row's position. Rows that did not end right before the range's start, as after an
+  account import whose rescan starts inside an interrupted range's shard, put every later
+  leaf of the commitment tree at the wrong position. A range now resumes only the run of
+  rows that ends right before its start, on its own `from_state` frontier's leaf, and only
+  when the commitment tree takes that run. The frontier's leaf vouches for the run's last
+  row alone: a run with an earlier row that is not the chain's can conflict with the tree
+  when it is built, and a range that resumed it would fail on every pass. So the seed
+  first inserts the run into a copy of its shard as the wallet holds it, with the range's
+  frontier inserted; nothing is written. A run that ends there on another leaf, such as
+  another chain's rows a reorg's truncation can leave, or that the tree refuses, is not
+  continued, and the range builds what it scans in that shard instead of buffering it next
+  to the run, so neither the range's remainder nor the next pass's sweep takes the run up
+  with the range's own rows. The next pass's sweep queues the run's blocks for a rescan
+  and then deletes it (below), or keeps it, with a warning, when the wallet's block
+  metadata cannot place its blocks; no seed resumes it. The resumed run is no longer
+  deleted when the wallet already holds content for the shard (after a second committed
+  unit of the interrupted range), which lost its leaves and anchors. A range also no
+  longer deletes the rest of the shard's rows, rows of blocks that may stay scanned: its
+  seed deletes only the rows at the positions it scans again, and a build or graft only
+  the rows it built, so the others wait for the next pass's sweep (below).
+- The range-end graft build, and every other build of buffered rows, inserted the rows
+  without first registering their durable anchors as retained. With the wallet at its
+  100-checkpoint budget (the ChainTip range's window), the build evicted the anchors it
+  had just added, and the anchors it kept were never recorded as retained. Buffered rows
+  also kept every per-block checkpoint when they were scanned deep below the chain tip,
+  so a later build created checkpoints that graft off never creates. Graft on now leaves
+  the same checkpoints and retained anchors as graft off.
+- A pass stopped or aborted after a Historic range's last commit, such as a host abort
+  that lands in the range's final drain, skipped the range-end build: the range's last
+  shard stayed only in the graft buffer, so its leaves, checkpoints and durable anchors
+  never reached the tree, and a later range that seeded in that shard deleted them. Each
+  pass now starts with a sweep of the buffer for the runs no pending range will resume. A
+  run is built when data the wallet already holds checks where it ends (the tree's leaf at
+  its last position, or the stored server root of the shard it completes); any other run
+  is deleted and its blocks are queued for a rescan. A wallet whose stranded rows are
+  still buffered heals on its next pass. This change neither detects nor repairs what an
+  earlier version already did: rows it deleted (their checkpoints and durable anchors are
+  missing), or leaves it built at the wrong positions. A buffered row that will not decode
+  no longer fails every pass: for each run of its shard, the sweep queues a rescan of the
+  blocks holding it, by position, and then deletes it; a run the wallet's block metadata
+  cannot place keeps its rows, with a warning. A range that still meets such a row seeds
+  without the shard's rows and builds what it scans in that shard, with a warning. Only a
+  row that will not decode counts: any other error reading the buffer (a busy database,
+  an I/O error) fails the range for the pass, as before, and the sweep leaves that
+  shard's rows as they are. Any other run the sweep cannot read, build or rescan gets a
+  warning and keeps its rows; a sweep that fails only warns, and the pass goes on. A run
+  whose end checks but whose build the tree refuses is deleted once its blocks are queued
+  for a rescan, as any other.
+- A reorg recovery's truncation and an account import's rewind left the graft-buffer rows
+  of the blocks they queue again, though after a reorg those may be another chain's
+  commitments. The truncation (`WalletSession::truncate_to_height`) and the engine's own
+  account import (`WalletSession::import_account`) now drop every buffered row at or
+  above their rewind point. The truncation drops them in upstream's own truncation
+  transaction, so a crash or an error never leaves the wallet truncated with those rows
+  still buffered; a pool whose tree size the highest remaining block does not record
+  keeps its rows, with a warning. For an account a host imports into the wallet database
+  itself, the first range to seed in the shard resumes only the run that ends right
+  before its start, as above.
+
+## [0.4.0-pre.2] - 2026-10-20
+
+### Added
+- `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
+  host calls the first right before it changes the wallet (adding or removing an account,
+  a rewind, a wipe), and the running session's scan ends at its next block instead of
+  after the whole chunk. `Progress::begin_session` re-arms the stop, so a request never
+  stops a later session.
+- `block_source::StoppedForWalletChange` and `block_source::MemBlockSource::with_stop`,
+  which make the in-memory block source refuse its next block once a stop is requested.
+  The check is two relaxed atomic loads per block.
+- `SlipstreamError::StoppedForWalletChange` and
+  `SlipstreamError::is_stop_for_wallet_change`.
+- `ffi_handle::StopReport`, `ffi_handle::SlipstreamHandle::{stop, stop_for_wallet_change,
+  quiesce_before_start}`, `ffi_handle::{settle_passes, drain_wallet_writers}` and the
+  `SlipstreamHandle::unfinished_passes` field: the bounded stop that proves the wallet
+  file quiescent, which every host wrapper used to keep its own copy of. Its report says
+  whether each wait finished and how long it took. A pass that outlives a stop's budget
+  stays on record, so a later stop still answers for it.
+- `ffi_handle::FfiSlipstreamStopReport`, the by-value C form of `StopReport` that the C
+  ABI's two stop functions return: `settled` and `drained` as 1 or 0, `settle_ms` and
+  `drain_ms` in milliseconds (`From<StopReport>`). The report return and
+  `zcashlc_slipstream_stop_for_wallet_change` are the C ABI wrappers adopt with this
+  release (today's wrappers return `bool` from `zcashlc_slipstream_stop`), and a wrapper's
+  cbindgen re-declaration of the struct must keep its field order.
+
+### Changed
+- `block_source::MemBlockSource`'s `BlockSource::Error` is `StoppedForWalletChange` (was
+  `Infallible`). A source built without `with_stop` never returns it.
+- `session::run_session` returns when the host stops it for a wallet change, leaving
+  `SyncState::Idle` and pushing no error event. It still never returns otherwise.
+- Each `Progress::request_stop_for_wallet_change` owes, process-wide, a wait for the trial
+  decryption the stopped scan leaves queued on rayon's global pool: the next scan in the
+  process, on any handle (one reopened on the same wallet too), waits right before its
+  first scan call until rayon has taken that backlog, so a stop that follows quickly is
+  seen at the next block instead of after it. The wait overlaps the Tor bootstrap and the
+  fetch of the first chunk, and one cut short by an abort leaves it owed.
+- `ffi_handle::SlipstreamHandle` has a new public field, `unfinished_passes`: code that
+  builds the handle with a struct literal must set it (to `Vec::new()`).
+- `engine::ENGINE_BUILD` is `2026-10-20.v0.15-stop-for-wallet-change`.
+
 ## [0.4.0-pre.1] - 2026-10-06
 
 ### Changed

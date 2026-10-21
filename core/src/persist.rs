@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::num::NonZeroU32;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::time::SystemTime;
 
 use incrementalmerkletree::{Address, Level, Marking, Position, Retention};
@@ -50,7 +50,7 @@ use zcash_client_backend::data_api::{
     chain::ChainState,
     error::{FindAccountForAddressError, LockError},
     ll::{LowLevelWalletWrite, wallet::PutBlocksError},
-    scanning::ScanRange,
+    scanning::{ScanPriority, ScanRange},
     wallet::{ConfirmationsPolicy, TargetHeight},
 };
 use zcash_client_backend::wallet::{
@@ -344,13 +344,34 @@ impl<H> SparseShardStore<H> {
     /// after the pass-start root ingest EVERY completed shard has a row, so a
     /// presence check silently forfeits the graft of any shard a range starts
     /// exactly on. Root-only leaves are graft/build-eligible; only a built
-    /// interior means "already have it" (the crash-heal case).
+    /// interior means "already have it", and the seed then stays passthrough
+    /// (never grafts over that interior).
     pub fn shard_has_interior(&self, idx: u64) -> bool {
         match self.shards.get(&idx) {
             Some(t) => !t.root().is_leaf(),
             // Not in memory (seed loads every known shard, so effectively
             // unreachable) — stay conservative: presence ⇒ interior.
             None => self.db_shard_indices.contains(&idx),
+        }
+    }
+
+    /// A copy of the whole store: what the pass-start sweep puts back when the tree refuses
+    /// a stranded run or its build does not commit, so the next run builds on the tree the
+    /// wallet holds. Cheap: shards share their subtrees.
+    fn snapshot(&self) -> Self
+    where
+        H: Clone,
+    {
+        Self {
+            shard_level: self.shard_level,
+            db_shard_indices: self.db_shard_indices.clone(),
+            shards: self.shards.clone(),
+            dirty_shards: self.dirty_shards.clone(),
+            cap: self.cap.clone(),
+            cap_dirty: self.cap_dirty,
+            checkpoints: self.checkpoints.clone(),
+            db_checkpoints: self.db_checkpoints.clone(),
+            retained: self.retained.clone(),
         }
     }
 
@@ -673,13 +694,16 @@ type BuildSegment<H> = (Position, Vec<Option<(H, Retention<BlockHeight>)>>);
 /// One pool's build plan for one put_blocks call: contiguous row segments to
 /// build inside the main txn (passthrough spans, eager note flushes, and — in
 /// Task 7, where the verdict is still always-build — closed clean shards), plus
-/// the shards whose buffer rows die once the txn commits.
+/// the buffer rows that die once the txn commits.
 struct PoolPlan<H> {
     segments: Vec<BuildSegment<H>>,
     /// Task 8: clean shards with a server root — installed as root-only shards
     /// (upstream's own put_shard_roots shape), ZERO combines.
     grafts: Vec<(u64, H)>,
-    cleanup_shards: Vec<u64>,
+    /// The positions each built or grafted row set covers, by shard ([`fed_span`]):
+    /// only those rows are deleted after the commit. Other rows of the shard are no
+    /// row set's of this range, and stay for whatever resumes or sweeps them.
+    cleanup_spans: Vec<(u64, Range<u64>)>,
     /// Clean shards with NO server root (tip lag / server gap) — built instead.
     fallbacks: u64,
     /// Task 10 sampling verify: shards built ANYWAY (their rows ride
@@ -700,63 +724,185 @@ fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<
     Some((Position::from(first), seg))
 }
 
+/// The shard and the positions of one row set an accumulator built or grafted:
+/// a contiguous run within one shard, as every `FeedAction` carries it. Its buffer
+/// rows are the ones that die once the build commits.
+fn fed_span<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Option<(u64, Range<u64>)> {
+    let (first, last) = (rows.first()?.0, rows.last()?.0);
+    Some((first >> 16, first..last + 1))
+}
+
 /// Pre-txn planner for one pool: lazily seed the accumulator (buffer resume +
 /// conservative store-presence probe), feed this call's stream, persist Buffer
 /// rows on the side connection, and return the build plan. Runs BEFORE the main
 /// transaction opens — no lock conflict, and a crash after these appends is the
 /// benign "rescan re-appends identical rows" window (graft.rs header).
+///
+/// `frontier_leaf`: the leaf of this call's `from_state` frontier for the pool,
+/// with its position (`start_position - 1`). The seed resumes only the buffered
+/// run that ends on it (`graft_accumulator::resumable_run`) and that the
+/// commitment tree takes: `tree_refuses` says why the tree would refuse the run
+/// ([`resume_refusal`]), or `None`. A run that ends at `start_position - 1` on
+/// another leaf, or that the tree refuses, is never continued, and the range then
+/// builds what it scans in that shard, so none of its rows is buffered next to
+/// that run. The seed deletes only the shard's rows at the positions this call
+/// feeds, which the range scans again;
+/// every other row of the shard stays buffered, for a later range that continues
+/// it or for the next pass's sweep, which verifies or rescans it. A shard whose
+/// buffered rows will not decode ([`crate::graft::will_not_decode`]) seeds
+/// without a resume and builds what the range scans in it, with a warning; any
+/// other error reading the shard's rows fails the call.
 #[allow(clippy::too_many_arguments)]
-fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
+fn plan_pool<H: Clone + PartialEq + zcash_primitives::merkle_tree::HashSer>(
     conn: &rusqlite::Connection,
     verify_sample: u32,
     acc: &mut Option<crate::graft_accumulator::ShardAccumulator<H>>,
     pool: ShieldedPool,
     start_position: u64,
+    frontier_leaf: Option<(u64, &H)>,
     stream: Vec<(H, Retention<BlockHeight>)>,
     note_positions: &[u64],
     store_has_shard: impl Fn(u64) -> bool,
+    tree_refuses: impl FnOnce(&[crate::graft_accumulator::AccRow<H>]) -> Option<String>,
     mut server_root: impl FnMut(u64) -> Result<Option<H>, SqliteClientError>,
     anchor_retention: Option<&AnchorRetention>,
 ) -> Result<PoolPlan<H>, SqliteClientError> {
-    use crate::graft_accumulator::{FeedAction, ShardAccumulator};
+    use crate::graft_accumulator::{FeedAction, ShardAccumulator, resumable_run};
 
     if acc.is_none() {
         let shard = start_position >> 16;
-        let mut resume = crate::graft::load_shard::<H>(conn, pool, shard)?;
-        let has_internals = store_has_shard(shard);
-        if has_internals && !resume.is_empty() {
-            // Stale rows for a shard the store already holds (crash between a
-            // build-commit and its cleanup) — the documented self-heal path.
-            crate::graft::delete_shard(conn, pool, shard)?;
-            resume = vec![];
+        // The seed shard's positions this call feeds: the range scans their blocks again,
+        // so rows buffered there are stale. Rows elsewhere in the shard may be another
+        // range's (below the start, a run this range does not continue; above this call,
+        // rows of later blocks, which may lie past the range's end), so no seed deletes
+        // them: a later range continues them, or the next pass's sweep verifies or
+        // rescans them.
+        let fed = start_position..(start_position + stream.len() as u64).min((shard + 1) << 16);
+        let mut will_not_decode = false;
+        let resume = match crate::graft::load_shard::<H>(conn, pool, shard) {
+            Ok(rows) => {
+                if rows.iter().any(|(p, ..)| fed.contains(p)) {
+                    crate::graft::delete_rows_in(conn, pool, shard, fed)?;
+                }
+                rows
+            }
+            Err(e) if crate::graft::will_not_decode(&e) => {
+                // A row that will not decode. The pass-start sweep rescans such a shard's
+                // runs by position, so this is the backstop for one it did not reach or
+                // could not place: failing here would fail this range on every pass. No
+                // seed in this shard can read its rows, so rows buffered next to them
+                // could never be resumed; the range builds what it scans here instead.
+                tracing::warn!(
+                    ?pool,
+                    shard,
+                    %e,
+                    "graft seed: the shard's buffered rows will not decode; seeding without a resume, building this shard as it is scanned, and leaving its rows to the next pass's sweep"
+                );
+                crate::graft::delete_rows_in(conn, pool, shard, fed)?;
+                will_not_decode = true;
+                vec![]
+            }
+            // An SQLite error (a busy database past the timeout, an I/O error) says nothing
+            // about the rows: the range fails this pass and is retried, the rows untouched.
+            Err(e) => return Err(e),
+        };
+        // Only a run that ends right before the start, on this range's own frontier
+        // leaf, can be continued. Rows an interrupted range left behind elsewhere in
+        // the shard, or rows from another chain, would be laid out from the wrong
+        // position.
+        let below_start = resume.partition_point(|(p, ..)| *p < start_position);
+        let ends_at_start = resume[..below_start]
+            .last()
+            .is_some_and(|(p, ..)| *p + 1 == start_position);
+        let (resume, _) = resumable_run(resume, start_position, frontier_leaf);
+        // A run that ends right before the start on another leaf than this range's
+        // frontier holds is not this chain's there (another chain's rows, as a reorg's
+        // truncation can leave them). Rows this range buffered right after it would join
+        // it into one contiguous run, which a later seed takes whole (`resumable_run`
+        // walks back while positions are contiguous) and the sweep's last-leaf check
+        // builds whole. So the range builds what it scans in this shard instead: the store
+        // then holds the chain's frontier at start - 1 and the range's rows above it,
+        // every later seed in the shard builds too (the store has content for it), and
+        // the run waits for the next pass's sweep. Its last-leaf check reads the chain's
+        // leaf at start - 1, which is not the run's, so the sweep rescans the run's
+        // blocks, or keeps the run, with nothing next to it, when it cannot place them.
+        let rejected_at_start = ends_at_start && resume.is_empty();
+        if rejected_at_start {
+            tracing::warn!(
+                ?pool,
+                shard,
+                start_position,
+                "graft seed: the buffered run ending right before the start is not on this range's frontier leaf; building this shard as it is scanned, and leaving the run to the next pass's sweep"
+            );
         }
-        *acc = Some(ShardAccumulator::seed(
-            start_position,
-            resume,
-            has_internals,
-        ));
+        // The frontier's leaf vouches only for the run's last row. A row below it that is
+        // not the chain's (a stale row the buffer kept) gives every node above it another
+        // root, so the run's build, whenever the range makes it, can conflict with what the
+        // tree holds there: the transaction rolls back, the rows stay buffered, the range
+        // keeps its start, and it would fail the same way on every pass. So the tree is
+        // asked first ([`resume_refusal`]), and a run it refuses is not continued either:
+        // the range builds what it scans in this shard, as next to a run on another leaf,
+        // and the run waits for the next pass's sweep. By then the tree holds this range's
+        // frontier, so the sweep's build of the run meets the same refusal (or nothing
+        // checks where the run ends), and the sweep queues a rescan of the run's blocks and
+        // then deletes its rows, or keeps them, with nothing next to them, when it cannot
+        // place the blocks. A seed asks the tree on every attempt, so no attempt resumes a
+        // run the tree refuses.
+        let refusal = if resume.is_empty() {
+            None
+        } else {
+            tree_refuses(&resume)
+        };
+        if let Some(reason) = &refusal {
+            tracing::warn!(
+                ?pool,
+                shard,
+                first = resume.first().map(|row| row.0),
+                start_position,
+                %reason,
+                "graft seed: the commitment tree refuses the buffered run ending right before the start; building this shard as it is scanned, and leaving the run to the next pass's sweep"
+            );
+        }
+        let resume = if refusal.is_some() { vec![] } else { resume };
+        if below_start > resume.len() {
+            tracing::debug!(
+                ?pool,
+                shard,
+                left = below_start - resume.len(),
+                "graft seed: buffered rows below the start that this range does not continue stay for the next pass's sweep"
+            );
+        }
+        // Passthrough: the range builds what it scans in this shard instead of buffering
+        // it, when the store already holds content for the shard, its rows will not
+        // decode, or they end right before the start on another leaf or in a run the tree
+        // refuses.
+        let passthrough =
+            store_has_shard(shard) || will_not_decode || rejected_at_start || refusal.is_some();
+        *acc = Some(ShardAccumulator::seed(start_position, resume, passthrough));
     }
     let acc = acc.as_mut().unwrap_or_else(|| unreachable!("seeded above"));
 
     let mut plan = PoolPlan {
         segments: vec![],
         grafts: vec![],
-        cleanup_shards: vec![],
+        cleanup_spans: vec![],
         fallbacks: 0,
         verify_roots: vec![],
     };
     for action in acc.feed(start_position, stream, note_positions) {
         match action {
             FeedAction::Build(rows) => {
-                if let Some(first) = rows.first() {
-                    plan.cleanup_shards.push(first.0 >> 16);
-                }
+                plan.cleanup_spans.extend(fed_span(&rows));
                 plan.segments.extend(rows_to_segment(rows));
             }
             FeedAction::CloseCleanShard { shard_index, rows } => {
                 // Task 8 — THE verdict: note-free shard + server root ⇒ graft
                 // (zero combines); no root ⇒ build these exact rows (fallback).
-                plan.cleanup_shards.push(shard_index);
+                plan.cleanup_spans.extend(fed_span(&rows));
+                debug_assert!(
+                    rows.first().is_none_or(|row| row.0 >> 16 == shard_index),
+                    "a closed shard's rows lie in that shard"
+                );
                 // [B6] A graft installs a root-only leaf: the shard's interior —
                 // INCLUDING its checkpoint rows — never materializes. Pre-B6 that
                 // was free (the downgrade doomed those checkpoints anyway); a
@@ -801,9 +947,74 @@ fn plan_pool<H: Clone + zcash_primitives::merkle_tree::HashSer>(
     Ok(plan)
 }
 
+/// Why the commitment tree would refuse `run`, the buffered run a range's seed would
+/// resume ([`plan_pool`]), or `None` when it takes it.
+///
+/// The run ends right before the range's start on the leaf the range's `from_state`
+/// frontier holds there, but that leaf vouches only for its last row. Every build of the
+/// run (with the range's first span on a shard the store holds content for, otherwise at
+/// a shard close, an eager flush or the range-end finish) meets the frontier's subtree
+/// roots, which the call inserts before it builds anything, and the content the store
+/// holds for the shard (the frontiers of earlier units, rows built earlier). So the run
+/// is inserted here first, into a copy of its shard as `store` holds it with the frontier
+/// inserted. Every row below the last lies under one of the frontier's subtree roots: one
+/// the run covers whole must be the root of the run's rows there, and one it covers only
+/// in part is checked once the content the store holds below the run (the frontier its
+/// own range inserted where it started) completes it with them. The run is laid out as
+/// those builds lay it out ([`build_subtrees`] from its first row, with its own
+/// retentions, which no build keeps more of), so a conflict any of them would meet over
+/// the run's rows is met here. Nothing is written.
+///
+/// `None` as well when `store` cannot read the shard, or when the frontier itself
+/// conflicts with what the store holds: the call then fails whatever the run holds.
+fn resume_refusal<H, const SHARD_HEIGHT: u8>(
+    store: &SparseShardStore<H>,
+    frontier: Option<&incrementalmerkletree::frontier::NonEmptyFrontier<H>>,
+    frontier_id: BlockHeight,
+    run: &[crate::graft_accumulator::AccRow<H>],
+) -> Option<String>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+{
+    let first = Position::from(run.first()?.0);
+    let addr = Address::above_position(store.shard_level, first);
+    let mut shard = store
+        .get_shard(addr)
+        .ok()?
+        .unwrap_or_else(|| LocatedTree::empty(addr));
+    if let Some(frontier) = frontier.filter(|f| addr.position_range().contains(&f.position())) {
+        let retention = Retention::Checkpoint {
+            id: frontier_id,
+            marking: Marking::Reference,
+        };
+        shard = shard
+            .insert_frontier_nodes(frontier.clone(), &retention)
+            .ok()?
+            .0;
+    }
+    // The build's rayon work runs on the persist lane's pool, as every build does.
+    let build = || {
+        let mut rows: Vec<_> = run
+            .iter()
+            .map(|(_, hash, retention)| Some((hash.clone(), *retention)))
+            .collect();
+        build_subtrees::<_, SHARD_HEIGHT>(first, &mut rows, BUILD_CHUNK_SIZE)
+    };
+    let subtrees = match persist_pool() {
+        Some(workers) => workers.install(build),
+        None => build(),
+    };
+    for (subtree, _) in subtrees {
+        match shard.insert_subtree(subtree, false) {
+            Ok((merged, _)) => shard = merged,
+            Err(e) => return Some(e.to_string()),
+        }
+    }
+    None
+}
+
 fn seed_sapling(
     db: &mut Db,
-    _from_state: &ChainState,
     anchor_floor: Option<&AnchorRetention>,
 ) -> Result<SaplingSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
@@ -847,7 +1058,6 @@ fn seed_sapling(
 
 fn seed_orchard(
     db: &mut Db,
-    _from_state: &ChainState,
     anchor_floor: Option<&AnchorRetention>,
 ) -> Result<OrchardSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
@@ -891,7 +1101,6 @@ fn seed_orchard(
 // fork's `with_ironwood_tree_mut` is the SQLite bridge.
 fn seed_ironwood(
     db: &mut Db,
-    _from_state: &ChainState,
     anchor_floor: Option<&AnchorRetention>,
 ) -> Result<IronwoodSparseTree, SqliteClientError> {
     let mut store = SparseShardStore::<orchard::tree::MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
@@ -1131,25 +1340,13 @@ pub fn sparse_put_blocks(
     // Seed per-range trees lazily (first chunk of the range), then destructure
     // once — disjoint &mut borrows for the transactionally closure, no expect().
     if sparse.sapling.is_none() {
-        sparse.sapling = Some(seed_sapling(
-            inner,
-            from_state,
-            sparse.anchor_retention.as_ref(),
-        )?);
+        sparse.sapling = Some(seed_sapling(inner, sparse.anchor_retention.as_ref())?);
     }
     if sparse.orchard.is_none() {
-        sparse.orchard = Some(seed_orchard(
-            inner,
-            from_state,
-            sparse.anchor_retention.as_ref(),
-        )?);
+        sparse.orchard = Some(seed_orchard(inner, sparse.anchor_retention.as_ref())?);
     }
     if sparse.ironwood.is_none() {
-        sparse.ironwood = Some(seed_ironwood(
-            inner,
-            from_state,
-            sparse.anchor_retention.as_ref(),
-        )?);
+        sparse.ironwood = Some(seed_ironwood(inner, sparse.anchor_retention.as_ref())?);
     }
     let gpu_on = sparse.gpu_subtree;
     let batch_on = sparse.batch_combine;
@@ -1200,15 +1397,39 @@ pub fn sparse_put_blocks(
                 );
             }
         }
+        // [B6] The rows fed here may be built in a LATER call (an eager flush, a shard
+        // close, the range-end finish), so they must carry the retentions this call's own
+        // build gives its commitments: the deep-history doom is decided per call, from
+        // the same inputs the transaction below decides it from.
+        let chain_tip = inner.chain_height()?;
+        if blocks
+            .last()
+            .is_some_and(|last| is_deep_history(chain_tip, last.height()))
+        {
+            doom_deep_history_stream(&mut sap_stream, anchor_floor);
+            doom_deep_history_stream(&mut orch_stream, anchor_floor);
+        }
         let sp = plan_pool(
             &ctx.conn,
             ctx.verify_sample,
             &mut ctx.acc_sapling,
             ShieldedPool::Sapling,
             sap_start_u64,
+            from_state
+                .final_sapling_tree()
+                .value()
+                .map(|f| (u64::from(f.position()), f.leaf())),
             sap_stream,
             &sap_notes,
             |s| sap_tree.store().shard_has_interior(s),
+            |run| {
+                resume_refusal::<_, SAPLING_SHARD_HEIGHT>(
+                    sap_tree.store(),
+                    from_state.final_sapling_tree().value(),
+                    from_state.block_height(),
+                    run,
+                )
+            },
             |s| {
                 inner
                     .get_sapling_subtree_root(s)
@@ -1222,9 +1443,21 @@ pub fn sparse_put_blocks(
             &mut ctx.acc_orchard,
             ShieldedPool::Orchard,
             orch_start_u64,
+            from_state
+                .final_orchard_tree()
+                .value()
+                .map(|f| (u64::from(f.position()), f.leaf())),
             orch_stream,
             &orch_notes,
             |s| orch_tree.store().shard_has_interior(s),
+            |run| {
+                resume_refusal::<_, ORCHARD_SHARD_HEIGHT>(
+                    orch_tree.store(),
+                    from_state.final_orchard_tree().value(),
+                    from_state.block_height(),
+                    run,
+                )
+            },
             |s| {
                 inner
                     .get_orchard_subtree_root(s)
@@ -1232,7 +1465,7 @@ pub fn sparse_put_blocks(
             },
             anchor_floor,
         )?;
-        let cleanup = (sp.cleanup_shards.clone(), op.cleanup_shards.clone());
+        let cleanup = (sp.cleanup_spans.clone(), op.cleanup_spans.clone());
         let verdicts = (
             (sp.grafts.len() as u64, sp.fallbacks),
             (op.grafts.len() as u64, op.fallbacks),
@@ -1307,9 +1540,7 @@ pub fn sparse_put_blocks(
             // empty maps → ensure_checkpoints adds nothing → no store
             // checkpoints → nothing for prune_excess_checkpoints to evict
             // into an unmaterialized (buffered/root-only) shard.
-            let deep_history = wdb.chain_height()?.is_some_and(|tip| {
-                last_scanned_height + DEEP_HISTORY_CHECKPOINT_MARGIN < tip
-            });
+            let deep_history = is_deep_history(wdb.chain_height()?, last_scanned_height);
             if deep_history {
                 let doom_all = BlockHeight::from(u32::MAX);
                 downgrade_doomed_checkpoints(&mut sapling_commitments, doom_all, anchor_floor);
@@ -1829,17 +2060,19 @@ pub fn sparse_put_blocks(
         Ok(())
     })?;
 
-    // v0.4 Plan A: buffer rows for shards built/closed this call are dead now the
-    // txn committed. POST-commit on purpose (graft.rs contract): a crash before
-    // this point leaves stale rows that the store-has-internals seed rule heals.
+    // v0.4 Plan A: buffer rows of the row sets built/grafted this call are dead now
+    // the txn committed: exactly their positions, never the rest of their shard.
+    // POST-commit on purpose (graft.rs contract): a crash before this point leaves
+    // rows that a later seed in that shard resumes, or the next pass's sweep
+    // verifies or rescans.
     if let (Some(ctx), Some(((sap_cleanup, orch_cleanup), verdicts))) =
         (graft.as_ref(), graft_cleanup)
     {
-        for shard in sap_cleanup {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Sapling, shard)?;
+        for (shard, span) in sap_cleanup {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Sapling, shard, span)?;
         }
-        for shard in orch_cleanup {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Orchard, shard)?;
+        for (shard, span) in orch_cleanup {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Orchard, shard, span)?;
         }
         let ((sap_grafted, sap_fallback), (orch_grafted, orch_fallback)) = verdicts;
         if sap_grafted + sap_fallback + orch_grafted + orch_fallback > 0 {
@@ -2123,18 +2356,780 @@ fn downgrade_doomed_checkpoints<H>(
 ) -> u64 {
     let mut downgraded = 0u64;
     for slot in commitments.iter_mut().flatten() {
-        if let Retention::Checkpoint { id, marking } = &slot.1
-            && *id < cutoff
-            && !should_retain_anchor(anchor_retention, *id)
-        {
-            slot.1 = match marking {
-                Marking::Marked => Retention::Marked,
-                _ => Retention::Ephemeral,
-            };
+        if downgrade_if_doomed(&mut slot.1, cutoff, anchor_retention) {
             downgraded += 1;
         }
     }
     downgraded
+}
+
+/// The rule [`downgrade_doomed_checkpoints`] applies to each retention: a checkpoint below
+/// `cutoff` that is not a durable anchor becomes the residue upstream's prune leaves on its
+/// leaf. Returns whether `retention` was such a checkpoint.
+fn downgrade_if_doomed(
+    retention: &mut Retention<BlockHeight>,
+    cutoff: BlockHeight,
+    anchor_retention: Option<&AnchorRetention>,
+) -> bool {
+    if let Retention::Checkpoint { id, marking } = *retention
+        && id < cutoff
+        && !should_retain_anchor(anchor_retention, id)
+    {
+        *retention = match marking {
+            Marking::Marked => Retention::Marked,
+            _ => Retention::Ephemeral,
+        };
+        true
+    } else {
+        false
+    }
+}
+
+/// Whether a `sparse_put_blocks` call whose last block is `last_scanned_height` lies deep
+/// enough below `chain_tip` to keep no per-block checkpoints but the durable anchors (see
+/// `DEEP_HISTORY_CHECKPOINT_MARGIN`).
+fn is_deep_history(chain_tip: Option<BlockHeight>, last_scanned_height: BlockHeight) -> bool {
+    chain_tip.is_some_and(|tip| last_scanned_height + DEEP_HISTORY_CHECKPOINT_MARGIN < tip)
+}
+
+/// The deep-history doom on a graft accumulator's input stream: every checkpoint but the
+/// durable anchors is downgraded, as the transaction dooms the call's own commitments.
+fn doom_deep_history_stream<H>(
+    stream: &mut [(H, Retention<BlockHeight>)],
+    anchor_retention: Option<&AnchorRetention>,
+) {
+    let doom_all = BlockHeight::from(u32::MAX);
+    for (_, retention) in stream.iter_mut() {
+        downgrade_if_doomed(retention, doom_all, anchor_retention);
+    }
+}
+
+/// The deep-history doom on rows built long after they were scanned (the pass-start
+/// sweep's stranded runs): each checkpoint row is doomed when its own block lies deep
+/// below `chain_tip` now, the durable anchors excepted. Rows the graft stream doomed
+/// when they were buffered are unchanged; rows an older build buffered undoomed, or that
+/// were near the tip then, end as graft off ends them (deep checkpoints pruned).
+fn doom_deep_rows<H>(
+    rows: &mut [crate::graft_accumulator::AccRow<H>],
+    chain_tip: BlockHeight,
+    anchor_retention: Option<&AnchorRetention>,
+) {
+    let doom_all = BlockHeight::from(u32::MAX);
+    for (_, _, retention) in rows.iter_mut() {
+        if let Retention::Checkpoint { id, .. } = *retention
+            && is_deep_history(Some(chain_tip), id)
+        {
+            downgrade_if_doomed(retention, doom_all, anchor_retention);
+        }
+    }
+}
+
+/// The doomed-checkpoint cutoff of a deferred build: the one every build applies
+/// (fixture-proven, rev 2.1), computed from the store's existing ids ∪ the build's own
+/// checkpoint ids, with no new frontier (a deferred build inserts none). It downgrades
+/// exactly what upstream's per-chunk pruning would have.
+fn deferred_build_cutoff<H>(
+    existing: impl Iterator<Item = BlockHeight>,
+    rows: &[Option<(H, Retention<BlockHeight>)>],
+) -> Option<BlockHeight> {
+    let existing: Vec<BlockHeight> = existing.collect();
+    let frontier_id = existing.iter().max().copied()?;
+    let new_ids = rows.iter().flatten().filter_map(|(_, r)| match r {
+        Retention::Checkpoint { id, .. } => Some(*id),
+        _ => None,
+    });
+    doomed_checkpoint_cutoff(existing.iter().copied(), frontier_id, new_ids)
+}
+
+/// Insert rows whose build was deferred (the range-end finish's, or a stranded run the
+/// pass-start sweep builds) into `tree`, as every build in `sparse_put_blocks` inserts:
+/// the doomed-checkpoint downgrade ([`deferred_build_cutoff`]), then each subtree with its
+/// anchors PRE-registered. Shardtree's excess-checkpoint prune runs INSIDE insert_tree, so
+/// with the store at its budget (the ChainTip range's window) an anchor retained only
+/// afterwards is already gone, and flush_* writes retained marks only for ids the store
+/// retains (\[B6\]). `rows` must be one contiguous run; they are laid out from the first
+/// row's position. Returns whether anything was inserted (the caller then flushes);
+/// `label` prefixes the errors.
+fn insert_deferred_rows<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
+    rows: Vec<crate::graft_accumulator::AccRow<H>>,
+    anchor_floor: Option<&AnchorRetention>,
+    label: &str,
+) -> Result<bool, SqliteClientError>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+{
+    let Some((seg_start, mut rows)) = rows_to_segment(rows) else {
+        return Ok(false);
+    };
+    if let Some(cutoff) = deferred_build_cutoff(tree.store().checkpoints.keys().copied(), &rows) {
+        downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor);
+    }
+    for (subtree, checkpoints) in
+        build_subtrees::<_, SHARD_HEIGHT>(seg_start, &mut rows, BUILD_CHUNK_SIZE)
+    {
+        for h in checkpoints
+            .keys()
+            .copied()
+            .filter(|h| should_retain_anchor(anchor_floor, *h))
+        {
+            tree.ensure_retained(h)
+                .map_err(|e| SqliteClientError::CorruptedData(format!("{label} retain: {e:?}")))?;
+        }
+        tree.insert_tree(subtree, checkpoints)
+            .map_err(|e| SqliteClientError::CorruptedData(format!("{label} insert: {e:?}")))?;
+    }
+    Ok(true)
+}
+
+/// The root of shard `index`, computed from the leaves and subtree hashes `store` holds
+/// for it, or `None` while some of the shard is missing. The annotation on the shard's own
+/// root is ignored: the SQLite store puts its stored root there on every shard it loads
+/// (`get_shard` reads the `root_hash` that the pass-start `put_subtree_roots` ingest wrote),
+/// so reading it would only return the root it is compared with.
+fn shard_content_root<H>(store: &SparseShardStore<H>, index: u64) -> Option<H>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq,
+{
+    let shard = store.shards.get(&index)?.clone().reannotate_root(None);
+    shard.root_hash(shard.root_addr().position_range_end()).ok()
+}
+
+// ── v0.4 Plan A: the pass-start sweep of stranded graft rows ───────────────────
+
+/// What [`sweep_stranded_graft_rows`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct GraftSweep {
+    /// Buffered rows built into the commitment trees.
+    pub(crate) built_rows: u64,
+    /// Buffered rows deleted because nothing the wallet holds checks them, the tree refused
+    /// them, or their shard's rows will not decode; the scanned blocks holding them are
+    /// queued for a rescan.
+    pub(crate) discarded_rows: u64,
+    /// The block ranges queued for a rescan.
+    pub(crate) rescans: Vec<Range<BlockHeight>>,
+}
+
+impl GraftSweep {
+    /// Whether the sweep changed nothing.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.built_rows == 0 && self.discarded_rows == 0 && self.rescans.is_empty()
+    }
+}
+
+/// Build or discard the graft-buffer runs nothing will resume, before any range of the
+/// pass plans (`scheduler::run_to_completion` calls it before its first range). It does
+/// nothing when the buffer is empty, as it is between ranges on every path that ends a
+/// range normally.
+///
+/// A range's rows stay buffered when it stops after its last commit and before its
+/// range-end build, as when a host abort lands in the final drain (`scan.rs`). The range
+/// is scanned, and Historic ranges run newest first, so no later range resumes that
+/// shard's rows: their leaves, and the checkpoints and durable anchors among them, never
+/// reach the tree. No range deletes them either: a seed deletes only the rows at the
+/// positions its call feeds, and a build or graft only the rows of the row set it built
+/// (`plan_pool`), so they wait for this sweep, which runs first:
+///
+/// - the first pending Historic range to seed in a shard resumes the run that ends right
+///   before its start ([`crate::graft::first_seeders`], [`crate::graft::stranded_runs`]),
+///   and that run is left in place. The range's seed asks the tree whether it takes the
+///   run ([`resume_refusal`]), and builds what it scans next to a run it refuses, which
+///   the next sweep then finds stranded. With `graft_resumes` false (the kill switch: no
+///   range buffers, so none resumes) every run is stranded and swept as below;
+/// - a stranded run is built only when data the wallet already holds checks where it
+///   ends ([`crate::graft::end_check`]): the tree's leaf at its last position, or the
+///   stored root of the shard it completes, which the shard's root computed once the run
+///   is in the tree must equal ([`shard_content_root`]). The build is the range-end
+///   finish's ([`insert_deferred_rows`]), one transaction per run, then the run's rows are
+///   deleted; the tree also refuses rows that disagree with content it already holds.
+///   Positions alone never build a run: rows a reorg left buffered before the engine
+///   cleaned the buffer on rewinds may be another chain's;
+/// - any other stranded run, or one the tree refuses, is deleted after the scanned blocks
+///   holding it are queued for a rescan (in that order, so a crash in between leaves the
+///   rows for the next sweep);
+/// - every buffered shard is decoded, a resumed run's too: a shard whose rows will not all
+///   decode can be neither built nor resumed (no seed in it can read them), so each of its
+///   runs is handled by its positions alone: the scanned blocks holding it are queued for a
+///   rescan, and then its rows are deleted (`SweepInputs::undecodable_shard`). Only a
+///   decode failure counts ([`crate::graft::will_not_decode`]): a shard whose read fails
+///   with an SQLite error keeps its rows for the next sweep.
+///
+/// Warn-and-continue, as the open-time heals in `WalletSession::open`: a pool, shard or run
+/// the sweep cannot read, build or rescan, or whose blocks the wallet's block metadata
+/// cannot place, gets one warning and keeps its rows (the first range to seed in that shard
+/// resumes only the run it continues, seeds without a resume and builds what it scans when
+/// the shard's rows will not decode, and leaves the other rows to the next sweep), and the
+/// sweep goes on with the rest. Only a failure before any pool is swept is returned, and
+/// the scheduler logs it and runs the pass.
+///
+/// The forecast can go stale during the pass: the queue changes (a found note, a rescan
+/// queued after the sweep) and another range seeds in a shard first, or this sweep did not
+/// run. The rows of a run no range continues then stay buffered, never deleted unchecked,
+/// and the next pass's sweep builds or rescans them. The Orchard pool's forecast reads the
+/// queue again when the Sapling pool's sweep queued rescans.
+///
+/// Deep history: each built row's checkpoint is doomed when its own block lies deep below
+/// the chain tip now ([`doom_deep_rows`]). Rows buffered before the graft stream got the
+/// per-call doom carry every per-block checkpoint, and the deferred build's budget cutoff
+/// alone would keep some that graft off never creates.
+///
+/// Blocking: the scheduler runs it in `block_in_place`. A build's rayon work runs on the
+/// persist lane's pool ([`persist_pool`]), as every build in `sparse_put_blocks` does.
+pub(crate) fn sweep_stranded_graft_rows(
+    db: &mut Db,
+    wallet_db_path: &std::path::Path,
+    graft_resumes: bool,
+    anchor_retention: Option<&AnchorRetention>,
+) -> Result<GraftSweep, crate::error::SlipstreamError> {
+    let werr =
+        |e: SqliteClientError| crate::error::SlipstreamError::Wallet(format!("graft sweep: {e}"));
+    let ctx = GraftCtx::open(wallet_db_path, 0)?;
+    let sapling_shards =
+        crate::graft::buffered_shards(&ctx.conn, ShieldedPool::Sapling).map_err(werr)?;
+    let orchard_shards =
+        crate::graft::buffered_shards(&ctx.conn, ShieldedPool::Orchard).map_err(werr)?;
+    if sapling_shards.is_empty() && orchard_shards.is_empty() {
+        return Ok(GraftSweep::default());
+    }
+    let (Some(chain_tip), Some(floor)) = (
+        db.chain_height().map_err(werr)?,
+        db.get_wallet_birthday().map_err(werr)?,
+    ) else {
+        return Ok(GraftSweep::default());
+    };
+    // The pending ranges, in the order the scheduler scans them, and the scanned
+    // stretches between them.
+    let read_queue = |db: &mut Db| -> Result<_, SqliteClientError> {
+        let pending = db.suggest_scan_ranges()?;
+        let stretches = crate::graft::scanned_stretches(
+            pending.iter().map(|range| range.block_range().clone()),
+            floor,
+            chain_tip + 1,
+        );
+        Ok((pending, stretches))
+    };
+    let (pending, stretches) = read_queue(db).map_err(werr)?;
+    let mut done = GraftSweep::default();
+    let swept = SweepInputs {
+        conn: &ctx.conn,
+        pending: &pending,
+        stretches: &stretches,
+        chain_tip,
+        graft_resumes,
+        anchor_retention,
+    }
+    .pool::<sapling::Node, { sapling::NOTE_COMMITMENT_TREE_DEPTH }, SAPLING_SHARD_HEIGHT>(
+        db,
+        ShieldedPool::Sapling,
+        &sapling_shards,
+        &mut done,
+    );
+    if let Err(e) = swept {
+        warn_pool_left(ShieldedPool::Sapling, &e);
+    }
+    // The rescans the Sapling pool queued change the queue: the Orchard forecast (its
+    // first seeders, its scanned stretches) reads it again.
+    let queue = if done.rescans.is_empty() || orchard_shards.is_empty() {
+        Ok((pending, stretches))
+    } else {
+        read_queue(db)
+    };
+    match queue {
+        Ok((pending, stretches)) => {
+            let swept = SweepInputs {
+                conn: &ctx.conn,
+                pending: &pending,
+                stretches: &stretches,
+                chain_tip,
+                graft_resumes,
+                anchor_retention,
+            }
+            .pool::<
+                orchard::tree::MerkleHashOrchard,
+                { orchard::NOTE_COMMITMENT_TREE_DEPTH as u8 },
+                ORCHARD_SHARD_HEIGHT,
+            >(db, ShieldedPool::Orchard, &orchard_shards, &mut done);
+            if let Err(e) = swept {
+                warn_pool_left(ShieldedPool::Orchard, &e);
+            }
+        }
+        Err(e) => warn_pool_left(ShieldedPool::Orchard, &e),
+    }
+    if !done.is_empty() {
+        info!(
+            built_rows = done.built_rows,
+            discarded_rows = done.discarded_rows,
+            rescans = ?done.rescans,
+            "graft sweep: stranded buffer rows built or queued for a rescan"
+        );
+    }
+    Ok(done)
+}
+
+/// What every pool's sweep reads ([`sweep_stranded_graft_rows`]).
+struct SweepInputs<'a> {
+    conn: &'a rusqlite::Connection,
+    /// The pending ranges, in the order the scheduler scans them.
+    pending: &'a [ScanRange],
+    /// The heights no pending range covers ([`crate::graft::scanned_stretches`]).
+    stretches: &'a [Range<BlockHeight>],
+    chain_tip: BlockHeight,
+    graft_resumes: bool,
+    anchor_retention: Option<&'a AnchorRetention>,
+}
+
+/// One pool's in-memory tree, generic over the pool (`SaplingSparseTree`,
+/// `OrchardSparseTree`).
+type PoolTree<H, const DEPTH: u8, const SHARD_HEIGHT: u8> =
+    ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>;
+
+/// A pool's in-memory tree as the pass-start sweep uses it: seeded and flushed as
+/// `sparse_put_blocks` seeds and flushes it.
+trait SweptTree: Sized {
+    /// The pool's node type.
+    type Node;
+    fn seed(db: &mut Db, anchor_floor: Option<&AnchorRetention>)
+    -> Result<Self, SqliteClientError>;
+    fn flush<P: zcash_protocol::consensus::Parameters, CL, R>(
+        &mut self,
+        wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
+    ) -> Result<(), SqliteClientError>;
+    /// The root the wallet stores for shard `index`, as the graft verdict reads it: the
+    /// server's, which every pass start ingests (`put_subtree_roots`) before the sweep.
+    fn stored_root(db: &mut Db, index: u64) -> Result<Option<Self::Node>, SqliteClientError>;
+}
+
+impl SweptTree for SaplingSparseTree {
+    type Node = sapling::Node;
+    fn seed(
+        db: &mut Db,
+        anchor_floor: Option<&AnchorRetention>,
+    ) -> Result<Self, SqliteClientError> {
+        seed_sapling(db, anchor_floor)
+    }
+    fn flush<P: zcash_protocol::consensus::Parameters, CL, R>(
+        &mut self,
+        wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
+    ) -> Result<(), SqliteClientError> {
+        flush_sapling(wdb, self)
+    }
+    fn stored_root(db: &mut Db, index: u64) -> Result<Option<sapling::Node>, SqliteClientError> {
+        db.get_sapling_subtree_root(index)
+            .map_err(SqliteClientError::CommitmentTree)
+    }
+}
+
+impl SweptTree for OrchardSparseTree {
+    type Node = orchard::tree::MerkleHashOrchard;
+    fn seed(
+        db: &mut Db,
+        anchor_floor: Option<&AnchorRetention>,
+    ) -> Result<Self, SqliteClientError> {
+        seed_orchard(db, anchor_floor)
+    }
+    fn flush<P: zcash_protocol::consensus::Parameters, CL, R>(
+        &mut self,
+        wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
+    ) -> Result<(), SqliteClientError> {
+        flush_orchard(wdb, self)
+    }
+    fn stored_root(
+        db: &mut Db,
+        index: u64,
+    ) -> Result<Option<orchard::tree::MerkleHashOrchard>, SqliteClientError> {
+        db.get_orchard_subtree_root(index)
+            .map_err(SqliteClientError::CommitmentTree)
+    }
+}
+
+/// The sweep's warning for a pool it could not sweep at all.
+fn warn_pool_left(pool: ShieldedPool, e: &SqliteClientError) {
+    tracing::warn!(
+        ?pool,
+        %e,
+        "graft sweep: could not sweep the pool; its stranded rows stay buffered"
+    );
+}
+
+/// The sweep's warning for a shard whose buffered rows it could not read.
+fn warn_shard_left(pool: ShieldedPool, shard: u64, e: &SqliteClientError) {
+    tracing::warn!(
+        ?pool,
+        shard,
+        %e,
+        "graft sweep: could not read a shard's buffered rows; they stay buffered"
+    );
+}
+
+impl SweepInputs<'_> {
+    /// One pool's sweep over its buffered `shards`. An error is the pool's own (the starts
+    /// of its pending ranges, or its tree); a shard or run that fails gets a warning and
+    /// keeps its rows, and the sweep goes on with the rest. A shard whose rows will not
+    /// decode is swept by position ([`Self::undecodable_shard`]); one whose read fails with
+    /// an SQLite error keeps its rows.
+    fn pool<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+        &self,
+        db: &mut Db,
+        pool: ShieldedPool,
+        shards: &[u64],
+        done: &mut GraftSweep,
+    ) -> Result<(), SqliteClientError>
+    where
+        H: zcash_primitives::merkle_tree::HashSer
+            + incrementalmerkletree::Hashable
+            + Clone
+            + PartialEq
+            + Send
+            + Sync,
+        ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>: SweptTree<Node = H>,
+    {
+        if shards.is_empty() {
+            return Ok(());
+        }
+        // The first range to seed in each shard, from the pending Historic ranges' starts.
+        let seeders = if self.graft_resumes {
+            let mut historic_starts = vec![];
+            for range in self.pending {
+                if range.priority() == ScanPriority::Historic {
+                    historic_starts.push(range_start_position(db, pool, range)?);
+                }
+            }
+            crate::graft::first_seeders(historic_starts)
+        } else {
+            BTreeMap::new()
+        };
+
+        // Positions decide which runs are stranded; a restart's resumable rows are never
+        // built. Every buffered shard is decoded all the same: no seed can resume rows that
+        // will not decode, so even the run a seeder would continue is stranded there. Such a
+        // shard is swept by its positions alone ([`Self::undecodable_shard`]).
+        let mut stranded = vec![];
+        for &shard in shards {
+            let positions = match crate::graft::buffered_positions(self.conn, pool, shard) {
+                Ok(positions) => positions,
+                Err(e) => {
+                    warn_shard_left(pool, shard, &e);
+                    continue;
+                }
+            };
+            match crate::graft::load_shard::<H>(self.conn, pool, shard) {
+                Ok(rows) => {
+                    let runs =
+                        crate::graft::stranded_runs(&positions, seeders.get(&shard).copied());
+                    if !runs.is_empty() {
+                        stranded.push((shard, runs, rows));
+                    }
+                }
+                Err(e) if crate::graft::will_not_decode(&e) => {
+                    self.undecodable_shard(db, pool, shard, &positions, &e, done)
+                }
+                // An SQLite error (a busy database past the timeout, an I/O error) says
+                // nothing about the rows: they stay as they are, for the next sweep.
+                Err(e) => warn_shard_left(pool, shard, &e),
+            }
+        }
+        if stranded.is_empty() {
+            return Ok(());
+        }
+
+        let mut tree = PoolTree::<H, DEPTH, SHARD_HEIGHT>::seed(db, self.anchor_retention)?;
+        for (shard, runs, rows) in stranded {
+            // The root the wallet stores for the shard: what checks a run completing it.
+            let stored_root = match PoolTree::<H, DEPTH, SHARD_HEIGHT>::stored_root(db, shard) {
+                Ok(root) => root,
+                Err(e) => {
+                    warn_shard_left(pool, shard, &e);
+                    continue;
+                }
+            };
+            for run in runs {
+                let from = rows.partition_point(|row| row.0 < *run.start());
+                let to = rows.partition_point(|row| row.0 <= *run.end());
+                let swept = self.run(
+                    db,
+                    &mut tree,
+                    pool,
+                    shard,
+                    &run,
+                    rows[from..to].to_vec(),
+                    stored_root.clone(),
+                    done,
+                );
+                if let Err(e) = swept {
+                    tracing::warn!(
+                        ?pool,
+                        shard,
+                        first = *run.start(),
+                        last = *run.end(),
+                        %e,
+                        "graft sweep: could not build or rescan a stranded run; its rows stay buffered"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build one stranded run of `shard` when data the wallet already holds checks where it
+    /// ends ([`crate::graft::end_check`]), and otherwise, or when the tree refuses it, delete
+    /// it after queueing a rescan of the scanned blocks holding it. `rows` must be the run's
+    /// own, one per position ([`crate::graft::rows_cover_run`]); any other read of them is
+    /// treated as unchecked, since a build lays rows out from the first row's position.
+    /// `tree` is the pool's tree as the wallet holds it, and stays so: a refused build, or
+    /// one whose transaction fails, is undone in memory as well. An error leaves the run's
+    /// rows buffered.
+    #[allow(clippy::too_many_arguments)]
+    fn run<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+        &self,
+        db: &mut Db,
+        tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
+        pool: ShieldedPool,
+        shard: u64,
+        run: &RangeInclusive<u64>,
+        rows: Vec<crate::graft_accumulator::AccRow<H>>,
+        stored_root: Option<H>,
+        done: &mut GraftSweep,
+    ) -> Result<(), SqliteClientError>
+    where
+        H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+        ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>: SweptTree<Node = H>,
+    {
+        let span = *run.start()..*run.end() + 1;
+        let covered = crate::graft::rows_cover_run(&rows, run);
+        if !covered {
+            tracing::warn!(
+                ?pool,
+                shard,
+                first = *run.start(),
+                last = *run.end(),
+                rows = rows.len(),
+                "graft sweep: the rows read for a stranded run are not one per position; rescanning its blocks instead"
+            );
+        }
+        let last_leaf_matches = tree
+            .store()
+            .get_shard(Address::from_parts(tree.store().shard_level, shard))
+            .map_err(|e| SqliteClientError::CorruptedData(format!("shard {shard}: {e}")))?
+            .as_ref()
+            .and_then(|t| t.value_at_position(Position::from(*run.end())))
+            .zip(rows.last())
+            .is_some_and(|((leaf, _), (_, row, _))| leaf == row);
+        let check = covered
+            .then(|| crate::graft::end_check(run, last_leaf_matches, stored_root))
+            .flatten();
+        if let Some(check) = check {
+            let built_rows = rows.len() as u64;
+            let before = tree.store().snapshot();
+            let (chain_tip, anchor_retention) = (self.chain_tip, self.anchor_retention);
+            let insert =
+                || insert_checked(tree, pool, shard, rows, check, chain_tip, anchor_retention);
+            // The build's rayon work (`build_subtrees`) runs on the persist lane's pool, as
+            // every tree build in `sparse_put_blocks` does, rather than on the global pool
+            // behind any trial decryption a stopped pass left queued there.
+            let inserted = match persist_pool() {
+                Some(workers) => workers.install(insert),
+                None => insert(),
+            };
+            match inserted {
+                Ok(()) => {
+                    let flushed =
+                        db.transactionally::<_, _, SqliteClientError>(|wdb| tree.flush(wdb));
+                    if let Err(e) = flushed {
+                        *tree.store_mut() = before;
+                        return Err(e);
+                    }
+                    crate::graft::delete_rows_in(self.conn, pool, shard, span)?;
+                    done.built_rows += built_rows;
+                    return Ok(());
+                }
+                Err(e) => {
+                    *tree.store_mut() = before;
+                    tracing::warn!(
+                        ?pool,
+                        shard,
+                        first = *run.start(),
+                        last = *run.end(),
+                        %e,
+                        "graft sweep: the tree refused a stranded run; rescanning its blocks instead"
+                    );
+                }
+            }
+        }
+        if self.queue_rescans(db, pool, run, done)? {
+            crate::graft::delete_rows_in(self.conn, pool, shard, span)?;
+            done.discarded_rows += *run.end() - *run.start() + 1;
+        } else {
+            tracing::warn!(
+                ?pool,
+                shard,
+                first = *run.start(),
+                last = *run.end(),
+                "graft sweep: the wallet's block metadata does not place a stranded run; left buffered"
+            );
+        }
+        Ok(())
+    }
+
+    /// Queue a rescan of the scanned blocks holding `run`'s positions ([`rescans_for`]) and
+    /// record it in `done`. Returns false, queueing nothing, when the wallet's block
+    /// metadata cannot place the run.
+    fn queue_rescans(
+        &self,
+        db: &mut Db,
+        pool: ShieldedPool,
+        run: &RangeInclusive<u64>,
+        done: &mut GraftSweep,
+    ) -> Result<bool, SqliteClientError> {
+        let Some(rescans) = rescans_for(db, pool, run, self.stretches)? else {
+            return Ok(false);
+        };
+        for rescan in &rescans {
+            db.queue_rescan(rescan.clone())?;
+        }
+        done.rescans.extend(rescans);
+        Ok(true)
+    }
+
+    /// Sweep a shard whose buffered rows will not all decode, by their positions alone. No
+    /// range can resume or build such rows (a seed in the shard cannot read them, and seeds
+    /// without a resume), so each run is handled as a run nothing checks: the scanned blocks
+    /// holding it are queued for a rescan ([`rescans_for`]), then its rows are deleted, in
+    /// that order, so a crash in between leaves them for the next sweep. A run the wallet's
+    /// block metadata cannot place, or whose rescan cannot be queued, gets a warning and
+    /// keeps its rows, as on the decodable path: deleting it would leave scanned blocks
+    /// whose commitments are in neither the tree nor the buffer, with no rescan to bring
+    /// them back. A later sweep handles it as any other run once the rows that will not
+    /// decode are gone, or places it once the metadata does (as the pending ranges around
+    /// it are scanned and the stretches merge).
+    fn undecodable_shard(
+        &self,
+        db: &mut Db,
+        pool: ShieldedPool,
+        shard: u64,
+        positions: &[u64],
+        e: &SqliteClientError,
+        done: &mut GraftSweep,
+    ) {
+        tracing::warn!(
+            ?pool,
+            shard,
+            %e,
+            "graft sweep: a shard's buffered rows will not decode; rescanning their blocks instead"
+        );
+        for run in crate::graft::contiguous_runs(positions) {
+            match self.queue_rescans(db, pool, &run, done) {
+                Ok(true) => {
+                    let span = *run.start()..*run.end() + 1;
+                    match crate::graft::delete_rows_in(self.conn, pool, shard, span) {
+                        Ok(()) => done.discarded_rows += *run.end() - *run.start() + 1,
+                        Err(e) => tracing::warn!(
+                            ?pool,
+                            shard,
+                            first = *run.start(),
+                            last = *run.end(),
+                            %e,
+                            "graft sweep: could not delete a run of rows that will not decode once its rescan was queued; it stays buffered"
+                        ),
+                    }
+                }
+                Ok(false) => tracing::warn!(
+                    ?pool,
+                    shard,
+                    first = *run.start(),
+                    last = *run.end(),
+                    "graft sweep: the wallet's block metadata does not place a run of rows that will not decode; left buffered"
+                ),
+                Err(e) => tracing::warn!(
+                    ?pool,
+                    shard,
+                    first = *run.start(),
+                    last = *run.end(),
+                    %e,
+                    "graft sweep: could not queue the rescan of a run of rows that will not decode; left buffered"
+                ),
+            }
+        }
+    }
+}
+
+/// The in-memory half of a stranded run's build ([`SweepInputs::run`]): the deep-history
+/// doom by each row's own block below `chain_tip` ([`doom_deep_rows`]), the range-end
+/// finish's insert ([`insert_deferred_rows`]), then the root check `check` asks for. An
+/// error is the tree refusing the run.
+#[allow(clippy::too_many_arguments)]
+fn insert_checked<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
+    pool: ShieldedPool,
+    shard: u64,
+    mut rows: Vec<crate::graft_accumulator::AccRow<H>>,
+    check: crate::graft::EndCheck<H>,
+    chain_tip: BlockHeight,
+    anchor_retention: Option<&AnchorRetention>,
+) -> Result<(), SqliteClientError>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq + Send + Sync,
+{
+    let label = format!("graft sweep {pool:?}");
+    doom_deep_rows(&mut rows, chain_tip, anchor_retention);
+    insert_deferred_rows(tree, rows, anchor_retention, &label)?;
+    if let crate::graft::EndCheck::ShardRoot(stored) = check {
+        match shard_content_root(tree.store(), shard) {
+            Some(root) if root == stored => {}
+            Some(_) => {
+                return Err(SqliteClientError::CorruptedData(format!(
+                    "{label}: shard {shard}'s root is not the root the wallet stores"
+                )));
+            }
+            None => {
+                return Err(SqliteClientError::CorruptedData(format!(
+                    "{label}: shard {shard}'s root cannot be computed from the tree"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One pool's commitment-tree size at the end of block `height`, when the wallet holds
+/// that block's metadata.
+fn tree_size_at(
+    db: &Db,
+    pool: ShieldedPool,
+    height: BlockHeight,
+) -> Result<Option<u64>, SqliteClientError> {
+    Ok(db
+        .block_metadata(height)?
+        .and_then(|block| match pool {
+            ShieldedPool::Sapling => block.sapling_tree_size(),
+            ShieldedPool::Orchard => block.orchard_tree_size(),
+            ShieldedPool::Ironwood => block.ironwood_tree_size(),
+        })
+        .map(u64::from))
+}
+
+/// The position `range` starts at in `pool`: the tree size at the end of the block below
+/// it, when the wallet holds that block's metadata.
+fn range_start_position(
+    db: &Db,
+    pool: ShieldedPool,
+    range: &ScanRange,
+) -> Result<Option<u64>, SqliteClientError> {
+    match u32::from(range.block_range().start).checked_sub(1) {
+        Some(below) => tree_size_at(db, pool, BlockHeight::from(below)),
+        None => Ok(None),
+    }
+}
+
+/// The ranges to rescan so that every scanned block holding a position of `run` is
+/// scanned again ([`crate::graft::rescans_for`], over this pool's block metadata).
+/// `None` when the wallet's block metadata cannot place the run.
+fn rescans_for(
+    db: &Db,
+    pool: ShieldedPool,
+    run: &RangeInclusive<u64>,
+    stretches: &[Range<BlockHeight>],
+) -> Result<Option<Vec<Range<BlockHeight>>>, SqliteClientError> {
+    crate::graft::rescans_for(|height| tree_size_at(db, pool, height), run, stretches)
 }
 
 // ── WalletWrite facade ─────────────────────────────────────────────────────────
@@ -3428,9 +4423,12 @@ impl PersistLane {
 
     /// v0.4 Plan A (Task 7b rev 2): build whatever the graft accumulators still
     /// hold — the range-end / tip shard, which NEVER grafts (accumulator rule 1)
-    /// — inside one small transaction, then drop its buffer rows. Call after
+    /// — inside one small transaction, then drop the buffer rows of the positions
+    /// it built (other rows of that shard stay for the next pass's sweep). Call after
     /// `drain()` on the success path only (on error exits the buffered rows stay
-    /// for the restart-resume path). Blocking — wrap in `block_in_place`.
+    /// for the restart-resume path; an abort that skips this call leaves them to
+    /// the next pass's `sweep_stranded_graft_rows`). Blocking — wrap in
+    /// `block_in_place`.
     pub fn finish_graft_blocking(&mut self) -> Result<(), crate::error::SlipstreamError> {
         use crate::graft_accumulator::FeedAction;
         let werr = |c: &str, e: String| {
@@ -3461,13 +4459,9 @@ impl PersistLane {
         if sap_rows.is_empty() && orch_rows.is_empty() {
             return Ok(());
         }
-        fn shard_ids<H>(rows: &[crate::graft_accumulator::AccRow<H>]) -> Vec<u64> {
-            let mut v: Vec<u64> = rows.iter().map(|r| r.0 >> 16).collect();
-            v.dedup();
-            v
-        }
-        let sap_shards = shard_ids(&sap_rows);
-        let orch_shards = shard_ids(&orch_rows);
+        // The positions the finish builds: only their buffer rows die with it.
+        let sap_span = fed_span(&sap_rows);
+        let orch_span = fed_span(&orch_rows);
 
         let (Some(sap_tree), Some(orch_tree)) = (sapling.as_mut(), orchard.as_mut()) else {
             // Rows only exist if put_blocks ran, which seeds the trees first.
@@ -3478,55 +4472,12 @@ impl PersistLane {
             .as_mut()
             .ok_or_else(|| werr("db", "lane connection lost (prior commit panic)".into()))?;
 
-        // Same doomed-checkpoint policy as every build (fixture-proven, rev 2.1):
-        // retentions travel verbatim; the cutoff — computed from existing ids ∪
-        // this build's own checkpoint ids (no NEW frontier at finish) — downgrades
-        // exactly what upstream's per-chunk pruning would have.
-        fn finish_cutoff<H>(
-            existing: impl Iterator<Item = BlockHeight>,
-            rows: &[Option<(H, Retention<BlockHeight>)>],
-        ) -> Option<BlockHeight> {
-            let existing: Vec<BlockHeight> = existing.collect();
-            let frontier_id = existing.iter().max().copied()?;
-            let new_ids = rows.iter().flatten().filter_map(|(_, r)| match r {
-                Retention::Checkpoint { id, .. } => Some(*id),
-                _ => None,
-            });
-            doomed_checkpoint_cutoff(existing.iter().copied(), frontier_id, new_ids)
-        }
+        let anchor_floor = anchor_floor.as_ref();
         db.transactionally::<_, _, SqliteClientError>(|wdb| {
-            if let Some((seg_start, mut rows)) = rows_to_segment(sap_rows) {
-                if let Some(cutoff) =
-                    finish_cutoff(sap_tree.store().checkpoints.keys().copied(), &rows)
-                {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
-                }
-                for (subtree, checkpoints) in build_subtrees::<_, SAPLING_SHARD_HEIGHT>(
-                    seg_start,
-                    &mut rows,
-                    BUILD_CHUNK_SIZE,
-                ) {
-                    sap_tree.insert_tree(subtree, checkpoints).map_err(|e| {
-                        SqliteClientError::CorruptedData(format!("finish sapling insert: {e:?}"))
-                    })?;
-                }
+            if insert_deferred_rows(sap_tree, sap_rows, anchor_floor, "finish sapling")? {
                 flush_sapling(wdb, sap_tree)?;
             }
-            if let Some((seg_start, mut rows)) = rows_to_segment(orch_rows) {
-                if let Some(cutoff) =
-                    finish_cutoff(orch_tree.store().checkpoints.keys().copied(), &rows)
-                {
-                    downgrade_doomed_checkpoints(&mut rows, cutoff, anchor_floor.as_ref());
-                }
-                for (subtree, checkpoints) in build_subtrees::<_, ORCHARD_SHARD_HEIGHT>(
-                    seg_start,
-                    &mut rows,
-                    BUILD_CHUNK_SIZE,
-                ) {
-                    orch_tree.insert_tree(subtree, checkpoints).map_err(|e| {
-                        SqliteClientError::CorruptedData(format!("finish orchard insert: {e:?}"))
-                    })?;
-                }
+            if insert_deferred_rows(orch_tree, orch_rows, anchor_floor, "finish orchard")? {
                 flush_orchard(wdb, orch_tree)?;
             }
             Ok(())
@@ -3534,12 +4485,12 @@ impl PersistLane {
         .map_err(|e: SqliteClientError| werr("txn", e.to_string()))?;
 
         // Post-commit cleanup (ordering contract — crash before this self-heals).
-        for shard in sap_shards {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Sapling, shard)
+        if let Some((shard, span)) = sap_span {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Sapling, shard, span)
                 .map_err(|e| werr("cleanup sapling", e.to_string()))?;
         }
-        for shard in orch_shards {
-            crate::graft::delete_shard(&ctx.conn, ShieldedPool::Orchard, shard)
+        if let Some((shard, span)) = orch_span {
+            crate::graft::delete_rows_in(&ctx.conn, ShieldedPool::Orchard, shard, span)
                 .map_err(|e| werr("cleanup orchard", e.to_string()))?;
         }
         info!("graft finish: range-end shards built + buffer cleaned");
@@ -4611,6 +5562,674 @@ mod flush_retained_tests {
         assert_eq!(
             ranges[0].priority(),
             zcash_client_backend::data_api::scanning::ScanPriority::Historic
+        );
+    }
+}
+
+/// A range's graft seed continues only the buffered run that ends right before its start
+/// position, on its own frontier's leaf. Here an interrupted Historic range left shard 1's
+/// rows [k_start, k_start + 20) buffered, and the forced rescan after an account import
+/// starts inside that span, at k_start + 10: the seed resumes [k_start, k_start + 10) and
+/// leaves the rest to the rescan, so every built row sits at its own position (the leaf for
+/// position `p` is `node(p)`).
+#[cfg(test)]
+mod graft_resume_seed_tests {
+    use super::*;
+    use zcash_primitives::merkle_tree::HashSer as _;
+
+    fn node(n: u64) -> sapling::Node {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        sapling::Node::read(&b[..]).expect("small LE ints are canonical nodes")
+    }
+
+    /// (built at, belongs at) for each built row that is not at its own position; where the
+    /// first few belong is searched in `candidates`.
+    fn misplaced(
+        plan: &PoolPlan<sapling::Node>,
+        candidates: std::ops::Range<u64>,
+    ) -> Vec<(u64, u64)> {
+        let mut out = vec![];
+        for (seg_start, rows) in &plan.segments {
+            for (i, row) in rows.iter().enumerate() {
+                let at = u64::from(*seg_start) + i as u64;
+                if let Some((h, _)) = row
+                    && *h != node(at)
+                {
+                    let belongs = if out.len() < 5 {
+                        candidates
+                            .clone()
+                            .find(|p| node(*p) == *h)
+                            .unwrap_or(u64::MAX)
+                    } else {
+                        u64::MAX
+                    };
+                    out.push((at, belongs));
+                }
+            }
+        }
+        out
+    }
+
+    /// (start, row count) of every segment the plan builds.
+    fn segments(plan: &PoolPlan<sapling::Node>) -> Vec<(u64, usize)> {
+        plan.segments
+            .iter()
+            .map(|(start, rows)| (u64::from(*start), rows.len()))
+            .collect()
+    }
+
+    fn stale_rows(k_start: u64) -> Vec<crate::graft::BufferRow<sapling::Node>> {
+        (0..20)
+            .map(|i| (k_start + i, node(k_start + i), Retention::Ephemeral))
+            .collect()
+    }
+
+    fn buffer_with(
+        shard: u64,
+        rows: &[crate::graft::BufferRow<sapling::Node>],
+    ) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().expect("in-memory conn");
+        conn.execute_batch(crate::graft::GRAFT_BUFFER_DDL)
+            .expect("buffer table");
+        crate::graft::append_rows(&conn, ShieldedPool::Sapling, shard, rows).expect("append");
+        conn
+    }
+
+    /// The eager flush (a note of the freshly imported account in that shard) builds the
+    /// resumed run and the new span as one segment from the shard's first position, whether
+    /// or not the store already holds content for the shard (absent, or the root-only leaf
+    /// the pass-start subtree-root ingest installs for every completed shard).
+    #[test]
+    fn seed_resumes_only_the_run_that_ends_at_the_start_position() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 10;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let note = start + 5;
+        let frontier_leaf = node(start - 1);
+        for store_has_content in [true, false] {
+            let conn = buffer_with(shard, &stale_rows(k_start));
+            let mut acc = None;
+            let plan = plan_pool(
+                &conn,
+                0,
+                &mut acc,
+                ShieldedPool::Sapling,
+                start,
+                Some((start - 1, &frontier_leaf)),
+                stream.clone(),
+                &[note],
+                |_| store_has_content,
+                |_| None,
+                |_| Ok(None),
+                None,
+            )
+            .expect("plan");
+            let wrong = misplaced(&plan, k_start..k_start + 100);
+            assert!(
+                wrong.is_empty(),
+                "every built row sits at its own position (store content: {store_has_content}); \
+                 {} do not, e.g. (built at, belongs at): {:?}",
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+            assert_eq!(
+                segments(&plan),
+                vec![(k_start, 40)],
+                "the resumed run and the new span build as one segment (store content: \
+                 {store_has_content})"
+            );
+            let buffered: Vec<u64> =
+                crate::graft::load_shard::<sapling::Node>(&conn, ShieldedPool::Sapling, shard)
+                    .expect("load")
+                    .iter()
+                    .map(|r| r.0)
+                    .collect();
+            assert_eq!(
+                buffered,
+                (k_start..start).collect::<Vec<_>>(),
+                "the seed deletes the buffered rows the rescan covers again"
+            );
+        }
+    }
+
+    /// The same resume when the rescan runs through the shard's close. A graft installs the
+    /// server root and builds nothing; the 1-in-N audit and the fallback (no server root)
+    /// build exactly shard 1, from its first position, every row at its own position.
+    #[test]
+    fn close_verdicts_build_resumed_rows_at_their_own_positions() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let k_end = k_start + (1 << 16) - 1;
+        let start = k_start + 10;
+        // Through the end of shard 1 and 5 rows into shard 2.
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (start..=k_end + 5)
+            .map(|p| (node(p), Retention::Ephemeral))
+            .collect();
+        let frontier_leaf = node(start - 1);
+        for (verdict, verify_sample, root, built, grafts) in [
+            ("graft", 0u32, Some(node(7)), vec![], 1),
+            ("audit", 1u32, Some(node(7)), vec![(k_start, 1 << 16)], 0),
+            ("fallback", 0u32, None, vec![(k_start, 1 << 16)], 0),
+        ] {
+            let conn = buffer_with(shard, &stale_rows(k_start));
+            let mut acc = None;
+            let plan = plan_pool(
+                &conn,
+                verify_sample,
+                &mut acc,
+                ShieldedPool::Sapling,
+                start,
+                Some((start - 1, &frontier_leaf)),
+                stream.clone(),
+                &[],
+                |_| false,
+                |_| None,
+                |s| Ok(if s == shard { root } else { None }),
+                None,
+            )
+            .expect("plan");
+            let wrong = misplaced(&plan, k_start..k_start + 100);
+            assert!(
+                wrong.is_empty(),
+                "the {verdict} verdict builds every row at its own position; {} do not, e.g. \
+                 (built at, belongs at): {:?}",
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+            assert_eq!(
+                segments(&plan),
+                built,
+                "the {verdict} verdict builds exactly shard 1"
+            );
+            assert_eq!(
+                plan.grafts.len(),
+                grafts,
+                "only the graft verdict installs a root"
+            );
+        }
+    }
+
+    /// A buffered row that will not decode never fails a range's seed. The pass-start sweep
+    /// rescans such a shard by position; for one it did not reach, the seed warns and seeds
+    /// without a resume, so the range builds what it scans from its own start, and the
+    /// shard's rows stay for the next pass's sweep. Here the run [k_start, k_start + 20)
+    /// would have been resumed.
+    #[test]
+    fn seed_survives_a_buffered_row_that_will_not_decode() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let garbled = conn
+            .execute(
+                "UPDATE ext_slipstream_graft_buffer SET commitment = x'C7C7C7' WHERE position = ?1",
+                [i64::try_from(k_start + 3).expect("fits")],
+            )
+            .expect("garble a buffered row");
+        assert_eq!(garbled, 1, "the row is buffered");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[start + 5],
+            |_| false,
+            |_| None,
+            |_| Ok(None),
+            None,
+        )
+        .expect("a row that will not decode does not fail the seed");
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the shard's rows stay for the next pass's sweep"
+        );
+    }
+
+    /// A seed deletes only the rows at the positions its own call feeds, which the range
+    /// scans again. Rows below its start that it does not continue, and rows past what its
+    /// call feeds (later blocks, which may lie past the range's end, as another range's
+    /// rows do), stay buffered: a later range continues them, or the next pass's sweep
+    /// verifies or rescans them. Here the buffer holds [k_start, k_start + 20) and a range
+    /// starting at k_start + 8 feeds 4 rows in its first call: the run below it ends right
+    /// before its start and is resumed, its 4 positions are fed again, and the 8 rows past
+    /// them stay.
+    #[test]
+    fn seed_deletes_only_the_rows_its_own_call_feeds_again() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 8;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..4)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        // The fed positions' rows differ from what this call feeds there, so a stale row
+        // left in place would show.
+        let restamped = conn
+            .execute(
+                "UPDATE ext_slipstream_graft_buffer SET retention_kind = 1
+                 WHERE position >= ?1 AND position < ?2",
+                [
+                    i64::try_from(start).expect("fits"),
+                    i64::try_from(start + 4).expect("fits"),
+                ],
+            )
+            .expect("mark the stale rows");
+        assert_eq!(restamped, 4, "the four fed positions are buffered");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |_| None,
+            |_| Ok(None),
+            None,
+        )
+        .expect("plan");
+        assert!(
+            segments(&plan).is_empty(),
+            "nothing builds: the shard buffers"
+        );
+        let rows = crate::graft::load_shard::<sapling::Node>(&conn, ShieldedPool::Sapling, shard)
+            .expect("load");
+        assert_eq!(
+            rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the rows below the start and past the call stay, and the fed ones are buffered again"
+        );
+        assert!(
+            rows.iter()
+                .all(|(p, h, r)| *h == node(*p) && *r == Retention::Ephemeral),
+            "every fed position holds what this call fed, not the stale row"
+        );
+    }
+
+    /// A seed in a shard whose rows will not decode builds what its range scans there
+    /// instead of buffering it: no seed in the shard can read its rows, so rows buffered
+    /// next to them could never be resumed. Here no note flushes the shard and the store
+    /// holds no content for it, so a seed that buffered would build nothing.
+    #[test]
+    fn seed_builds_what_it_scans_in_a_shard_that_will_not_decode() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let garbled = conn
+            .execute(
+                "UPDATE ext_slipstream_graft_buffer SET commitment = x'C7C7C7' WHERE position = ?1",
+                [i64::try_from(k_start + 3).expect("fits")],
+            )
+            .expect("garble a buffered row");
+        assert_eq!(garbled, 1, "the row is buffered");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |_| None,
+            |_| Ok(None),
+            None,
+        )
+        .expect("a row that will not decode does not fail the seed");
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans in the shard, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "nothing is buffered next to the shard's rows, which stay for the next pass's sweep"
+        );
+    }
+
+    /// Only a row that will not decode makes a seed go on without a resume. Any other error
+    /// reading the shard's rows says nothing about them (a busy database past the timeout,
+    /// an I/O error; here a renamed column, which fails the read of the rows but not the
+    /// writes the seed makes), so the call fails, as it did before rows that will not decode
+    /// had a backstop: the range fails this pass and is retried, the rows untouched. The
+    /// store holds content for the shard, so a seed that went on would build, not buffer.
+    #[test]
+    fn seed_fails_on_an_sqlite_error_reading_its_shard() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        conn.execute_batch(
+            "ALTER TABLE ext_slipstream_graft_buffer RENAME COLUMN marking TO marking_renamed",
+        )
+        .expect("rename a column the read selects");
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let planned = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| true,
+            |_| None,
+            |_| Ok(None),
+            None,
+        );
+        assert!(
+            matches!(&planned, Err(SqliteClientError::DbError(_))),
+            "an SQLite error reading the shard's rows fails the seed, as that error"
+        );
+        assert!(acc.is_none(), "the range is not seeded");
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the shard's rows stay as they are"
+        );
+    }
+
+    /// A run that ends right before the start on another leaf than the range's frontier
+    /// (another chain's rows, as a reorg's truncation can leave them) is never continued,
+    /// and the range builds what it scans in that shard instead of buffering it: rows
+    /// buffered right after the run would join it, and a later seed (which takes every row
+    /// contiguous below its start) or the sweep's last-leaf check would take both as one.
+    /// Here the buffer holds [k_start, k_start + 20) and the range starting at
+    /// k_start + 20 holds another leaf at k_start + 19; no note flushes the shard and the
+    /// store holds no content for it, so a seed that buffered would build nothing.
+    #[test]
+    fn seed_builds_instead_of_buffering_next_to_a_run_its_frontier_rejects() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let frontier_leaf = node(7_000_000);
+        let mut acc = None;
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |_| None,
+            |_| Ok(None),
+            None,
+        )
+        .expect("plan");
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans in the shard, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..k_start + 20).collect::<Vec<_>>(),
+            "the rejected run stays for the next pass's sweep, with nothing buffered next to it"
+        );
+    }
+
+    /// A run that ends right before the start on the range's frontier leaf, but that the
+    /// commitment tree refuses (a row below its last is not the chain's), is not continued
+    /// either: the range builds what it scans in that shard instead of buffering it next to
+    /// the run, and the run stays buffered for the next pass's sweep.
+    #[test]
+    fn seed_builds_instead_of_resuming_a_run_the_tree_refuses() {
+        let shard = 1u64;
+        let k_start = shard << 16;
+        let start = k_start + 20;
+        let stream: Vec<(sapling::Node, Retention<BlockHeight>)> = (0..30)
+            .map(|i| (node(start + i), Retention::Ephemeral))
+            .collect();
+        let conn = buffer_with(shard, &stale_rows(k_start));
+        let frontier_leaf = node(start - 1);
+        let mut acc = None;
+        let mut asked = vec![];
+        let plan = plan_pool(
+            &conn,
+            0,
+            &mut acc,
+            ShieldedPool::Sapling,
+            start,
+            Some((start - 1, &frontier_leaf)),
+            stream,
+            &[],
+            |_| false,
+            |run| {
+                asked.extend(run.iter().map(|row| row.0));
+                Some("a conflict".into())
+            },
+            |_| Ok(None),
+            None,
+        )
+        .expect("plan");
+        assert_eq!(
+            asked,
+            (k_start..start).collect::<Vec<_>>(),
+            "the tree is asked about the run that ends on the frontier's leaf"
+        );
+        assert_eq!(
+            segments(&plan),
+            vec![(start, 30)],
+            "the range builds what it scans in the shard, from its own start"
+        );
+        assert!(
+            misplaced(&plan, k_start..k_start + 100).is_empty(),
+            "every built row sits at its own position"
+        );
+        assert_eq!(
+            crate::graft::buffered_positions(&conn, ShieldedPool::Sapling, shard)
+                .expect("positions"),
+            (k_start..start).collect::<Vec<_>>(),
+            "the refused run stays for the next pass's sweep, with nothing buffered next to it"
+        );
+    }
+
+    /// What `resume_refusal` checks a run against. The chain's leaf at position p is
+    /// node(p). The run is positions 20 to 59, right before a range that starts at 60, whose
+    /// frontier ends at 59: the roots of [0, 32), [32, 48), [48, 56) and [56, 58), and leaf 58.
+    /// The store holds nothing for the shard, or what the run's own range inserted when it
+    /// started at 20: its frontier at 19, the roots of [0, 16) and [16, 18), and leaves 18
+    /// and 19.
+    ///
+    /// A subtree the run covers whole must have the frontier's root there. The run covers
+    /// [0, 32) only from 20, so its rows there are checked against the frontier's root once
+    /// the store's content below the run completes that subtree with them; with nothing
+    /// stored below the run, nothing checks them, and no build of the run meets a conflict
+    /// there either.
+    #[test]
+    fn resume_refusal_checks_a_run_against_the_frontier_and_the_store() {
+        use incrementalmerkletree::frontier::NonEmptyFrontier;
+
+        let frontier_at = |last: u64| {
+            let mut frontier = NonEmptyFrontier::new(node(0));
+            for p in 1..=last {
+                frontier.append(node(p));
+            }
+            frontier
+        };
+        let empty = SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT);
+        let mut below_the_run: SaplingSparseTree = ShardTree::new(
+            SparseShardStore::<sapling::Node>::new(SAPLING_SHARD_HEIGHT),
+            MAX_CHECKPOINTS,
+        );
+        below_the_run
+            .insert_frontier_nodes(
+                frontier_at(19),
+                Retention::Checkpoint {
+                    id: BlockHeight::from(19),
+                    marking: Marking::Reference,
+                },
+            )
+            .expect("the frontier the run's range inserted");
+        let frontier = frontier_at(59);
+        let refusal = |store: &SparseShardStore<sapling::Node>, replaced: Option<u64>| {
+            let run: Vec<crate::graft_accumulator::AccRow<sapling::Node>> = (20..60)
+                .map(|p| {
+                    let leaf = if replaced == Some(p) {
+                        node(7_000_000)
+                    } else {
+                        node(p)
+                    };
+                    (p, leaf, Retention::Ephemeral)
+                })
+                .collect();
+            resume_refusal::<_, SAPLING_SHARD_HEIGHT>(
+                store,
+                Some(&frontier),
+                BlockHeight::from(59),
+                &run,
+            )
+        };
+
+        assert_eq!(refusal(&empty, None), None, "the chain's run");
+        assert_eq!(
+            refusal(below_the_run.store(), None),
+            None,
+            "the chain's run, above what its range inserted"
+        );
+        for store in [&empty, below_the_run.store()] {
+            assert!(
+                refusal(store, Some(50)).is_some(),
+                "position 50 is under the frontier's root of [48, 56), which the run covers whole"
+            );
+        }
+        assert!(
+            refusal(below_the_run.store(), Some(25)).is_some(),
+            "position 25 is under the frontier's root of [0, 32), which the store's content \
+             below the run completes with it"
+        );
+        assert_eq!(
+            refusal(&empty, Some(25)),
+            None,
+            "with nothing stored below the run, nothing completes [0, 32) to check position 25"
+        );
+    }
+}
+
+/// The pass-start sweep builds a stranded run that completes its shard only when the
+/// shard's root, computed once the run is in the tree, is the root the wallet stores. The
+/// SQLite store puts that stored root on the root of every shard it loads, so the
+/// computation must not read it back: the comparison would then always hold.
+#[cfg(test)]
+mod graft_sweep_root_tests {
+    use std::sync::Arc;
+
+    use incrementalmerkletree::Hashable as _;
+    use orchard::tree::MerkleHashOrchard;
+
+    use super::*;
+
+    fn h(n: u8) -> MerkleHashOrchard {
+        // Distinct valid nodes: hash the empty leaf up n levels.
+        let mut v = MerkleHashOrchard::empty_leaf();
+        for level in 0..n {
+            v = MerkleHashOrchard::combine(Level::from(level), &v, &v);
+        }
+        v
+    }
+
+    #[test]
+    fn shard_content_root_ignores_the_stored_root_on_the_shard() {
+        let addr = Address::from_parts(Level::from(ORCHARD_SHARD_HEIGHT), 3);
+        let leaf = |v| Tree::leaf((v, RetentionFlags::EPHEMERAL));
+        let content =
+            MerkleHashOrchard::combine(Level::from(ORCHARD_SHARD_HEIGHT - 1), &h(1), &h(2));
+        let stored = h(9);
+        assert_ne!(
+            content, stored,
+            "the stored root differs from the content's"
+        );
+        let mut store = SparseShardStore::<MerkleHashOrchard>::new(ORCHARD_SHARD_HEIGHT);
+        store
+            .put_shard(
+                LocatedTree::from_parts(
+                    addr,
+                    Tree::parent(Some(Arc::new(stored)), leaf(h(1)), leaf(h(2))),
+                )
+                .expect("shard 3"),
+            )
+            .expect("put the complete shard");
+        assert_eq!(
+            shard_content_root(&store, 3),
+            Some(content),
+            "the root comes from the shard's content, not from the root stored on it"
+        );
+        store
+            .put_shard(
+                LocatedTree::from_parts(
+                    addr,
+                    Tree::parent(Some(Arc::new(stored)), leaf(h(1)), Tree::empty()),
+                )
+                .expect("shard 3"),
+            )
+            .expect("put the incomplete shard");
+        assert_eq!(
+            shard_content_root(&store, 3),
+            None,
+            "a shard with a missing part has no computed root, whatever root is stored on it"
+        );
+        assert_eq!(
+            shard_content_root(&store, 4),
+            None,
+            "nor has a shard the store does not hold"
         );
     }
 }
