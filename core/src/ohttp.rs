@@ -908,6 +908,28 @@ fn check_response_body(len: usize, max: Option<usize>) -> Result<(), RoundTripEr
     }
 }
 
+/// The opened answer as the [`BhttpResponse`] a round trip returns (header fields as bytes), once
+/// its body is checked against `max_response_bytes`, the ceiling the caller set.
+fn bhttp_response_within(
+    response: zodl_ohttp_client::Response,
+    max_response_bytes: Option<usize>,
+) -> Result<BhttpResponse, RoundTripError> {
+    check_response_body(response.body.len(), max_response_bytes)?;
+
+    // Convert Response to BhttpResponse (headers as bytes)
+    Ok(BhttpResponse {
+        status: response.status,
+        informational: Vec::new(),
+        headers: response
+            .headers
+            .into_iter()
+            .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
+            .collect(),
+        body: response.body,
+        trailers: Vec::new(),
+    })
+}
+
 /// The relay POST loop for chunked OHTTP. Returns the decoder and the relay's answer (buffered
 /// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
 /// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
@@ -1714,20 +1736,7 @@ impl OhttpClient {
         // Collect events into a Response and convert to BhttpResponse
         let response = zodl_ohttp_client::collect_response(events)
             .map_err(|e| RoundTripError::Decode(e.to_string()))?;
-        check_response_body(response.body.len(), max_response_bytes)?;
-
-        // Convert Response to BhttpResponse (headers as bytes)
-        Ok(BhttpResponse {
-            status: response.status,
-            informational: Vec::new(),
-            headers: response
-                .headers
-                .into_iter()
-                .map(|(k, v)| (k.into_bytes(), v.into_bytes()))
-                .collect(),
-            body: response.body,
-            trailers: Vec::new(),
-        })
+        bhttp_response_within(response, max_response_bytes)
     }
 
     /// [`Self::round_trip_stream_once`] with the same single retry as [`Self::round_trip`] when
@@ -2011,7 +2020,7 @@ fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
 /// with automatic key rotation retry on gateway 400/422.
 ///
 /// # Response size cap
-/// A sealed response larger than the gateway's own 256 MiB cap (plus 64 KiB of framing) is
+/// A sealed response larger than the gateway's own 256 MiB cap (plus 1 MiB of framing) is
 /// rejected while it is being read, before it is buffered or decrypted.
 ///
 /// # Caching
@@ -2069,9 +2078,11 @@ impl std::error::Error for HttpRoundTripError {}
 
 /// Like [`http_round_trip`], but with a ceiling on the answer and a hook for the send.
 ///
-/// The answer is read only up to `max_response_bytes` (see the argument below): a service that
-/// answers with more fails early as [`HttpRoundTripError::ResponseTooLarge`], not after the
-/// answer has been buffered and opened.
+/// The answer is read only up to `max_response_bytes` plus room for its sealed framing (see the
+/// argument below). A service that answers with much more fails as
+/// [`HttpRoundTripError::ResponseTooLarge`] while the answer is being read, before it is
+/// buffered in full or opened. One only a little past the ceiling, within that room, is read and
+/// opened first, and then refused by the exact check on its body: the same error.
 ///
 /// `on_dispatch` is called right before the sealed request is written to the relay connection:
 /// after the key config fetch, the encapsulation, the relay-pause check and the connection setup.
@@ -3761,22 +3772,84 @@ mod tests {
         assert_eq!(n.get(), 1);
     }
 
-    /// A client of the `SLIPSTREAM_HTTP` profile for a relay on loopback port `port`. It holds a
-    /// key that is good for another hour, so a round trip goes straight to the relay post.
-    async fn client_with_a_key_for_a_relay_on(port: u16) -> OhttpClient {
+    /// Gives `client` a key that is good for another hour, so that a round trip goes straight to
+    /// the relay post.
+    async fn cache_a_key(client: &OhttpClient) {
+        *client.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: unix_now().expect("time") + 3600,
+        });
+    }
+
+    /// A client of the `SLIPSTREAM_HTTP` profile for the relay at `relay_url`, with a key (see
+    /// [`cache_a_key`]).
+    async fn client_with_a_key(relay_url: &str) -> OhttpClient {
         let client = OhttpClient::new(
             "ohttp-gateway-testnet.example",
-            &format!("https://127.0.0.1:{port}/relay"),
+            relay_url,
             Dialer::Direct,
             None,
             ClientProfile::SLIPSTREAM_HTTP,
         )
         .expect("client");
-        *client.key_config.lock().await = Some(CachedKey {
-            config: test_key(),
-            not_after: unix_now().expect("time") + 3600,
-        });
+        cache_a_key(&client).await;
         client
+    }
+
+    /// [`client_with_a_key`] for a relay on loopback port `port`.
+    async fn client_with_a_key_for_a_relay_on(port: u16) -> OhttpClient {
+        client_with_a_key(&format!("https://127.0.0.1:{port}/relay")).await
+    }
+
+    /// Puts an in-process relay behind the pooled h2 connection of `client` to its relay, where
+    /// `h2_sender` finds it before it dials anything (so no TLS). `handler` is called for each
+    /// request the client sends the relay, and answers it.
+    async fn serve_in_process_relay<H, Fut>(client: &OhttpClient, handler: H)
+    where
+        H: Fn(Request<Incoming>) -> Fut + Send + 'static,
+        Fut: Future<Output = Response<BoxBody<Bytes, Infallible>>> + Send + 'static,
+    {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let relay = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let answer = handler(req);
+            async move { Ok::<_, Infallible>(answer.await) }
+        });
+        tokio::spawn(async move {
+            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(server_io), relay)
+                .await;
+        });
+        let (sender, conn) =
+            http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(client_io))
+                .await
+                .expect("h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+        client.h2_pool.lock().await.insert(
+            format!("{}:{}", client.relay.host, client.relay.port),
+            (sender, std::time::Instant::now()),
+        );
+    }
+
+    /// A relay's answer of `len` bytes of filler under the sealed-response media type, in 8 KiB
+    /// frames and without a content length.
+    fn filler_answer(len: usize) -> Response<BoxBody<Bytes, Infallible>> {
+        let frames: Vec<Result<Frame<Bytes>, Infallible>> = (0..len)
+            .step_by(8 * 1024)
+            .map(|start| {
+                let size = (len - start).min(8 * 1024);
+                Ok(Frame::data(Bytes::from(vec![7u8; size])))
+            })
+            .collect();
+        let mut answer = Response::new(BodyExt::boxed(StreamBody::new(
+            futures_util::stream::iter(frames),
+        )));
+        answer.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(CONTENT_TYPE_CHUNKED_RES),
+        );
+        answer
     }
 
     /// The hook marks a request that may have reached the relay. A relay that cannot be
@@ -3883,35 +3956,18 @@ mod tests {
         let hook_calls = Arc::new(AtomicUsize::new(0));
         // How many times the hook had run when each request reached the relay.
         let seen_by_relay = Arc::new(StdMutex::new(Vec::<usize>::new()));
-
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let relay = {
+        serve_in_process_relay(&client, {
             let hook_calls = Arc::clone(&hook_calls);
             let seen_by_relay = Arc::clone(&seen_by_relay);
-            hyper::service::service_fn(move |_req: Request<Incoming>| {
+            move |_req| {
                 seen_by_relay
                     .lock()
                     .unwrap()
                     .push(hook_calls.load(Ordering::SeqCst));
-                async { Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"x")))) }
-            })
-        };
-        tokio::spawn(async move {
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(server_io), relay)
-                .await;
-        });
-        let (sender, conn) =
-            http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(client_io))
-                .await
-                .expect("h2 handshake");
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        client.h2_pool.lock().await.insert(
-            format!("{}:{}", client.relay.host, client.relay.port),
-            (sender, std::time::Instant::now()),
-        );
+                async { Response::new(Full::new(Bytes::from_static(b"x")).boxed()) }
+            }
+        })
+        .await;
 
         let hook = || {
             hook_calls.fetch_add(1, Ordering::SeqCst);
@@ -4113,59 +4169,19 @@ mod tests {
         assert_eq!(boxed.to_string(), "d");
     }
 
-    /// One `round_trip` of a `SLIPSTREAM_HTTP` client whose relay is in-process behind a pooled h2
-    /// connection (no TLS: `h2_sender` looks in the pool before it dials). The relay answers with
-    /// `answer_len` bytes of filler under the sealed-response media type, in 8 KiB frames and
-    /// without a content length.
+    /// One `round_trip` of a `SLIPSTREAM_HTTP` client with a key, whose relay is in-process (see
+    /// [`serve_in_process_relay`]) and answers with `answer_len` bytes of filler (see
+    /// [`filler_answer`]).
     async fn round_trip_to_a_relay_answering(
         answer_len: usize,
         max_response_bytes: Option<usize>,
     ) -> Result<BhttpResponse, RoundTripError> {
-        let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
-            "https://relay-answer-ceiling-test.invalid/relay",
-            Dialer::Direct,
-            None,
-            ClientProfile::SLIPSTREAM_HTTP,
+        let client = client_with_a_key("https://relay-answer-ceiling-test.invalid/relay").await;
+        serve_in_process_relay(
+            &client,
+            move |_req| async move { filler_answer(answer_len) },
         )
-        .expect("client");
-        *client.key_config.lock().await = Some(CachedKey {
-            config: test_key(),
-            not_after: unix_now().expect("time") + 3600,
-        });
-
-        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-        let relay = hyper::service::service_fn(move |_req: Request<Incoming>| async move {
-            let frames: Vec<Result<Frame<Bytes>, Infallible>> = (0..answer_len)
-                .step_by(8 * 1024)
-                .map(|start| {
-                    let len = (answer_len - start).min(8 * 1024);
-                    Ok(Frame::data(Bytes::from(vec![7u8; len])))
-                })
-                .collect();
-            let mut answer = Response::new(StreamBody::new(futures_util::stream::iter(frames)));
-            answer.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static(CONTENT_TYPE_CHUNKED_RES),
-            );
-            Ok::<_, Infallible>(answer)
-        });
-        tokio::spawn(async move {
-            let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-                .serve_connection(TokioIo::new(server_io), relay)
-                .await;
-        });
-        let (sender, conn) =
-            http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(client_io))
-                .await
-                .expect("h2 handshake");
-        tokio::spawn(async move {
-            let _ = conn.await;
-        });
-        client.h2_pool.lock().await.insert(
-            format!("{}:{}", client.relay.host, client.relay.port),
-            (sender, std::time::Instant::now()),
-        );
+        .await;
 
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -4200,6 +4216,165 @@ mod tests {
             .await
             .expect_err("filler does not open");
         assert!(matches!(err, RoundTripError::Decode(_)), "{err:?}");
+    }
+
+    /// The exact bound on an answer: its opened body is checked against the caller's ceiling
+    /// before the answer is returned, and exactly the ceiling is let through. (The sealed
+    /// ceiling has room to spare, so only this check refuses a body just past the ceiling.)
+    #[test]
+    fn an_opened_answer_is_returned_up_to_the_ceiling_and_refused_past_it() {
+        let answer = |len: usize| zodl_ohttp_client::Response {
+            status: 200,
+            headers: vec![("content-type".to_string(), "text/plain".to_string())],
+            body: vec![0u8; len],
+        };
+
+        let returned = bhttp_response_within(answer(10), Some(10)).expect("exactly the ceiling");
+        assert_eq!(returned.status, 200);
+        assert_eq!(returned.body.len(), 10);
+        assert_eq!(
+            returned.headers,
+            vec![(b"content-type".to_vec(), b"text/plain".to_vec())]
+        );
+
+        let err =
+            bhttp_response_within(answer(11), Some(10)).expect_err("one byte past the ceiling");
+        assert!(
+            matches!(&err, RoundTripError::ResponseTooLarge(m) if m.contains("11 > 10")),
+            "{err:?}"
+        );
+
+        let returned = bhttp_response_within(answer(11), None).expect("no ceiling of the caller's");
+        assert_eq!(returned.body.len(), 11);
+    }
+
+    /// An answer that announces a length past the guard is refused as soon as its head arrives,
+    /// without waiting for a body. This relay never sends one, which is what tells the announced
+    /// length from the count of the bytes read: a body that does arrive is refused the same
+    /// way by either.
+    #[tokio::test]
+    async fn an_announced_length_past_the_guard_is_refused_without_waiting_for_the_body() {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://relay-announced-length-test.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        serve_in_process_relay(&client, |_req| async {
+            let no_body = futures_util::stream::pending::<Result<Frame<Bytes>, Infallible>>();
+            let mut answer = Response::new(BodyExt::boxed(StreamBody::new(no_body)));
+            answer
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, HeaderValue::from(101u64));
+            answer
+        })
+        .await;
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.post_sealed(vec![0u8; 32], SizeGuard::new(Some(100)), &|| {}),
+        )
+        .await
+        .expect("refused from the head alone, not after a body that never comes")
+        .err()
+        .expect("past the guard");
+        assert!(matches!(err, HttpsError::TooLarge(_)), "{err:?}");
+    }
+
+    /// The public functions carry the caller's ceiling down to the read of the answer, and tell
+    /// its refusal apart. They use the client the cache holds for the gateway and its relay,
+    /// which this test gives a key and an in-process relay: from `http_round_trip_with_dispatch`
+    /// and `http_round_trip` to the read, the code is the production code. The relay answers
+    /// with filler one byte past the sealed ceiling of a caller that allows no body, and far
+    /// inside the general cap.
+    #[tokio::test]
+    async fn the_public_functions_carry_the_ceiling_to_the_read() {
+        let gateway = "ohttp-gateway-testnet.example";
+        let relay_url = relay_for(gateway).expect("a relay for the testnet gateway");
+        let client = get_or_create_client(
+            gateway,
+            relay_url,
+            Dialer::Direct,
+            get_default_client_trace_prefix(),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("client");
+        cache_a_key(&client).await;
+        let answer_len = sealed_response_ceiling(0) + 1;
+        serve_in_process_relay(
+            &client,
+            move |_req| async move { filler_answer(answer_len) },
+        )
+        .await;
+
+        // A caller that allows no body: the answer is refused as it is read, and the request
+        // had gone out by then.
+        let dispatched = AtomicBool::new(false);
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            http_round_trip_with_dispatch(
+                gateway,
+                NetworkType::Test,
+                Dialer::Direct,
+                "POST",
+                "https://origin.invalid/api",
+                &[],
+                b"{}",
+                0,
+                || dispatched.store(true, Ordering::SeqCst),
+            ),
+        )
+        .await
+        .expect("the round trip must finish")
+        .expect_err("past the ceiling");
+        assert!(
+            matches!(err, HttpRoundTripError::ResponseTooLarge(_)),
+            "{err:?}"
+        );
+        assert!(
+            dispatched.load(Ordering::SeqCst),
+            "the request had gone out"
+        );
+
+        // Without a ceiling of the caller's the same answer is read, and fails to open.
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            http_round_trip(
+                gateway,
+                NetworkType::Test,
+                Dialer::Direct,
+                "POST",
+                "https://origin.invalid/api",
+                &[],
+                b"{}",
+            ),
+        )
+        .await
+        .expect("the round trip must finish")
+        .expect_err("filler does not open");
+        assert!(err.starts_with("bhttp decode:"), "{err}");
+
+        // The cache is process-wide: forget the client that was given the in-process relay.
+        let key = ClientCacheKey::new(
+            gateway,
+            relay_url,
+            get_default_client_trace_prefix(),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .expect("a cache key");
+        let removed = CLIENT_CACHE
+            .get()
+            .expect("the cache exists")
+            .lock()
+            .await
+            .remove(&key);
+        assert!(
+            removed.is_some(),
+            "the client was cached under the key the public functions use"
+        );
     }
 
     /// Streaming decode with SizeGuard: frames beyond the limit are rejected before being pushed
