@@ -10,6 +10,8 @@ workspace.
 
 ## [Unreleased]
 
+## [0.4.0-pre.2] - 2026-10-20
+
 ### Added
 - `events::Progress::request_stop_for_wallet_change` and `Progress::stop_requested`. A
   host calls the first right before it changes the wallet (adding or removing an account,
