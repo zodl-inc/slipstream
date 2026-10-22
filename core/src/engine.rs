@@ -57,7 +57,7 @@ use crate::{
 /// hand cannot be relied on — and this is the evidence that it cannot — it should be
 /// derived from something that moves on its own (git describe at build time) rather
 /// than maintained.
-pub const ENGINE_BUILD: &str = "2026-10-20.v0.16-graft-buffer-fixes";
+pub const ENGINE_BUILD: &str = "2026-10-22.v0.17-nu7-block-cadence";
 
 /// [v0.7 P2] Mid-pass endpoint switches allowed per pass before the
 /// detector disarms and the pass grinds to completion (the all-sick
@@ -114,6 +114,9 @@ pub struct SyncOutcome {
     pub wire_switches: u32,
     /// This pass's persist-lane telemetry (delta over the pass). Reporting input.
     pub persist_lane: crate::persist::lane_stats::Totals,
+    /// This pass's lightwalletd channels and RPCs (delta over the pass of
+    /// `grpc::net_stats`). Reporting input.
+    pub net: crate::grpc::net_stats::Totals,
 }
 
 impl SyncOutcome {
@@ -233,6 +236,8 @@ pub async fn sync_once(
     // v0.6 P2: persist-lane totals are process-cumulative atomics — snapshot
     // here so the pass-end log reports THIS pass's delta.
     let persist_lane_start = crate::persist::lane_stats::totals();
+    // Same pattern for the pass's lightwalletd channels and RPCs.
+    let net_start = grpc::net_stats::totals();
 
     // [v0.7 P1] Probe-then-commit (`EngineConfig::with_selected_endpoint`):
     // with alternates configured, race every endpoint and commit the winner
@@ -263,11 +268,33 @@ pub async fn sync_once(
         session.import_account(ufvk, birthday_ts)?;
     }
 
-    let roots = grpc::get_subtree_roots(&mut client, progress.as_deref()).await?;
+    // Subtree roots. A follow pass asks only for the ones the wallet does not have yet: from
+    // each pool's second-to-last stored shard, so the last complete one overlaps, instead of
+    // every root of every pool. A pass whose scan queue holds Historic work when it starts
+    // (before this pass's own tip update) asks from index 0 instead, so that its grafts see
+    // every stored root: a graft install or a fully pruned note-free shard leaves its row
+    // without one, and a download restores only the rows it reaches. A wallet with nothing
+    // stored starts at 0 either way, as does a pool whose stored shards are not a complete
+    // range from 0 (one seeded only near the tip).
+    let roots_start = if session.has_historic_scan_ranges()? {
+        grpc::SubtreeRootStart::default()
+    } else {
+        session.next_subtree_root_start()?
+    };
+    let roots = grpc::get_subtree_roots_from(&mut client, roots_start, progress.as_deref()).await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
-    session.put_subtree_roots(&roots)?;
+    session.put_subtree_roots_at(roots_start, &roots)?;
+    info!(
+        sapling_from = roots_start.sapling,
+        orchard_from = roots_start.orchard,
+        ironwood_from = roots_start.ironwood,
+        sapling = roots.sapling.len(),
+        orchard = roots.orchard.len(),
+        ironwood = roots.ironwood.len(),
+        "subtree roots updated"
+    );
 
     let tip = grpc::get_latest_block_height(&mut client).await?;
     if let Some(ref p) = progress {
@@ -410,6 +437,7 @@ pub async fn sync_once(
     // v0.6 P2: this pass's persist-lane delta over the pass-start snapshot
     // (process-cumulative atomics; see the snapshot at pass start).
     let persist_lane = crate::persist::lane_stats::totals().delta_since(&persist_lane_start);
+    let net = grpc::net_stats::totals().delta_since(&net_start);
 
     let outcome = SyncOutcome {
         report,
@@ -421,6 +449,7 @@ pub async fn sync_once(
         wire_probe_ms,
         wire_switches,
         persist_lane,
+        net,
     };
 
     // A completed pass got past whatever the block download failed on before.
@@ -473,6 +502,7 @@ mod tests {
             wire_probe_ms: 0.0,
             wire_switches: 0,
             persist_lane: crate::persist::lane_stats::Totals::default(),
+            net: grpc::net_stats::Totals::default(),
         }
     }
 

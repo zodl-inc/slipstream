@@ -42,7 +42,7 @@ fn wire_mbps_avg(report: &SyncReport) -> f64 {
 }
 
 /// Emit this pass's tracing summary: stage split, wire health, shard census,
-/// scan-lane split, persist-lane split, and enhance split.
+/// scan-lane split, persist-lane split, network split, and enhance split.
 pub fn log_pass_summary(outcome: &SyncOutcome, config: &EngineConfig) {
     // Log the stage split: total time + per-stage breakdown + bound.
     // F3: enhance_s is now the SUM of all per-range runs + the final post-loop run.
@@ -150,6 +150,24 @@ pub fn log_pass_summary(outcome: &SyncOutcome, config: &EngineConfig) {
         downgraded = persist_lane.downgraded,
         "persist lane split"
     );
+    // The pass's lightwalletd channels and RPCs (`grpc::net_stats`). On a follow pass
+    // this is what each new block costs, apart from the follow loop's own mempool
+    // session and tip probe between passes.
+    let net = &outcome.net;
+    info!(
+        channels = net.channels(),
+        direct_channels = net.direct_channels,
+        tor_channels = net.tor_channels,
+        get_latest_block = net.get_latest_block,
+        get_subtree_roots = net.get_subtree_roots,
+        get_block_range = net.get_block_range,
+        get_tree_state = net.get_tree_state,
+        get_address_utxos = net.get_address_utxos,
+        get_taddress_txids = net.get_taddress_txids,
+        get_transaction = net.get_transaction,
+        get_mempool_stream = net.get_mempool_stream,
+        "pass network split"
+    );
     info!(
         fetch_wait_s = outcome.enhance.fetch_wait.as_secs_f64(),
         store_s = outcome.enhance.store.as_secs_f64(),
@@ -235,6 +253,7 @@ mod tests {
                 rows_ms: 1_500,
                 ..Default::default()
             },
+            net: crate::grpc::net_stats::Totals::default(),
         }
     }
 

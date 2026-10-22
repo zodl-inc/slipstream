@@ -51,10 +51,10 @@ use crate::{
     chunk::ChunkQueueReceiver,
     config::{Endpoint, EngineConfig},
     connector::TorConn,
-    enhance::run_enhancement,
+    enhance::{enhancement_connection, run_enhancement_lazily},
     error::SlipstreamError,
     events::Progress,
-    grpc::{self, LwdClient},
+    grpc,
     wallet_session::WalletSession,
 };
 
@@ -150,6 +150,33 @@ pub fn next_batch_len(
 /// chunk completes.
 pub fn should_interleave_enhancement(chunks_done: u64, every: u32) -> bool {
     every > 0 && chunks_done > 0 && chunks_done.is_multiple_of(u64::from(every))
+}
+
+/// Whether the scan needs the server's tree state at `boundary`, the last block of a
+/// sub-batch of a range ending at `range_end`.
+///
+/// In server mode that state is the next sub-batch's `from_state`, so every boundary below
+/// the range end needs it and the range end does not: nothing in the range is scanned after
+/// it, and the next range seeds its own state. In local mode boundaries are derived from the
+/// scanned blocks, and a server state is fetched only for an `audit`.
+pub(crate) fn needs_server_boundary_state(
+    local_mode: bool,
+    audit: bool,
+    boundary: u64,
+    range_end: u64,
+) -> bool {
+    if local_mode {
+        audit
+    } else {
+        boundary < range_end
+    }
+}
+
+/// Whether a range runs in local-treestate mode: `EngineConfig::local_treestate` is on and
+/// no boundary audit has tripped the process fuse. The scan and the scheduler's boundary
+/// fetcher both decide by this one check.
+pub(crate) fn local_treestate_active(config: &EngineConfig) -> bool {
+    config.local_treestate && !crate::treestate::fuse_tripped()
 }
 
 // ── Trial-decryption backlog fence ─────────────────────────────────────────────
@@ -404,8 +431,10 @@ struct WriteBehind {
 // ── Production scan driver ─────────────────────────────────────────────────────
 
 /// Scans every chunk arriving on `rx` (they are ordered and continuity-verified
-/// by the fetcher). `range_start` is the first height; the caller provides a
-/// client for treestate prefetches.
+/// by the fetcher). `range_start` is the first height and `range_end` the last:
+/// a chunk that runs past `range_end` is an error, and in server mode the tree
+/// state at `range_end` is not fetched — nothing in the range is scanned after
+/// it. Interleaved enhancement opens its own connection, on first use.
 /// Preconditions: range_start >= 1 (treestate is fetched at range_start - 1) and
 /// range_start equals the first chunk's start height.
 ///
@@ -451,12 +480,13 @@ struct WriteBehind {
 ///
 /// RPC cost: ~1 GetTreeState per ~TARGET_BATCH_MS on slow devices, fully hidden
 /// behind the blocking scan; zero extra RPCs on fast devices (fast-path = 1 call
-/// per chunk, same as before T5.2).
+/// per chunk, same as before T5.2). In server mode the range's last boundary is
+/// skipped: its state would only seed a sub-batch that does not exist.
 #[allow(clippy::too_many_arguments)] // +tor (T-Tor.2); bundling would obscure the borrow structure
 pub async fn scan_chunks(
     session: &mut WalletSession,
-    client: &mut LwdClient,
     range_start: u64,
+    range_end: u64,
     rx: ChunkQueueReceiver,
     progress: Option<Arc<Progress>>,
     config: &EngineConfig,
@@ -466,6 +496,11 @@ pub async fn scan_chunks(
 ) -> Result<ScanStats, SlipstreamError> {
     if range_start == 0 {
         return Err(SlipstreamError::Wallet("range_start must be >= 1".into()));
+    }
+    if range_end < range_start {
+        return Err(SlipstreamError::Wallet(format!(
+            "range_end {range_end} is below range_start {range_start}"
+        )));
     }
     // v0.4 Plan A: buffering only on Historic ranges (accumulator safety rule 2).
     let graft_buffering = config.graft_subtree && historic_range;
@@ -498,8 +533,8 @@ pub async fn scan_chunks(
 
     let result = scan_chunks_inner(
         session,
-        client,
         range_start,
+        range_end,
         rx,
         progress.clone(),
         config,
@@ -568,8 +603,8 @@ pub async fn scan_chunks(
 #[allow(clippy::too_many_arguments)] // internal seam of scan_chunks; bundling would obscure the borrow structure
 async fn scan_chunks_inner(
     session: &mut WalletSession,
-    client: &mut LwdClient,
     range_start: u64,
+    range_end: u64,
     mut rx: ChunkQueueReceiver,
     progress: Option<Arc<Progress>>,
     config: &EngineConfig,
@@ -588,6 +623,11 @@ async fn scan_chunks_inner(
     let network = config.network;
     // Clone endpoint once for use in retry-capable prefetch spawns (T6.8-H2).
     let endpoint: Endpoint = config.endpoint.clone();
+    // The interleaved enhancement's connection, opened when an interleave first needs the
+    // server and reused by later ones. Most ranges — a follow pass's single block among
+    // them — run no interleave, and used to connect anyway (with Tor on, an isolated
+    // circuit).
+    let mut enhance_client = enhancement_connection(&config.endpoint, tor);
 
     let mut stats = ScanStats::default();
     // State for the FIRST chunk: seed treestate at (range_start - 1).
@@ -606,7 +646,7 @@ async fn scan_chunks_inner(
     // When enabled, every boundary AFTER the seeded first sub-batch is served
     // from running frontiers absorbed out of the scanned blocks themselves;
     // the sampled server fetch becomes an off-path audit (drain_audits).
-    let local_mode = config.local_treestate && !crate::treestate::fuse_tripped();
+    let local_mode = local_treestate_active(config);
     if config.local_treestate && !local_mode {
         warn!("local treestate requested but the process fuse is tripped — server path");
     }
@@ -643,6 +683,13 @@ async fn scan_chunks_inner(
             (Some(s), Some(e)) => (s, e),
             _ => return Err(SlipstreamError::Wallet("empty chunk".into())),
         };
+        // The range's last boundary is not fetched in server mode, so a chunk past
+        // `range_end` would scan from a state nobody fetched — refuse it instead.
+        if chunk_end > range_end {
+            return Err(SlipstreamError::Wallet(format!(
+                "chunk {chunk_start}..={chunk_end} runs past the range end {range_end}"
+            )));
+        }
 
         let chunk_len = chunk.blocks.len(); // total blocks in this chunk
 
@@ -692,11 +739,13 @@ async fn scan_chunks_inner(
             // On scan failure, prefetch.abort() is called before returning. The to_chain_state() and height-overflow error paths return without aborting — the spawned task completes detached, which is harmless.
             // v0.5: in local mode the fetch is needed only on audited
             // boundaries (and consumed off the critical path); in server mode
-            // it is the actual next state, exactly as before. The queue may
-            // have carried a FETCH-SIDE pre-spawned handle for the chunk's end
-            // boundary (started at emit — its RTT has been hiding under queue
-            // wait + scan since); use it when this sub-batch IS that boundary,
-            // spawn late otherwise (mid-chunk sub-batches, tests, darkside).
+            // it is the actual next state — so the range's last boundary, with
+            // no next sub-batch, needs none (`needs_server_boundary_state`). The
+            // queue may have carried a FETCH-SIDE pre-spawned handle for the
+            // chunk's end boundary (started at emit — its RTT has been hiding
+            // under queue wait + scan since); use it when this sub-batch IS that
+            // boundary, spawn late otherwise (mid-chunk sub-batches, tests,
+            // darkside).
             let spawn_started = Instant::now();
             let audit_this = local_mode
                 && config.treestate_verify_sample > 0
@@ -707,31 +756,33 @@ async fn scan_chunks_inner(
             } else {
                 None
             };
-            let prefetch = if !local_mode || audit_this {
-                carried.or_else(|| {
-                    Some(tokio::spawn({
-                        let ep = endpoint.clone();
-                        let tor_owned = tor.cloned();
-                        let progress = progress.clone();
-                        async move {
-                            grpc::retry_get_tree_state(
-                                &ep,
-                                sub_end,
-                                "chunk-boundary prefetch",
-                                tor_owned.as_ref(),
-                                progress,
-                            )
-                            .await
-                        }
-                    }))
-                })
-            } else {
-                if let Some(h) = carried {
-                    // Local mode, unaudited boundary — the carried fetch is unneeded.
-                    h.abort();
-                }
-                None
-            };
+            let prefetch =
+                if needs_server_boundary_state(local_mode, audit_this, sub_end, range_end) {
+                    carried.or_else(|| {
+                        Some(tokio::spawn({
+                            let ep = endpoint.clone();
+                            let tor_owned = tor.cloned();
+                            let progress = progress.clone();
+                            async move {
+                                grpc::retry_get_tree_state(
+                                    &ep,
+                                    sub_end,
+                                    "chunk-boundary prefetch",
+                                    tor_owned.as_ref(),
+                                    progress,
+                                )
+                                .await
+                            }
+                        }))
+                    })
+                } else {
+                    if let Some(h) = carried {
+                        // Unneeded: an unaudited local-mode boundary, or (server mode) the
+                        // range's last boundary.
+                        h.abort();
+                    }
+                    None
+                };
             stats.prefetch_spawn += spawn_started.elapsed();
 
             let state_started = Instant::now();
@@ -958,9 +1009,10 @@ async fn scan_chunks_inner(
                 );
             }
 
-            // Advance for the next sub-batch. (next_state was already updated
-            // inside the server-mode prefetch consumption above; local mode
-            // serves the next boundary from the running frontiers instead.)
+            // Advance for the next sub-batch. (In server mode next_state was updated
+            // inside the prefetch consumption above, except at the range's last
+            // boundary, which has no prefetch and no next sub-batch to read it; local
+            // mode serves the next boundary from the running frontiers instead.)
             sub_start = sub_end + 1;
         }
         // ── End sub-batch loop ────────────────────────────────────────────────
@@ -1021,8 +1073,7 @@ async fn scan_chunks_inner(
                 stats.interleave_drain += drain_started.elapsed();
             }
             let started = Instant::now();
-            let mut enhance_client = client.clone();
-            match run_enhancement(
+            match run_enhancement_lazily(
                 session,
                 &mut enhance_client,
                 network,
@@ -1646,6 +1697,25 @@ mod tests {
         assert!(should_interleave_enhancement(6, 3));
         assert!(should_interleave_enhancement(1, 1));
         assert!(should_interleave_enhancement(2, 1));
+    }
+
+    /// Server mode fetches every boundary below the range end — the next sub-batch starts
+    /// from it — and not the range end itself; local mode fetches only to audit.
+    #[test]
+    fn server_mode_skips_only_the_final_boundary() {
+        assert!(needs_server_boundary_state(false, false, 99, 100));
+        assert!(
+            !needs_server_boundary_state(false, false, 100, 100),
+            "nothing in the range is scanned after its last block"
+        );
+        // The scheduler's fetch-side call does not know which boundaries the scan audits, so
+        // it asks with `audit` set: server mode must still skip the range end.
+        assert!(!needs_server_boundary_state(false, true, 100, 100));
+        // A one-block range: its only boundary is its end — no boundary fetch at all.
+        assert!(!needs_server_boundary_state(false, false, 5, 5));
+        // Local mode: fetched only to audit, the final boundary included.
+        assert!(needs_server_boundary_state(true, true, 100, 100));
+        assert!(!needs_server_boundary_state(true, false, 50, 100));
     }
 
     // T5.5 — None-path decision logic: with batch_target_ms=None, batch_len is

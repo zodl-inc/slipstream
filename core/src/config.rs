@@ -98,7 +98,8 @@ pub struct EngineConfig {
     /// cools that endpoint, re-probes the rest, and resumes from the wallet
     /// DB. Default ON; this is the kill switch.
     pub wire_failover: bool,
-    /// Concurrent GetBlockRange sub-streams (P1).
+    /// Most concurrent GetBlockRange streams a range's fetch opens: one per plan chunk, up
+    /// to this many (P1; see `FetchPlan::worker_count`).
     pub fetch_streams: usize,
     /// Target blocks per in-memory chunk / per scan call (P1/P2).
     pub chunk_blocks: u32,
@@ -175,6 +176,13 @@ pub struct EngineConfig {
     /// here: on mainnet that is `AnchorRetentionInterval::ZIP_318`, and a host
     /// running a shortened test-network grid must pass the same one it configured
     /// on the wallet.
+    ///
+    /// The interval counts ZIP 318 reference blocks, which are blocks at the 75 s
+    /// target spacing, and the policy's block spacing places its boundaries. From NU7
+    /// activation each reference block spans three blocks, so the same interval spans
+    /// three times as many blocks. Build the policy with
+    /// `BlockSpacing::for_network(&network)` (`zcash_protocol::zip318`), as upstream's
+    /// `put_blocks` does, so that its grid is the wallet's on every network.
     ///
     /// `None` (default) = retention off, byte-identical to pre-B6 behavior.
     pub anchor_retention: Option<AnchorRetention>,
