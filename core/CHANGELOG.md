@@ -58,7 +58,10 @@ workspace.
   that serves a network other than the wallet's; the signed key configuration
   is checked against the network of the gateway's exact host name.
 - OHTTP: an outer 429's `Retry-After` holds every request through that relay
-  until it has run (no sleep inside the call); an outer 413 and a local size
+  until it has run (no sleep inside the call), a 429 without one for 30 s; an
+  outer answer that is not a success (a relay or gateway error page) is read
+  within a fixed 64 KiB guard and keeps its status whatever ceiling the caller
+  set for the answer; an outer 413 and a local size
   refusal are `RESOURCE_EXHAUSTED`; a response that ends before its final chunk
   is `UNAVAILABLE`; an inner status other than 200 or a non-gRPC content type
   is `INTERNAL`; the gRPC status is delivered only once the final chunk has
