@@ -214,6 +214,7 @@ pub async fn connect(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> 
         .connect()
         .await
         .map_err(|e| transport_err(&format!("connect {}", endpoint.host), e))?;
+    net_stats::record(net_stats::NetEvent::DirectChannel);
     Ok(CompactTxStreamerClient::new(channel))
 }
 
@@ -236,6 +237,7 @@ pub async fn send_transaction(
 }
 
 pub async fn get_latest_block_height(client: &mut LwdClient) -> Result<u64, SlipstreamError> {
+    net_stats::record(net_stats::NetEvent::GetLatestBlock);
     Ok(
         with_unary_timeout("get_latest_block", client.get_latest_block(ChainSpec {}))
             .await?
@@ -247,6 +249,7 @@ pub async fn get_tree_state(
     client: &mut LwdClient,
     height: u64,
 ) -> Result<TreeState, SlipstreamError> {
+    net_stats::record(net_stats::NetEvent::GetTreeState);
     with_unary_timeout(
         "get_tree_state",
         client.get_tree_state(BlockId {
@@ -267,17 +270,34 @@ pub struct SubtreeRoots {
     pub ironwood: Vec<CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>>,
 }
 
+/// The subtree index each pool's subtree-root request starts at — and so the index of its
+/// first returned root. All zero (the default) asks for every root.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SubtreeRootStart {
+    pub sapling: u64,
+    pub orchard: u64,
+    pub ironwood: u64,
+}
+
 /// One pool's subtree-root stream, collected under per-message idle deadlines (B2); every root
 /// received stamps `progress`.
 async fn collect_subtree_roots<H: HashSer>(
     client: &mut LwdClient,
     protocol: ShieldedProtocol,
+    start_index: u64,
     label: &str,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<CommitmentTreeRoot<H>>, SlipstreamError> {
-    let mut req = GetSubtreeRootsArg::default();
+    let mut req = GetSubtreeRootsArg {
+        start_index: u32::try_from(start_index).map_err(|_| {
+            SlipstreamError::Wallet(format!("{label} subtree index {start_index} exceeds u32"))
+        })?,
+        ..Default::default()
+    };
     req.set_shielded_protocol(protocol);
-    let context = format!("get_subtree_roots({label})");
+    let context = format!("get_subtree_roots({label} from {start_index})");
+    net_stats::record(net_stats::NetEvent::GetSubtreeRoots);
     let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
     collect_stream(
         &mut stream,
@@ -296,13 +316,26 @@ async fn collect_subtree_roots<H: HashSer>(
     .await
 }
 
+/// Every subtree root of every pool, from index 0.
 pub async fn get_subtree_roots(
     client: &mut LwdClient,
+    progress: Option<&crate::events::Progress>,
+) -> Result<SubtreeRoots, SlipstreamError> {
+    get_subtree_roots_from(client, SubtreeRootStart::default(), progress).await
+}
+
+/// Each pool's subtree roots from its index in `start` onward: a pool's `i`-th root is the
+/// root of subtree `start + i`. Store them at the same `start`
+/// (`WalletSession::put_subtree_roots_at`).
+pub async fn get_subtree_roots_from(
+    client: &mut LwdClient,
+    start: SubtreeRootStart,
     progress: Option<&crate::events::Progress>,
 ) -> Result<SubtreeRoots, SlipstreamError> {
     let sapling_roots = collect_subtree_roots::<sapling::Node>(
         client,
         ShieldedProtocol::Sapling,
+        start.sapling,
         "sapling",
         progress,
     )
@@ -310,6 +343,7 @@ pub async fn get_subtree_roots(
     let orchard_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
         client,
         ShieldedProtocol::Orchard,
+        start.orchard,
         "orchard",
         progress,
     )
@@ -317,6 +351,7 @@ pub async fn get_subtree_roots(
     let ironwood_roots = collect_subtree_roots::<orchard::tree::MerkleHashOrchard>(
         client,
         ShieldedProtocol::Ironwood,
+        start.ironwood,
         "ironwood",
         progress,
     )
@@ -344,6 +379,7 @@ pub async fn get_transaction(
     client: &mut LwdClient,
     txid: [u8; 32],
 ) -> Result<Option<RawTransaction>, SlipstreamError> {
+    net_stats::record(net_stats::NetEvent::GetTransaction);
     // B2: unary deadline; the not-found mapping below needs the raw status, so this
     // call cannot reuse with_unary_timeout's uniform error mapping.
     let outcome = tokio::time::timeout(
@@ -388,6 +424,7 @@ pub async fn get_taddress_txids(
     filter: TransparentAddressBlockFilter,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<RawTransaction>, SlipstreamError> {
+    net_stats::record(net_stats::NetEvent::GetTaddressTxids);
     let mut stream =
         with_unary_timeout("get_taddress_txids", client.get_taddress_txids(filter)).await?;
     collect_stream(
@@ -408,13 +445,16 @@ pub async fn get_taddress_txids(
 /// Deliberately NOT wrapped in `with_unary_timeout`: `GetMempoolStream` is
 /// server-streaming and lightwalletd sends its response HEADERS lazily — only
 /// with the first mempool tx, or when it closes the stream on a new block. On a
-/// quiet mempool the `.await` here legitimately blocks well past the 30 s unary
-/// timeout (blocks are ~75 s apart on mainnet), so wrapping it would spuriously
-/// fail. The CALLER bounds the open with `mempool::MEMPOOL_SESSION_IDLE` and
+/// quiet mempool the `.await` here legitimately blocks past the 30 s unary
+/// timeout whenever the next block takes longer than that — routinely before
+/// NU7 (75 s target spacing), and still often from NU7 (a third of that, with
+/// block intervals spread around the target) — so wrapping it would spuriously
+/// fail. The CALLER bounds the open with `mempool::mempool_session_idle` and
 /// treats an over-idle open as a benign reconnect (Deviation D6), not a failure.
 pub async fn open_mempool_stream(
     client: &mut LwdClient,
 ) -> Result<tonic::Streaming<RawTransaction>, SlipstreamError> {
+    net_stats::record(net_stats::NetEvent::GetMempoolStream);
     client
         .get_mempool_stream(Empty {})
         .await
@@ -430,6 +470,7 @@ pub async fn get_address_utxos(
     start_height: u64,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<GetAddressUtxosReply>, SlipstreamError> {
+    net_stats::record(net_stats::NetEvent::GetAddressUtxos);
     let mut stream = with_unary_timeout(
         "get_address_utxos",
         client.get_address_utxos_stream(GetAddressUtxosArg {
@@ -447,6 +488,143 @@ pub async fn get_address_utxos(
         Ok,
     )
     .await
+}
+
+/// Pass-level network telemetry: the lightwalletd channels the engine opens and the RPCs it
+/// issues, by kind.
+///
+/// Process-cumulative atomics, like `persist::lane_stats`: fetch workers, tree-state
+/// prefetches and the mempool session each run on their own task. `engine::sync_once`
+/// snapshots [`totals`](net_stats::totals) when a pass starts and returns the pass's delta as
+/// `SyncOutcome::net`, which `report::log_pass_summary` logs as `pass network split`. A process
+/// that runs several engines at once counts them all.
+///
+/// A channel counts once it is connected (a failed connect opens nothing); an RPC counts when
+/// it is issued, whether or not it succeeds.
+pub mod net_stats {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// What [`record`] counts.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum NetEvent {
+        /// A direct (non-Tor) channel connected.
+        DirectChannel,
+        /// A channel connected over a Tor circuit.
+        TorChannel,
+        /// `GetLatestBlock`.
+        GetLatestBlock,
+        /// One pool's `GetSubtreeRoots` stream.
+        GetSubtreeRoots,
+        /// A `GetBlockRange` stream: every fetch attempt, and the endpoint probe's sample.
+        GetBlockRange,
+        /// `GetTreeState`.
+        GetTreeState,
+        /// `GetAddressUtxosStream`.
+        GetAddressUtxos,
+        /// `GetTaddressTxids`.
+        GetTaddressTxids,
+        /// `GetTransaction`.
+        GetTransaction,
+        /// `GetMempoolStream`.
+        GetMempoolStream,
+    }
+
+    static DIRECT_CHANNELS: AtomicU64 = AtomicU64::new(0);
+    static TOR_CHANNELS: AtomicU64 = AtomicU64::new(0);
+    static GET_LATEST_BLOCK: AtomicU64 = AtomicU64::new(0);
+    static GET_SUBTREE_ROOTS: AtomicU64 = AtomicU64::new(0);
+    static GET_BLOCK_RANGE: AtomicU64 = AtomicU64::new(0);
+    static GET_TREE_STATE: AtomicU64 = AtomicU64::new(0);
+    static GET_ADDRESS_UTXOS: AtomicU64 = AtomicU64::new(0);
+    static GET_TADDRESS_TXIDS: AtomicU64 = AtomicU64::new(0);
+    static GET_TRANSACTION: AtomicU64 = AtomicU64::new(0);
+    static GET_MEMPOOL_STREAM: AtomicU64 = AtomicU64::new(0);
+
+    fn counter(event: NetEvent) -> &'static AtomicU64 {
+        match event {
+            NetEvent::DirectChannel => &DIRECT_CHANNELS,
+            NetEvent::TorChannel => &TOR_CHANNELS,
+            NetEvent::GetLatestBlock => &GET_LATEST_BLOCK,
+            NetEvent::GetSubtreeRoots => &GET_SUBTREE_ROOTS,
+            NetEvent::GetBlockRange => &GET_BLOCK_RANGE,
+            NetEvent::GetTreeState => &GET_TREE_STATE,
+            NetEvent::GetAddressUtxos => &GET_ADDRESS_UTXOS,
+            NetEvent::GetTaddressTxids => &GET_TADDRESS_TXIDS,
+            NetEvent::GetTransaction => &GET_TRANSACTION,
+            NetEvent::GetMempoolStream => &GET_MEMPOOL_STREAM,
+        }
+    }
+
+    /// Counts one `event`.
+    pub(crate) fn record(event: NetEvent) {
+        counter(event).fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Channel and RPC counts: since process start ([`totals`]), or over a pass
+    /// ([`Totals::delta_since`]).
+    ///
+    /// Non-exhaustive so that a count for a future RPC kind is not a breaking change.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    #[non_exhaustive]
+    pub struct Totals {
+        pub direct_channels: u64,
+        pub tor_channels: u64,
+        pub get_latest_block: u64,
+        pub get_subtree_roots: u64,
+        pub get_block_range: u64,
+        pub get_tree_state: u64,
+        pub get_address_utxos: u64,
+        pub get_taddress_txids: u64,
+        pub get_transaction: u64,
+        pub get_mempool_stream: u64,
+    }
+
+    impl Totals {
+        /// Channels opened, direct and over Tor.
+        pub fn channels(&self) -> u64 {
+            self.direct_channels.saturating_add(self.tor_channels)
+        }
+
+        /// This pass's counts, against a pass-start snapshot.
+        pub fn delta_since(&self, start: &Totals) -> Totals {
+            Totals {
+                direct_channels: self.direct_channels.saturating_sub(start.direct_channels),
+                tor_channels: self.tor_channels.saturating_sub(start.tor_channels),
+                get_latest_block: self.get_latest_block.saturating_sub(start.get_latest_block),
+                get_subtree_roots: self
+                    .get_subtree_roots
+                    .saturating_sub(start.get_subtree_roots),
+                get_block_range: self.get_block_range.saturating_sub(start.get_block_range),
+                get_tree_state: self.get_tree_state.saturating_sub(start.get_tree_state),
+                get_address_utxos: self
+                    .get_address_utxos
+                    .saturating_sub(start.get_address_utxos),
+                get_taddress_txids: self
+                    .get_taddress_txids
+                    .saturating_sub(start.get_taddress_txids),
+                get_transaction: self.get_transaction.saturating_sub(start.get_transaction),
+                get_mempool_stream: self
+                    .get_mempool_stream
+                    .saturating_sub(start.get_mempool_stream),
+            }
+        }
+    }
+
+    /// The counts since process start.
+    pub fn totals() -> Totals {
+        Totals {
+            direct_channels: DIRECT_CHANNELS.load(Ordering::Relaxed),
+            tor_channels: TOR_CHANNELS.load(Ordering::Relaxed),
+            get_latest_block: GET_LATEST_BLOCK.load(Ordering::Relaxed),
+            get_subtree_roots: GET_SUBTREE_ROOTS.load(Ordering::Relaxed),
+            get_block_range: GET_BLOCK_RANGE.load(Ordering::Relaxed),
+            get_tree_state: GET_TREE_STATE.load(Ordering::Relaxed),
+            get_address_utxos: GET_ADDRESS_UTXOS.load(Ordering::Relaxed),
+            get_taddress_txids: GET_TADDRESS_TXIDS.load(Ordering::Relaxed),
+            get_transaction: GET_TRANSACTION.load(Ordering::Relaxed),
+            get_mempool_stream: GET_MEMPOOL_STREAM.load(Ordering::Relaxed),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -661,5 +839,56 @@ mod tests {
         assert!(!wallet.is_transient(), "Wallet must not be transient");
         let config = SlipstreamError::Config("bad host".into());
         assert!(!config.is_transient(), "Config must not be transient");
+    }
+
+    // ── Pass-level network telemetry ──────────────────────────────────────────
+
+    /// A pass's counts are the field-by-field difference from the pass-start snapshot,
+    /// never negative.
+    #[test]
+    fn net_stats_delta_is_per_counter_and_never_negative() {
+        use net_stats::Totals;
+        let start = Totals {
+            direct_channels: 3,
+            tor_channels: 1,
+            get_tree_state: 5,
+            ..Totals::default()
+        };
+        let end = Totals {
+            direct_channels: 7,
+            tor_channels: 1,
+            get_tree_state: 6,
+            get_block_range: 2,
+            ..Totals::default()
+        };
+        let pass = end.delta_since(&start);
+        assert_eq!(
+            pass,
+            Totals {
+                direct_channels: 4,
+                get_tree_state: 1,
+                get_block_range: 2,
+                ..Totals::default()
+            }
+        );
+        assert_eq!(pass.channels(), 4);
+        assert_eq!(
+            start.delta_since(&end),
+            Totals::default(),
+            "saturates at zero"
+        );
+    }
+
+    /// Recording an event bumps its counter. Other tests in this process may record
+    /// too, so this asserts a lower bound.
+    #[test]
+    fn net_stats_record_bumps_the_named_counter() {
+        use net_stats::{NetEvent, record, totals};
+        let before = totals();
+        record(NetEvent::GetTransaction);
+        record(NetEvent::TorChannel);
+        let pass = totals().delta_since(&before);
+        assert!(pass.get_transaction >= 1, "got {pass:?}");
+        assert!(pass.tor_channels >= 1, "got {pass:?}");
     }
 }

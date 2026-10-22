@@ -447,7 +447,7 @@ async fn mempool_session_handles_quiet_mempool() {
     let cfg = EngineConfig::new(Network::MainNetwork, db_path, ep.clone());
 
     // One bounded session against the quiet mempool. A short idle keeps the test
-    // fast; production passes mempool::MEMPOOL_SESSION_IDLE (60 s).
+    // fast; production passes mempool::mempool_session_idle (60 s, 40 s from NU7).
     let mut seen: HashSet<[u8; 32]> = HashSet::new();
     let (end, stats) = mempool::run_session(&cfg, None, &mut seen, Duration::from_secs(4), None)
         .await

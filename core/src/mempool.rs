@@ -29,7 +29,7 @@ use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::{WalletRead, wallet::decrypt_and_store_transaction};
 use zcash_primitives::transaction::Transaction;
-use zcash_protocol::consensus::BranchId;
+use zcash_protocol::consensus::{BlockHeight, BranchId, NetworkUpgrade, Parameters};
 
 use crate::{
     config::EngineConfig, error::SlipstreamError, events::Progress, grpc,
@@ -41,15 +41,33 @@ use crate::{
 pub enum SessionEnd {
     /// Server closed the stream — a new block was mined (probe + pass NOW).
     BlockBoundary,
-    /// No message for [`MEMPOOL_SESSION_IDLE`] — reconnect after a tip probe
-    /// (dead-connection vs quiet-mempool are indistinguishable; Deviation D6).
+    /// No message within the session's idle bound ([`mempool_session_idle`]) — reconnect
+    /// after a tip probe (dead-connection vs quiet-mempool are indistinguishable; Deviation D6).
     IdleReconnect,
 }
 
-/// Idle bound per session. 60 s ≈ block cadence; deliberately NOT the
-/// hardening1 `grpc::STREAM_IDLE_TIMEOUT` (30 s) — an empty mempool is
-/// legitimate silence, not a stalled connection (Deviation D6).
+/// Idle bound per session before NU7 (75 s target block spacing). Deliberately NOT the
+/// hardening1 `grpc::STREAM_IDLE_TIMEOUT` (30 s) — an empty mempool is legitimate silence,
+/// not a stalled connection (Deviation D6).
 pub const MEMPOOL_SESSION_IDLE: Duration = Duration::from_secs(60);
+
+/// Idle bound per session from NU7, whose target block spacing is a third of the 75 s
+/// before it, so a dead stream would otherwise hide more than two blocks. Still above
+/// `grpc::STREAM_IDLE_TIMEOUT` — an empty mempool is legitimately silent (D6) — and below
+/// the Tor client's default 60 s response-header timeout.
+pub const MEMPOOL_SESSION_IDLE_NU7: Duration = Duration::from_secs(40);
+
+/// The idle bound for a session that waits on the block after `tip`:
+/// [`MEMPOOL_SESSION_IDLE_NU7`] once NU7 is active at `tip + 1`, [`MEMPOOL_SESSION_IDLE`]
+/// before.
+pub fn mempool_session_idle<P: Parameters>(params: &P, tip: u64) -> Duration {
+    let next = u32::try_from(tip.saturating_add(1)).unwrap_or(u32::MAX);
+    if params.is_nu_active(NetworkUpgrade::Nu7, BlockHeight::from_u32(next)) {
+        MEMPOOL_SESSION_IDLE_NU7
+    } else {
+        MEMPOOL_SESSION_IDLE
+    }
+}
 
 /// Dedupe-set cap: lightwalletd replays the whole mempool on reconnect
 /// (`mempool.go` `g_txList`), so `seen` persists across sessions; clear it when
@@ -74,8 +92,12 @@ pub struct SessionStats {
 
 /// Runs one mempool session against `config.endpoint`.
 ///
-/// For each streamed tx: dedupe by txid → parse (`Transaction::read`, branch id
-/// irrelevant pre-consensus: `rust/src/lib.rs:2045-2050` rationale) →
+/// For each streamed tx: dedupe by txid → parse (`Transaction::read` with a
+/// placeholder `BranchId::Sapling`, which is harmless: v5 and v6 transactions carry
+/// their consensus branch id in the header, and `read` uses that instead; for v4 and
+/// earlier it is only recorded on the parsed value, where nothing but the v4
+/// signature hash reads it — and nothing signs a transaction parsed here, so the
+/// placeholder branch id never reaches a v4 signature hash) →
 /// `decrypt_and_store_transaction(…, mined_height=None)` (upstream's relevance
 /// gate stores ONLY wallet-involving txs — `ll/wallet.rs:655-662`) → hit check
 /// via `WalletRead::get_transaction(txid)` → `progress.add_enhanced(1)` per NEW
@@ -90,8 +112,9 @@ pub struct SessionStats {
 /// applies the non-fatal policy).
 ///
 /// `idle` bounds BOTH the stream open and each `next()`; production passes
-/// [`MEMPOOL_SESSION_IDLE`] (tests use a short value). A timeout yields a benign
-/// [`SessionEnd::IdleReconnect`], never an error.
+/// [`mempool_session_idle`] — [`MEMPOOL_SESSION_IDLE`] before NU7,
+/// [`MEMPOOL_SESSION_IDLE_NU7`] from it (tests use a short value). A timeout yields a
+/// benign [`SessionEnd::IdleReconnect`], never an error.
 pub async fn run_session(
     config: &EngineConfig,
     progress: Option<Arc<Progress>>,
@@ -134,6 +157,7 @@ pub async fn run_session(
         stats.received += 1;
         // NOTE: raw.height is the SERVER TIP, not 0 (lightwalletd mempool.go;
         // fact E). We deliberately pass mined_height=None — Deviation D1.
+        // Placeholder branch id — harmless, see this function's doc.
         let tx = match Transaction::read(&raw.data[..], BranchId::Sapling) {
             Ok(tx) => tx,
             Err(e) => {
@@ -170,16 +194,127 @@ pub async fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::network::SlipstreamNetwork;
 
     /// Documents Deviation D6: an empty mempool is legitimate silence, so the
     /// session idle bound is INTENTIONALLY looser than the hardening1 stream
     /// idle timeout (which treats silence as a stall).
     #[test]
     fn session_idle_is_longer_than_hardening() {
-        assert!(
-            MEMPOOL_SESSION_IDLE > grpc::STREAM_IDLE_TIMEOUT,
-            "an empty mempool is legitimately silent — must not reuse the 30 s stall timeout (D6)"
+        for idle in [MEMPOOL_SESSION_IDLE, MEMPOOL_SESSION_IDLE_NU7] {
+            assert!(
+                idle > grpc::STREAM_IDLE_TIMEOUT,
+                "an empty mempool is legitimately silent — must not reuse the 30 s stall timeout (D6)"
+            );
+        }
+    }
+
+    /// 60 s before NU7, 40 s from NU7, judged at the block after the tip.
+    #[test]
+    fn session_idle_follows_nu7_activation() {
+        use zcash_protocol::consensus::{Network, NetworkUpgrade, Parameters};
+        let mainnet_nu7 = u64::from(u32::from(
+            Network::MainNetwork
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("mainnet NU7 height"),
+        ));
+        assert_eq!(
+            mainnet_nu7, 3_543_405,
+            "mainnet NU7 activation (zcash_protocol 0.11.0)"
         );
+        assert_eq!(
+            mempool_session_idle(&Network::MainNetwork, mainnet_nu7 - 2),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::MainNetwork, mainnet_nu7 - 1),
+            Duration::from_secs(40)
+        );
+        let nu7 = u64::from(u32::from(
+            Network::TestNetwork
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("testnet NU7 height"),
+        ));
+        assert_eq!(
+            nu7, 4_465_026,
+            "testnet NU7 activation (zcash_protocol 0.11.0)"
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::TestNetwork, 4_000_000),
+            Duration::from_secs(60)
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::TestNetwork, nu7 - 2),
+            Duration::from_secs(60),
+            "the next block is still before NU7"
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::TestNetwork, nu7 - 1),
+            Duration::from_secs(40),
+            "the next block activates NU7"
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::TestNetwork, nu7 + 10_000),
+            Duration::from_secs(40)
+        );
+    }
+
+    /// The follow loop passes the engine's own network type, so pin the switch through it as
+    /// well as through the stock one above.
+    #[test]
+    fn session_idle_switches_at_nu7_on_the_engine_network() {
+        let nu7 = u64::from(u32::from(
+            SlipstreamNetwork::TEST
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("testnet NU7 height"),
+        ));
+        assert_eq!(
+            mempool_session_idle(&SlipstreamNetwork::TEST, nu7 - 2),
+            Duration::from_secs(60),
+            "the next block is still before NU7"
+        );
+        assert_eq!(
+            mempool_session_idle(&SlipstreamNetwork::TEST, nu7 - 1),
+            Duration::from_secs(40),
+            "the next block activates NU7"
+        );
+    }
+
+    /// The idle bound follows a custom chain's NU7 height too.
+    #[test]
+    fn session_idle_follows_a_custom_nu7_height() {
+        use crate::network::CustomActivations;
+        use zcash_protocol::consensus::NetworkType;
+        let net = SlipstreamNetwork::Custom {
+            constants: NetworkType::Test,
+            heights: CustomActivations {
+                nu7: Some(6_000),
+                ..CustomActivations::all_from_genesis()
+            },
+        };
+        assert_eq!(mempool_session_idle(&net, 5_998), MEMPOOL_SESSION_IDLE);
+        assert_eq!(mempool_session_idle(&net, 5_999), MEMPOOL_SESSION_IDLE_NU7);
+        let without_nu7 = SlipstreamNetwork::Custom {
+            constants: NetworkType::Test,
+            heights: CustomActivations::all_from_genesis(),
+        };
+        assert_eq!(
+            mempool_session_idle(&without_nu7, 1_000_000),
+            MEMPOOL_SESSION_IDLE
+        );
+    }
+
+    /// A tip too large for a `u32` height clamps to the last height instead of wrapping to a
+    /// low one, and `u64::MAX` does not overflow `tip + 1`.
+    #[test]
+    fn session_idle_clamps_a_tip_beyond_u32_heights() {
+        for tip in [u64::from(u32::MAX) + 1, u64::MAX] {
+            assert_eq!(
+                mempool_session_idle(&SlipstreamNetwork::TEST, tip),
+                Duration::from_secs(40),
+                "tip {tip}"
+            );
+        }
     }
 
     /// The dedupe contract `run_session` relies on: `HashSet::insert` returns
