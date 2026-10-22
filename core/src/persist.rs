@@ -2101,9 +2101,11 @@ pub fn sparse_put_blocks(
         flush_ms,
         downgraded,
         // [B6] retention observability: the active floor and grid, plus how many
-        // anchors the orchard store currently pins (None = retention off).
+        // anchors the orchard store currently pins (None = retention off). The grid
+        // is the intervals themselves, in reference blocks, not blocks: from NU7
+        // activation each reference block spans three blocks.
         anchor_floor = anchor_floor.map(|r| u32::from(r.from_height())),
-        anchor_grid = anchor_floor
+        anchor_grid_reference_blocks = anchor_floor
             .map(|r| {
                 r.intervals()
                     .iter()
@@ -3593,7 +3595,7 @@ pub(crate) fn apply_nullifier_delta<A: Copy, Nf: PartialEq + Copy>(
 }
 
 /// Mirror of upstream `SpendIdentifiers::update_with`'s transparent half for ONE
-/// block's worth of deltas (zcash_client_backend-0.25.0-pre.0 src/scanning.rs:697-722):
+/// block's worth of deltas (zcash_client_backend-0.25.0 src/scanning.rs:697-722):
 /// remove the spent outpoints, then insert the received ones. Generic so the
 /// semantics are unit-testable without `ScannedBlock` values.
 pub(crate) fn apply_outpoint_delta<K: Eq + std::hash::Hash + Clone, A: Copy>(
@@ -3647,7 +3649,7 @@ fn unvirtualized(name: &str) -> SqliteClientError {
 /// 4. `get_orchard_nullifiers(NullifierQuery::Unspent)` — same as (3),
 ///    scanning.rs:366.
 /// 5. `get_unspent_transparent_outpoints` — via `SpendIdentifiers::unspent`
-///    (zcash_client_backend-0.25.0-pre.0 scanning.rs:655-664). Served from a
+///    (zcash_client_backend-0.25.0 scanning.rs:655-663). Served from a
 ///    running view seeded and re-seeded like (3), advanced per stashed block by
 ///    `apply_outpoint_delta` (upstream `SpendIdentifiers::update_with` semantics,
 ///    scanning.rs:697-722). EXACT, as for (3).
@@ -4933,6 +4935,40 @@ mod store_tests {
         );
         assert!(should_retain_anchor(Some(&short), h(1308)));
         assert!(!should_retain_anchor(Some(&at(1000)), h(1308)));
+    }
+
+    /// [B6] The policy's block spacing is part of what it retains. With NU7 active from
+    /// 1000, the ZIP 318 interval of 144 reference blocks puts boundaries on multiples of
+    /// 144 below 1000 and on multiples of 432 (three times as many blocks) from 1000. So
+    /// 1152 = 8 x 144 is retained on a chain whose spacing never scales and discarded once
+    /// NU7 is active; a predicate that ignored the spacing would keep it.
+    #[test]
+    fn should_retain_anchor_follows_the_nu7_scaled_grid() {
+        let h = |n: u32| BlockHeight::from(n);
+        let policy = |spacing: BlockSpacing| {
+            AnchorRetention::new(h(0), spacing, AnchorRetentionInterval::ZIP_318)
+        };
+
+        let nu7 = policy(BlockSpacing::with_nu7_activation(h(1000)));
+        assert!(
+            should_retain_anchor(Some(&nu7), h(864)),
+            "below NU7 activation: 864 = 6 x 144"
+        );
+        assert!(
+            should_retain_anchor(Some(&nu7), h(1296)),
+            "from NU7 activation: 1296 = 3 x 432"
+        );
+        assert!(
+            !should_retain_anchor(Some(&nu7), h(1152)),
+            "from NU7 activation: 1152 = 8 x 144 is not a multiple of 432"
+        );
+
+        // The same height where the spacing never scales: the grid stays on 144.
+        let uniform = policy(BlockSpacing::UNIFORM);
+        assert!(
+            should_retain_anchor(Some(&uniform), h(1152)),
+            "UNIFORM spacing: 1152 = 8 x 144"
+        );
     }
 
     #[test]

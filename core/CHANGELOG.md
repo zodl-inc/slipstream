@@ -43,6 +43,9 @@ workspace.
   field passes `BlockSpacing::for_network(&network)`, with the network the wallet runs on.
   The interval counts reference blocks, so from NU7 activation it spans three times as many
   blocks.
+- The `anchor_grid` field of the `sparse put_blocks` log line is now
+  `anchor_grid_reference_blocks`. It counts ZIP 318 reference blocks, which from NU7 activation
+  span three blocks each.
 - `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
   `report::log_pass_summary` logs them as a `pass network split` line.
 - A block fetch starts one worker per plan chunk, up to `EngineConfig::fetch_streams`,
