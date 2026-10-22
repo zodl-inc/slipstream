@@ -93,6 +93,17 @@ const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bound on opening a direct TCP connection to the relay.
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// The pause an outer 429 without a `Retry-After` starts (the ZIP's reference default). The
+/// Android and Swift transports keep the same value under the same name, so the three clients
+/// back off alike from a relay that does not say for how long.
+const DEFAULT_RETRY_AFTER: Duration = Duration::from_secs(30);
+
+/// The most that is read of an outer answer that is not a success (a relay or gateway error
+/// page), whatever ceiling the caller set for the sealed answer: enough for the start of the
+/// message quoted in the error. The status is the answer there, so a long error page is cut,
+/// never refused as too large (see [`read_error_body`]).
+const ERROR_BODY_GUARD_BYTES: usize = 64 * 1024;
+
 /// Longest a pooled relay connection is reused with Tor off: connection lifetime is linkable
 /// metadata the relay sees, so a long-lived wallet process moves to a fresh connection now and
 /// then. In-flight requests finish on the old one.
@@ -791,6 +802,40 @@ where
     Ok(bytes)
 }
 
+/// Reads the body of an outer answer that is not a success (an error page), up to
+/// [`ERROR_BODY_GUARD_BYTES`] and whatever the caller's ceiling for the sealed answer: the
+/// status is the answer, the body only illustrates it. A longer body is cut there (the frames
+/// behind the cut are not pulled from the peer), and a body that cannot be read to its end
+/// (a read error, [`CHUNK_IDLE_TIMEOUT`] without a frame) gives what had arrived. So an outer
+/// 429 or 503 is reported with its status, and never as too large or as a failed read, even
+/// when the caller allows only a small answer. `host` names the peer in the log line.
+async fn read_error_body<B>(mut body: B, host: &str) -> Vec<u8>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let mut bytes = Vec::new();
+    while bytes.len() < ERROR_BODY_GUARD_BYTES {
+        let frame = match tokio::time::timeout(CHUNK_IDLE_TIMEOUT, body.frame()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(None) => break,
+            Ok(Some(Err(e))) => {
+                tracing::debug!(host, err = %e, "ohttp: error page not read to its end");
+                break;
+            }
+            Err(_) => {
+                tracing::debug!(host, "ohttp: error page not read to its end (idle timeout)");
+                break;
+            }
+        };
+        if let Ok(data) = frame.into_data() {
+            let room = ERROR_BODY_GUARD_BYTES - bytes.len();
+            bytes.extend_from_slice(&data[..data.len().min(room)]);
+        }
+    }
+    bytes
+}
+
 /// Why a whole OHTTP round trip failed; the gRPC bridge maps each differently.
 #[derive(Debug)]
 enum RoundTripError {
@@ -890,6 +935,11 @@ fn once_dispatch<D: Fn()>(on_dispatch: D) -> impl Fn() {
 /// the body, one 256th more for the chunk tags and length prefixes, and 64 KiB for the header
 /// fields and the framing; never more than the gateway's own sealed cap. The opened body is
 /// then checked against `max_response_bytes` itself, see [`check_response_body`].
+///
+/// The 256th assumes the gateway's 16 KiB chunks (`chunk_size` in the gateway's `hpke.rs`, about
+/// 19 bytes of tag and length prefix per chunk, under 1/862; a padded final chunk is at most
+/// one more). A gateway that sealed much smaller chunks would need more room here: a body within
+/// `max_response_bytes` could otherwise be refused by this ceiling before it is opened.
 fn sealed_response_ceiling(max_response_bytes: usize) -> usize {
     max_response_bytes
         .saturating_add(max_response_bytes / 256)
@@ -969,7 +1019,8 @@ fn bhttp_response_within(
 /// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
 /// is retried once; an outer 400 or 422 refetches the key and retries once. An answer that a
 /// size guard refused ([`HttpsError::TooLarge`]) is final: [`RoundTripError::ResponseTooLarge`],
-/// not posted again.
+/// not posted again. Only a success answer can be refused so: an error page is read within a
+/// fixed 64 KiB guard and keeps its status (see [`read_error_body`]).
 ///
 /// The caller's dispatch hook is not called here but inside `post`, at the moment the sealed
 /// request is handed to the relay connection: until then a post may still fail without having
@@ -1302,9 +1353,11 @@ impl OhttpClient {
     /// otherwise a fresh HTTP/1.1 connection. A failure before anything was sent on a pooled h2
     /// connection is [`HttpsError::PreSend`] (and drops that connection from the pool); it is
     /// never retried here, because resending a relay POST's body would repeat its ciphertext.
-    /// The caller decides, and seals afresh. The body is read by [`read_body_capped`] through
-    /// `guard`: a declared length past the size cap, or the first frame that goes past it, ends
-    /// the exchange as [`HttpsError::TooLarge`].
+    /// The caller decides, and seals afresh. The body of a success answer is read by
+    /// [`read_body_capped`] through `guard`: a declared length past the size cap, or the first
+    /// frame that goes past it, ends the exchange as [`HttpsError::TooLarge`]. The body of any
+    /// other status (an error page) is read by [`read_error_body`] within a fixed 64 KiB guard,
+    /// cut there rather than refused, so the answer keeps its status whatever `guard` allows.
     ///
     /// `on_send` is called once, right before the request is handed to the connection: on h2
     /// when the connection is ready, on HTTP/1.1 when TLS and the handshake are done. A failure
@@ -1364,7 +1417,14 @@ impl OhttpClient {
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.trim().parse::<u64>().ok());
-        let bytes = read_body_capped(body, declared_len, guard, &target.host).await?;
+        // Only a success answer is read through the caller's guard: an error page is read
+        // within the fixed small guard of `read_error_body`, so that its status, not its length,
+        // is what the caller learns.
+        let bytes = if parts.status.is_success() {
+            read_body_capped(body, declared_len, guard, &target.host).await?
+        } else {
+            read_error_body(body, &target.host).await
+        };
         Ok(RelayAnswer {
             status: parts.status,
             content_type: parts
@@ -1685,19 +1745,21 @@ impl OhttpClient {
 
     /// Records the pause an outer 429 asks for as soon as its head arrives (before its body is
     /// read, which may stall or be cancelled), so that every later request through this relay
-    /// waits for it.
+    /// waits for it. A 429 without a `Retry-After` (or with one in the HTTP-date form, which is
+    /// not parsed) starts the [`DEFAULT_RETRY_AFTER`] pause.
     fn note_retry_after(&self, status: StatusCode, headers: &HeaderMap) {
         if status != StatusCode::TOO_MANY_REQUESTS {
             return;
         }
-        if let Some(wait) = retry_after(headers) {
-            tracing::warn!(
-                wait_secs = wait.as_secs(),
-                relay = %self.relay_url,
-                "ohttp: relay rate limit (429); holding requests through it"
-            );
-            RelayBackoff::global().note(&self.backoff_key(), wait);
-        }
+        let asked = retry_after(headers);
+        let wait = asked.unwrap_or(DEFAULT_RETRY_AFTER);
+        tracing::warn!(
+            wait_secs = wait.as_secs(),
+            retry_after_header = asked.is_some(),
+            relay = %self.relay_url,
+            "ohttp: relay rate limit (429); holding requests through it"
+        );
+        RelayBackoff::global().note(&self.backoff_key(), wait);
     }
 
     /// [`Self::round_trip_once`], sent once more (sealed afresh) when the gateway refused it
@@ -2144,7 +2206,9 @@ impl std::error::Error for HttpRoundTripError {}
 /// * `max_response_bytes` - The largest answer body read. A larger answer stops being read there
 ///   and fails as [`HttpRoundTripError::ResponseTooLarge`]. The sealed answer gets a little more
 ///   room for its framing (a 256th of this and 64 KiB); the body it opens to must then fit in
-///   `max_response_bytes` itself.
+///   `max_response_bytes` itself. An outer answer that is not a success (a relay or gateway
+///   error page) is read within a fixed 64 KiB guard instead and fails with its status
+///   (`Failed`, e.g. "HTTP 429"), never as `ResponseTooLarge`.
 /// * `on_dispatch` - Called at most once, right before the sealed request is written to the
 ///   relay connection, after the relay-pause check and the connection setup. So a pause, a
 ///   relay that cannot be reached, or a connection that is not ready leaves it uncalled. A
@@ -4103,6 +4167,23 @@ mod tests {
         assert_eq!(pulled.load(Ordering::SeqCst), 0, "no frame was pulled");
     }
 
+    /// An error page is read within its fixed guard and cut there, not refused: the frame that
+    /// crosses the guard is kept up to it and the frames behind are never pulled from the relay.
+    #[tokio::test]
+    async fn an_error_page_is_cut_at_its_guard_not_refused() {
+        let (body, pulled) = counted_body(&[40 * 1024, 40 * 1024, 40 * 1024]);
+        let bytes = read_error_body(body, "relay.test").await;
+        assert_eq!(bytes.len(), ERROR_BODY_GUARD_BYTES);
+        assert_eq!(
+            pulled.load(Ordering::SeqCst),
+            2,
+            "the third frame was not pulled"
+        );
+
+        let (body, _) = counted_body(&[100, 100]);
+        assert_eq!(read_error_body(body, "relay.test").await.len(), 200);
+    }
+
     /// Without a declared length the count decides, at the first frame that goes past the
     /// ceiling: the frames after it are never pulled from the relay.
     #[tokio::test]
@@ -4639,6 +4720,124 @@ mod tests {
         .err()
         .expect("413 is final");
         assert!(matches!(err, RoundTripError::TooLarge(_)), "{err:?}");
+    }
+
+    /// A 429 without a `Retry-After` starts the default pause (30 s, as in the ZIP), so a relay
+    /// that does not say for how long is still backed off from; another status without the
+    /// header starts none, and a `Retry-After` is taken at its word.
+    #[tokio::test]
+    async fn a_429_without_retry_after_starts_the_default_pause() {
+        let relay = "https://relay-429-default-pause-test.invalid/relay";
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+
+        client.note_retry_after(StatusCode::SERVICE_UNAVAILABLE, &HeaderMap::new());
+        assert!(RelayBackoff::global().remaining(relay).is_none());
+
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new());
+        let left = RelayBackoff::global()
+            .remaining(relay)
+            .expect("the default pause");
+        assert!(
+            left > Duration::from_secs(29) && left <= DEFAULT_RETRY_AFTER,
+            "{left:?}"
+        );
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static("90"));
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &headers);
+        let left = RelayBackoff::global()
+            .remaining(relay)
+            .expect("the longer pause");
+        assert!(left > Duration::from_secs(89), "{left:?}");
+    }
+
+    /// `client_with_a_key` whose in-process relay answers every post with `status` and a 1 MiB
+    /// error page (declared length, so a size guard would refuse it before a frame), with the
+    /// `retry_after` header when given.
+    async fn client_of_a_relay_answering_an_error_page(
+        relay: &str,
+        status: StatusCode,
+        retry_after: Option<&'static str>,
+    ) -> OhttpClient {
+        let client = client_with_a_key(relay).await;
+        serve_in_process_relay(&client, move |_req| async move {
+            let mut answer = Response::new(Full::new(Bytes::from(vec![b'e'; 1024 * 1024])).boxed());
+            *answer.status_mut() = status;
+            if let Some(value) = retry_after {
+                answer
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static(value));
+            }
+            answer
+        })
+        .await;
+        client
+    }
+
+    /// An outer status that is not a success keeps its class whatever the caller's ceiling: the
+    /// error page is read within its own fixed guard, never refused as `ResponseTooLarge`. A 503
+    /// whose page is far past `sealed_response_ceiling(0)` is `Transport` quoting the page and
+    /// starts no pause; a 429 without `Retry-After` is `RateLimited` and starts the default pause.
+    #[tokio::test]
+    async fn an_oversized_error_page_keeps_its_status_under_a_small_ceiling() {
+        let relay = "https://relay-error-page-503-test.invalid/relay";
+        let client =
+            client_of_a_relay_answering_an_error_page(relay, StatusCode::SERVICE_UNAVAILABLE, None)
+                .await;
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.round_trip(&test_request(), Some(0), || {}),
+        )
+        .await
+        .expect("the round trip must finish")
+        .expect_err("a 503");
+        match &err {
+            RoundTripError::Transport(m) => {
+                assert!(m.contains("503"), "{m}");
+                assert!(m.contains("eee"), "the start of the page is quoted: {m}");
+            }
+            other => panic!("not the status: {other:?}"),
+        }
+        assert!(
+            RelayBackoff::global().remaining(relay).is_none(),
+            "a 503 starts no pause"
+        );
+
+        let relay = "https://relay-error-page-429-test.invalid/relay";
+        let client =
+            client_of_a_relay_answering_an_error_page(relay, StatusCode::TOO_MANY_REQUESTS, None)
+                .await;
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.round_trip(&test_request(), Some(0), || {}),
+        )
+        .await
+        .expect("the round trip must finish")
+        .expect_err("a 429");
+        assert!(
+            matches!(
+                &err,
+                RoundTripError::RateLimited {
+                    retry_after: None,
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let left = RelayBackoff::global()
+            .remaining(relay)
+            .expect("the default pause was noted");
+        assert!(
+            left > Duration::from_secs(29) && left <= DEFAULT_RETRY_AFTER,
+            "{left:?}"
+        );
     }
 
     /// The pause a 429 asked for holds every later request through that relay, from any
