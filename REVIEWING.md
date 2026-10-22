@@ -2,7 +2,7 @@
 
 > For Zcash protocol / cryptographic engineers. This is a **map** — where to look and why — not a
 > tutorial.
-> The engine consumes **canonical** librustzcash from crates.io, currently the NU7 pre-releases
+> The engine consumes **canonical** librustzcash from crates.io, currently the NU7 release
 > pinned with `=` requirements (see `Cargo.toml`), never a third-party fork. It adds *scheduling,
 > persistence shape, and transport policy* — **not cryptography**.
 

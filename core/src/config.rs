@@ -177,6 +177,13 @@ pub struct EngineConfig {
     /// running a shortened test-network grid must pass the same one it configured
     /// on the wallet.
     ///
+    /// The interval counts ZIP 318 reference blocks, which are blocks at the 75 s
+    /// target spacing, and the policy's block spacing places its boundaries. From NU7
+    /// activation each reference block spans three blocks, so the same interval spans
+    /// three times as many blocks. Build the policy with
+    /// `BlockSpacing::for_network(&network)` (`zcash_protocol::zip318`), as upstream's
+    /// `put_blocks` does, so that its grid is the wallet's on every network.
+    ///
     /// `None` (default) = retention off, byte-identical to pre-B6 behavior.
     pub anchor_retention: Option<AnchorRetention>,
 

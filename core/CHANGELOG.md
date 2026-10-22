@@ -28,8 +28,21 @@ workspace.
   queue holds a `Historic` range: a restore under way, or the rescan an account import queues.
 - `mempool::MEMPOOL_SESSION_IDLE_NU7` and `mempool::mempool_session_idle`, which pick a
   mempool session's idle bound from the network upgrade active at the block after the tip.
+- `persist::SparseFacade` and `persist::WriteBehindFacade` implement
+  `WalletWrite::set_account_name`, the method `zcash_client_backend` adds to the trait.
+  The sparse facade forwards it to the wallet db; the write-behind facade, which holds no
+  connection, refuses it like every other write outside `put_blocks`.
 
 ### Changed
+- Migrated to `zcash_address 0.14.0`, `zcash_client_backend 0.25.0`,
+  `zcash_client_sqlite 0.23.0`, `zcash_keys 0.17.0`, `zcash_primitives 0.31.0`,
+  `zcash_protocol 0.11.0`, and `zcash_transparent 0.11.0`.
+- `EngineConfig::anchor_retention` holds upstream's `AnchorRetention`, whose constructors,
+  `AnchorRetention::new` and `AnchorRetention::union`, now take a
+  `zcash_protocol::zip318::BlockSpacing` as their second argument. A host that sets the
+  field passes `BlockSpacing::for_network(&network)`, with the network the wallet runs on.
+  The interval counts reference blocks, so from NU7 activation it spans three times as many
+  blocks.
 - `engine::SyncOutcome` has a new field, `net`: the pass's channel and RPC counts.
   `report::log_pass_summary` logs them as a `pass network split` line.
 - A block fetch starts one worker per plan chunk, up to `EngineConfig::fetch_streams`,
@@ -77,7 +90,10 @@ workspace.
   sets `nu6_3` instead: the CLI's `--custom-heights genesis,nu6_2=5000` becomes
   `--custom-heights genesis,nu6_3=5000`. The old form now activates NU6.3 from height 1,
   before the stand-in NU6.2 height of 5000.
-- `engine::ENGINE_BUILD` is `2026-10-21.v0.17-nu7-block-cadence`.
+- On mainnet, the behaviours these entries describe from NU7 activation, such as the mempool
+  session's 40 s idle bound, apply from height 3,543,405, the activation height
+  `zcash_protocol 0.11.0` sets.
+- `engine::ENGINE_BUILD` is `2026-10-22.v0.17-nu7-block-cadence`.
 
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed

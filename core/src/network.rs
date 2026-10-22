@@ -60,11 +60,10 @@ impl CustomActivations {
     /// height 1. Matches the common shape of hosted test chains (only the upgrade under test
     /// gets a distinctive height, via the corresponding field).
     ///
-    /// NU7 stays unset. It is still proposed: NU7 has no mainnet activation height in the
-    /// pinned `zcash_protocol`. A chain therefore opts in to it with an explicit `nu7` height,
-    /// just as the Swift SDK's regtest default `allActiveFromGenesis` leaves NU7 out. A genesis
-    /// NU7 would also break the non-decreasing order as soon as an earlier upgrade is given a
-    /// later height (`nu6_3 = 5000`, say).
+    /// NU7 stays unset. A chain opts in to it with an explicit `nu7` height, just as the
+    /// Swift SDK's regtest default `allActiveFromGenesis` leaves NU7 out. A genesis NU7 would
+    /// also break the non-decreasing order as soon as an earlier upgrade is given a later
+    /// height (`nu6_3 = 5000`, say).
     pub fn all_from_genesis() -> Self {
         Self {
             overwinter: Some(1),

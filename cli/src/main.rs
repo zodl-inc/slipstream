@@ -161,7 +161,9 @@ enum Cmd {
         /// anchors. Off when omitted.
         #[arg(long)]
         anchor_retention: Option<u32>,
-        /// \[B6\] Anchor-bucket grid, in blocks (default 144, the ZIP 318 value).
+        /// \[B6\] Anchor-bucket grid, in reference blocks of 75 s (default 144, the
+        /// ZIP 318 value). The chain's block spacing places the boundaries, so from
+        /// NU7 activation the grid spans three times as many blocks.
         /// MUST match the interval the wallet itself retains on, or a migration
         /// transfer anchored to a boundary this engine did not retain becomes
         /// unprovable. Only meaningful with `--anchor-retention`.
@@ -1047,6 +1049,7 @@ fn cmd_sync(
             };
             Some(zodl_slipstream::AnchorRetention::new(
                 zcash_protocol::consensus::BlockHeight::from(floor),
+                zcash_protocol::zip318::BlockSpacing::for_network(&network),
                 zodl_slipstream::AnchorRetentionInterval::custom(blocks),
             ))
         }

@@ -213,10 +213,22 @@ mod tests {
     #[test]
     fn session_idle_follows_nu7_activation() {
         use zcash_protocol::consensus::{Network, NetworkUpgrade, Parameters};
-        // Long before any mainnet NU7 activation.
+        let mainnet_nu7 = u64::from(u32::from(
+            Network::MainNetwork
+                .activation_height(NetworkUpgrade::Nu7)
+                .expect("mainnet NU7 height"),
+        ));
         assert_eq!(
-            mempool_session_idle(&Network::MainNetwork, 3_000_000),
+            mainnet_nu7, 3_543_405,
+            "mainnet NU7 activation (zcash_protocol 0.11.0)"
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::MainNetwork, mainnet_nu7 - 2),
             Duration::from_secs(60)
+        );
+        assert_eq!(
+            mempool_session_idle(&Network::MainNetwork, mainnet_nu7 - 1),
+            Duration::from_secs(40)
         );
         let nu7 = u64::from(u32::from(
             Network::TestNetwork
@@ -225,7 +237,7 @@ mod tests {
         ));
         assert_eq!(
             nu7, 4_465_026,
-            "testnet NU7 activation (zcash_protocol 0.11.0-pre.0)"
+            "testnet NU7 activation (zcash_protocol 0.11.0)"
         );
         assert_eq!(
             mempool_session_idle(&Network::TestNetwork, 4_000_000),
