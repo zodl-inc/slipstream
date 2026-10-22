@@ -1523,7 +1523,8 @@ mod tests {
 
     /// Prepare hook: create the SPENDING account from `seed`, then seed the
     /// shard-0 "server" root (only when `with_root`) — mirroring the engine's
-    /// pass-start `put_subtree_roots` ingest.
+    /// pass-start `put_subtree_roots_at` ingest, from index 0 as in a pass with
+    /// `Historic` scan work.
     fn t10b_prepare(
         seed: [u8; 32],
         blocks: &[zcash_client_backend::proto::compact_formats::CompactBlock],
@@ -3021,7 +3022,8 @@ mod tests {
         /// Its one unit ends on shard 1's last position, so no shard close builds them, and
         /// the stop skips the range-end finish. The tree holds no leaf where they end (R's own
         /// `from_state` frontier sits right before them). The subtree roots are ingested
-        /// before R is scanned, as every pass start ingests them.
+        /// before R is scanned, from index 0, as the start of a pass with `Historic` scan
+        /// work ingests them.
         ///
         /// - With the server's root for shard 1 stored, the sweep builds the run: the shard's
         ///   root computed from the run and R's frontier is that root.

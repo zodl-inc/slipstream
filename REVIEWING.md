@@ -68,8 +68,8 @@ scan work) → chain tip → **transparent UTXO refresh** (before shielded)
 → `run_to_completion`:
 - **graft-buffer sweep** (`persist::sweep_stranded_graft_rows`), before any range plans: buffered graft
   rows that no pending range will resume (a range stopped after its last commit, before its range-end
-  build) are built when the wallet can check where they end, against the tree or the subtree roots just
-  ingested, and otherwise deleted once their blocks are queued for a rescan (kept, with a warning, when
+  build) are built when the wallet can check where they end, against the tree or the stored subtree
+  roots, and otherwise deleted once their blocks are queued for a rescan (kept, with a warning, when
   the wallet's block metadata cannot place them). A connection open and two queries when the buffer is
   empty; a failure only warns, and the rows wait for the next pass's sweep.
 - `suggest_scan_ranges` → **ChainTip priority, then Historic** (Spend-before-Sync; non-linear order, so

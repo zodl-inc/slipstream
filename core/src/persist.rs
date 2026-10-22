@@ -2485,7 +2485,7 @@ where
 /// The root of shard `index`, computed from the leaves and subtree hashes `store` holds
 /// for it, or `None` while some of the shard is missing. The annotation on the shard's own
 /// root is ignored: the SQLite store puts its stored root there on every shard it loads
-/// (`get_shard` reads the `root_hash` that the pass-start `put_subtree_roots` ingest wrote),
+/// (`get_shard` reads the `root_hash` that a pass-start `put_subtree_roots_at` ingest wrote),
 /// so reading it would only return the root it is compared with.
 fn shard_content_root<H>(store: &SparseShardStore<H>, index: u64) -> Option<H>
 where
@@ -2695,7 +2695,9 @@ trait SweptTree: Sized {
         wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
     ) -> Result<(), SqliteClientError>;
     /// The root the wallet stores for shard `index`, as the graft verdict reads it: the
-    /// server's, which every pass start ingests (`put_subtree_roots`) before the sweep.
+    /// server's, which a pass start ingests (`put_subtree_roots_at`) before the sweep, in
+    /// this pass or an earlier one. A pass with `Historic` scan work ingests every root,
+    /// and any other pass only those from each pool's next subtree index on.
     fn stored_root(db: &mut Db, index: u64) -> Result<Option<Self::Node>, SqliteClientError>;
 }
 
