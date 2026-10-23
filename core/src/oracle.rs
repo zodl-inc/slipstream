@@ -2423,6 +2423,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             // Unit 2 [40, 80) holds block 50's anchor; unit 3 [80, 150) holds block 100's.
@@ -2507,6 +2508,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + tip_lead;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let mut dirs = vec![];
@@ -2653,6 +2655,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             open_wallet(dir, &base, &blocks, tip);
@@ -2913,6 +2916,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let root = tempfile::tempdir().expect("tempdir");
@@ -3691,6 +3695,7 @@ mod tests {
             let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
             let anchors = AnchorRetention::new(
                 height(0),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let root = tempfile::tempdir().expect("tempdir");
@@ -3803,6 +3808,7 @@ mod tests {
             let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
             let anchors = AnchorRetention::new(
                 height(0),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let root = tempfile::tempdir().expect("tempdir");
@@ -3898,6 +3904,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             open_wallet(dir, &base, &blocks, tip);
@@ -4116,6 +4123,7 @@ mod tests {
             let blocks = chain(base_size, 150);
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             open_wallet(dir, &base, &blocks, STOPPED_R_TIP);
@@ -4601,6 +4609,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(ORCHARD_START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let r_anchors = [ORCHARD_START + 50, ORCHARD_START + 100];
@@ -4692,6 +4701,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(ORCHARD_START).expect("fits")),
+                zcash_protocol::zip318::BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let r_anchors = [ORCHARD_START + 50, ORCHARD_START + 100];

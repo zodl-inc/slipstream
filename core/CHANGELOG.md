@@ -22,6 +22,11 @@ workspace.
 
 ### Changed
 - `engine::ENGINE_BUILD` is `2026-10-20.v0.16-graft-buffer-fixes`.
+- Migrated to the stable librustzcash releases that set the NU7 mainnet activation
+  height (`zcash_protocol 0.11.0`, `zcash_client_backend 0.25.0`, `zcash_client_sqlite 0.23.0`,
+  `zcash_keys 0.17.0`, `zcash_primitives 0.31.0`, `zcash_transparent 0.11.0`,
+  `zcash_address 0.14.0`), from their pre-releases, and to `schemerz 0.3` /
+  `schemerz-rusqlite 0.371` to match `zcash_client_sqlite 0.23.0`.
 
 ### Fixed
 - With graft on (`EngineConfig::graft_subtree`, the default), a Historic range resumed

@@ -4663,6 +4663,7 @@ mod store_tests {
     use super::*;
     use incrementalmerkletree::{Address, Hashable as _};
     use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
+    use zcash_protocol::zip318::BlockSpacing;
 
     type Store = SparseShardStore<sapling::Node>;
 
@@ -4844,7 +4845,13 @@ mod store_tests {
         };
 
         // Retention ON, floor below the anchors: grid ids survive, off-grid is doomed.
-        let zip318 = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
+        let zip318 = |floor: u32| {
+            AnchorRetention::new(
+                h(floor),
+                BlockSpacing::UNIFORM,
+                AnchorRetentionInterval::ZIP_318,
+            )
+        };
         let mut commitments = fresh(&[1152, 1300, 1440]);
         let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&zip318(1000)));
         assert_eq!(n, 1, "only the off-grid checkpoint is doomed");
@@ -4876,6 +4883,7 @@ mod store_tests {
         // test network needs, and what a mirrored constant could never express.
         let short = AnchorRetention::new(
             h(1000),
+            BlockSpacing::UNIFORM,
             AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
         );
         let mut commitments = fresh(&[1152, 1300, 1440]);
@@ -4893,7 +4901,13 @@ mod store_tests {
     #[test]
     fn should_retain_anchor_matches_upstream_predicate() {
         let h = |n: u32| BlockHeight::from(n);
-        let at = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
+        let at = |floor: u32| {
+            AnchorRetention::new(
+                h(floor),
+                BlockSpacing::UNIFORM,
+                AnchorRetentionInterval::ZIP_318,
+            )
+        };
         assert!(should_retain_anchor(Some(&at(1000)), h(1152)));
         assert!(
             should_retain_anchor(Some(&at(1152)), h(1152)),
@@ -4912,6 +4926,7 @@ mod store_tests {
         // the interval configurable rather than mirroring a constant.
         let short = AnchorRetention::new(
             h(1000),
+            BlockSpacing::UNIFORM,
             AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
         );
         assert!(should_retain_anchor(Some(&short), h(1308)));
