@@ -1045,6 +1045,7 @@ fn cmd_sync(
             };
             Some(zodl_slipstream::AnchorRetention::new(
                 zcash_protocol::consensus::BlockHeight::from(floor),
+                zcash_protocol::zip318::BlockSpacing::for_network(&network),
                 zodl_slipstream::AnchorRetentionInterval::custom(blocks),
             ))
         }

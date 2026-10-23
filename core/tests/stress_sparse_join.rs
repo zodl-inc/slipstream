@@ -369,7 +369,11 @@ fn run_anchor_retention_pair() -> Result<(), String> {
         first_grid + grid < SYNTH_START + 650,
         "grid must fall well below the window"
     );
-    let retention = AnchorRetention::new(BlockHeight::from(SYNTH_START as u32), interval);
+    let retention = AnchorRetention::new(
+        BlockHeight::from(SYNTH_START as u32),
+        zcash_protocol::zip318::BlockSpacing::UNIFORM,
+        interval,
+    );
 
     let query = |dir: &Path, id: u64| -> Result<bool, String> {
         let conn = rusqlite::Connection::open(dir.join("data.db"))

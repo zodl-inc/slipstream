@@ -16,6 +16,13 @@ workspace.
   The sparse facade forwards it to the wallet db; the write-behind facade, which holds no
   connection, refuses it like every other write outside `put_blocks`.
 
+### Changed
+- Migrated to the stable librustzcash releases that set the NU7 mainnet activation
+  height (`zcash_protocol 0.11.0`, `zcash_client_backend 0.25.0`, `zcash_client_sqlite 0.23.0`,
+  `zcash_keys 0.17.0`, `zcash_primitives 0.31.0`, `zcash_transparent 0.11.0`,
+  `zcash_address 0.14.0`), from their pre-releases, and to `schemerz 0.3` /
+  `schemerz-rusqlite 0.371` to match `zcash_client_sqlite 0.23.0`.
+
 ## [0.4.0-pre.1] - 2026-10-06
 
 ### Changed
