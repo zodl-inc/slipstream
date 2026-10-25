@@ -793,7 +793,8 @@ async fn follow_loop(
             }
         };
 
-        // Probe succeeded: reset probe failure counter and clear Error(3) if set.
+        // Probe succeeded: reset probe failure counter, clear Error(3) if set, and re-enable
+        // mempool monitoring if it was disabled (network recovered after Doze or transient failure).
         failures.probe_ok();
         {
             let state = reporter.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -801,6 +802,11 @@ async fn follow_loop(
                 drop(state);
                 reporter.set_state(SyncState::Done);
             }
+        }
+        if !mempool_enabled {
+            tracing::info!("follow: re-enabling mempool monitoring after successful tip probe");
+            mempool_enabled = true;
+            mempool_failures = 0;
         }
 
         if !should_resync(last_tip, observed) {
