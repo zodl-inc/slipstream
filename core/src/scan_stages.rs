@@ -16,15 +16,15 @@
 
 //! Scan stage timings for diagnostic purposes (sandblasting performance analysis).
 //!
-//! Tracks per-chunk aggregated stage timing and rayon load-balance metrics to show
-//! where CPU goes during scan. Cheap enough to leave on: atomics + Instants per
-//! stage, never per-output instrumentation in hot loops.
+//! Measures real per-thread CPU time for rayon worker threads during scan via
+//! CLOCK_THREAD_CPUTIME_ID (Linux/Android only). Also captures put_blocks timing
+//! (tree + rows) from persist callbacks.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-chunk scan stage timings, accumulated via atomics so multiple threads
-/// can contribute (rayon tasks, persist lane, scan thread).
+/// can contribute (persist lane, scan thread).
 #[derive(Default)]
 pub struct ChunkStageTimings {
     /// Milliseconds spent in tree building (put_blocks time from persist facades).
@@ -106,6 +106,122 @@ pub fn record_rows_ms(ms: u64) {
     });
 }
 
+// ── Rayon worker thread CPU time measurement (Linux/Android only) ─────────────
+
+/// Per-thread CPU time sample (thread-cputime via CLOCK_THREAD_CPUTIME_ID).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ThreadCpuSample {
+    pub cpu_ns: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl ThreadCpuSample {
+    /// Sample current thread's CPU time (user + system) via CLOCK_THREAD_CPUTIME_ID.
+    pub fn now() -> Self {
+        use std::mem::MaybeUninit;
+        let mut ts = MaybeUninit::<libc::timespec>::uninit();
+        let ret = unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, ts.as_mut_ptr()) };
+        if ret == 0 {
+            let ts = unsafe { ts.assume_init() };
+            let cpu_ns = ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64;
+            Self { cpu_ns }
+        } else {
+            // clock_gettime failed (should not happen on Linux 2.6.12+)
+            Self { cpu_ns: 0 }
+        }
+    }
+
+    /// Compute delta in milliseconds.
+    pub fn delta_ms(self, earlier: Self) -> u64 {
+        self.cpu_ns.saturating_sub(earlier.cpu_ns) / 1_000_000
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl ThreadCpuSample {
+    /// No-op on non-Linux platforms.
+    pub fn now() -> Self {
+        Self { cpu_ns: 0 }
+    }
+
+    /// No-op delta.
+    pub fn delta_ms(self, _earlier: Self) -> u64 {
+        0
+    }
+}
+
+/// Sample all rayon worker threads' CPU time via broadcast.
+/// Returns per-thread samples in worker order.
+pub fn sample_rayon_workers(pool: Option<&rayon::ThreadPool>) -> Vec<ThreadCpuSample> {
+    let broadcast_fn = |_ctx: rayon::BroadcastContext<'_>| ThreadCpuSample::now();
+
+    match pool {
+        Some(pool) => pool.broadcast(broadcast_fn),
+        None => rayon::broadcast(broadcast_fn),
+    }
+}
+
+/// Rayon worker CPU statistics from sampled deltas.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RayonCpuStats {
+    /// Sum of all worker CPU time (milliseconds).
+    pub total_cpu_ms: u64,
+    /// Minimum per-thread CPU time (milliseconds).
+    pub min_cpu_ms: u64,
+    /// Median per-thread CPU time (milliseconds).
+    pub median_cpu_ms: u64,
+    /// Maximum per-thread CPU time (milliseconds).
+    pub max_cpu_ms: u64,
+    /// Number of worker threads.
+    pub num_threads: usize,
+}
+
+impl RayonCpuStats {
+    /// Compute statistics from start and end samples.
+    pub fn from_samples(start: &[ThreadCpuSample], end: &[ThreadCpuSample]) -> Self {
+        if start.len() != end.len() || start.is_empty() {
+            return Self::default();
+        }
+
+        let mut deltas_ms: Vec<u64> = start
+            .iter()
+            .zip(end.iter())
+            .map(|(s, e)| e.delta_ms(*s))
+            .collect();
+
+        if deltas_ms.is_empty() {
+            return Self::default();
+        }
+
+        let total_cpu_ms: u64 = deltas_ms.iter().sum();
+        let min_cpu_ms = *deltas_ms.iter().min().unwrap_or(&0);
+        let max_cpu_ms = *deltas_ms.iter().max().unwrap_or(&0);
+
+        deltas_ms.sort_unstable();
+        let median_cpu_ms = deltas_ms[deltas_ms.len() / 2];
+
+        Self {
+            total_cpu_ms,
+            min_cpu_ms,
+            median_cpu_ms,
+            max_cpu_ms,
+            num_threads: deltas_ms.len(),
+        }
+    }
+
+    /// Calculate utilization: (total CPU-ms) / (wall-ms * threads) as percentage.
+    pub fn utilization_pct(&self, wall_ms: u64) -> u64 {
+        if wall_ms == 0 || self.num_threads == 0 {
+            return 0;
+        }
+        let denominator = wall_ms.saturating_mul(self.num_threads as u64);
+        if denominator == 0 {
+            return 0;
+        }
+        self.total_cpu_ms.saturating_mul(100) / denominator
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +236,48 @@ mod tests {
         let snap = timings.snapshot();
         assert_eq!(snap.tree_ms, 300);
         assert_eq!(snap.rows_ms, 50);
+    }
+
+    #[test]
+    fn rayon_cpu_stats_from_samples() {
+        let start = vec![
+            ThreadCpuSample {
+                cpu_ns: 1_000_000_000,
+            }, // 1s
+            ThreadCpuSample {
+                cpu_ns: 2_000_000_000,
+            }, // 2s
+            ThreadCpuSample {
+                cpu_ns: 1_500_000_000,
+            }, // 1.5s
+        ];
+        let end = vec![
+            ThreadCpuSample {
+                cpu_ns: 1_100_000_000,
+            }, // +100ms
+            ThreadCpuSample {
+                cpu_ns: 2_300_000_000,
+            }, // +300ms
+            ThreadCpuSample {
+                cpu_ns: 1_700_000_000,
+            }, // +200ms
+        ];
+
+        let stats = RayonCpuStats::from_samples(&start, &end);
+        assert_eq!(stats.total_cpu_ms, 600); // 100+300+200
+        assert_eq!(stats.min_cpu_ms, 100);
+        assert_eq!(stats.max_cpu_ms, 300);
+        assert_eq!(stats.median_cpu_ms, 200); // sorted: 100,200,300
+        assert_eq!(stats.num_threads, 3);
+
+        // Utilization: 600ms CPU / (200ms wall * 3 threads) = 100%
+        assert_eq!(stats.utilization_pct(200), 100);
+    }
+
+    #[test]
+    fn rayon_cpu_stats_empty() {
+        let stats = RayonCpuStats::from_samples(&[], &[]);
+        assert_eq!(stats.total_cpu_ms, 0);
+        assert_eq!(stats.num_threads, 0);
     }
 }

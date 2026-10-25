@@ -48,6 +48,7 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+libc = "0.2"
 tokio-stream = "0.1"
 tonic = { workspace = true }
 prost = { workspace = true }

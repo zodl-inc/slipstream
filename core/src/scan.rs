@@ -698,6 +698,10 @@ async fn scan_chunks_inner(
         let chunk_timings = std::sync::Arc::new(crate::scan_stages::ChunkStageTimings::new());
         crate::scan_stages::set_current_chunk_timings(chunk_timings.clone());
 
+        // Sample rayon worker CPU time at chunk start (Linux/Android only).
+        let chunk_wall_start = Instant::now();
+        let rayon_start_samples = crate::scan_stages::sample_rayon_workers(None);
+
         // Initialise or reset batch_len.
         // None path: always reset to chunk_len (ensures the loop executes exactly once
         // per chunk — after one iteration sub_start == chunk_end + 1, remaining == 0,
@@ -718,9 +722,6 @@ async fn scan_chunks_inner(
         let mut chunk_elapsed_ms: u64 = 0;
         // T6.9: time this chunk's submits spent blocked on previous commits.
         let mut chunk_persist_wait_ms: u64 = 0;
-        // Sandblasting diagnostics: accumulate walk times per chunk.
-        let mut chunk_walk1_ms: u64 = 0;
-        let mut chunk_walk2_ms: u64 = 0;
 
         loop {
             // How many blocks remain in this chunk from sub_start?
@@ -894,8 +895,6 @@ async fn scan_chunks_inner(
             let (walk1, walk2) = source.walk_walls();
             stats.scan_pass1 += walk1;
             stats.scan_pass2 += walk2;
-            chunk_walk1_ms += walk1.as_millis() as u64;
-            chunk_walk2_ms += walk2.as_millis() as u64;
             drop(source);
 
             let summary = match scan_result {
@@ -1054,106 +1053,42 @@ async fn scan_chunks_inner(
             "chunk scanned"
         );
 
-        // Sandblasting diagnostics: log stage breakdown. The breakdown approximates:
-        // - decode_ms: part of pass1+pass2 (estimated as overhead)
-        // - tree_ms + rows_ms: from put_blocks timing (recorded via thread-local)
-        // - sapling_decrypt_ms + orchard_decrypt_ms: trial decryption (happens in rayon,
-        //   estimated as scan_call - tree - rows - overhead)
-        // - nullifier_ms: part of pass2 (lumped into other)
-        // - other_ms: everything else
+        // Sandblasting diagnostics: measure real rayon worker CPU time and persist timing.
+        // Sample rayon worker CPU time at chunk end (Linux/Android only).
+        let rayon_end_samples = crate::scan_stages::sample_rayon_workers(None);
+        let chunk_wall_ms = chunk_wall_start.elapsed().as_millis() as u64;
+
+        // Compute rayon CPU statistics from start/end samples.
+        let rayon_stats = crate::scan_stages::RayonCpuStats::from_samples(
+            &rayon_start_samples,
+            &rayon_end_samples,
+        );
+
+        // Get persist-side timings (tree + rows from put_blocks).
         let stage_snap = chunk_timings.snapshot();
-        let pass1_ms = chunk_walk1_ms;
-        let pass2_ms = chunk_walk2_ms;
-        let tree_ms = stage_snap.tree_ms;
-        let rows_ms = stage_snap.rows_ms;
+        let persist_tree_ms = stage_snap.tree_ms;
+        let persist_rows_ms = stage_snap.rows_ms;
 
-        // Estimate decode as ~10% of walk time (heuristic: block parsing overhead)
-        let total_walk_ms = pass1_ms + pass2_ms;
-        let decode_ms = total_walk_ms / 10;
+        // Calculate utilization from measured rayon CPU time.
+        let util_pct = rayon_stats.utilization_pct(chunk_wall_ms);
 
-        // Estimate trial decryption as scan_call - tree - rows - decode overhead
-        // (This is imperfect: includes nullifier checks and assembly, but those are
-        // relatively cheap compared to trial decryption in the spam range)
-        let decrypt_ms = chunk_elapsed_ms
-            .saturating_sub(tree_ms)
-            .saturating_sub(rows_ms)
-            .saturating_sub(decode_ms);
-
-        // Split decrypt between Sapling and Orchard (heuristic: proportional to outputs)
-        // In the spam range, Sapling dominates; outside it, Orchard may dominate.
-        let total_outputs = chunk.outputs.max(1);
-        let sapling_ratio = if total_outputs > 0 {
-            // Approximate: assume most outputs are Sapling in spam range
-            // (This is a rough heuristic; real ratio requires per-pool output counts)
-            70 // 70% Sapling, 30% Orchard as default split
-        } else {
-            50
-        };
-        let sapling_decrypt_ms = decrypt_ms * sapling_ratio / 100;
-        let orchard_decrypt_ms = decrypt_ms.saturating_sub(sapling_decrypt_ms);
-
-        // spam_filter_ms: no Sapling spam filter in this codebase (upstream handles it)
-        let spam_filter_ms = 0;
-
-        // nullifier_ms: happens during pass2, hard to separate; estimated as ~5% of pass2
-        // (heuristic: nullifier checks are relatively cheap lookups compared to decryption)
-        let nullifier_ms = pass2_ms / 20;
-
-        // Everything else (assembly, coordination, overhead)
-        let other_ms = chunk_elapsed_ms
-            .saturating_sub(decode_ms)
-            .saturating_sub(sapling_decrypt_ms)
-            .saturating_sub(orchard_decrypt_ms)
-            .saturating_sub(spam_filter_ms)
-            .saturating_sub(tree_ms)
-            .saturating_sub(rows_ms)
-            .saturating_sub(nullifier_ms);
-
-        // Rayon statistics: get pool size and estimate task count
-        let pool_size = rayon::current_num_threads();
-        // Estimate task count based on pool size and chunk size
-        // (Upstream spawns batches; exact count unavailable without instrumentation)
-        let estimated_tasks = if pool_size > 0 {
-            (len as u64).div_ceil(1000).max(pool_size as u64)
-        } else {
-            1
-        };
-
-        // Utilization: (total task time) / (chunk wall * threads)
-        // Estimated as (decrypt time + tree time) / (chunk_elapsed * threads)
-        let total_cpu_ms = sapling_decrypt_ms + orchard_decrypt_ms + tree_ms;
-        let util_pct = if chunk_elapsed_ms > 0 && pool_size > 0 {
-            (total_cpu_ms.saturating_mul(100)) / (chunk_elapsed_ms.saturating_mul(pool_size as u64))
-        } else {
-            0
-        };
-
-        // Task timing statistics (estimated; real values require rayon instrumentation)
-        // Estimated max task = longest decrypt time (approximated)
-        let task_max_ms = total_cpu_ms
-            .checked_div(estimated_tasks.min(pool_size as u64))
-            .unwrap_or(0);
-        // Estimated median = average task time
-        let task_p50_ms = total_cpu_ms.checked_div(estimated_tasks).unwrap_or(0);
-
-        // Log rayon pool size once per pass (not per chunk)
+        // Log rayon pool size once per pass (not per chunk).
         if stats.chunks == 1 {
-            info!(pool_size, "rayon global pool");
+            info!(pool_size = rayon_stats.num_threads, "rayon global pool");
         }
 
+        // Log measured values only (no estimates).
+        // On non-Linux: rayon fields will be 0 (sample_rayon_workers returns empty vec).
         info!(
             chunk_start,
-            decode_ms,
-            sapling_decrypt_ms,
-            orchard_decrypt_ms,
-            spam_filter_ms,
-            tree_ms,
-            nullifier_ms,
-            other_ms,
-            tasks = estimated_tasks,
+            persist_tree_ms,
+            persist_rows_ms,
+            rayon_cpu_ms = rayon_stats.total_cpu_ms,
+            rayon_cpu_min = rayon_stats.min_cpu_ms,
+            rayon_cpu_median = rayon_stats.median_cpu_ms,
+            rayon_cpu_max = rayon_stats.max_cpu_ms,
+            wall_ms = chunk_wall_ms,
             util_pct,
-            task_max_ms,
-            task_p50_ms,
             "chunk stages"
         );
 

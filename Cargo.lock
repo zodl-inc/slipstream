@@ -8327,6 +8327,7 @@ dependencies = [
  "hyper-util",
  "incrementalmerkletree",
  "jubjub",
+ "libc",
  "orchard",
  "pasta_curves",
  "prost",
