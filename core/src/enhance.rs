@@ -35,7 +35,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::{
     OutputStatusFilter, TransactionDataRequest, TransactionStatus, TransactionStatusFilter,
@@ -102,14 +102,13 @@ const MAX_TXID_RETRIES: u32 = 3;
 /// Per-txid retry backoff schedule: attempt index → sleep Duration.
 /// Jittered exponential: 250 ms, 500 ms, 1 s, 2 s (±20% jitter).
 fn txid_retry_backoff(attempt: u32) -> std::time::Duration {
-    use rand::Rng;
     let base_ms = match attempt {
         1 => 250,
         2 => 500,
         3 => 1000,
         _ => 2000,
     };
-    let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+    let jitter = 0.8 + (rand::random::<f64>() * 0.4);
     std::time::Duration::from_millis((base_ms as f64 * jitter) as u64)
 }
 
@@ -209,7 +208,7 @@ const ISOLATED_FETCH_CONCURRENCY: usize = 4;
 /// concurrent heavy calls to respect the gateway's per-host cap (field evidence:
 /// 4-32, tested at 8). Each fetch that hits the cap gets `grpc-status 14` and is
 /// retried per-txid with backoff, so this bound prevents the all-at-once storm.
-const ENHANCE_FETCH_CONCURRENCY: usize = 8;
+pub const ENHANCE_FETCH_CONCURRENCY: usize = 8;
 
 /// [`run_enhancement`], with every wallet-identifying call (each `GetTransaction`, each
 /// `GetTaddressTxids`) on its own isolated Tor circuit when `isolate` names the Tor client and
@@ -347,10 +346,11 @@ where
         } else {
             None
         };
+        let isolate_for_fetches = isolate.clone();
         let txid_fetches =
-            futures_util::stream::iter(txid_reqs.into_iter().map(|(txid, want_enhance)| {
+            futures_util::stream::iter(txid_reqs.into_iter().map(move |(txid, want_enhance)| {
                 let c = open.clone();
-                let iso = isolate.clone();
+                let iso = isolate_for_fetches.clone();
                 async move { fetch_with_retry(c, iso.as_ref(), txid, want_enhance).await }
             }))
             .buffer_unordered(ENHANCE_FETCH_CONCURRENCY);

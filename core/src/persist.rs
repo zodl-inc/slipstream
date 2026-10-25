@@ -1485,6 +1485,16 @@ pub fn sparse_put_blocks(
     let mut flush_ms = 0u128;
     let mut downgraded = 0u64;
 
+    // Capture block heights before moving blocks into the transactionally closure.
+    let first_height = u32::from(initial_block.height());
+    let last_height = u32::from(
+        blocks
+            .last()
+            .map(|b| b.height())
+            .unwrap_or(initial_block.height()),
+    );
+
+    let t_txn = std::time::Instant::now();
     inner.transactionally::<_, _, SqliteClientError>(|wdb| {
         // ── Rows stage — upstream verbatim (#2586 extraction + #2604 nfskip) ──
         // `put_blocks_rows` persists every row-level artifact (block meta, tx
@@ -1502,6 +1512,20 @@ pub fn sparse_put_blocks(
         >(wdb, GapLimits::default(), from_state, blocks)
         .map_err(SqliteClientError::from)?;
         rows_ms = t_rows.elapsed().as_millis();
+        if rows_ms > 5000 {
+            // Log slow rows stage timing to pinpoint first-put stalls.
+            // Field evidence (2026-10-25): 24 s rows stage on the first small pass after a
+            // restore (3 blocks). Hypothesis: deferred work on the first put after a big sparse
+            // restore (graft buffer cleanup, checkpoint pruning, shard tree pruning, index
+            // rebuild, WAL checkpoint). This log helps isolate which stage takes the time.
+            info!(
+                rows_ms,
+                first_height,
+                last_height,
+                block_count = last_height - first_height + 1,
+                "sparse put_blocks: rows stage took >5s (first put after restore?)"
+            );
+        }
 
         let mut sapling_commitments = rows.sapling_commitments;
         let mut orchard_commitments = rows.orchard_commitments;
@@ -2059,6 +2083,7 @@ pub fn sparse_put_blocks(
         }
         Ok(())
     })?;
+    let txn_ms = t_txn.elapsed().as_millis();
 
     // v0.4 Plan A: buffer rows of the row sets built/grafted this call are dead now
     // the txn committed: exactly their positions, never the rest of their shard.
@@ -2093,12 +2118,15 @@ pub fn sparse_put_blocks(
     // tree_ms ≈ max(sap, orch) when the join truly runs in parallel, ≈ sap + orch when
     // it degenerates to serial (single-thread rayon pool) — this distinguishes
     // "lopsided pools" from "no parallelism" directly in device logs.
+    // txn_ms is the total transaction time (rows + tree + flush + commit); a gap between
+    // txn_ms and (rows_ms + tree_ms + flush_ms) indicates commit/WAL checkpoint overhead.
     info!(
         rows_ms,
         tree_ms,
         sap_tree_ms,
         orch_tree_ms,
         flush_ms,
+        txn_ms,
         downgraded,
         // [B6] retention observability: the active floor and grid, plus how many
         // anchors the orchard store currently pins (None = retention off). The grid

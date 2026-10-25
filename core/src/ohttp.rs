@@ -1334,7 +1334,10 @@ impl OhttpClient {
         // has likely filled it by then). This prevents the connection storm.
         let dial_lock = {
             let mut locks = self.dial_locks.lock().await;
-            locks.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
         };
         let _guard = dial_lock.lock().await;
 
