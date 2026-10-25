@@ -1074,7 +1074,10 @@ async fn scan_chunks_inner(
         // Estimate trial decryption as scan_call - tree - rows - decode overhead
         // (This is imperfect: includes nullifier checks and assembly, but those are
         // relatively cheap compared to trial decryption in the spam range)
-        let decrypt_ms = chunk_elapsed_ms.saturating_sub(tree_ms).saturating_sub(rows_ms).saturating_sub(decode_ms);
+        let decrypt_ms = chunk_elapsed_ms
+            .saturating_sub(tree_ms)
+            .saturating_sub(rows_ms)
+            .saturating_sub(decode_ms);
 
         // Split decrypt between Sapling and Orchard (heuristic: proportional to outputs)
         // In the spam range, Sapling dominates; outside it, Orchard may dominate.
@@ -1111,7 +1114,7 @@ async fn scan_chunks_inner(
         // Estimate task count based on pool size and chunk size
         // (Upstream spawns batches; exact count unavailable without instrumentation)
         let estimated_tasks = if pool_size > 0 {
-            ((len as u64 + 999) / 1000).max(pool_size as u64)
+            (len as u64).div_ceil(1000).max(pool_size as u64)
         } else {
             1
         };
@@ -1127,17 +1130,11 @@ async fn scan_chunks_inner(
 
         // Task timing statistics (estimated; real values require rayon instrumentation)
         // Estimated max task = longest decrypt time (approximated)
-        let task_max_ms = if estimated_tasks > 0 {
-            total_cpu_ms / estimated_tasks.min(pool_size as u64)
-        } else {
-            0
-        };
+        let task_max_ms = total_cpu_ms
+            .checked_div(estimated_tasks.min(pool_size as u64))
+            .unwrap_or(0);
         // Estimated median = average task time
-        let task_p50_ms = if estimated_tasks > 0 {
-            total_cpu_ms / estimated_tasks
-        } else {
-            0
-        };
+        let task_p50_ms = total_cpu_ms.checked_div(estimated_tasks).unwrap_or(0);
 
         // Log rayon pool size once per pass (not per chunk)
         if stats.chunks == 1 {
