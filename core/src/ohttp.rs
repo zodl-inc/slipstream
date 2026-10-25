@@ -1235,6 +1235,13 @@ struct OhttpClient {
     /// more: every new connection would be a new circuit build.
     /// Each with the time it was opened, see [`H2_MAX_CONNECTION_AGE`].
     h2_pool: Mutex<HashMap<String, PooledH2>>,
+    /// Per-key lock to prevent concurrent dials to the same target (single-flight semantics).
+    /// Concurrent callers that find no live connection wait for one in-progress dial to complete
+    /// and share its resulting sender, so the connection storm (70 dials in seconds with 70
+    /// concurrent GetTransaction calls) never happens. With one dial at a time per key, rustls's
+    /// in-memory session resumption cache (default in ClientConfig) also starts working for later
+    /// reconnects.
+    dial_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
     client_trace: Option<ClientTrace>,
     /// The shared core's options for this client (`SLIPSTREAM` for gRPC, `SLIPSTREAM_HTTP` for
@@ -1265,6 +1272,10 @@ impl OhttpClient {
         .with_root_certificates(roots)
         .with_no_client_auth();
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // rustls ClientConfig defaults: session resumption enabled (in-memory cache, no storage
+        // backend), max_fragment_size None (16 KiB). With single-flight dials per key, the resumption
+        // cache now starts working for later reconnects (one dial at a time means the second dial
+        // can resume from the first).
         Ok(Self {
             gateway_host: gateway_host.to_string(),
             relay_url: relay_url.to_string(),
@@ -1273,6 +1284,7 @@ impl OhttpClient {
             tls: Arc::new(tls),
             dialer,
             h2_pool: Mutex::new(HashMap::new()),
+            dial_locks: Mutex::new(HashMap::new()),
             client_trace: client_trace_prefix.map(|p| ClientTrace::new(&p, &profile.trace)),
             profile,
         })
@@ -1296,11 +1308,17 @@ impl OhttpClient {
 
     /// Pooled HTTP/2 sender for `target`, (re)connecting when there is none or it has closed.
     /// Returns `None` if the server does not negotiate h2 (caller falls back to HTTP/1.1).
+    /// Single-flight per pool key: concurrent callers that find no live connection wait for
+    /// one in-progress dial to complete and share its resulting sender (no connection storm).
+    /// Tor-dialer clients are never cached across calls (fresh client per call) to preserve
+    /// circuit isolation — this single-flight applies WITHIN one client's concurrent calls only.
     async fn h2_sender(
         &self,
         target: &HttpsTarget,
     ) -> Result<Option<http2::SendRequest<Full<Bytes>>>, String> {
         let key = format!("{}:{}", target.host, target.port);
+
+        // Fast path: check the pool without holding the dial lock.
         {
             let pool = self.h2_pool.lock().await;
             if let Some((s, opened)) = pool.get(&key)
@@ -1310,6 +1328,29 @@ impl OhttpClient {
                 return Ok(Some(s.clone()));
             }
         }
+
+        // Slow path: acquire the per-key dial lock so that only one caller dials at a time.
+        // Other concurrent callers wait here, then check the pool again (the first caller
+        // has likely filled it by then). This prevents the connection storm.
+        let dial_lock = {
+            let mut locks = self.dial_locks.lock().await;
+            locks.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+        };
+        let _guard = dial_lock.lock().await;
+
+        // Re-check the pool after acquiring the dial lock: a concurrent caller may have
+        // dialed already while we waited.
+        {
+            let pool = self.h2_pool.lock().await;
+            if let Some((s, opened)) = pool.get(&key)
+                && !s.is_closed()
+                && (self.dialer.is_tor() || opened.elapsed() < H2_MAX_CONNECTION_AGE)
+            {
+                return Ok(Some(s.clone()));
+            }
+        }
+
+        // No live connection found: dial. The guard ensures only one caller per key reaches here.
         let (tls, is_h2) = self.tls_connect(target).await?;
         if !is_h2 {
             return Ok(None);
