@@ -18,13 +18,12 @@
 //! fetching full tx data from lightwalletd.
 //!
 //! ## Concurrency model
-//! Fetches run concurrently via `futures_util::stream::FuturesUnordered`: every
-//! request in a round is pushed at once, with the gRPC channel's HTTP/2 stream
-//! multiplexing providing the practical concurrency bound (no explicit cap is
-//! applied — see the note at the `FuturesUnordered` construction site if one is
-//! ever needed). DB applies are serial (driven by `&mut WalletSession`).
-//! Unordered application is correct because each txid write is independent —
-//! there are no cross-txid ordering constraints in the `WalletWrite` API.
+//! Fetches run concurrently via `futures_util::stream::FuturesUnordered` with an
+//! explicit cap ([`ENHANCE_FETCH_CONCURRENCY`]) on the concurrent GetTransaction
+//! calls, so the gateway's per-host heavy-call limit is respected. DB applies are
+//! serial (driven by `&mut WalletSession`). Unordered application is correct
+//! because each txid write is independent — there are no cross-txid ordering
+//! constraints in the `WalletWrite` API.
 //!
 //! ## Variant semantics
 //! Mirrors `Sources/ZcashLightClientKit/Block/Enhance/BlockEnhancer.swift:94-171`
@@ -97,8 +96,60 @@ fn fetch_transaction(
     }
 }
 
-/// Counters from one enhancement run: `run_enhancement_lazily`, or [`run_enhancement`],
-/// which wraps it.
+/// Maximum per-txid retry attempts after the first failure (4 total attempts).
+const MAX_TXID_RETRIES: u32 = 3;
+
+/// Per-txid retry backoff schedule: attempt index → sleep Duration.
+/// Jittered exponential: 250 ms, 500 ms, 1 s, 2 s (±20% jitter).
+fn txid_retry_backoff(attempt: u32) -> std::time::Duration {
+    use rand::Rng;
+    let base_ms = match attempt {
+        1 => 250,
+        2 => 500,
+        3 => 1000,
+        _ => 2000,
+    };
+    let jitter = rand::thread_rng().gen_range(0.8..=1.2);
+    std::time::Duration::from_millis((base_ms as f64 * jitter) as u64)
+}
+
+/// One GetTransaction fetch with per-txid retry on transient transport errors.
+/// A transient error (gRPC UNAVAILABLE / RESOURCE_EXHAUSTED / DEADLINE_EXCEEDED,
+/// as classified by [`SlipstreamError::is_transient`]) retries up to
+/// [`MAX_TXID_RETRIES`] times with jittered exponential backoff. Non-transient
+/// errors (wallet DB, decode, policy denial, rate limit with the whole-round
+/// backoff already applied) propagate immediately.
+async fn fetch_with_retry(
+    client: Option<LwdClient>,
+    isolate: Option<&(TorConn, Endpoint, Arc<tokio::sync::Semaphore>)>,
+    txid: zcash_primitives::transaction::TxId,
+    want_enhance: bool,
+) -> FetchResult {
+    let mut attempt = 0;
+    loop {
+        let (_, _, result) = fetch_transaction(client.clone(), isolate, txid, want_enhance).await;
+        match result {
+            Ok(raw) => return (txid, want_enhance, Ok(raw)),
+            Err(e) if e.is_transient() && attempt < MAX_TXID_RETRIES => {
+                attempt += 1;
+                let backoff = txid_retry_backoff(attempt);
+                debug!(
+                    %txid,
+                    %e,
+                    attempt,
+                    backoff_ms = backoff.as_millis(),
+                    "txid fetch failed (transient) — retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => {
+                return (txid, want_enhance, Err(e));
+            }
+        }
+    }
+}
+
+/// Counters from one `run_enhancement` call.
 #[derive(Debug, Default, Clone)]
 pub struct EnhanceStats {
     /// Total number of `TransactionDataRequest` items processed (across all rounds).
@@ -154,7 +205,16 @@ pub async fn run_enhancement(
 /// Concurrent isolated Tor connections opened for wallet-identifying fetches.
 const ISOLATED_FETCH_CONCURRENCY: usize = 4;
 
-/// Enhancement with an isolated circuit per wallet-identifying request when Tor is on.
+/// Concurrent GetTransaction fetches (enhancement or status checks). Bounds the
+/// concurrent heavy calls to respect the gateway's per-host cap (field evidence:
+/// 4-32, tested at 8). Each fetch that hits the cap gets `grpc-status 14` and is
+/// retried per-txid with backoff, so this bound prevents the all-at-once storm.
+const ENHANCE_FETCH_CONCURRENCY: usize = 8;
+
+/// [`run_enhancement`], with every wallet-identifying call (each `GetTransaction`, each
+/// `GetTaddressTxids`) on its own isolated Tor circuit when `isolate` names the Tor client and
+/// the endpoint, so that the relay cannot link them to each other or to the sync traffic.
+/// `client` is used when `isolate` is `None` (Tor off).
 pub async fn run_enhancement_isolated(
     session: &mut WalletSession,
     client: &mut LwdClient,
@@ -250,27 +310,28 @@ where
 
         // ── Phase 1: concurrent txid fetches ──────────────────────────────────
         //
-        // Transaction fetches use the lazy shared channel without Tor, or a fresh isolated
-        // circuit for each request with Tor. DB applies remain serial below.
+        // Build a set of futures, each cloning a lightweight `LwdClient` handle
+        // (backed by a shared `Channel` — no new TCP connections per clone).
+        // Bounded by ENHANCE_FETCH_CONCURRENCY to respect the gateway's per-host
+        // cap on concurrent heavy calls (GetTransaction counts as heavy). Each
+        // fetch that fails with a transient transport error (gRPC UNAVAILABLE,
+        // RESOURCE_EXHAUSTED, DEADLINE_EXCEEDED) is retried for that txid only,
+        // with jittered exponential backoff (250 ms, 500 ms, 1 s, 2 s). A txid
+        // that still fails after its retries is left un-enhanced (remains queued
+        // in the wallet DB so the next pass retries it) and does not fail the
+        // pass — the engine reaches DONE, and follow-mode passes and the final
+        // post-loop enhancement will retry it. DB applies are serial below —
+        // `session` is never held across an await point.
         let mut address_reqs: Vec<TransactionsInvolvingAddress> = Vec::new();
-        let mut pending: FuturesUnordered<FetchFuture> = FuturesUnordered::new();
+        let mut txid_reqs: Vec<(zcash_primitives::transaction::TxId, bool)> = Vec::new();
 
         for req in requests {
             match req {
-                TransactionDataRequest::GetStatus(txid)
-                | TransactionDataRequest::Enhancement(txid) => {
-                    let want_enhance = matches!(req, TransactionDataRequest::Enhancement(_));
-                    let open = if isolate.is_none() {
-                        Some(client.get().await?.clone())
-                    } else {
-                        None
-                    };
-                    pending.push(fetch_transaction(
-                        open,
-                        isolate.as_ref(),
-                        txid,
-                        want_enhance,
-                    ));
+                TransactionDataRequest::GetStatus(txid) => {
+                    txid_reqs.push((txid, false));
+                }
+                TransactionDataRequest::Enhancement(txid) => {
+                    txid_reqs.push((txid, true));
                 }
                 TransactionDataRequest::TransactionsInvolvingAddress(tia) => {
                     address_reqs.push(tia);
@@ -278,16 +339,26 @@ where
             }
         }
 
+        // Fetch with retry: each txid is retried up to MAX_TXID_RETRIES times on
+        // transient errors. buffer_unordered bounds the concurrency.
+        let mut failed_txids = Vec::new();
+        let open = if !txid_reqs.is_empty() && isolate.is_none() {
+            Some(client.get().await?.clone())
+        } else {
+            None
+        };
+        let txid_fetches =
+            futures_util::stream::iter(txid_reqs.into_iter().map(|(txid, want_enhance)| {
+                let c = open.clone();
+                let iso = isolate.clone();
+                async move { fetch_with_retry(c, iso.as_ref(), txid, want_enhance).await }
+            }))
+            .buffer_unordered(ENHANCE_FETCH_CONCURRENCY);
+        futures_util::pin_mut!(txid_fetches);
+
         // Collect results as they arrive and apply to DB immediately (serial apply).
-        // All futures are already pushed; we drain them in order. The gRPC channel's
-        // HTTP/2 multiplexing handles the actual concurrency (not FuturesUnordered).
-        // This design is correct for typical 0-10 enhancement requests per scan pass.
-        loop {
-            // v0.5 pacer: awaiting the next fetch = the network-bound share.
+        while let Some((txid, want_enhance, fetched)) = txid_fetches.next().await {
             let fetch_started = std::time::Instant::now();
-            let Some((txid, want_enhance, fetched)) = pending.next().await else {
-                break;
-            };
             if fetched.is_ok() {
                 // Liveness: each GetTransaction answer is forward progress — over Tor
                 // these take seconds each and most never store a transaction.
@@ -297,7 +368,7 @@ where
             }
             stats.fetch_wait += fetch_started.elapsed();
             let store_started = std::time::Instant::now();
-            apply_txid_fetch(
+            match apply_txid_fetch(
                 session,
                 txid,
                 want_enhance,
@@ -305,8 +376,34 @@ where
                 &network,
                 &mut stats,
                 progress.as_deref(),
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(e) if e.is_transient() => {
+                    // Transient error after all retries: leave un-enhanced, log it.
+                    // The wallet DB keeps the request queued, so the next pass retries.
+                    failed_txids.push((txid, want_enhance, e));
+                }
+                Err(e) => {
+                    // Non-transient error (wallet DB corruption, scan logic bug, etc.) — propagate.
+                    return Err(e);
+                }
+            }
             stats.store += store_started.elapsed();
+        }
+
+        if !failed_txids.is_empty() {
+            warn!(
+                count = failed_txids.len(),
+                "enhancement round: some txids failed after retries (left un-enhanced, will retry next pass)"
+            );
+            for (txid, want_enhance, err) in &failed_txids {
+                let kind = if *want_enhance {
+                    "Enhancement"
+                } else {
+                    "GetStatus"
+                };
+                warn!(%txid, %kind, %err, "txid fetch failed");
+            }
         }
 
         // ── Phase 2: serial address-window requests ────────────────────────────
@@ -353,6 +450,8 @@ where
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Apply the result of a `GetTransaction` fetch for one `GetStatus` or `Enhancement` request.
+/// Returns `Err` when the fetch failed or when the DB write failed: the caller distinguishes
+/// transient errors (leave un-enhanced, retry next pass) from non-transient (propagate).
 fn apply_txid_fetch(
     session: &mut WalletSession,
     txid: zcash_primitives::transaction::TxId,
@@ -364,7 +463,9 @@ fn apply_txid_fetch(
 ) -> Result<(), SlipstreamError> {
     match fetched {
         Err(err) => {
-            // Transport-class error (connection refused, timeout, etc.) — propagate.
+            // Transport-class error (connection refused, timeout, rate limit after backoff,
+            // etc.) — return it so the caller can decide whether to leave un-enhanced (transient)
+            // or propagate (non-transient).
             return Err(err);
         }
         Ok(None) => {
