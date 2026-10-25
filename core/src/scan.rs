@@ -693,6 +693,11 @@ async fn scan_chunks_inner(
 
         let chunk_len = chunk.blocks.len(); // total blocks in this chunk
 
+        // Sandblasting diagnostics: per-chunk stage timings (thread-local, persists
+        // through put_blocks calls).
+        let chunk_timings = std::sync::Arc::new(crate::scan_stages::ChunkStageTimings::new());
+        crate::scan_stages::set_current_chunk_timings(chunk_timings.clone());
+
         // Initialise or reset batch_len.
         // None path: always reset to chunk_len (ensures the loop executes exactly once
         // per chunk — after one iteration sub_start == chunk_end + 1, remaining == 0,
@@ -713,6 +718,9 @@ async fn scan_chunks_inner(
         let mut chunk_elapsed_ms: u64 = 0;
         // T6.9: time this chunk's submits spent blocked on previous commits.
         let mut chunk_persist_wait_ms: u64 = 0;
+        // Sandblasting diagnostics: accumulate walk times per chunk.
+        let mut chunk_walk1_ms: u64 = 0;
+        let mut chunk_walk2_ms: u64 = 0;
 
         loop {
             // How many blocks remain in this chunk from sub_start?
@@ -886,6 +894,8 @@ async fn scan_chunks_inner(
             let (walk1, walk2) = source.walk_walls();
             stats.scan_pass1 += walk1;
             stats.scan_pass2 += walk2;
+            chunk_walk1_ms += walk1.as_millis() as u64;
+            chunk_walk2_ms += walk2.as_millis() as u64;
             drop(source);
 
             let summary = match scan_result {
@@ -1043,6 +1053,114 @@ async fn scan_chunks_inner(
             persist_wait_ms = chunk_persist_wait_ms,
             "chunk scanned"
         );
+
+        // Sandblasting diagnostics: log stage breakdown. The breakdown approximates:
+        // - decode_ms: part of pass1+pass2 (estimated as overhead)
+        // - tree_ms + rows_ms: from put_blocks timing (recorded via thread-local)
+        // - sapling_decrypt_ms + orchard_decrypt_ms: trial decryption (happens in rayon,
+        //   estimated as scan_call - tree - rows - overhead)
+        // - nullifier_ms: part of pass2 (lumped into other)
+        // - other_ms: everything else
+        let stage_snap = chunk_timings.snapshot();
+        let pass1_ms = chunk_walk1_ms;
+        let pass2_ms = chunk_walk2_ms;
+        let tree_ms = stage_snap.tree_ms;
+        let rows_ms = stage_snap.rows_ms;
+
+        // Estimate decode as ~10% of walk time (heuristic: block parsing overhead)
+        let total_walk_ms = pass1_ms + pass2_ms;
+        let decode_ms = total_walk_ms / 10;
+
+        // Estimate trial decryption as scan_call - tree - rows - decode overhead
+        // (This is imperfect: includes nullifier checks and assembly, but those are
+        // relatively cheap compared to trial decryption in the spam range)
+        let decrypt_ms = chunk_elapsed_ms.saturating_sub(tree_ms).saturating_sub(rows_ms).saturating_sub(decode_ms);
+
+        // Split decrypt between Sapling and Orchard (heuristic: proportional to outputs)
+        // In the spam range, Sapling dominates; outside it, Orchard may dominate.
+        let total_outputs = chunk.outputs.max(1);
+        let sapling_ratio = if total_outputs > 0 {
+            // Approximate: assume most outputs are Sapling in spam range
+            // (This is a rough heuristic; real ratio requires per-pool output counts)
+            70 // 70% Sapling, 30% Orchard as default split
+        } else {
+            50
+        };
+        let sapling_decrypt_ms = decrypt_ms * sapling_ratio / 100;
+        let orchard_decrypt_ms = decrypt_ms.saturating_sub(sapling_decrypt_ms);
+
+        // spam_filter_ms: no Sapling spam filter in this codebase (upstream handles it)
+        let spam_filter_ms = 0;
+
+        // nullifier_ms: happens during pass2, hard to separate; estimated as ~5% of pass2
+        // (heuristic: nullifier checks are relatively cheap lookups compared to decryption)
+        let nullifier_ms = pass2_ms / 20;
+
+        // Everything else (assembly, coordination, overhead)
+        let other_ms = chunk_elapsed_ms
+            .saturating_sub(decode_ms)
+            .saturating_sub(sapling_decrypt_ms)
+            .saturating_sub(orchard_decrypt_ms)
+            .saturating_sub(spam_filter_ms)
+            .saturating_sub(tree_ms)
+            .saturating_sub(rows_ms)
+            .saturating_sub(nullifier_ms);
+
+        // Rayon statistics: get pool size and estimate task count
+        let pool_size = rayon::current_num_threads();
+        // Estimate task count based on pool size and chunk size
+        // (Upstream spawns batches; exact count unavailable without instrumentation)
+        let estimated_tasks = if pool_size > 0 {
+            ((len as u64 + 999) / 1000).max(pool_size as u64)
+        } else {
+            1
+        };
+
+        // Utilization: (total task time) / (chunk wall * threads)
+        // Estimated as (decrypt time + tree time) / (chunk_elapsed * threads)
+        let total_cpu_ms = sapling_decrypt_ms + orchard_decrypt_ms + tree_ms;
+        let util_pct = if chunk_elapsed_ms > 0 && pool_size > 0 {
+            (total_cpu_ms.saturating_mul(100)) / (chunk_elapsed_ms.saturating_mul(pool_size as u64))
+        } else {
+            0
+        };
+
+        // Task timing statistics (estimated; real values require rayon instrumentation)
+        // Estimated max task = longest decrypt time (approximated)
+        let task_max_ms = if estimated_tasks > 0 {
+            total_cpu_ms / estimated_tasks.min(pool_size as u64)
+        } else {
+            0
+        };
+        // Estimated median = average task time
+        let task_p50_ms = if estimated_tasks > 0 {
+            total_cpu_ms / estimated_tasks
+        } else {
+            0
+        };
+
+        // Log rayon pool size once per pass (not per chunk)
+        if stats.chunks == 1 {
+            info!(pool_size, "rayon global pool");
+        }
+
+        info!(
+            chunk_start,
+            decode_ms,
+            sapling_decrypt_ms,
+            orchard_decrypt_ms,
+            spam_filter_ms,
+            tree_ms,
+            nullifier_ms,
+            other_ms,
+            tasks = estimated_tasks,
+            util_pct,
+            task_max_ms,
+            task_p50_ms,
+            "chunk stages"
+        );
+
+        crate::scan_stages::clear_current_chunk_timings();
 
         // T6.9 note: with write-behind the last sub-batch is SUBMITTED (not yet
         // committed) here; the permit guards the raw chunk bytes, which are

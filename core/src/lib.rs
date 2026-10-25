@@ -72,6 +72,8 @@ pub mod report;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod scan;
 #[cfg(feature = "zcash_client_sqlite")]
+pub(crate) mod scan_stages;
+#[cfg(feature = "zcash_client_sqlite")]
 pub mod scan_queue;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod scheduler;

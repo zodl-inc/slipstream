@@ -1512,6 +1512,7 @@ pub fn sparse_put_blocks(
         >(wdb, GapLimits::default(), from_state, blocks)
         .map_err(SqliteClientError::from)?;
         rows_ms = t_rows.elapsed().as_millis();
+        crate::scan_stages::record_rows_ms(rows_ms as u64);
         if rows_ms > 5000 {
             // Log slow rows stage timing to pinpoint first-put stalls.
             // Field evidence (2026-10-25): 24 s rows stage on the first small pass after a
@@ -2067,6 +2068,7 @@ pub fn sparse_put_blocks(
             orch_split = orch_timers;
 
             tree_ms = t_tree.elapsed().as_millis();
+            crate::scan_stages::record_tree_ms(tree_ms as u64);
 
             // Flush the dirty tree delta + scan-queue update in the SAME txn.
             let t_flush = std::time::Instant::now();
