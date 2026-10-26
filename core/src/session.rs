@@ -469,6 +469,15 @@ fn reusable_tor_conn(
         .map(|(_, _, tc)| tc.clone())
 }
 
+/// Drop the Tor client kept for the handle owning `pass_lock` (and any entry whose handle is
+/// gone). Called when the handle is dropped, so its arti client and connections are released
+/// with it rather than at the next Tor session of some other handle.
+pub fn forget_tor_conns(pass_lock: &Arc<tokio::sync::Mutex<()>>) {
+    tor_conns().retain(|(owner, _, _)| {
+        owner.strong_count() > 0 && owner.as_ptr() != Arc::as_ptr(pass_lock)
+    });
+}
+
 /// Keep `tc` for later sessions of the handle owning `pass_lock` (see [`TOR_CONNS`]).
 fn remember_tor_conn(pass_lock: &Arc<tokio::sync::Mutex<()>>, dir: &std::path::Path, tc: &TorConn) {
     let mut conns = tor_conns();
