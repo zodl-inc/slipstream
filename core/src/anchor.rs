@@ -111,9 +111,9 @@ pub async fn restore_anchor(
                 let ts = grpc::get_tree_state(&mut client, anchor_height)
                     .await
                     .ok()?;
-                usable_height(ts.height)?;
-                // Trust the SERVER's height for consistency (it equals anchor_height in
-                // practice; on any discrepancy the treestate's own height wins).
+                if usable_height(ts.height)? != anchor_height {
+                    return None;
+                }
                 Some(Anchor {
                     height: ts.height,
                     treestate: Some(ts),
@@ -419,6 +419,62 @@ mod tests {
             let expected = tip - ANCHOR_MAX_REORG_BLOCKS;
             assert_eq!(anchor.height, expected);
             assert_eq!(anchor.treestate.map(|ts| ts.height), Some(expected));
+        }
+    }
+
+    /// A new wallet must reject a tree state returned at any height other than the
+    /// requested reorg-safe height, even when the server reports a usable height.
+    #[tokio::test]
+    async fn new_wallet_rejects_a_mismatched_tree_state() {
+        for height in [3_099_899, 3_099_901, 3_100_000] {
+            let anchor = anchor_from(
+                FakeLightwalletd {
+                    tip: 3_100_000,
+                    tree_state_height: Some(height),
+                },
+                AnchorIntent::New,
+            )
+            .await;
+            assert_eq!(anchor.height, 0, "tree state {height}");
+            assert!(anchor.treestate.is_none(), "tree state {height}");
+        }
+    }
+
+    /// The Sapling activation floor is itself the requested anchor; only an exact-height
+    /// tree state is usable there too.
+    #[tokio::test]
+    async fn new_wallet_accepts_the_requested_sapling_floor() {
+        let network = crate::network::SlipstreamNetwork::MAIN;
+        let sapling_activation = u64::from(u32::from(
+            network
+                .activation_height(NetworkUpgrade::Sapling)
+                .expect("Sapling activates on mainnet"),
+        ));
+        let tip = sapling_activation + 50;
+
+        for height in [
+            sapling_activation - 1,
+            sapling_activation,
+            sapling_activation + 1,
+        ] {
+            let anchor = anchor_from(
+                FakeLightwalletd {
+                    tip,
+                    tree_state_height: Some(height),
+                },
+                AnchorIntent::New,
+            )
+            .await;
+            if height == sapling_activation {
+                assert_eq!(anchor.height, sapling_activation);
+                assert_eq!(
+                    anchor.treestate.map(|treestate| treestate.height),
+                    Some(sapling_activation)
+                );
+            } else {
+                assert_eq!(anchor.height, 0, "tree state {height}");
+                assert!(anchor.treestate.is_none(), "tree state {height}");
+            }
         }
     }
 

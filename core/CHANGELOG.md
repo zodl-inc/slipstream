@@ -175,6 +175,9 @@ workspace.
   return such a height as reported, which a host that bounds server heights at `i32::MAX`
   cannot use, leaving a restore without a `recover_until`, so that it looked like a new
   wallet.
+- `anchor::restore_anchor` now rejects a new-wallet tree state whose height differs from the
+  requested reorg-safe height, falling back to no anchor rather than returning a mismatched
+  state.
 
 ## [0.4.0-pre.2] - 2026-10-20
 
