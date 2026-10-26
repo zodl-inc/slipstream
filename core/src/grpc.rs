@@ -246,12 +246,27 @@ where
 /// Open a channel to lightwalletd. TLS uses webpki roots (same trust source
 /// as the upstream tor module).
 pub async fn connect(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    connect_with(endpoint, true).await
+}
+
+/// [`connect`], except that an OHTTP gateway is reached over a relay connection of this client's
+/// own instead of the process-wide one. For bulk block streams, whose unread bodies hold HTTP/2
+/// flow-control window and would stall every other call sharing their connection.
+pub async fn connect_dedicated(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    connect_with(endpoint, false).await
+}
+
+async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, SlipstreamError> {
     // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
     // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
     if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
         tracing::info!(gateway = %endpoint.host, relay, "lightwalletd via OHTTP (RFC 9458)");
-        let connector = crate::ohttp::OhttpConnector::new(&endpoint.host, relay)
-            .map_err(|e| transport_err("ohttp connector", e))?;
+        let connector = if shared {
+            crate::ohttp::OhttpConnector::new(&endpoint.host, relay)
+        } else {
+            crate::ohttp::OhttpConnector::dedicated(&endpoint.host, relay)
+        }
+        .map_err(|e| transport_err("ohttp connector", e))?;
         // Plain `http://` on purpose: the transport tonic sees is an in-memory pipe to the
         // in-process h2 server; TLS happens inside the connector, towards the relay. (tonic
         // refuses an `https://` URI without a tls_config.)

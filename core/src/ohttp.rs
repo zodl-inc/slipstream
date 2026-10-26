@@ -397,6 +397,20 @@ impl OhttpConnector {
         )
     }
 
+    /// Direct dialer with a client of its own (its own pooled relay connection), for bulk block
+    /// streams: see [`crate::grpc::connect_dedicated`].
+    pub fn dedicated(gateway_host: &str, relay_url: &str) -> Result<Self, String> {
+        Ok(Self {
+            client: Arc::new(OhttpClient::new(
+                gateway_host,
+                relay_url,
+                Dialer::Direct,
+                get_default_client_trace_prefix(),
+                ClientProfile::SLIPSTREAM,
+            )?),
+        })
+    }
+
     /// Connector whose TCP legs (relay POSTs and the gateway key fetch) go through `dialer`.
     pub fn with_dialer(
         gateway_host: &str,

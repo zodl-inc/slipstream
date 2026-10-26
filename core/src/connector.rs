@@ -524,6 +524,13 @@ pub async fn connect_via(
     let is_ohttp_gateway = crate::ohttp::relay_for(&endpoint.host).is_some();
     match (tor, route(purpose, is_ohttp_gateway)) {
         (Some(t), Some(mode)) => t.connect(mode, endpoint).await,
+        // Bulk streams get a relay connection of their own: a block-range body the scan is not
+        // reading yet holds HTTP/2 flow-control window, and on a connection shared with the
+        // tree-state and tip calls it stalled all of them (device, spam era: "no chunk received
+        // in 30s" + GetTreeState timeouts until the pass restarted).
+        _ if purpose == ConnPurpose::BulkFetch => {
+            connect_direct_dedicated_with_retry(endpoint).await
+        }
         _ => connect_direct_with_retry(endpoint).await,
     }
 }
@@ -618,6 +625,19 @@ where
         };
         Ok(self.client.insert(client))
     }
+}
+
+/// [`connect_direct_with_retry`] for bulk block download: an OHTTP gateway is reached over a relay
+/// connection used by this client alone (`grpc::connect_dedicated`), never the process-wide one.
+pub async fn connect_direct_dedicated_with_retry(
+    endpoint: &Endpoint,
+) -> Result<LwdClient, SlipstreamError> {
+    retry_transient(
+        || grpc::connect_dedicated(endpoint),
+        DIRECT_CONNECT_ATTEMPTS,
+        direct_connect_backoff,
+    )
+    .await
 }
 
 #[cfg(test)]
