@@ -70,7 +70,8 @@ pub enum SlipstreamError {
     /// returns, with no `Error` state, no tag-4 event, no revival and no retry
     /// ([`Self::is_stop_for_wallet_change`] is what the session checks). The scan call it
     /// interrupted wrote nothing, because upstream `scan_cached_blocks` writes only in its final
-    /// `put_blocks` (earlier sub-batches of a chunk stay committed), so the next pass scans those
+    /// `put_blocks` (earlier units stay committed; on the write-behind path the scanned blocks of
+    /// a unit still below its commit limits are dropped with it), so the next pass scans those
     /// blocks again.
     ///
     /// Not to be confused with [`Self::Stopped`], an engine channel that closed.

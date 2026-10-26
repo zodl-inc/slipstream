@@ -232,6 +232,17 @@ pub struct EngineConfig {
     /// Only affects the write-behind path; the committed `data.db` is identical at any
     /// depth (persist stays serial + in-order). Auto-scaled per device RAM in R4.
     pub persist_depth: usize,
+
+    /// Size of one write-behind persist commit, independent of the scan call
+    /// (= fetch chunk or byte-split sub-chunk; over OHTTP at most
+    /// `connector::OHTTP_MAX_CHUNK_BLOCKS` = 2,000 blocks): consecutive scan calls
+    /// are committed as one unit until it holds `max_blocks` blocks or
+    /// `max_outputs` note commitments (see [`crate::persist::CommitLimits`]).
+    /// `None` = one commit per scan call (the pre-round-6 behavior). Only affects
+    /// the write-behind path. Scanned blocks of a unit not yet submitted are lost
+    /// on an error exit or stop and scanned again by the next pass, so the
+    /// limits also bound that rework.
+    pub persist_commit_limits: Option<crate::persist::CommitLimits>,
 }
 
 impl EngineConfig {
@@ -273,6 +284,10 @@ impl EngineConfig {
             local_treestate: false,
             treestate_verify_sample: 1,
             persist_depth: 1,
+            persist_commit_limits: Some(crate::persist::CommitLimits {
+                max_blocks: crate::persist::CommitLimits::DEFAULT_MAX_BLOCKS,
+                max_outputs: crate::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
+            }),
         }
     }
 

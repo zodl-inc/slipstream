@@ -3502,7 +3502,15 @@ impl WalletWrite for SparseFacade<'_> {
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        sparse_put_blocks(self.inner, self.sparse, from_state, blocks, None)
+        // Inline path: put_blocks runs on the scan thread, under the chunk's timings.
+        let timings = crate::scan_stages::current_chunk_timings();
+        sparse_put_blocks(
+            self.inner,
+            self.sparse,
+            from_state,
+            blocks,
+            timings.as_ref(),
+        )
     }
 
     fn put_received_transparent_utxo(
@@ -3619,6 +3627,9 @@ pub struct PendingPersist {
     /// First/last block height of the unit (log attribution only).
     pub first_height: u64,
     pub last_height: u64,
+    /// Note commitments (all pools) the unit's blocks append to the trees: what
+    /// [`CommitLimits::max_outputs`] counts.
+    pub outputs: u64,
     /// Chunk stage timings for diagnostic logging.
     pub timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
 }
@@ -3727,6 +3738,43 @@ pub struct WriteBehindFacade {
     transparent_receivers: HashMap<TransparentAddress, (DbAccountId, Option<TransparentKeyScope>)>,
     stash: Option<PendingPersist>,
     timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
+    /// `Some`: consecutive `put_blocks` calls extend the stash into one persist
+    /// unit until it reaches these limits (see [`CommitLimits`]). `None`: every
+    /// call is its own unit and must be taken before the next (depth-1 invariant).
+    coalesce: Option<CommitLimits>,
+}
+
+/// Size of one persist commit on the write-behind path, decoupled from the scan
+/// call (= fetch chunk or sub-chunk, e.g. the 2,000-block OHTTP window): the
+/// stash of consecutive scan calls is committed as ONE unit once it holds at
+/// least `max_blocks` blocks or `max_outputs` note commitments.
+///
+/// One unit over the blocks of several calls is exactly the `put_blocks` call a
+/// single `scan_cached_blocks` over the merged window makes: the scanned blocks
+/// do not depend on where the scan calls split (the facade serves every call
+/// the state the previous calls left), and the unit keeps the first call's
+/// `from_state`. Larger units amortize the per-commit cost (transaction, the
+/// frontier insert and its checks, flush) — normal-era 10,000-block units
+/// were 26 % faster than 2,000-block ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitLimits {
+    pub max_blocks: u64,
+    pub max_outputs: u64,
+}
+
+impl CommitLimits {
+    /// 10,000 blocks: the gRPC chunk size, whose commit unit the OHTTP window
+    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`) would otherwise shrink fivefold.
+    pub const DEFAULT_MAX_BLOCKS: u64 = 10_000;
+    /// 50,000 commitments: about one normal-era 10,000-block unit, and below one
+    /// sandblasting-era byte-split sub-chunk (~67,000), so dense chunks still
+    /// commit one by one and a unit's tree work and memory stay bounded.
+    pub const DEFAULT_MAX_OUTPUTS: u64 = 50_000;
+
+    fn reached(&self, pending: &PendingPersist) -> bool {
+        pending.last_height + 1 - pending.first_height >= self.max_blocks
+            || pending.outputs >= self.max_outputs
+    }
 }
 
 impl WriteBehindFacade {
@@ -3754,6 +3802,7 @@ impl WriteBehindFacade {
             transparent_receivers: db.get_transparent_receiver_accounts()?,
             stash: None,
             timings: None,
+            coalesce: None,
         })
     }
 
@@ -3783,6 +3832,22 @@ impl WriteBehindFacade {
         self.stash.take()
     }
 
+    /// Let consecutive `put_blocks` calls extend the stash up to `limits` (`None` =
+    /// one unit per call, the default).
+    pub fn set_commit_limits(&mut self, limits: Option<CommitLimits>) {
+        self.coalesce = limits;
+    }
+
+    /// Take the stash if it is due for its commit: always without commit limits,
+    /// otherwise once it has reached them. Barriers (enhancement, range end) take
+    /// it unconditionally with [`Self::take_stash`].
+    pub fn take_full_stash(&mut self) -> Option<PendingPersist> {
+        match (&self.stash, &self.coalesce) {
+            (Some(pending), Some(limits)) if !limits.reached(pending) => None,
+            _ => self.stash.take(),
+        }
+    }
+
     #[cfg(test)]
     fn test_new(prior_meta_height: BlockHeight, prior_meta: Option<BlockMetadata>) -> Self {
         Self {
@@ -3796,6 +3861,7 @@ impl WriteBehindFacade {
             transparent_receivers: HashMap::new(),
             stash: None,
             timings: None,
+            coalesce: None,
         }
     }
 }
@@ -4052,8 +4118,10 @@ impl WalletWrite for WriteBehindFacade {
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
         // Depth-1 invariant FIRST: an occupied stash means the scan loop failed
-        // to submit the previous unit — a loop bug, never tolerated silently.
-        if self.stash.is_some() {
+        // to submit the previous unit — a loop bug, never tolerated silently —
+        // unless commit limits let the stash grow (by the blocks that directly
+        // follow it, checked below).
+        if self.stash.is_some() && self.coalesce.is_none() {
             return Err(SqliteClientError::CorruptedData(
                 "write-behind facade: put_blocks with an occupied stash — depth-1 invariant violated".into(),
             ));
@@ -4064,6 +4132,23 @@ impl WalletWrite for WriteBehindFacade {
         };
         let first_height = u64::from(u32::from(first.height()));
         let last_height = u64::from(u32::from(last.height()));
+        if let Some(pending) = &self.stash
+            && first_height != pending.last_height + 1
+        {
+            return Err(SqliteClientError::CorruptedData(format!(
+                "write-behind facade: put_blocks from {first_height} does not continue the \
+                 stashed unit {}..={}",
+                pending.first_height, pending.last_height
+            )));
+        }
+        let outputs: u64 = blocks
+            .iter()
+            .map(|b| {
+                (b.sapling().commitments().len()
+                    + b.orchard().commitments().len()
+                    + b.ironwood().commitments().len()) as u64
+            })
+            .sum();
 
         // Advance the virtualized prior-block metadata to this unit's tail —
         // identical to upstream's intra-call threading (chain.rs:653).
@@ -4143,13 +4228,40 @@ impl WalletWrite for WriteBehindFacade {
             apply_outpoint_delta(&mut self.transparent_outpoints, &t_spent, &t_found);
         }
 
-        self.stash = Some(PendingPersist {
-            from_state: from_state.clone(),
-            blocks,
-            first_height,
-            last_height,
-            timings: self.timings.clone(),
-        });
+        match &mut self.stash {
+            // Commit limits: the unit grows; it keeps its first call's
+            // `from_state` (the treestate below its first block).
+            Some(pending) => {
+                pending.blocks.extend(blocks);
+                pending.last_height = last_height;
+                pending.outputs += outputs;
+                // The commit's numbers go to the chunk that closes the unit.
+                if let Some(t) = &self.timings {
+                    t.mark_stashed();
+                }
+                if let Some(prev) = std::mem::replace(&mut pending.timings, self.timings.clone())
+                    && !self
+                        .timings
+                        .as_ref()
+                        .is_some_and(|t| std::sync::Arc::ptr_eq(t, &prev))
+                {
+                    prev.settle_carried();
+                }
+            }
+            None => {
+                if let Some(t) = &self.timings {
+                    t.mark_stashed();
+                }
+                self.stash = Some(PendingPersist {
+                    from_state: from_state.clone(),
+                    blocks,
+                    first_height,
+                    last_height,
+                    outputs,
+                    timings: self.timings.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -4687,13 +4799,19 @@ impl PersistLane {
         self.submit_job(
             span,
             Box::new(move |db, sparse| {
+                let started = std::time::Instant::now();
                 sparse_put_blocks(
                     db,
                     sparse,
                     &pending.from_state,
                     pending.blocks,
                     pending.timings.as_ref(),
-                )
+                )?;
+                // The chunk's `chunk stages` line waits for this (see scan.rs).
+                if let Some(t) = &pending.timings {
+                    t.settle_committed(started.elapsed().as_millis() as u64);
+                }
+                Ok(())
             }),
         )
         .await
@@ -5240,6 +5358,7 @@ mod write_behind_tests {
             blocks: vec![],
             first_height: 2,
             last_height: 2,
+            outputs: 0,
             timings: None,
         });
         let err = f.put_blocks(&empty_chain_state(1), vec![]).unwrap_err();
