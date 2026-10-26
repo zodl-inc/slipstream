@@ -479,14 +479,15 @@ fn reusable_tor_conn(
 pub fn forget_tor_conns(pass_lock: &Arc<tokio::sync::Mutex<()>>) {
     // Mark the handle closed first, so that a session of it still finishing a bootstrap on
     // the runtime that is about to shut down cannot insert its client after this cleanup.
-    {
-        let mut closed = closed_handles();
-        closed.retain(|w| w.strong_count() > 0);
-        closed.push(Arc::downgrade(pass_lock));
-    }
+    // Lock order everywhere: CLOSED_HANDLES, then TOR_CONNS. Both are held together here and
+    // in `remember_tor_conn`, so the closed check and the insert there are atomic with this.
+    let mut closed = closed_handles();
+    closed.retain(|w| w.strong_count() > 0);
+    closed.push(Arc::downgrade(pass_lock));
     tor_conns().retain(|(owner, _, _)| {
         owner.strong_count() > 0 && owner.as_ptr() != Arc::as_ptr(pass_lock)
     });
+    drop(closed);
 }
 
 /// Pass locks of dropped handles whose sessions may still be running (see
@@ -512,12 +513,11 @@ fn remember_tor_conn(
     trust_everyone: bool,
     tc: &TorConn,
 ) {
-    {
-        let mut closed = closed_handles();
-        closed.retain(|w| w.strong_count() > 0);
-        if closed.iter().any(|w| w.as_ptr() == Arc::as_ptr(pass_lock)) {
-            return;
-        }
+    // Held until the insert below (lock order: CLOSED_HANDLES, then TOR_CONNS).
+    let mut closed = closed_handles();
+    closed.retain(|w| w.strong_count() > 0);
+    if closed.iter().any(|w| w.as_ptr() == Arc::as_ptr(pass_lock)) {
+        return;
     }
     let mut conns = tor_conns();
     // One client per handle: a new one replaces whatever the handle had.
