@@ -426,6 +426,58 @@ pub struct ScanStats {
 struct WriteBehind {
     facade: crate::persist::WriteBehindFacade,
     lane: crate::persist::PersistLane,
+    /// `chunk stages` lines waiting for their chunk's commit (see [`StageLine`]).
+    stage_lines: std::collections::VecDeque<StageLine>,
+}
+
+/// A chunk's `chunk stages` line. On the write-behind path the chunk's commit
+/// runs after its scan, so the line is held until the persist unit holding the
+/// chunk is committed and logged then, with the commit's tree/rows/commit
+/// numbers (on the chunk that closed the unit; a chunk whose blocks were carried
+/// into a later chunk's unit logs zeros and `persist_carried=true`).
+struct StageLine {
+    chunk_start: u64,
+    timings: Arc<crate::scan_stages::ChunkStageTimings>,
+    rayon_cpu_ms: u64,
+    rayon_cpu_min: u64,
+    rayon_cpu_median: u64,
+    rayon_cpu_max: u64,
+    wall_ms: u64,
+    util_pct: u64,
+}
+
+impl StageLine {
+    fn log(&self) {
+        let snap = self.timings.snapshot();
+        // Log measured values only (no estimates).
+        // On non-Linux: rayon fields will be 0 (sample_rayon_workers returns empty vec).
+        info!(
+            chunk_start = self.chunk_start,
+            persist_tree_ms = snap.tree_ms,
+            persist_rows_ms = snap.rows_ms,
+            persist_commit_ms = snap.commit_ms,
+            persist_carried = snap.carried,
+            rayon_cpu_ms = self.rayon_cpu_ms,
+            rayon_cpu_min = self.rayon_cpu_min,
+            rayon_cpu_median = self.rayon_cpu_median,
+            rayon_cpu_max = self.rayon_cpu_max,
+            wall_ms = self.wall_ms,
+            util_pct = self.util_pct,
+            "chunk stages"
+        );
+    }
+}
+
+/// Logs the held `chunk stages` lines in order, up to the first chunk whose
+/// commit is still pending (`all`: every line, after the final drain).
+fn flush_stage_lines(lines: &mut std::collections::VecDeque<StageLine>, all: bool) {
+    while let Some(line) = lines.front() {
+        if !all && !line.timings.is_settled() {
+            break;
+        }
+        line.log();
+        lines.pop_front();
+    }
 }
 
 // ── Production scan driver ─────────────────────────────────────────────────────
@@ -528,7 +580,11 @@ pub async fn scan_chunks(
         if let Some(p) = &progress {
             lane.attach_writer_gate(p.clone());
         }
-        Some(WriteBehind { facade, lane })
+        Some(WriteBehind {
+            facade,
+            lane,
+            stage_lines: std::collections::VecDeque::new(),
+        })
     } else {
         None
     };
@@ -582,6 +638,8 @@ pub async fn scan_chunks(
                 stats.final_drain = final_drain_elapsed;
                 stats.persist_wait = wb.lane.total_wait();
                 stats.persist_busy = wb.lane.total_busy();
+                // Every unit is committed: the last chunks' stage lines are final.
+                flush_stage_lines(&mut wb.stage_lines, true);
                 // v0.4 census: the lane's sparse state ran the builds on this path.
                 (stats.census_sapling, stats.census_orchard) = wb.lane.census();
                 info!(
@@ -1083,11 +1141,6 @@ async fn scan_chunks_inner(
             &rayon_end_samples,
         );
 
-        // Get persist-side timings (tree + rows from put_blocks).
-        let stage_snap = chunk_timings.snapshot();
-        let persist_tree_ms = stage_snap.tree_ms;
-        let persist_rows_ms = stage_snap.rows_ms;
-
         // Calculate utilization from measured rayon CPU time.
         let util_pct = rayon_stats.utilization_pct(chunk_wall_ms);
 
@@ -1096,20 +1149,30 @@ async fn scan_chunks_inner(
             info!(pool_size = rayon_stats.num_threads, "rayon global pool");
         }
 
-        // Log measured values only (no estimates).
-        // On non-Linux: rayon fields will be 0 (sample_rayon_workers returns empty vec).
-        info!(
+        // Persist-side timings (tree + rows from put_blocks): known now on the inline
+        // path; on the write-behind path once the chunk's unit is committed, so the
+        // line is held until then (previous chunks' lines are logged as their commits
+        // complete).
+        let line = StageLine {
             chunk_start,
-            persist_tree_ms,
-            persist_rows_ms,
-            rayon_cpu_ms = rayon_stats.total_cpu_ms,
-            rayon_cpu_min = rayon_stats.min_cpu_ms,
-            rayon_cpu_median = rayon_stats.median_cpu_ms,
-            rayon_cpu_max = rayon_stats.max_cpu_ms,
-            wall_ms = chunk_wall_ms,
+            timings: chunk_timings.clone(),
+            rayon_cpu_ms: rayon_stats.total_cpu_ms,
+            rayon_cpu_min: rayon_stats.min_cpu_ms,
+            rayon_cpu_median: rayon_stats.median_cpu_ms,
+            rayon_cpu_max: rayon_stats.max_cpu_ms,
+            wall_ms: chunk_wall_ms,
             util_pct,
-            "chunk stages"
-        );
+        };
+        match wb.as_mut() {
+            Some(wb) => {
+                if !chunk_timings.is_stashed() {
+                    chunk_timings.settle(); // nothing of this chunk to commit
+                }
+                wb.stage_lines.push_back(line);
+                flush_stage_lines(&mut wb.stage_lines, false);
+            }
+            None => line.log(),
+        }
 
         crate::scan_stages::clear_current_chunk_timings();
 
@@ -1143,6 +1206,7 @@ async fn scan_chunks_inner(
                 }
                 wb.lane.drain().await?;
                 stats.interleave_drain += drain_started.elapsed();
+                flush_stage_lines(&mut wb.stage_lines, true);
             }
             let started = Instant::now();
             match run_enhancement_lazily_isolated(
@@ -1306,7 +1370,11 @@ pub async fn scan_chunks_from_treestate(
             false,
             None,
         )?;
-        Some(WriteBehind { facade, lane })
+        Some(WriteBehind {
+            facade,
+            lane,
+            stage_lines: std::collections::VecDeque::new(),
+        })
     } else {
         None
     };
@@ -1769,6 +1837,59 @@ mod tests {
     fn controller_stable_when_on_target() {
         let result = next_batch_len(5_000, 3_000, 3_000, 1_000, 10_000);
         assert_eq!(result, 5_000);
+    }
+
+    fn stage_line(chunk_start: u64) -> StageLine {
+        StageLine {
+            chunk_start,
+            timings: Arc::new(crate::scan_stages::ChunkStageTimings::new()),
+            rayon_cpu_ms: 0,
+            rayon_cpu_min: 0,
+            rayon_cpu_median: 0,
+            rayon_cpu_max: 0,
+            wall_ms: 0,
+            util_pct: 0,
+        }
+    }
+
+    /// A chunk's `chunk stages` line waits for its commit and keeps chunk order: a
+    /// later chunk settled first is held behind the earlier one.
+    #[test]
+    fn stage_lines_wait_for_their_commit_in_chunk_order() {
+        let mut lines: std::collections::VecDeque<StageLine> =
+            (0..3).map(|i| stage_line(i * 100)).collect();
+        let timings: Vec<_> = lines.iter().map(|l| l.timings.clone()).collect();
+
+        // Chunk 0 carried into chunk 1's unit, which is still being committed.
+        timings[0].mark_stashed();
+        timings[0].settle_carried();
+        timings[2].settle();
+        flush_stage_lines(&mut lines, false);
+        assert_eq!(
+            lines.len(),
+            2,
+            "chunk 0 logged, chunk 1 waits, chunk 2 behind it"
+        );
+
+        // The commit records its numbers before it settles the chunk.
+        timings[1].add_tree_ms(7);
+        timings[1].add_rows_ms(3);
+        timings[1].settle_committed(12);
+        let snap = timings[1].snapshot();
+        assert_eq!(
+            (snap.tree_ms, snap.rows_ms, snap.commit_ms, snap.carried),
+            (7, 3, 12, false)
+        );
+        assert!(timings[0].snapshot().carried);
+        flush_stage_lines(&mut lines, false);
+        assert!(lines.is_empty());
+
+        // After the final drain everything goes, settled or not.
+        let mut lines: std::collections::VecDeque<StageLine> = [stage_line(0)].into();
+        flush_stage_lines(&mut lines, false);
+        assert_eq!(lines.len(), 1);
+        flush_stage_lines(&mut lines, true);
+        assert!(lines.is_empty());
     }
 
     // T6.1 — interleave cadence helper.

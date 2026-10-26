@@ -21,16 +21,30 @@
 //! (tree + rows) from persist callbacks.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// Per-chunk scan stage timings, accumulated via atomics so multiple threads
 /// can contribute (persist lane, scan thread).
+///
+/// On the write-behind path the chunk's commit runs on the persist lane after
+/// the chunk's scan, so its numbers are only known once the unit holding the
+/// chunk is committed ([`Self::is_settled`]); the scan loop logs the chunk's
+/// `chunk stages` line then.
 #[derive(Default)]
 pub struct ChunkStageTimings {
     /// Milliseconds spent in tree building (put_blocks time from persist facades).
     pub tree_ms: AtomicU64,
     /// Milliseconds spent in put_blocks' rows stage (row-level persistence).
     pub rows_ms: AtomicU64,
+    /// Wall milliseconds of the write-behind commit the chunk closed.
+    pub commit_ms: AtomicU64,
+    /// The chunk's blocks were handed to a persist unit.
+    stashed: AtomicBool,
+    /// The chunk's blocks went into a unit that a later chunk closed: that
+    /// chunk's line carries the commit's numbers, this one's are zero.
+    carried: AtomicBool,
+    /// The numbers are final (committed, carried, or nothing to persist).
+    settled: AtomicBool,
 }
 
 impl ChunkStageTimings {
@@ -48,11 +62,45 @@ impl ChunkStageTimings {
         self.rows_ms.fetch_add(ms, Ordering::Relaxed);
     }
 
+    /// The chunk's blocks were stashed into a write-behind persist unit.
+    pub fn mark_stashed(&self) {
+        self.stashed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the chunk's blocks were stashed into a persist unit.
+    pub fn is_stashed(&self) -> bool {
+        self.stashed.load(Ordering::Relaxed)
+    }
+
+    /// The unit holding the chunk's blocks was committed by `commit_ms`; the tree
+    /// and rows numbers are final.
+    pub fn settle_committed(&self, commit_ms: u64) {
+        self.commit_ms.fetch_add(commit_ms, Ordering::Relaxed);
+        self.settled.store(true, Ordering::Release);
+    }
+
+    /// The chunk's blocks were carried into a unit a later chunk closes.
+    pub fn settle_carried(&self) {
+        self.carried.store(true, Ordering::Relaxed);
+        self.settled.store(true, Ordering::Release);
+    }
+
+    /// The chunk has nothing (more) to wait for.
+    pub fn settle(&self) {
+        self.settled.store(true, Ordering::Release);
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.settled.load(Ordering::Acquire)
+    }
+
     /// Snapshot current values.
     pub fn snapshot(&self) -> ChunkStageSnapshot {
         ChunkStageSnapshot {
             tree_ms: self.tree_ms.load(Ordering::Relaxed),
             rows_ms: self.rows_ms.load(Ordering::Relaxed),
+            commit_ms: self.commit_ms.load(Ordering::Relaxed),
+            carried: self.carried.load(Ordering::Relaxed),
         }
     }
 }
@@ -62,6 +110,8 @@ impl ChunkStageTimings {
 pub struct ChunkStageSnapshot {
     pub tree_ms: u64,
     pub rows_ms: u64,
+    pub commit_ms: u64,
+    pub carried: bool,
 }
 
 // ── Thread-local storage for chunk timings ───────────────────────────────────
@@ -77,6 +127,12 @@ pub fn set_current_chunk_timings(timings: std::sync::Arc<ChunkStageTimings>) {
     CURRENT_CHUNK_TIMINGS.with(|cell| {
         *cell.borrow_mut() = Some(timings);
     });
+}
+
+/// The current chunk's timings on this thread, if any (the inline persist path
+/// runs `put_blocks` on the scan thread).
+pub fn current_chunk_timings() -> Option<std::sync::Arc<ChunkStageTimings>> {
+    CURRENT_CHUNK_TIMINGS.with(|cell| cell.borrow().clone())
 }
 
 /// Clear the current chunk timings (called at chunk end by scan).

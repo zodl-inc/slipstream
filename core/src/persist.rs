@@ -3502,7 +3502,15 @@ impl WalletWrite for SparseFacade<'_> {
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        sparse_put_blocks(self.inner, self.sparse, from_state, blocks, None)
+        // Inline path: put_blocks runs on the scan thread, under the chunk's timings.
+        let timings = crate::scan_stages::current_chunk_timings();
+        sparse_put_blocks(
+            self.inner,
+            self.sparse,
+            from_state,
+            blocks,
+            timings.as_ref(),
+        )
     }
 
     fn put_received_transparent_utxo(
@@ -4227,9 +4235,23 @@ impl WalletWrite for WriteBehindFacade {
                 pending.blocks.extend(blocks);
                 pending.last_height = last_height;
                 pending.outputs += outputs;
-                pending.timings = self.timings.clone();
+                // The commit's numbers go to the chunk that closes the unit.
+                if let Some(t) = &self.timings {
+                    t.mark_stashed();
+                }
+                if let Some(prev) = std::mem::replace(&mut pending.timings, self.timings.clone())
+                    && !self
+                        .timings
+                        .as_ref()
+                        .is_some_and(|t| std::sync::Arc::ptr_eq(t, &prev))
+                {
+                    prev.settle_carried();
+                }
             }
             None => {
+                if let Some(t) = &self.timings {
+                    t.mark_stashed();
+                }
                 self.stash = Some(PendingPersist {
                     from_state: from_state.clone(),
                     blocks,
@@ -4777,13 +4799,19 @@ impl PersistLane {
         self.submit_job(
             span,
             Box::new(move |db, sparse| {
+                let started = std::time::Instant::now();
                 sparse_put_blocks(
                     db,
                     sparse,
                     &pending.from_state,
                     pending.blocks,
                     pending.timings.as_ref(),
-                )
+                )?;
+                // The chunk's `chunk stages` line waits for this (see scan.rs).
+                if let Some(t) = &pending.timings {
+                    t.settle_committed(started.elapsed().as_millis() as u64);
+                }
+                Ok(())
             }),
         )
         .await
