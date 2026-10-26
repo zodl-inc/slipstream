@@ -678,6 +678,11 @@ impl GraftCtx {
             .map_err(|e| {
                 crate::error::SlipstreamError::Wallet(format!("graft side conn busy_timeout: {e}"))
             })?;
+        crate::wallet_session::tune_connection(
+            &conn,
+            Some(crate::wallet_session::SCAN_WRITER_CACHE_BYTES),
+        )
+        .map_err(|e| crate::error::SlipstreamError::Wallet(format!("graft side conn tune: {e}")))?;
         Ok(Self {
             conn,
             verify_sample,
@@ -1308,6 +1313,7 @@ pub fn sparse_put_blocks(
     sparse: &mut SparseTreeState,
     from_state: &ChainState,
     blocks: Vec<ScannedBlock<<Db as WalletRead>::AccountId>>,
+    timings: Option<&std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
 ) -> Result<(), SqliteClientError> {
     // ll/wallet.rs:245-247.
     let Some(initial_block) = blocks.first() else {
@@ -1512,7 +1518,9 @@ pub fn sparse_put_blocks(
         >(wdb, GapLimits::default(), from_state, blocks)
         .map_err(SqliteClientError::from)?;
         rows_ms = t_rows.elapsed().as_millis();
-        crate::scan_stages::record_rows_ms(rows_ms as u64);
+        if let Some(t) = timings {
+            t.add_rows_ms(rows_ms as u64);
+        }
         if rows_ms > 5000 {
             // Log slow rows stage timing to pinpoint first-put stalls.
             // Field evidence (2026-10-25): 24 s rows stage on the first small pass after a
@@ -2068,7 +2076,9 @@ pub fn sparse_put_blocks(
             orch_split = orch_timers;
 
             tree_ms = t_tree.elapsed().as_millis();
-            crate::scan_stages::record_tree_ms(tree_ms as u64);
+            if let Some(t) = timings {
+                t.add_tree_ms(tree_ms as u64);
+            }
 
             // Flush the dirty tree delta + scan-queue update in the SAME txn.
             let t_flush = std::time::Instant::now();
@@ -3492,7 +3502,7 @@ impl WalletWrite for SparseFacade<'_> {
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        sparse_put_blocks(self.inner, self.sparse, from_state, blocks)
+        sparse_put_blocks(self.inner, self.sparse, from_state, blocks, None)
     }
 
     fn put_received_transparent_utxo(
@@ -3609,6 +3619,8 @@ pub struct PendingPersist {
     /// First/last block height of the unit (log attribution only).
     pub first_height: u64,
     pub last_height: u64,
+    /// Chunk stage timings for diagnostic logging.
+    pub timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
 }
 
 /// Mirror of upstream `Nullifiers::update_with` for ONE block's worth of deltas
@@ -3714,6 +3726,7 @@ pub struct WriteBehindFacade {
     /// Snapshot of the wallet's transparent receivers (see read surface item 6).
     transparent_receivers: HashMap<TransparentAddress, (DbAccountId, Option<TransparentKeyScope>)>,
     stash: Option<PendingPersist>,
+    timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
 }
 
 impl WriteBehindFacade {
@@ -3740,6 +3753,7 @@ impl WriteBehindFacade {
             transparent_outpoints: db.get_unspent_transparent_outpoints()?,
             transparent_receivers: db.get_transparent_receiver_accounts()?,
             stash: None,
+            timings: None,
         })
     }
 
@@ -3781,6 +3795,7 @@ impl WriteBehindFacade {
             transparent_outpoints: HashMap::new(),
             transparent_receivers: HashMap::new(),
             stash: None,
+            timings: None,
         }
     }
 }
@@ -4133,6 +4148,7 @@ impl WalletWrite for WriteBehindFacade {
             blocks,
             first_height,
             last_height,
+            timings: self.timings.clone(),
         });
         Ok(())
     }
@@ -4400,6 +4416,11 @@ impl PersistLane {
             .map_err(|e| {
                 crate::error::SlipstreamError::Wallet(format!("persist lane busy_timeout: {e}"))
             })?;
+        crate::wallet_session::tune_connection(
+            &lane_conn,
+            Some(crate::wallet_session::SCAN_WRITER_CACHE_BYTES),
+        )
+        .map_err(|e| crate::error::SlipstreamError::Wallet(format!("persist lane tune: {e}")))?;
         rusqlite::vtab::array::load_module(&lane_conn).map_err(|e| {
             crate::error::SlipstreamError::Wallet(format!("persist lane array module: {e}"))
         })?;
@@ -4666,7 +4687,13 @@ impl PersistLane {
         self.submit_job(
             span,
             Box::new(move |db, sparse| {
-                sparse_put_blocks(db, sparse, &pending.from_state, pending.blocks)
+                sparse_put_blocks(
+                    db,
+                    sparse,
+                    &pending.from_state,
+                    pending.blocks,
+                    pending.timings.as_ref(),
+                )
             }),
         )
         .await
@@ -5213,6 +5240,7 @@ mod write_behind_tests {
             blocks: vec![],
             first_height: 2,
             last_height: 2,
+            timings: None,
         });
         let err = f.put_blocks(&empty_chain_state(1), vec![]).unwrap_err();
         assert!(
@@ -6385,5 +6413,15 @@ mod graft_sweep_root_tests {
             None,
             "nor has a shard the store does not hold"
         );
+    }
+}
+
+impl WriteBehindFacade {
+    /// Set the chunk stage timings for diagnostic logging.
+    pub fn set_timings(
+        &mut self,
+        timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
+    ) {
+        self.timings = timings;
     }
 }

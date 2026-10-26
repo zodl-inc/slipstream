@@ -88,6 +88,7 @@ pub fn clear_current_chunk_timings() {
 
 /// Record tree building time for the current chunk (called from put_blocks).
 /// No-op if no chunk timings are active (tests, non-instrumented paths).
+#[allow(dead_code)]
 pub fn record_tree_ms(ms: u64) {
     CURRENT_CHUNK_TIMINGS.with(|cell| {
         if let Some(ref timings) = *cell.borrow() {
@@ -98,6 +99,7 @@ pub fn record_tree_ms(ms: u64) {
 
 /// Record rows stage time for the current chunk (called from put_blocks).
 /// No-op if no chunk timings are active.
+#[allow(dead_code)]
 pub fn record_rows_ms(ms: u64) {
     CURRENT_CHUNK_TIMINGS.with(|cell| {
         if let Some(ref timings) = *cell.borrow() {
@@ -114,7 +116,7 @@ pub struct ThreadCpuSample {
     pub cpu_ns: u64,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 impl ThreadCpuSample {
     /// Sample current thread's CPU time (user + system) via CLOCK_THREAD_CPUTIME_ID.
     pub fn now() -> Self {
@@ -137,7 +139,7 @@ impl ThreadCpuSample {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
 impl ThreadCpuSample {
     /// No-op on non-Linux platforms.
     pub fn now() -> Self {

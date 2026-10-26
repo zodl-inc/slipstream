@@ -699,6 +699,11 @@ async fn scan_chunks_inner(
         // through put_blocks calls).
         let chunk_timings = std::sync::Arc::new(crate::scan_stages::ChunkStageTimings::new());
         crate::scan_stages::set_current_chunk_timings(chunk_timings.clone());
+        // The write-behind persist runs on another thread than the thread-local above:
+        // hand it the same timings through the facade so persist_tree/rows are recorded.
+        if let Some(wb) = wb.as_mut() {
+            wb.facade.set_timings(Some(chunk_timings.clone()));
+        }
 
         // Sample rayon worker CPU time at chunk start (Linux/Android only).
         let chunk_wall_start = Instant::now();
