@@ -142,7 +142,8 @@ static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 /// Process-wide cache of OHTTP clients for Direct-dialer connections only. Each cached client
 /// pools HTTP/2 connections and verified key configs per gateway. Tor-dialer clients are never
 /// cached (fresh client per call) to avoid linking requests across isolated circuits.
-static CLIENT_CACHE: OnceLock<Mutex<HashMap<ClientCacheKey, Arc<OhttpClient>>>> = OnceLock::new();
+static CLIENT_CACHE: OnceLock<std::sync::Mutex<HashMap<ClientCacheKey, Arc<OhttpClient>>>> =
+    OnceLock::new();
 
 /// Cache key for OHTTP clients: gateway host, relay URL, trace prefix, and profile.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -214,6 +215,25 @@ async fn get_or_create_client(
     client_trace_prefix: Option<String>,
     profile: ClientProfile,
 ) -> Result<Arc<OhttpClient>, String> {
+    cached_or_new_client(
+        gateway_host,
+        relay_url,
+        dialer,
+        client_trace_prefix,
+        profile,
+    )
+}
+
+/// Synchronous core of [`get_or_create_client`], also used by [`OhttpConnector`] so that every
+/// gRPC channel of a Direct-dialer session shares one client, and with it one pooled h2
+/// connection to the relay, instead of a TLS handshake per channel.
+fn cached_or_new_client(
+    gateway_host: &str,
+    relay_url: &str,
+    dialer: Dialer,
+    client_trace_prefix: Option<String>,
+    profile: ClientProfile,
+) -> Result<Arc<OhttpClient>, String> {
     // Tor clients are never cached: each call gets a fresh client with fresh connections.
     // Neither is a profile outside the known presets, which has no distinguishing cache key.
     let key = if dialer.is_tor() {
@@ -237,8 +257,8 @@ async fn get_or_create_client(
     };
 
     // Direct clients are cached per (gateway_host, relay_url, trace_prefix, profile)
-    let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut map = cache.lock().await;
+    let cache = CLIENT_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
 
     if let Some(client) = map.get(&key) {
         return Ok(Arc::clone(client));
@@ -384,14 +404,16 @@ impl OhttpConnector {
         dialer: Dialer,
         client_trace_prefix: Option<String>,
     ) -> Result<Self, String> {
+        // Direct: the process-wide client, so channels reuse one h2 connection to the relay.
+        // Tor: a fresh client, as before (circuit isolation).
         Ok(Self {
-            client: Arc::new(OhttpClient::new(
+            client: cached_or_new_client(
                 gateway_host,
                 relay_url,
                 dialer,
                 client_trace_prefix.or_else(get_default_client_trace_prefix),
                 ClientProfile::SLIPSTREAM,
-            )?),
+            )?,
         })
     }
 
@@ -4578,7 +4600,7 @@ mod tests {
             .get()
             .expect("the cache exists")
             .lock()
-            .await
+            .unwrap()
             .remove(&key);
         assert!(
             removed.is_some(),
