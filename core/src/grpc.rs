@@ -133,19 +133,20 @@ pub(crate) async fn retry_get_tree_state(
     height: u64,
     context: &str,
     tor: Option<&crate::connector::TorConn>,
+    purpose: crate::connector::ConnPurpose,
     progress: Option<Arc<crate::events::Progress>>,
 ) -> Result<zcash_client_backend::proto::service::TreeState, SlipstreamError> {
     let mut attempt: u32 = 0;
     loop {
-        // For the first attempt, connect fresh; for retries, also fresh (reconnect
-        // semantics — avoids reusing a wedged channel). Tor-aware: treestate is
-        // `.uniqueTor` (isolated circuit) when Tor is on, direct otherwise.
-        let mut client = crate::connector::connect_via(
-            endpoint,
-            tor,
-            crate::connector::ConnPurpose::MetadataUnique,
-        )
-        .await?;
+        // First attempt: `purpose` (with Tor on, `SyncShared` reuses the session connection,
+        // `MetadataUnique` an isolated circuit). Retries always connect fresh on an isolated
+        // circuit, so a wedged (or shared) channel is never retried into.
+        let purpose = if attempt == 0 {
+            purpose
+        } else {
+            crate::connector::ConnPurpose::MetadataUnique
+        };
+        let mut client = crate::connector::connect_via(endpoint, tor, purpose).await?;
         match get_tree_state(&mut client, height).await {
             Ok(ts) => {
                 // Liveness: a server response is forward progress (tree states ride
@@ -156,6 +157,11 @@ pub(crate) async fn retry_get_tree_state(
                 return Ok(ts);
             }
             Err(err) if err.is_transient() && attempt < TREESTATE_RETRY_MAX => {
+                if purpose == crate::connector::ConnPurpose::SyncShared
+                    && let Some(t) = tor
+                {
+                    t.forget_shared(endpoint);
+                }
                 attempt += 1;
                 let backoff = treestate_retry_backoff(attempt);
                 tracing::warn!(
@@ -877,7 +883,15 @@ mod tests {
         // PASS_RETRY_MAX=2 means 3 total attempts; all will fail with Transport.
         // The test just confirms that: (a) it returns a Transport error (not panic),
         // and (b) the function exists and is callable.
-        let result = retry_get_tree_state(&ep, 1_000_000, "test-context", None, None).await;
+        let result = retry_get_tree_state(
+            &ep,
+            1_000_000,
+            "test-context",
+            None,
+            crate::connector::ConnPurpose::MetadataUnique,
+            None,
+        )
+        .await;
         assert!(
             matches!(result, Err(SlipstreamError::Transport(_))),
             "unroutable endpoint must yield Transport error, got: {result:?}"

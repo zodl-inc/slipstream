@@ -523,6 +523,7 @@ pub async fn run_to_completion(
                         end_height,
                         "boundary prefetch (fetch-side)",
                         tor_owned.as_ref(),
+                        crate::connector::ConnPurpose::SyncShared,
                         progress,
                     )
                     .await

@@ -638,6 +638,8 @@ async fn scan_chunks_inner(
         range_start - 1,
         "initial seed",
         tor,
+        // The range start can be the wallet birthday: keep it on its own circuit.
+        crate::connector::ConnPurpose::MetadataUnique,
         progress.clone(),
     )
     .await?;
@@ -778,6 +780,7 @@ async fn scan_chunks_inner(
                                     sub_end,
                                     "chunk-boundary prefetch",
                                     tor_owned.as_ref(),
+                                    crate::connector::ConnPurpose::SyncShared,
                                     progress,
                                 )
                                 .await

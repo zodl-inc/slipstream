@@ -157,15 +157,23 @@ pub fn should_resync(last_synced_tip: u64, observed_tip: u64) -> bool {
 /// One cheap tip probe (T8.1 fast path): connect + GetLatestBlock ONLY —
 /// none of the preflight work of a full pass (subtree roots, UTXO refresh).
 ///
-/// Fresh connection per probe (TLS ~100-300 ms every FOLLOW_POLL; a held
-/// connection would need its own keepalive/staleness handling). All awaits
-/// carry the hardening1 deadlines (connect 10 s, unary 30 s).
+/// Direct: fresh connection per probe (TLS ~100-300 ms every FOLLOW_POLL; a held
+/// connection would need its own keepalive/staleness handling). Tor: the session's
+/// shared connection (`SyncShared`), dropped after a failed probe so the next one
+/// reconnects. All awaits carry the hardening1 deadlines (connect 10 s, unary 30 s).
 pub async fn probe_tip(
     config: &EngineConfig,
     tor: Option<&TorConn>,
 ) -> Result<u64, SlipstreamError> {
-    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-    grpc::get_latest_block_height(&mut client).await
+    // Public tip data (ZIP circuit isolation policy): the session's shared connection.
+    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::SyncShared).await?;
+    let tip = grpc::get_latest_block_height(&mut client).await;
+    if tip.is_err()
+        && let Some(t) = tor
+    {
+        t.forget_shared(&config.endpoint);
+    }
+    tip
 }
 
 /// One sync pass. `accounts` bootstraps the wallet: each `(ufvk, birthday)` is imported

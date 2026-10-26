@@ -34,12 +34,13 @@
 //! `block_on` and no cross-runtime polling — see `tests/tor_runtime_spike.rs`.
 
 use std::{
+    collections::HashMap,
     future::Future,
     path::Path,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arti_client::{
@@ -70,6 +71,12 @@ pub enum ConnPurpose {
     MetadataUnique,
     /// Server validation / lightd info. Default Tor circuit (`.defaultTor`).
     MetadataDefault,
+    /// Public sync metadata asked many times per pass (chunk-boundary tree states, tip probes).
+    /// With Tor ON: one session-wide connection on the default circuit, reused for up to
+    /// [`SHARED_CONN_MAX_AGE`], instead of a fresh isolated circuit per call (ZIP "Circuit
+    /// isolation policy": public range data MAY share one circuit per session). Never use it
+    /// for a wallet-identifying call.
+    SyncShared,
 }
 
 /// Which Tor circuit a purpose uses, or `None` for direct. This is the single source of the
@@ -78,7 +85,14 @@ pub enum ConnPurpose {
 enum TorMode {
     Isolated,
     Default,
+    /// The default circuit, through one cached connection per endpoint ([`TorConn::shared`]).
+    Shared,
 }
+
+/// How long [`ConnPurpose::SyncShared`] reuses one connection before opening a new one, so a long
+/// session is not a single linkable stream at the Relay (arti retires a used circuit after 10 min
+/// as well).
+const SHARED_CONN_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
     match purpose {
@@ -87,6 +101,7 @@ fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
         ConnPurpose::BulkFetch => Some(TorMode::Default),
         ConnPurpose::MetadataUnique => Some(TorMode::Isolated),
         ConnPurpose::MetadataDefault => Some(TorMode::Default),
+        ConnPurpose::SyncShared => Some(TorMode::Shared),
     }
 }
 
@@ -132,6 +147,8 @@ const TOR_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 pub struct TorConn {
     client: Arc<TorClient<PreferredRuntime>>,
     client_trace_prefix: Option<String>,
+    /// [`TorMode::Shared`] connections, per endpoint (`host:port`), with their opening time.
+    shared: Arc<std::sync::Mutex<HashMap<String, (LwdClient, Instant)>>>,
 }
 
 impl TorConn {
@@ -174,6 +191,7 @@ impl TorConn {
         Ok(Self {
             client,
             client_trace_prefix,
+            shared: Arc::default(),
         })
     }
 
@@ -185,6 +203,7 @@ impl TorConn {
         Self {
             client,
             client_trace_prefix,
+            shared: Arc::default(),
         }
     }
 
@@ -222,6 +241,9 @@ impl TorConn {
         mode: TorMode,
         endpoint: &Endpoint,
     ) -> Result<LwdClient, SlipstreamError> {
+        if mode == TorMode::Shared {
+            return self.connect_shared(endpoint).await;
+        }
         self.ensure_bootstrapped().await?;
         let relay = crate::ohttp::relay_for(&endpoint.host);
         let per_attempt = if relay.is_some() {
@@ -240,7 +262,7 @@ impl TorConn {
             // circuit); `.defaultTor` = the default circuit (a retry still gets a fresh isolated
             // one, since the default one just failed us).
             let client = match (mode, attempt) {
-                (TorMode::Default, 1) => self.client.clone(),
+                (TorMode::Default | TorMode::Shared, 1) => self.client.clone(),
                 _ => self.client.isolated_client(),
             };
             let client_trace_prefix = self.client_trace_prefix.clone();
@@ -278,6 +300,39 @@ impl TorConn {
         Err(SlipstreamError::Transport(last_err.unwrap_or_else(|| {
             "tor connect: failed to obtain a circuit".to_string()
         })))
+    }
+
+    /// Drop the cached [`TorMode::Shared`] connection to `endpoint` after a call on it failed, so
+    /// the next `SyncShared` connect opens a fresh one instead of reusing a broken channel.
+    pub fn forget_shared(&self, endpoint: &Endpoint) {
+        let key = format!("{}:{}", endpoint.host, endpoint.port);
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&key);
+    }
+
+    /// [`TorMode::Shared`]: hand out the cached connection to `endpoint` while it is younger than
+    /// [`SHARED_CONN_MAX_AGE`], else open one on the default circuit and cache it. A tonic
+    /// channel multiplexes concurrent calls and redials a broken transport itself; callers that
+    /// retry after a failure use an isolated connection, so a bad shared one is never retried
+    /// into.
+    async fn connect_shared(&self, endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+        let key = format!("{}:{}", endpoint.host, endpoint.port);
+        {
+            let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((client, opened)) = shared.get(&key)
+                && opened.elapsed() < SHARED_CONN_MAX_AGE
+            {
+                return Ok(client.clone());
+            }
+        }
+        let client = Box::pin(self.connect(TorMode::Default, endpoint)).await?;
+        self.shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (client.clone(), Instant::now()));
+        Ok(client)
     }
 
     /// OHTTP gateway over Tor: tonic talks to the in-process OHTTP pipe exactly as in
@@ -590,6 +645,9 @@ mod tests {
             Some(TorMode::Default)
         );
         assert!(crate::ohttp::relay_for("ohttp-gateway-testnet.example").is_some());
+        // Public sync metadata shares the session connection on the default circuit.
+        assert_eq!(route(ConnPurpose::SyncShared, true), Some(TorMode::Shared));
+        assert_eq!(route(ConnPurpose::SyncShared, false), Some(TorMode::Shared));
     }
 
     #[test]

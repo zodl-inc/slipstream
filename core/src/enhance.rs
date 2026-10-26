@@ -202,7 +202,9 @@ pub async fn run_enhancement(
 }
 
 /// Concurrent isolated Tor connections opened for wallet-identifying fetches.
-const ISOLATED_FETCH_CONCURRENCY: usize = 4;
+/// Matches [`ENHANCE_FETCH_CONCURRENCY`]: each fetch still gets its own circuit, and a device
+/// resync over Tor spent ~2.5 min on 111 txids at 4.
+const ISOLATED_FETCH_CONCURRENCY: usize = ENHANCE_FETCH_CONCURRENCY;
 
 /// Concurrent GetTransaction fetches (enhancement or status checks). Bounds the
 /// concurrent heavy calls to respect the gateway's per-host cap (field evidence:
