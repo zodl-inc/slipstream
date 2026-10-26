@@ -433,30 +433,21 @@ impl SessionReporter {
     }
 }
 
+/// One [`TOR_CONNS`] entry: the owning handle's pass lock (weak), the Tor directory, the client.
+type TorConnEntry = (
+    std::sync::Weak<tokio::sync::Mutex<()>>,
+    std::path::PathBuf,
+    TorConn,
+);
+
 /// Engine Tor clients kept across sessions of one handle. A host stop + start (the app going to
 /// the background and back, a rewind, a resync) used to bootstrap a new arti client every time,
 /// 12-28 s on a device even with a warm directory cache. A client is bound to the runtime it was
 /// bootstrapped on, so it is reused only by a later session of the same handle: the entry keeps a
 /// weak reference to that handle's pass lock, which dies with the handle (and its runtime).
-#[allow(clippy::type_complexity)]
-static TOR_CONNS: std::sync::OnceLock<
-    Mutex<
-        Vec<(
-            std::sync::Weak<tokio::sync::Mutex<()>>,
-            std::path::PathBuf,
-            TorConn,
-        )>,
-    >,
-> = std::sync::OnceLock::new();
+static TOR_CONNS: std::sync::OnceLock<Mutex<Vec<TorConnEntry>>> = std::sync::OnceLock::new();
 
-fn tor_conns() -> std::sync::MutexGuard<
-    'static,
-    Vec<(
-        std::sync::Weak<tokio::sync::Mutex<()>>,
-        std::path::PathBuf,
-        TorConn,
-    )>,
-> {
+fn tor_conns() -> std::sync::MutexGuard<'static, Vec<TorConnEntry>> {
     TOR_CONNS
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()

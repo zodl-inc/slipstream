@@ -73,7 +73,7 @@ pub enum ConnPurpose {
     MetadataDefault,
     /// Public sync metadata asked many times per pass (chunk-boundary tree states, tip probes).
     /// With Tor ON: one session-wide connection on the default circuit, reused for up to
-    /// [`SHARED_CONN_MAX_AGE`], instead of a fresh isolated circuit per call (ZIP "Circuit
+    /// `SHARED_CONN_MAX_AGE` (10 min), instead of a fresh isolated circuit per call (ZIP "Circuit
     /// isolation policy": public range data MAY share one circuit per session). Never use it
     /// for a wallet-identifying call.
     SyncShared,
@@ -302,7 +302,7 @@ impl TorConn {
         })))
     }
 
-    /// Drop the cached [`TorMode::Shared`] connection to `endpoint` after a call on it failed, so
+    /// Drop the cached shared (`SyncShared`) connection to `endpoint` after a call on it failed, so
     /// the next `SyncShared` connect opens a fresh one instead of reusing a broken channel.
     pub fn forget_shared(&self, endpoint: &Endpoint) {
         let key = format!("{}:{}", endpoint.host, endpoint.port);
