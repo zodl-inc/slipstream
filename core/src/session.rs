@@ -433,6 +433,60 @@ impl SessionReporter {
     }
 }
 
+/// Engine Tor clients kept across sessions of one handle. A host stop + start (the app going to
+/// the background and back, a rewind, a resync) used to bootstrap a new arti client every time,
+/// 12-28 s on a device even with a warm directory cache. A client is bound to the runtime it was
+/// bootstrapped on, so it is reused only by a later session of the same handle: the entry keeps a
+/// weak reference to that handle's pass lock, which dies with the handle (and its runtime).
+#[allow(clippy::type_complexity)]
+static TOR_CONNS: std::sync::OnceLock<
+    Mutex<
+        Vec<(
+            std::sync::Weak<tokio::sync::Mutex<()>>,
+            std::path::PathBuf,
+            TorConn,
+        )>,
+    >,
+> = std::sync::OnceLock::new();
+
+fn tor_conns() -> std::sync::MutexGuard<
+    'static,
+    Vec<(
+        std::sync::Weak<tokio::sync::Mutex<()>>,
+        std::path::PathBuf,
+        TorConn,
+    )>,
+> {
+    TOR_CONNS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The Tor client an earlier session of the handle owning `pass_lock` bootstrapped from `dir`.
+fn reusable_tor_conn(
+    pass_lock: &Arc<tokio::sync::Mutex<()>>,
+    dir: &std::path::Path,
+) -> Option<TorConn> {
+    let mut conns = tor_conns();
+    conns.retain(|(owner, _, _)| owner.strong_count() > 0);
+    conns
+        .iter()
+        .find(|(owner, d, _)| {
+            d == dir && owner.upgrade().is_some_and(|o| Arc::ptr_eq(&o, pass_lock))
+        })
+        .map(|(_, _, tc)| tc.clone())
+}
+
+/// Keep `tc` for later sessions of the handle owning `pass_lock` (see [`TOR_CONNS`]).
+fn remember_tor_conn(pass_lock: &Arc<tokio::sync::Mutex<()>>, dir: &std::path::Path, tc: &TorConn) {
+    let mut conns = tor_conns();
+    conns.retain(|(owner, d, _)| {
+        owner.strong_count() > 0 && !(d == dir && owner.as_ptr() == Arc::as_ptr(pass_lock))
+    });
+    conns.push((Arc::downgrade(pass_lock), dir.to_path_buf(), tc.clone()));
+}
+
 /// Run a full sync session: resilient Tor bootstrap (never falls back to direct) → resilient
 /// initial pass (T8.7, with [B4-16] non-transient revival) → tip-following loop with mempool
 /// monitoring, until the future is dropped or aborted by the host (via the `AbortHandle`
@@ -498,11 +552,16 @@ pub async fn run_session(
         Some(ref t) => {
             let mut boot_failures: u32 = 0;
             loop {
+                if let Some(tc) = reusable_tor_conn(&pass_lock, &t.dir) {
+                    tracing::info!("slipstream Tor client reused from the previous session");
+                    break Some(tc);
+                }
                 match TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone, None).await {
                     Ok(tc) => {
                         tracing::info!(
                             "slipstream Tor bootstrapped (engine-owned isolated circuits)"
                         );
+                        remember_tor_conn(&pass_lock, &t.dir, &tc);
                         break Some(tc);
                     }
                     Err(err) => {
