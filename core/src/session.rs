@@ -477,9 +477,32 @@ fn reusable_tor_conn(
 /// gone). Called when the handle is dropped, so its arti client and connections are released
 /// with it rather than at the next Tor session of some other handle.
 pub fn forget_tor_conns(pass_lock: &Arc<tokio::sync::Mutex<()>>) {
+    // Mark the handle closed first, so that a session of it still finishing a bootstrap on
+    // the runtime that is about to shut down cannot insert its client after this cleanup.
+    {
+        let mut closed = closed_handles();
+        closed.retain(|w| w.strong_count() > 0);
+        closed.push(Arc::downgrade(pass_lock));
+    }
     tor_conns().retain(|(owner, _, _)| {
         owner.strong_count() > 0 && owner.as_ptr() != Arc::as_ptr(pass_lock)
     });
+}
+
+/// Pass locks of dropped handles whose sessions may still be running (see
+/// [`forget_tor_conns`]). An entry holds only a weak reference, which also keeps the
+/// allocation (and so the address compared against) from being reused while it is listed; it
+/// is pruned once no session holds the lock any more, at which point no insert can come.
+static CLOSED_HANDLES: std::sync::OnceLock<Mutex<Vec<WeakPassLock>>> = std::sync::OnceLock::new();
+
+/// A weak reference to a handle's pass lock.
+type WeakPassLock = std::sync::Weak<tokio::sync::Mutex<()>>;
+
+fn closed_handles() -> std::sync::MutexGuard<'static, Vec<WeakPassLock>> {
+    CLOSED_HANDLES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 /// Keep `tc` for later sessions of the handle owning `pass_lock` (see [`TOR_CONNS`]).
@@ -489,6 +512,13 @@ fn remember_tor_conn(
     trust_everyone: bool,
     tc: &TorConn,
 ) {
+    {
+        let mut closed = closed_handles();
+        closed.retain(|w| w.strong_count() > 0);
+        if closed.iter().any(|w| w.as_ptr() == Arc::as_ptr(pass_lock)) {
+            return;
+        }
+    }
     let mut conns = tor_conns();
     // One client per handle: a new one replaces whatever the handle had.
     conns.retain(|(owner, _, _)| {
