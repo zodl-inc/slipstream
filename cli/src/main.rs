@@ -198,6 +198,12 @@ enum Cmd {
         /// and for observing follow behaviour without a full Zodl build.
         #[arg(long, default_value_t = false)]
         follow: bool,
+        /// Route the pass through Tor: bootstrap an arti client from this directory
+        /// (created if absent) and hand it to the engine, as the mobile SDKs do with
+        /// Tor mode on. With an OHTTP gateway as --server, every call (bulk included)
+        /// is OHTTP-encapsulated and its relay leg dialled through Tor.
+        #[arg(long)]
+        tor_dir: Option<std::path::PathBuf>,
     },
     /// v0.4 P0 bench (spec §3.3): scripted fresh-restore benchmark. Restores the
     /// given UFVK into an EMPTY wallet dir (temp by default — a bench is always a
@@ -1018,6 +1024,7 @@ fn cmd_sync(
     follow: bool,
     anchor_retention: Option<u32>,
     anchor_retention_interval: u32,
+    tor_dir: Option<std::path::PathBuf>,
 ) {
     let endpoint = parse_server(&server).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -1067,6 +1074,31 @@ fn cmd_sync(
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
+        // Tor mode: the engine-owned arti client, bootstrapped on this runtime.
+        // (`--follow` hands the directory to the session instead, which bootstraps its own.)
+        let tor = match tor_dir.as_ref().filter(|_| !follow) {
+            Some(dir) => {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    eprintln!("error: tor dir {}: {e}", dir.display());
+                    std::process::exit(2);
+                }
+                let started = std::time::Instant::now();
+                match zodl_slipstream::connector::TorConn::bootstrap(dir, false, None).await {
+                    Ok(t) => {
+                        println!(
+                            "tor: bootstrapped in {:.1}s",
+                            started.elapsed().as_secs_f64()
+                        );
+                        Some(t)
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => None,
+        };
         // Build shared progress state for the CLI ticker (decision D8 poll-based).
         let progress = std::sync::Arc::new(zodl_slipstream::Progress::default());
         let ticker_progress = std::sync::Arc::clone(&progress);
@@ -1101,7 +1133,12 @@ fn cmd_sync(
             let scfg = zodl_slipstream::SessionConfig {
                 engine: cfg.clone(),
                 accounts: accounts.clone(),
-                tor: None,
+                tor: tor_dir
+                    .clone()
+                    .map(|dir| zodl_slipstream::TorSessionConfig {
+                        dir,
+                        dangerously_trust_everyone: false,
+                    }),
             };
             let reporter = zodl_slipstream::SessionReporter {
                 progress: std::sync::Arc::clone(&progress),
@@ -1123,7 +1160,7 @@ fn cmd_sync(
         }
 
         let result =
-            zodl_slipstream::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
+            zodl_slipstream::engine::sync_once(&cfg, &accounts, Some(progress), tor.as_ref()).await;
 
         // Abort the ticker (JoinHandle::abort is fine per spec — no cleanup needed).
         ticker.abort();
@@ -1598,6 +1635,7 @@ fn main() {
             gpu_subtree,
             persist_depth,
             follow,
+            tor_dir,
         } => {
             cmd_sync(
                 resolve_network(network, custom_heights.as_deref()),
@@ -1616,6 +1654,7 @@ fn main() {
                 follow,
                 anchor_retention,
                 anchor_retention_interval,
+                tor_dir,
             );
         }
         Cmd::Bench {

@@ -62,10 +62,11 @@ use crate::{
 /// Why a lightwalletd connection is being opened — selects direct vs Tor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnPurpose {
-    /// Bulk compact-block download. Direct with Tor off; with Tor ON it rides the shared default
-    /// circuit for EVERY host (OHTTP gateway or clearnet lightwalletd). Upstream Zashi kept bulk
-    /// direct even with Tor on (`blockStream(.direct)`); Zodl changed that on 2026-09-14 so that a
-    /// clearnet lightwalletd used as the OHTTP fallback never sees the device IP while Tor is on.
+    /// Bulk compact-block download. Direct with Tor off; with Tor ON it rides Tor for EVERY host
+    /// (OHTTP gateway or clearnet lightwalletd), each fetch connection on a circuit of its own.
+    /// Upstream Zashi kept bulk direct even with Tor on (`blockStream(.direct)`); Zodl changed
+    /// that on 2026-09-14 so that a clearnet lightwalletd used as the OHTTP fallback never sees
+    /// the device IP while Tor is on.
     BulkFetch,
     /// Wallet-identifying metadata (treestate, latest-block, tip). Isolated Tor (`.uniqueTor`).
     MetadataUnique,
@@ -87,6 +88,9 @@ enum TorMode {
     Default,
     /// The default circuit, through one cached connection per endpoint ([`TorConn::shared`]).
     Shared,
+    /// A circuit of the connection's own, for throughput rather than unlinkability: the bulk
+    /// fetch workers each get one, so the download is not capped by a single circuit's window.
+    OwnCircuit,
 }
 
 /// How long [`ConnPurpose::SyncShared`] reuses one connection before opening a new one, so a long
@@ -96,9 +100,14 @@ const SHARED_CONN_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
     match purpose {
-        // Public range data: needs no isolation from itself, and one shared circuit keeps the
-        // fetch workers' pooled h2 connections cheap.
-        ConnPurpose::BulkFetch => Some(TorMode::Default),
+        // Public range data: needs no isolation from itself, but one circuit per fetch worker.
+        // A Tor circuit carries at most one flow-control window (1000 cells, ~500 KB) per round
+        // trip (arti 0.35 has no congestion control), so the workers sharing the default circuit
+        // all ran at that one circuit's rate: 0.3 to 1.6 MB/s on EC2 (2026-10-26), with no gain
+        // from 8 workers over 4. On circuits of their own, 4 workers fetched 230 MB at 2.9 MB/s.
+        // The ZIP's circuit isolation policy lets public range data share a circuit; it does
+        // not ask for it, and splitting public data over several circuits links nothing more.
+        ConnPurpose::BulkFetch => Some(TorMode::OwnCircuit),
         ConnPurpose::MetadataUnique => Some(TorMode::Isolated),
         ConnPurpose::MetadataDefault => Some(TorMode::Default),
         ConnPurpose::SyncShared => Some(TorMode::Shared),
@@ -258,9 +267,9 @@ impl TorConn {
         // on attempt 1 with no added latency.
         let mut last_err: Option<String> = None;
         for attempt in 1..=TOR_CONNECT_ATTEMPTS {
-            // `.uniqueTor` = a fresh isolated circuit EACH attempt (so a retry escapes a stuck
-            // circuit); `.defaultTor` = the default circuit (a retry still gets a fresh isolated
-            // one, since the default one just failed us).
+            // `.uniqueTor` (and a bulk worker's own circuit) = a fresh isolated circuit EACH
+            // attempt (so a retry escapes a stuck circuit); `.defaultTor` = the default circuit
+            // (a retry still gets a fresh isolated one, since the default one just failed us).
             let client = match (mode, attempt) {
                 (TorMode::Default | TorMode::Shared, 1) => self.client.clone(),
                 _ => self.client.isolated_client(),
@@ -504,9 +513,9 @@ impl Connector {
 /// Free-function form of [`Connector::connect`] for call sites that already thread `endpoint`
 /// (from `EngineConfig`) and an optional Tor handle separately — avoids restructuring the run
 /// path around the bundled [`Connector`]. Per-call policy: with `tor` `Some` every purpose rides
-/// Tor (bulk on the default circuit, metadata on its own — see `route` helper); with `tor` `None`,
-/// `connect_direct_with_retry` → `grpc::connect`, which already speaks OHTTP to gateways over the
-/// direct relay leg.
+/// Tor (bulk on a circuit per connection, metadata on its own — see `route` helper); with `tor`
+/// `None`, `connect_direct_with_retry` → `grpc::connect`, which already speaks OHTTP to gateways
+/// over the direct relay leg.
 pub async fn connect_via(
     endpoint: &Endpoint,
     tor: Option<&TorConn>,
@@ -639,8 +648,11 @@ mod tests {
     fn plain_hosts_route_every_purpose_through_tor_too() {
         // Tor ON + clearnet lightwalletd (the OHTTP fallback / a manual pick): bulk must NOT
         // bypass Tor — the device IP would otherwise reach the server during the block download.
-        assert_eq!(tor_mode(ConnPurpose::BulkFetch), Some(TorMode::Default));
-        assert_eq!(route(ConnPurpose::BulkFetch, false), Some(TorMode::Default));
+        assert_eq!(tor_mode(ConnPurpose::BulkFetch), Some(TorMode::OwnCircuit));
+        assert_eq!(
+            route(ConnPurpose::BulkFetch, false),
+            Some(TorMode::OwnCircuit)
+        );
         assert_eq!(
             route(ConnPurpose::MetadataUnique, false),
             Some(TorMode::Isolated)
@@ -653,9 +665,12 @@ mod tests {
 
     #[test]
     fn ohttp_gateway_routes_every_purpose_through_tor() {
-        // With Tor on and an OHTTP gateway endpoint, nothing may bypass Tor: bulk rides the
-        // default circuit, metadata keeps its usual isolation.
-        assert_eq!(route(ConnPurpose::BulkFetch, true), Some(TorMode::Default));
+        // With Tor on and an OHTTP gateway endpoint, nothing may bypass Tor: bulk rides a
+        // circuit per fetch connection, metadata keeps its usual isolation.
+        assert_eq!(
+            route(ConnPurpose::BulkFetch, true),
+            Some(TorMode::OwnCircuit)
+        );
         assert_eq!(
             route(ConnPurpose::MetadataUnique, true),
             Some(TorMode::Isolated)
