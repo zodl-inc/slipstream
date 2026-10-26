@@ -324,6 +324,8 @@ where
         let mut address_reqs: Vec<TransactionsInvolvingAddress> = Vec::new();
         let mut txid_reqs: Vec<(zcash_primitives::transaction::TxId, bool)> = Vec::new();
 
+        // Whether this round did anything that can change the wallet's next requests.
+        let mut served_any = false;
         for req in requests {
             match req {
                 TransactionDataRequest::GetStatus(txid) => {
@@ -337,6 +339,8 @@ where
                 }
             }
         }
+
+        served_any |= !txid_reqs.is_empty();
 
         // Fetch with retry: each txid is retried up to MAX_TXID_RETRIES times on
         // transient errors. buffer_unordered bounds the concurrency.
@@ -409,32 +413,40 @@ where
         // ── Phase 2: serial address-window requests ────────────────────────────
         let address_started = std::time::Instant::now();
         for tia in address_reqs {
-            if let Some((tor, endpoint, _)) = &isolate {
-                let mut isolated = LazyConnection::new(|| tor.connect_isolated(endpoint));
-                apply_address_request(
-                    session,
-                    &mut isolated,
-                    &network,
-                    tia,
-                    &mut stats,
-                    skipped_keys,
-                    progress.as_deref(),
-                )
-                .await?;
-            } else {
-                apply_address_request(
-                    session,
-                    client,
-                    &network,
-                    tia,
-                    &mut stats,
-                    skipped_keys,
-                    progress.as_deref(),
-                )
-                .await?;
-            }
+            // Skip guards first: a skipped request needs no connection, and over Tor each
+            // isolated connection costs a fresh circuit (seconds) for nothing.
+            let Some(block_range_end) =
+                address_request_range_end(session, &network, &tia, &mut stats, skipped_keys)?
+            else {
+                continue;
+            };
+            served_any = true;
+            let mut isolated;
+            let address_client = match &isolate {
+                Some((tor, endpoint, _)) => {
+                    isolated = tor.connect_isolated(endpoint).await?;
+                    &mut isolated
+                }
+                None => client.get().await?,
+            };
+            apply_address_request(
+                session,
+                address_client,
+                &network,
+                tia,
+                block_range_end,
+                &mut stats,
+                progress.as_deref(),
+            )
+            .await?;
         }
         stats.address += address_started.elapsed();
+
+        // A round that fetched no txid and served no address request changed nothing in the
+        // wallet DB, so the next round would get the same (all skipped) requests again.
+        if !served_any {
+            break;
+        }
     }
 
     info!(
@@ -546,39 +558,21 @@ fn effective_range_end(
     block_range_end.unwrap_or(chain_height + 1)
 }
 
-/// Handle one `TransactionsInvolvingAddress` request.
-///
-/// Mirrors `BlockEnhancer.swift:124-171` skip-guards and streaming logic:
-/// 1. Open-ended `block_range_end` (None) → clamp to `chain_height + 1` (T8.5); only
-///    skipped if there is no scanned chain tip yet (cannot happen after preflight).
-/// 2. `request_at` set → skip + warn (timed/decorrelated fetches not supported yet).
-/// 3. `output_status_filter == Unspent` → skip silently (not supported yet).
-/// 4. Otherwise: stream `GetTaddressTxids` over `[block_range_start, block_range_end - 1]`
-///    and apply `decrypt_and_store_transaction` for each returned tx, honoring
-///    `tx_status_filter` (Mined-only / Mempool-only skip per Swift lines 160-163).
-/// 5. On success: call `notify_address_checked` with `block_range_end - 1` so the wallet
-///    advances its check watermark.
-///
-/// `client` is asked for its connection only at step 4, so a skipped request never opens
-/// one.
+/// Skip guards 1-3 of [`apply_address_request`] for one `TransactionsInvolvingAddress` request:
+/// `Ok(None)` when the request is skipped (recorded in `skipped_keys` / `stats`), otherwise the
+/// effective end-exclusive range end to serve it with.
 ///
 /// `skipped_keys` — the per-run dedupe set shared across all rounds.  When a skip guard
 /// fires, the skip key (`address:range_start-range_end` or `address:open-no-tip`) is inserted.
 /// If the key is already present (same request re-issued in a later round), the duplicate
 /// is silently counted without re-emitting a `warn!` or incrementing `stats.skipped`.
-async fn apply_address_request<F, Fut>(
+fn address_request_range_end(
     session: &mut WalletSession,
-    client: &mut LazyConnection<LwdClient, F>,
     network: &crate::network::SlipstreamNetwork,
-    tia: TransactionsInvolvingAddress,
+    tia: &TransactionsInvolvingAddress,
     stats: &mut EnhanceStats,
     skipped_keys: &mut HashSet<String>,
-    progress: Option<&Progress>,
-) -> Result<(), SlipstreamError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
-{
+) -> Result<Option<BlockHeight>, SlipstreamError> {
     // Guard 1 (T8.5): clamp an open-ended range to the wallet's current chain tip instead
     // of skipping it. An open range (None) means "unbounded above" (data_api.rs:1131-1135);
     // the completest answer lightwalletd can give now is through the tip — so we clamp via
@@ -607,7 +601,7 @@ where
                         "TransactionsInvolvingAddress open-no-tip skip (duplicate, already counted)"
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
         },
     };
@@ -632,7 +626,7 @@ where
                 "TransactionsInvolvingAddress requestAt skip (duplicate, already counted)"
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // Guard 3: unspent-only output filter (not implemented).
@@ -651,9 +645,36 @@ where
                 "TransactionsInvolvingAddress unspent-filter skip (duplicate, already counted)"
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
+    Ok(Some(block_range_end))
+}
+
+/// Handle one `TransactionsInvolvingAddress` request.
+///
+/// Mirrors `BlockEnhancer.swift:124-171` skip-guards and streaming logic:
+/// 1. Open-ended `block_range_end` (None) → clamp to `chain_height + 1` (T8.5); only
+///    skipped if there is no scanned chain tip yet (cannot happen after preflight).
+/// 2. `request_at` set → skip + warn (timed/decorrelated fetches not supported yet).
+/// 3. `output_status_filter == Unspent` → skip silently (not supported yet).
+/// 4. Otherwise: stream `GetTaddressTxids` over `[block_range_start, block_range_end - 1]`
+///    and apply `decrypt_and_store_transaction` for each returned tx, honoring
+///    `tx_status_filter` (Mined-only / Mempool-only skip per Swift lines 160-163).
+/// 5. On success: call `notify_address_checked` with `block_range_end - 1` so the wallet
+///    advances its check watermark.
+///
+/// The skip guards (1-3) run in [`address_request_range_end`], before the caller opens a
+/// connection; this function serves a request that passed them (4-5).
+async fn apply_address_request(
+    session: &mut WalletSession,
+    client: &mut LwdClient,
+    network: &crate::network::SlipstreamNetwork,
+    tia: TransactionsInvolvingAddress,
+    block_range_end: BlockHeight,
+    stats: &mut EnhanceStats,
+    progress: Option<&Progress>,
+) -> Result<(), SlipstreamError> {
     // Build the gRPC filter: range is [start, end - 1] inclusive
     // (lightwalletd's GetTaddressTxids takes a closed range; block_range_end is exclusive
     // per the TransactionsInvolvingAddress contract, matching Swift's `blockRangeEnd - 1`).
@@ -675,9 +696,6 @@ where
         }),
     };
 
-    // Past every skip guard the request needs the server: take the client, connecting if
-    // nothing earlier in the run has.
-    let client = client.get().await?;
     let raw_txs = grpc::get_taddress_txids(client, filter, progress)
         .await
         .map_err(|e| {
