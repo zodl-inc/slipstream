@@ -66,7 +66,7 @@ use http_body::Frame;
 use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
 use hyper::body::Incoming;
 use hyper::client::conn::http2;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
@@ -108,6 +108,12 @@ const ERROR_BODY_GUARD_BYTES: usize = 64 * 1024;
 /// metadata the relay sees, so a long-lived wallet process moves to a fresh connection now and
 /// then. In-flight requests finish on the old one.
 const H2_MAX_CONNECTION_AGE: Duration = Duration::from_secs(10 * 60);
+
+/// HTTP/2 PING interval on a pooled relay connection (see [`OhttpClient::h2_sender`]).
+const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+
+/// How long a PING may go unanswered before the pooled relay connection is closed.
+const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Trailers-only metadata the in-process server attaches to a gRPC error so that the engine can
 /// tell an OHTTP outcome from an unreachable server (see `grpc::status_err`). It never leaves
@@ -1394,10 +1400,19 @@ impl OhttpClient {
         if !is_h2 {
             return Ok(None);
         }
-        let (sender, conn) =
-            http2::handshake::<_, _, Full<Bytes>>(TokioExecutor::new(), TokioIo::new(tls))
-                .await
-                .map_err(|e| format!("h2 handshake {}: {e}", target.host))?;
+        // HTTP/2 PINGs detect a dead pooled connection (mobile network handoff: the TCP
+        // connection silently stops, nothing errors) within H2_KEEPALIVE_INTERVAL +
+        // H2_KEEPALIVE_TIMEOUT; hyper then closes it and the next caller redials. Without them
+        // every call multiplexed on it waited out its own 30 s deadline, and the retries found
+        // the same dead connection (device, hotspot: 23 tree states timed out together).
+        let (sender, conn) = http2::Builder::new(TokioExecutor::new())
+            .timer(TokioTimer::new())
+            .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
+            .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
+            .keep_alive_while_idle(true)
+            .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
+            .await
+            .map_err(|e| format!("h2 handshake {}: {e}", target.host))?;
         let host = target.host.clone();
         tokio::spawn(async move {
             if let Err(e) = conn.await {
