@@ -678,6 +678,11 @@ impl GraftCtx {
             .map_err(|e| {
                 crate::error::SlipstreamError::Wallet(format!("graft side conn busy_timeout: {e}"))
             })?;
+        crate::wallet_session::tune_connection(
+            &conn,
+            Some(crate::wallet_session::SCAN_WRITER_CACHE_BYTES),
+        )
+        .map_err(|e| crate::error::SlipstreamError::Wallet(format!("graft side conn tune: {e}")))?;
         Ok(Self {
             conn,
             verify_sample,
@@ -4400,6 +4405,11 @@ impl PersistLane {
             .map_err(|e| {
                 crate::error::SlipstreamError::Wallet(format!("persist lane busy_timeout: {e}"))
             })?;
+        crate::wallet_session::tune_connection(
+            &lane_conn,
+            Some(crate::wallet_session::SCAN_WRITER_CACHE_BYTES),
+        )
+        .map_err(|e| crate::error::SlipstreamError::Wallet(format!("persist lane tune: {e}")))?;
         rusqlite::vtab::array::load_module(&lane_conn).map_err(|e| {
             crate::error::SlipstreamError::Wallet(format!("persist lane array module: {e}"))
         })?;
