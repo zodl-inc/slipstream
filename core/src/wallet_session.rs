@@ -70,8 +70,13 @@ const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 /// Page cache of the connections that write scan results: the persist lane's (block rows,
 /// nullifier map, commitment tree) and the graft buffer's. SQLite's default is 2 MiB; with 64
 /// MiB the row stage of the range above went from 32 s to 16 s. Memory is taken as pages are
-/// read, up to this bound.
+/// read, up to this bound. Two connections use it, so phones get half (32 MiB each, 64 MiB at
+/// most in total) to keep a restore clear of the low-memory killer.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub(crate) const SCAN_WRITER_CACHE_BYTES: i64 = 64 * 1024 * 1024;
+/// Mobile value of the page cache bound above (see the desktop/server definition).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) const SCAN_WRITER_CACHE_BYTES: i64 = 32 * 1024 * 1024;
 
 /// Applies the engine's checkpoint and WAL size settings to a connection to the wallet file,
 /// and, when `cache_bytes` is set, its page cache size. Both are per connection (never stored

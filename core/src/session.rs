@@ -433,10 +433,11 @@ impl SessionReporter {
     }
 }
 
-/// One [`TOR_CONNS`] entry: the owning handle's pass lock (weak), the Tor directory, the client.
+/// One [`TOR_CONNS`] entry: the owning handle's pass lock (weak), the Tor directory and its
+/// `dangerously_trust_everyone` setting, the client.
 type TorConnEntry = (
     std::sync::Weak<tokio::sync::Mutex<()>>,
-    std::path::PathBuf,
+    (std::path::PathBuf, bool),
     TorConn,
 );
 
@@ -458,13 +459,16 @@ fn tor_conns() -> std::sync::MutexGuard<'static, Vec<TorConnEntry>> {
 fn reusable_tor_conn(
     pass_lock: &Arc<tokio::sync::Mutex<()>>,
     dir: &std::path::Path,
+    trust_everyone: bool,
 ) -> Option<TorConn> {
     let mut conns = tor_conns();
     conns.retain(|(owner, _, _)| owner.strong_count() > 0);
     conns
         .iter()
-        .find(|(owner, d, _)| {
-            d == dir && owner.upgrade().is_some_and(|o| Arc::ptr_eq(&o, pass_lock))
+        .find(|(owner, (d, trust), _)| {
+            d == dir
+                && *trust == trust_everyone
+                && owner.upgrade().is_some_and(|o| Arc::ptr_eq(&o, pass_lock))
         })
         .map(|(_, _, tc)| tc.clone())
 }
@@ -479,12 +483,22 @@ pub fn forget_tor_conns(pass_lock: &Arc<tokio::sync::Mutex<()>>) {
 }
 
 /// Keep `tc` for later sessions of the handle owning `pass_lock` (see [`TOR_CONNS`]).
-fn remember_tor_conn(pass_lock: &Arc<tokio::sync::Mutex<()>>, dir: &std::path::Path, tc: &TorConn) {
+fn remember_tor_conn(
+    pass_lock: &Arc<tokio::sync::Mutex<()>>,
+    dir: &std::path::Path,
+    trust_everyone: bool,
+    tc: &TorConn,
+) {
     let mut conns = tor_conns();
-    conns.retain(|(owner, d, _)| {
-        owner.strong_count() > 0 && !(d == dir && owner.as_ptr() == Arc::as_ptr(pass_lock))
+    // One client per handle: a new one replaces whatever the handle had.
+    conns.retain(|(owner, _, _)| {
+        owner.strong_count() > 0 && owner.as_ptr() != Arc::as_ptr(pass_lock)
     });
-    conns.push((Arc::downgrade(pass_lock), dir.to_path_buf(), tc.clone()));
+    conns.push((
+        Arc::downgrade(pass_lock),
+        (dir.to_path_buf(), trust_everyone),
+        tc.clone(),
+    ));
 }
 
 /// Run a full sync session: resilient Tor bootstrap (never falls back to direct) → resilient
@@ -552,7 +566,9 @@ pub async fn run_session(
         Some(ref t) => {
             let mut boot_failures: u32 = 0;
             loop {
-                if let Some(tc) = reusable_tor_conn(&pass_lock, &t.dir) {
+                if let Some(tc) =
+                    reusable_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone)
+                {
                     tracing::info!("slipstream Tor client reused from the previous session");
                     break Some(tc);
                 }
@@ -561,7 +577,7 @@ pub async fn run_session(
                         tracing::info!(
                             "slipstream Tor bootstrapped (engine-owned isolated circuits)"
                         );
-                        remember_tor_conn(&pass_lock, &t.dir, &tc);
+                        remember_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone, &tc);
                         break Some(tc);
                     }
                     Err(err) => {
