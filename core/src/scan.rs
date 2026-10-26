@@ -510,8 +510,10 @@ pub async fn scan_chunks(
     // nothing is stashed or in flight yet) and open the persist lane's own
     // connection to the wallet file. `None` = today's serialized path.
     let mut wb: Option<WriteBehind> = if config.write_behind {
-        let facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
+        let mut facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
             .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
+        // Commit size decoupled from the scan call (the OHTTP window, sub-chunks).
+        facade.set_commit_limits(config.persist_commit_limits);
         let mut lane = crate::persist::PersistLane::open(
             &config.wallet_db_path,
             config.network,
@@ -552,11 +554,18 @@ pub async fn scan_chunks(
     // Precedence on double failure: the persist error wins (a failed commit is
     // a DB-integrity signal; a ScanContinuity reorg is retried next pass).
     if let Some(mut wb) = wb {
-        if wb.facade.take_stash().is_some() {
+        if let Some(pending) = wb.facade.take_stash() {
             // A stashed-but-never-submitted unit only exists on error exits
-            // between scan and submit; dropping it is safe (its range is still
-            // marked unscanned — re-suggested next pass).
-            warn!("write-behind: dropping an unsubmitted pending unit on error exit");
+            // (between scan and submit, or a unit still below its commit limits);
+            // dropping it is safe (its range is still marked unscanned —
+            // re-suggested next pass). Not committed here: after a persist error
+            // the lane's database is behind the stash, and a stop must not wait
+            // for another commit.
+            warn!(
+                first_height = pending.first_height,
+                last_height = pending.last_height,
+                "write-behind: dropping an unsubmitted pending unit on error exit"
+            );
         }
         // v0.5 pacer: the end-of-range barrier is inside the scan stage too.
         let final_drain_started = Instant::now();
@@ -920,8 +929,10 @@ async fn scan_chunks_inner(
             // aborts before another unit is ever submitted), then spawns this
             // unit's commit so it overlaps the prefetch await + next recv +
             // next decrypt. The wait delta is this chunk's overlap-quality cost.
+            // With commit limits the unit grows over consecutive scan calls and is
+            // submitted once it reaches them (or at the next barrier).
             if let Some(wb) = wb.as_mut()
-                && let Some(pending) = wb.facade.take_stash()
+                && let Some(pending) = wb.facade.take_full_stash()
             {
                 let submit_started = Instant::now();
                 let wait_before = wb.lane.total_wait();
@@ -1106,7 +1117,7 @@ async fn scan_chunks_inner(
         // committed) here; the permit guards the raw chunk bytes, which are
         // dropped with this loop iteration either way — the pending unit holds
         // only the decrypted ScannedBlocks (commitments + wallet data), bounded
-        // at depth 1.
+        // at depth 1 and by the commit limits.
         drop(permit); // release byte budget after the chunk's last sub-batch was handed off
 
         // T6.1 — interleaved enhancement every K chunks. Non-fatal by design:
@@ -1127,6 +1138,9 @@ async fn scan_chunks_inner(
             // v0.5 pacer: this drain is INSIDE the scan stage (suspect #1).
             if let Some(wb) = wb.as_mut() {
                 let drain_started = Instant::now();
+                if let Some(pending) = wb.facade.take_stash() {
+                    wb.lane.submit(pending).await?;
+                }
                 wb.lane.drain().await?;
                 stats.interleave_drain += drain_started.elapsed();
             }
@@ -1167,6 +1181,18 @@ async fn scan_chunks_inner(
                 stats.reseed += reseed_started.elapsed();
             }
         }
+    }
+    // The unit still below its commit limits is submitted at range end (the
+    // drain in `scan_chunks` then commits it).
+    if let Some(wb) = wb.as_mut()
+        && let Some(pending) = wb.facade.take_stash()
+    {
+        let submit_started = Instant::now();
+        let wait_before = wb.lane.total_wait();
+        wb.lane.submit(pending).await?;
+        let waited = wb.lane.total_wait() - wait_before;
+        stats.submit_wait += waited;
+        stats.submit_extra += submit_started.elapsed().saturating_sub(waited);
     }
     // v0.5 local treestate: settle every outstanding boundary audit (the tail
     // costs at most ~one RTT — the fetches ran concurrently with scanning).

@@ -751,6 +751,33 @@ pub mod testkit {
         tip_override: Option<u64>,
         prepare: impl FnOnce(&mut WalletSession, &TreeState) -> Result<(), SlipstreamError>,
     ) -> Result<((u64, u64), (u64, u64)), SlipstreamError> {
+        scan_synthetic_windows_write_behind_limited(
+            dir,
+            blocks,
+            window_lens,
+            graft,
+            graft_verify_sample,
+            tip_override,
+            None,
+            prepare,
+        )
+        .await
+    }
+
+    /// As above, with the facade's commit limits set as `scan_chunks` sets them
+    /// from `EngineConfig::persist_commit_limits`: the windows' units are committed
+    /// together until they reach `commit_limits`, and the rest at the end.
+    #[allow(clippy::too_many_arguments)] // test driver mirroring scan_chunks' knobs
+    pub async fn scan_synthetic_windows_write_behind_limited(
+        dir: &Path,
+        blocks: Vec<CompactBlock>,
+        window_lens: &[usize],
+        graft: bool,
+        graft_verify_sample: u32,
+        tip_override: Option<u64>,
+        commit_limits: Option<crate::persist::CommitLimits>,
+        prepare: impl FnOnce(&mut WalletSession, &TreeState) -> Result<(), SlipstreamError>,
+    ) -> Result<((u64, u64), (u64, u64)), SlipstreamError> {
         if window_lens.iter().sum::<usize>() != blocks.len() {
             return Err(SlipstreamError::Wallet(format!(
                 "window_lens sum {} != blocks {}",
@@ -779,6 +806,7 @@ pub mod testkit {
         let range_start = blocks.first().map_or(SYNTH_START, |b| b.height);
         let mut facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
             .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
+        facade.set_commit_limits(commit_limits);
         let mut lane = crate::persist::PersistLane::open(
             &db_path,
             crate::network::SlipstreamNetwork::MAIN,
@@ -823,8 +851,9 @@ pub mod testkit {
                 )));
                 break;
             }
-            // Submit the deferred commit (depth-1: awaits the previous one).
-            if let Some(pending) = facade.take_stash()
+            // Submit the deferred commit (depth-1: awaits the previous one), once
+            // the unit has reached the commit limits (always without limits).
+            if let Some(pending) = facade.take_full_stash()
                 && let Err(e) = lane.submit(pending).await
             {
                 result = Err(e);
@@ -837,6 +866,13 @@ pub mod testkit {
                     break;
                 }
             };
+        }
+        // Range end: the unit still below its limits (mirror of scan_chunks_inner).
+        if result.is_ok()
+            && let Some(pending) = facade.take_stash()
+            && let Err(e) = lane.submit(pending).await
+        {
+            result = Err(e);
         }
         // Full barrier before returning — mirror of scan_chunks.
         let drain_result = lane.drain().await;
@@ -1231,6 +1267,56 @@ mod tests {
             "write-behind-vs-upstream diff not clean:\n{}",
             report.render()
         );
+    }
+
+    /// Round 6: write-behind commits sized independently of the scan call. The
+    /// chain is scanned in 250-block windows (the shape of the OHTTP fetch window)
+    /// with commit limits of 1,000 blocks; the units are then exactly the
+    /// `put_blocks` calls of a 1,000-block upstream scan, so the database must be
+    /// identical to the upstream path (A) scanned in 1,000-block windows —
+    /// including where the output limit closes a unit early, and the shorter
+    /// unit at range end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coalesced_write_behind_matches_upstream_at_the_unit_boundaries() {
+        // (window lens, limits, the upstream windows the units must equal)
+        let blocks = super::testkit::synth_blocks(3100, 3);
+        let windows = |len: usize| -> Vec<usize> { blocks.chunks(len).map(<[_]>::len).collect() };
+        let by_blocks = crate::persist::CommitLimits {
+            max_blocks: 1000,
+            max_outputs: u64::MAX,
+        };
+        // 3 commitments per block: 1,500 outputs close a unit after 500 blocks.
+        let by_outputs = crate::persist::CommitLimits {
+            max_blocks: 1000,
+            max_outputs: 1500,
+        };
+        for (limits, upstream) in [(by_blocks, windows(1000)), (by_outputs, windows(500))] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let da = dir.path().join("wa");
+            let db = dir.path().join("wb");
+            std::fs::create_dir_all(&da).unwrap();
+            std::fs::create_dir_all(&db).unwrap();
+            super::testkit::scan_synthetic_windows(&da, blocks.clone(), &upstream, false)
+                .expect("upstream scan");
+            super::testkit::scan_synthetic_windows_write_behind_limited(
+                &db,
+                blocks.clone(),
+                &windows(250),
+                false,
+                1,
+                None,
+                Some(limits),
+                |_, _| Ok(()),
+            )
+            .await
+            .expect("coalesced write-behind scan");
+            let report = semantic_diff(&da.join("data.db"), &db.join("data.db")).expect("diff");
+            assert!(
+                report.is_clean(),
+                "coalesced write-behind ({limits:?}) vs upstream diff not clean:\n{}",
+                report.render()
+            );
+        }
     }
 
     /// v0.4 Plan A Task 7 gate: graft-ON (verdict still ALWAYS-BUILD) vs

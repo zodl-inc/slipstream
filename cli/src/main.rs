@@ -192,6 +192,11 @@ enum Cmd {
         /// devices) at the cost of RAM. The committed data.db is identical at any depth.
         #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=64))]
         persist_depth: usize,
+        /// Write-behind commit size in blocks: consecutive scan calls (chunks or
+        /// sub-chunks) are committed together until this many blocks (or 50,000 note
+        /// commitments). 0 = one commit per scan call.
+        #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_BLOCKS)]
+        persist_commit_blocks: u64,
         /// T8.1: after reaching tip, keep the wallet tracking the chain.
         /// Probes the tip every 10–30 s (jittered); runs a full pass whenever a
         /// new block arrives. Cancellable with Ctrl-C. Useful for Mac CLI validation
@@ -1021,6 +1026,7 @@ fn cmd_sync(
     write_behind: bool,
     gpu_subtree: bool,
     persist_depth: usize,
+    persist_commit_blocks: u64,
     follow: bool,
     anchor_retention: Option<u32>,
     anchor_retention_interval: u32,
@@ -1071,6 +1077,11 @@ fn cmd_sync(
     // sparse build path, so the sparse kill switch implies graft off.
     cfg.graft_subtree = cfg.graft_subtree && sparse;
     cfg.persist_depth = persist_depth;
+    cfg.persist_commit_limits =
+        (persist_commit_blocks > 0).then_some(zodl_slipstream::persist::CommitLimits {
+            max_blocks: persist_commit_blocks,
+            max_outputs: zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
+        });
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
@@ -1634,6 +1645,7 @@ fn main() {
             write_behind,
             gpu_subtree,
             persist_depth,
+            persist_commit_blocks,
             follow,
             tor_dir,
         } => {
@@ -1651,6 +1663,7 @@ fn main() {
                 write_behind,
                 gpu_subtree,
                 persist_depth,
+                persist_commit_blocks,
                 follow,
                 anchor_retention,
                 anchor_retention_interval,
