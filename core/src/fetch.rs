@@ -19,7 +19,7 @@
 //! stream into byte-budgeted SUB-chunks (T6.8-S) so spam-era plan chunks
 //! (mainnet "sandblasting" ~1.70M–2.00M: hundreds of MB per 10k blocks) stay
 //! memory-bounded and timeout-immune. A reorder stage releases sub-chunks
-//! strictly in (plan_index, sub_index) order — continuity-verified — into the
+//! strictly in height order — continuity-verified — into the
 //! byte-budgeted ChunkQueue. Splitting + resume-from-height retry landed in
 //! run T6.8-S, 2026-06-12.
 
@@ -275,16 +275,42 @@ const DENSITY_SAMPLE_BLOCKS: u64 = 32;
 /// The first chunk is [`PROBE_SPAN`] blocks, so a range that starts dense does
 /// not open with such chunks; the other workers wait for the first blocks
 /// (at most [`DENSITY_WAIT`]) before taking theirs.
+///
+/// A chunk handed out at the plan's full span that turns out far denser (the
+/// light blocks right before a spam onset size the next chunks at that span) is
+/// cut by its worker, while the fetch is boosted (the scanner waits for blocks),
+/// as soon as the blocks it received show it ([`chunk_cut_end`]): the worker ends
+/// it where it would have ended at that density and gives the rest back
+/// ([`Self::give_back`]). Given-back ranges lie below every range not yet handed
+/// out, so they are handed out first, lowest first, sized like any other chunk.
+/// Chunks are then no longer in height order by index; the release stage orders
+/// by height.
 struct Dispatcher {
     end: u64,
     base_span: u64,
     /// `false`: every chunk is the plan's `chunk_blocks` (no adaptive prefetch).
     sized: bool,
     target_bytes: AtomicU64,
+    /// Whether chunks are cut ([`chunk_cut_end`]): only while the fetch is boosted,
+    /// the scanner waiting for blocks. On a link that keeps up, a cut only costs a
+    /// new request and the bytes in flight on the dropped one (measured: -1.3 % in
+    /// the Sapling spam unthrottled).
+    cutting: AtomicBool,
     fleet: Arc<FleetStats>,
     created: tokio::time::Instant,
-    /// (next index, its first height, fleet snapshot at the previous hand-out).
-    next: std::sync::Mutex<(u64, u64, (u64, u64))>,
+    next: std::sync::Mutex<DispatchState>,
+}
+
+/// What a [`Dispatcher`] has handed out so far.
+struct DispatchState {
+    /// Index of the next chunk handed out.
+    index: u64,
+    /// First height not handed out yet (given-back ranges aside).
+    start: u64,
+    /// Fleet snapshot at the previous hand-out.
+    seen: (u64, u64),
+    /// Ranges of cut chunks given back, `start -> end` (inclusive), all below `start`.
+    returned: BTreeMap<u64, u64>,
 }
 
 impl Dispatcher {
@@ -295,9 +321,15 @@ impl Dispatcher {
             base_span: u64::from(plan.chunk_blocks).max(1),
             sized: target_bytes.is_some(),
             target_bytes: AtomicU64::new(target_bytes.unwrap_or(1).max(1)),
+            cutting: AtomicBool::new(false),
             fleet,
             created: tokio::time::Instant::now(),
-            next: std::sync::Mutex::new((0, plan.start, (0, 0))),
+            next: std::sync::Mutex::new(DispatchState {
+                index: 0,
+                start: plan.start,
+                seen: (0, 0),
+                returned: BTreeMap::new(),
+            }),
         }
     }
 
@@ -322,10 +354,13 @@ impl Dispatcher {
     /// [`Self::take`] without waiting for the density estimate.
     fn take_now(&self) -> Option<(u64, u64, u64)> {
         let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (index, start, seen) = *next;
-        if start > self.end {
-            return None;
-        }
+        let (index, seen) = (next.index, next.seen);
+        // A given-back range first: it lies below everything not handed out yet.
+        let (start, range_end) = match next.returned.first_key_value() {
+            Some((&start, &end)) => (start, end),
+            None if next.start > self.end => return None,
+            None => (next.start, self.end),
+        };
         let now = self.fleet.snapshot();
         let unknown = now.0 < DENSITY_MIN_BLOCKS && self.created.elapsed() < DENSITY_WAIT;
         let span = if !self.sized {
@@ -347,15 +382,56 @@ impl Dispatcher {
                 ),
             }
         };
-        let end = start.saturating_add(span - 1).min(self.end);
-        *next = (index + 1, end + 1, now);
+        let end = start.saturating_add(span - 1).min(range_end);
+        if next.returned.remove(&start).is_some() {
+            if end < range_end {
+                next.returned.insert(end + 1, range_end);
+            }
+        } else {
+            next.start = end + 1;
+        }
+        next.index = index + 1;
+        next.seen = now;
         Some((index, start, end))
     }
 
-    /// Plan chunks handed out so far, and whether that is all of them.
+    /// Plan chunks handed out so far, and whether that is all of them (no range
+    /// left to hand out, given-back ones included).
     fn handed_out(&self) -> (u64, bool) {
         let next = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        (next.0, next.1 > self.end)
+        (
+            next.index,
+            next.start > self.end && next.returned.is_empty(),
+        )
+    }
+
+    /// Whether a cut chunk's range is waiting to be handed out again.
+    fn has_returned(&self) -> bool {
+        let next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        !next.returned.is_empty()
+    }
+
+    /// Takes back `start..=end`, the rest of a chunk its worker cut: it is handed
+    /// out again before any range not handed out yet.
+    fn give_back(&self, start: u64, end: u64) {
+        if start > end {
+            return;
+        }
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        debug_assert!(end < next.start, "a given-back range was handed out before");
+        next.returned.insert(start, end);
+    }
+
+    /// The bytes a chunk is sized to (see [`chunk_cut_end`]) while chunks are cut;
+    /// `None` otherwise, and always without the adaptive prefetch.
+    fn cut_target(&self) -> Option<u64> {
+        (self.sized && self.cutting.load(Ordering::Relaxed))
+            .then(|| self.target_bytes.load(Ordering::Relaxed))
+    }
+
+    /// Starts or stops cutting chunks (the booster's on/off).
+    fn set_cutting(&self, on: bool) {
+        self.cutting.store(on, Ordering::Relaxed);
     }
 
     fn set_target_bytes(&self, bytes: u64) {
@@ -373,6 +449,42 @@ fn chunk_target_bytes(ahead: usize, workers: usize) -> u64 {
 fn plan_span(target_bytes: u64, bytes_per_block: u64, base_span: u64) -> u64 {
     let span = target_bytes / bytes_per_block.max(1);
     span.clamp(BOOST_MIN_SPAN.min(base_span), base_span)
+}
+
+/// Where a worker ends the plan chunk `start..=end` it streams, or `None` to go on,
+/// once it has received `got_blocks` blocks of `got_bytes` through `height`: when the
+/// chunk at that density carries at least twice `target_bytes` (judged after
+/// [`DENSITY_SAMPLE_BLOCKS`] blocks, or once it carried `target_bytes`), it ends
+/// where a chunk sized at that density would ([`plan_span`]), or at `height` if the
+/// stream is already past that, and only when at least [`BOOST_MIN_SPAN`] blocks are
+/// left after it.
+///
+/// The pump asks only for a chunk handed out at the plan's full span, the span a
+/// light stretch gets: over a spam onset such a chunk carries hundreds of MB, keeps
+/// its worker on one connection for minutes on a slow link, and several of them keep
+/// every worker far ahead of the scan while the head chunk gets a fraction of the
+/// link. A chunk sized by density stays whole: within the spam the density of the
+/// next blocks varies up to ~2.6x from the estimate it was sized at (measured), and
+/// cutting it would cost a new request and the bytes in flight on the dropped one.
+fn chunk_cut_end(
+    target_bytes: u64,
+    got_blocks: u64,
+    got_bytes: u64,
+    start: u64,
+    height: u64,
+    end: u64,
+) -> Option<u64> {
+    if got_blocks == 0 || (got_blocks < DENSITY_SAMPLE_BLOCKS && got_bytes < target_bytes) {
+        return None;
+    }
+    let per_block = (got_bytes / got_blocks).max(1);
+    let span = end.checked_sub(start)? + 1;
+    if per_block.saturating_mul(span) < target_bytes.saturating_mul(2) {
+        return None;
+    }
+    let keep = plan_span(target_bytes, per_block, span);
+    let cut = height.max(start + keep - 1);
+    (cut < end && end - cut >= BOOST_MIN_SPAN).then_some(cut)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -452,11 +564,14 @@ impl FetchStats {
 
 /// One worker's in-order slice of a plan chunk. `sub_index` starts at 0 per plan
 /// chunk and SURVIVES retries (resume continues the sequence, never repeating an
-/// index); `is_last` marks the plan chunk's final sub-chunk so the reorder stage
-/// can advance to the next plan index.
+/// index); `is_last` marks the plan chunk's final sub-chunk (the reorder stage
+/// counts released plan chunks by it).
 struct SubChunk {
     plan_index: u64,
     sub_index: u64,
+    /// The height it was asked from (its worker's resume height): the release
+    /// stage's ordering key.
+    start: u64,
     is_last: bool,
     /// Estimated wire bytes (sum of prost encoded_len), as accumulated by the splitter.
     bytes: usize,
@@ -545,7 +660,8 @@ const AHEAD_BUDGET_FACTOR: usize = 8;
 const AHEAD_POLL: Duration = Duration::from_millis(100);
 
 /// Admission control for the reorder stage (T6.8-S): the plan chunk currently
-/// being released (the "floor") streams unthrottled — its sub-chunks flow
+/// being released (the head chunk: every height below its start is released)
+/// streams unthrottled — its sub-chunks flow
 /// straight through to the ChunkQueue — while every other plan chunk must
 /// acquire ahead-budget permits, pausing its stream when the budget is spent.
 /// Deadlock-free by construction: the floor never waits on the budget, a
@@ -556,7 +672,7 @@ const AHEAD_POLL: Duration = Duration::from_millis(100);
 struct AheadGate {
     budget: Arc<Semaphore>,
     cap: usize,
-    /// Plan index currently being released by the reorder stage.
+    /// The lowest height the reorder stage has not released (the "floor").
     floor: Arc<AtomicU64>,
 }
 
@@ -570,14 +686,15 @@ impl AheadGate {
         }
     }
 
-    /// Returns a budget permit for one sub-chunk, or `None` when `plan_index`
-    /// is (or becomes) the release floor — the floor is exempt.
-    async fn admit(&self, plan_index: u64, bytes: usize) -> Option<OwnedSemaphorePermit> {
+    /// Returns a budget permit for one sub-chunk of the plan chunk starting at
+    /// `chunk_start`, or `None` when that chunk is (or becomes) the head chunk,
+    /// every height below it released: the head chunk is exempt.
+    async fn admit(&self, chunk_start: u64, bytes: usize) -> Option<OwnedSemaphorePermit> {
         // u32 saturation mirrors ChunkQueueSender::send; oversized sub-chunks
         // clamp to the whole budget instead of deadlocking.
         let need = u32::try_from(bytes.min(self.cap).max(1)).unwrap_or(u32::MAX);
         loop {
-            if self.floor.load(Ordering::Acquire) >= plan_index {
+            if self.floor.load(Ordering::Acquire) >= chunk_start {
                 return None;
             }
             match tokio::time::timeout(
@@ -600,7 +717,9 @@ impl AheadGate {
 /// Per-plan-chunk streaming state, surviving retries (resume-from-height).
 struct PlanChunkCursor {
     plan_index: u64,
-    /// Plan-chunk end bound (inclusive).
+    /// Plan-chunk start (the ahead gate's key: see [`AheadGate::admit`]).
+    start: u64,
+    /// Plan-chunk end bound (inclusive); lowered when the chunk is cut.
     end: u64,
     /// Next height to request: (last emitted sub-chunk's end) + 1. Retries
     /// re-open the stream HERE — already-emitted heights are never re-sent, so
@@ -611,6 +730,9 @@ struct PlanChunkCursor {
     /// Set by every emitted sub-chunk; cleared at attempt start (see worker's
     /// zero-progress retry accounting).
     emitted_this_attempt: bool,
+    /// Blocks and wire bytes received for this plan chunk, all attempts.
+    got_blocks: u64,
+    got_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -638,10 +760,11 @@ async fn emit_sub_chunk(
 ) -> bool {
     debug_assert!(!blocks.is_empty(), "splitter never yields empty sub-chunks");
     let last_height = blocks.last().map(|b| b.height);
-    let permit = gate.admit(cursor.plan_index, bytes).await;
+    let permit = gate.admit(cursor.start, bytes).await;
     let sub = SubChunk {
         plan_index: cursor.plan_index,
         sub_index: cursor.next_sub_index,
+        start: cursor.resume_from,
         is_last,
         bytes,
         blocks,
@@ -712,6 +835,30 @@ async fn hand_on_then_kicked(
     Ok(PumpOutcome::Kicked)
 }
 
+/// Ends the plan chunk at `at` ([`chunk_cut_end`]) and gives `at + 1..=cursor.end`
+/// back to `dispatcher`. The stream goes on to `at`, where the pump completes the
+/// chunk and drops the stream, which cancels the rest of the request.
+fn cut_chunk(
+    at: u64,
+    cursor: &mut PlanChunkCursor,
+    dispatcher: &Dispatcher,
+    slot: Option<&WorkerSlot>,
+) {
+    info!(
+        plan_index = cursor.plan_index,
+        start = cursor.start,
+        cut_at = at,
+        rest_blocks = cursor.end - at,
+        received_kb = cursor.got_bytes / 1024,
+        "plan chunk denser than it was sized for: cut, its rest handed out again"
+    );
+    dispatcher.give_back(at + 1, cursor.end);
+    cursor.end = at;
+    if let Some(slot) = slot {
+        slot.chunk_end.store(at, Ordering::Relaxed);
+    }
+}
+
 /// `pump_block_window` over the whole plan chunk (the request ends at `cursor.end`).
 #[cfg(test)]
 async fn pump_block_stream<S>(
@@ -738,6 +885,7 @@ where
         out,
         progress,
         &mut refused,
+        None,
         None,
     )
     .await
@@ -767,6 +915,11 @@ where
 /// `cursor.end`. `refused` is set when the stream ended with `INVALID_ARGUMENT` (an OHTTP
 /// gateway answers a range over its span limit that way, with the status as the stream's
 /// trailers).
+///
+/// With `dispatcher` (the adaptive prefetch), a plan chunk denser than it was
+/// sized for is cut ([`chunk_cut_end`], [`cut_chunk`]): once the stream reaches the
+/// new end, the last sub-chunk is emitted there with `is_last` and the attempt
+/// completes before the request does.
 #[allow(clippy::too_many_arguments)]
 async fn pump_block_window<S>(
     stream: &mut S,
@@ -779,6 +932,7 @@ async fn pump_block_window<S>(
     progress: Option<&Progress>,
     refused: &mut bool,
     slot: Option<&WorkerSlot>,
+    dispatcher: Option<&Dispatcher>,
 ) -> Result<PumpOutcome, SlipstreamError>
 where
     S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
@@ -853,8 +1007,28 @@ where
         if let Some(p) = progress {
             p.touch();
         }
+        let (height, block_bytes) = (block.height, block.encoded_len() as u64);
         if let Some(slot) = slot {
-            slot.received(block.encoded_len() as u64);
+            slot.received(block_bytes);
+        }
+        cursor.got_blocks += 1;
+        cursor.got_bytes += block_bytes;
+        // Only a chunk handed out at the plan's full span: one sized by density is
+        // close to its target, and cutting it for a denser stretch would cost a new
+        // request and the bytes in flight on the dropped one.
+        if let Some(dispatcher) = dispatcher
+            && cursor.end - cursor.start + 1 >= dispatcher.base_span
+            && let Some(target) = dispatcher.cut_target()
+            && let Some(at) = chunk_cut_end(
+                target,
+                cursor.got_blocks,
+                cursor.got_bytes,
+                cursor.start,
+                height,
+                cursor.end,
+            )
+        {
+            cut_chunk(at, cursor, dispatcher, slot);
         }
         if let Some((blocks, bytes)) = splitter.push(block) {
             if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
@@ -878,6 +1052,18 @@ where
                 }
                 last_emit = tokio::time::Instant::now();
             }
+        }
+        // A cut chunk is complete at its new end, before the request is: its last
+        // block is still buffered (the deadline flush above never takes it).
+        if height == cursor.end
+            && cursor.end < window_end
+            && let Some((blocks, bytes)) = splitter.take_partial()
+        {
+            return if emit_sub_chunk(cursor, blocks, bytes, true, gate, out).await {
+                Ok(PumpOutcome::Completed)
+            } else {
+                Ok(PumpOutcome::ConsumerGone)
+            };
         }
     }
 }
@@ -906,6 +1092,7 @@ async fn open_and_pump(
     max_span: &mut u64,
     split_on_invalid: bool,
     slot: Option<&WorkerSlot>,
+    dispatcher: Option<&Dispatcher>,
 ) -> Result<PumpOutcome, SlipstreamError> {
     loop {
         let window_end = cursor
@@ -980,6 +1167,7 @@ async fn open_and_pump(
             progress,
             &mut refused,
             slot,
+            dispatcher,
         )
         .await;
         match pumped {
@@ -994,8 +1182,11 @@ async fn open_and_pump(
 /// What the booster sees of one worker, and how it restarts the worker's stream.
 #[derive(Debug)]
 struct WorkerSlot {
-    /// The plan chunk being streamed (`u64::MAX` before the first).
+    /// The plan chunk being streamed (`u64::MAX` when none).
     plan_index: AtomicU64,
+    /// Its heights (`u64::MAX` when none); the end is lowered when it is cut.
+    chunk_start: AtomicU64,
+    chunk_end: AtomicU64,
     /// Bytes received on the worker's streams.
     bytes: AtomicU64,
     kicked: AtomicBool,
@@ -1008,11 +1199,27 @@ impl WorkerSlot {
     fn new(fleet: Arc<FleetStats>) -> Self {
         Self {
             plan_index: AtomicU64::new(u64::MAX),
+            chunk_start: AtomicU64::new(u64::MAX),
+            chunk_end: AtomicU64::new(u64::MAX),
             bytes: AtomicU64::new(0),
             kicked: AtomicBool::new(false),
             kick: tokio::sync::Notify::new(),
             fleet,
         }
+    }
+
+    /// Records the plan chunk the worker streams now, or none.
+    fn set_chunk(&self, chunk: Option<(u64, u64, u64)>) {
+        let (index, start, end) = chunk.unwrap_or((u64::MAX, u64::MAX, u64::MAX));
+        self.plan_index.store(index, Ordering::Relaxed);
+        self.chunk_start.store(start, Ordering::Relaxed);
+        self.chunk_end.store(end, Ordering::Relaxed);
+    }
+
+    /// Whether the worker streams the plan chunk holding `height`.
+    fn holds(&self, height: u64) -> bool {
+        let start = self.chunk_start.load(Ordering::Relaxed);
+        start != u64::MAX && start <= height && height <= self.chunk_end.load(Ordering::Relaxed)
     }
 
     /// Records one received block of `bytes`.
@@ -1064,8 +1271,13 @@ async fn worker(
     let split_on_invalid = crate::ohttp::relay_for(&endpoint.host).is_some();
     let mut max_span = u64::MAX;
     loop {
-        // A worker added by a boost stops once the boost has ended.
-        if worker_id >= plan.streams && !boost_on.load(Ordering::Relaxed) {
+        // A worker added by a boost stops once the boost has ended, but not while
+        // the rest of a cut chunk waits: it may be the one the release needs next,
+        // and the workers ahead may all be parked on the ahead budget.
+        if worker_id >= plan.streams
+            && !boost_on.load(Ordering::Relaxed)
+            && !dispatcher.has_returned()
+        {
             debug!(worker_id, "boost over — extra worker stops");
             return Ok(());
         }
@@ -1073,13 +1285,16 @@ async fn worker(
             debug!(worker_id, "no more chunks");
             return Ok(());
         };
-        slot.plan_index.store(index, Ordering::Relaxed);
+        slot.set_chunk(Some((index, s, e)));
         let mut cursor = PlanChunkCursor {
             plan_index: index,
+            start: s,
             end: e,
             resume_from: s,
             next_sub_index: 0,
             emitted_this_attempt: false,
+            got_blocks: 0,
+            got_bytes: 0,
         };
         // Counts consecutive ZERO-PROGRESS attempts; an attempt that emitted a
         // sub-chunk resets the budget (resume makes such retries cheap and the
@@ -1102,11 +1317,12 @@ async fn worker(
                 &mut max_span,
                 split_on_invalid,
                 Some(&slot),
+                Some(&dispatcher),
             )
             .await
             {
                 Ok(PumpOutcome::Completed) => {
-                    slot.plan_index.store(u64::MAX, Ordering::Relaxed);
+                    slot.set_chunk(None);
                     break;
                 }
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
@@ -1137,7 +1353,8 @@ async fn worker(
                             return Err(err);
                         }
                         return Err(SlipstreamError::Transport(format!(
-                            "plan chunk {index} ({s}..{e}) failed after {attempt} zero-progress attempts: {err}"
+                            "plan chunk {index} ({s}..{}) failed after {attempt} zero-progress attempts: {err}",
+                            cursor.end
                         )));
                     }
                     warn!(
@@ -1293,25 +1510,27 @@ struct ReleaseSummary {
 }
 
 /// Reorder stage: receives sub-chunks in any cross-worker order and releases
-/// them strictly in (plan_index, sub_index) order into the ChunkQueue,
-/// advancing to plan chunk N+1 only after N's `is_last`. Each release also
-/// advances the AheadGate floor so the worker owning the floor plan chunk
-/// streams unthrottled and budget held by newly-floored sub-chunks drains.
+/// them strictly in height order into the ChunkQueue, starting at the height
+/// `unreleased_from` holds. Keyed by height, not by plan index: the rest of a cut
+/// plan chunk is handed out again under a later index ([`Dispatcher`]).
 ///
-/// After each release `unreleased_from` holds the lowest height not yet handed to the scanner.
+/// After each release `unreleased_from` holds the lowest height not yet handed to
+/// the scanner. It is also the AheadGate floor: the worker owning the plan chunk
+/// that starts at or below it streams unthrottled, and budget held by its
+/// buffered sub-chunks drains.
 async fn release_ordered(
     rx: &mut mpsc::Receiver<SubChunk>,
     queue: &ChunkQueueSender,
     progress: Option<&Arc<Progress>>,
-    floor: &AtomicU64,
     unreleased_from: &AtomicU64,
     started: Instant,
     failover: Option<WireFailoverArm>,
 ) -> Result<ReleaseSummary, SlipstreamError> {
     let mut summary = ReleaseSummary::default();
     let mut continuity = Continuity::default();
-    let mut pending: BTreeMap<(u64, u64), SubChunk> = BTreeMap::new();
-    let mut next: (u64, u64) = (0, 0);
+    // Buffered sub-chunks by their first height.
+    let mut pending: BTreeMap<u64, SubChunk> = BTreeMap::new();
+    let mut next_height = unreleased_from.load(Ordering::Acquire);
     // Dense queue-chunk counter (Chunk.index contract: consecutive from 0).
     let mut emitted_chunks: u64 = 0;
     // Per-plan-chunk split accounting for the info! summary line.
@@ -1344,8 +1563,17 @@ async fn release_ordered(
         if let Some(d) = detector.as_mut() {
             d.arrival(sub.bytes as u64, started.elapsed().as_secs_f64())?;
         }
-        pending.insert((sub.plan_index, sub.sub_index), sub);
-        while let Some(sub) = pending.remove(&next) {
+        // Keyed by the height the sub-chunk was asked from: a sub-chunk that does
+        // not start there is released in its place, and `continuity` rejects it.
+        let key = sub.start;
+        if key < next_height || pending.contains_key(&key) {
+            return Err(SlipstreamError::Transport(format!(
+                "fetch: plan chunk {} sub-chunk {} starts at {key}, already sent",
+                sub.plan_index, sub.sub_index
+            )));
+        }
+        pending.insert(key, sub);
+        while let Some(sub) = pending.remove(&next_height) {
             let SubChunk {
                 plan_index,
                 is_last,
@@ -1371,7 +1599,8 @@ async fn release_ordered(
             }
             queue.send(chunk).await?;
             if let Some(height) = released_through {
-                unreleased_from.store(height + 1, Ordering::Release);
+                next_height = height + 1;
+                unreleased_from.store(next_height, Ordering::Release);
             }
             if let (Some(p), Some(first), Some(last)) = (progress, released_from, released_through)
             {
@@ -1392,10 +1621,6 @@ async fn release_ordered(
                 }
                 summary.plans_released += 1;
                 (plan_subs, plan_blocks, plan_bytes) = (0, 0, 0);
-                next = (plan_index + 1, 0);
-                floor.store(plan_index + 1, Ordering::Release);
-            } else {
-                next.1 += 1;
             }
         }
     }
@@ -1558,7 +1783,7 @@ struct Booster {
     meter: Arc<QueueMeter>,
     dispatcher: Arc<Dispatcher>,
     boost_on: Arc<AtomicBool>,
-    /// The plan chunk the release stage waits for.
+    /// The lowest height the release stage has not released.
     floor: Arc<AtomicU64>,
     gate: AheadGate,
     base_streams: usize,
@@ -1678,7 +1903,7 @@ impl Booster {
         let floor = self.floor.load(Ordering::Acquire);
         let best = self.best_window_bytes;
         for (w, &delta) in self.workers.iter_mut().zip(per_stream) {
-            if w.slot.plan_index.load(Ordering::Relaxed) != floor {
+            if !w.slot.holds(floor) {
                 continue;
             }
             let cooling = w
@@ -1686,7 +1911,7 @@ impl Booster {
                 .is_some_and(|t| now.duration_since(t) < KICK_COOLDOWN);
             if !cooling && head_is_slow(delta, best) {
                 info!(
-                    plan_index = floor,
+                    plan_index = w.slot.plan_index.load(Ordering::Relaxed),
                     window_kb = delta / 1024,
                     best_window_kb = best / 1024,
                     "head stream slow while the scanner waits — restarting it"
@@ -1699,6 +1924,7 @@ impl Booster {
 
     fn start(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>, fraction: f64) {
         self.boost_on.store(true, Ordering::Relaxed);
+        self.dispatcher.set_cutting(true);
         self.top_up_workers(workers);
         // The ahead budget's share shrinks with the added workers.
         self.dispatcher.set_target_bytes(chunk_target_bytes(
@@ -1714,6 +1940,7 @@ impl Booster {
 
     fn stop(&mut self, fraction: f64) {
         self.boost_on.store(false, Ordering::Relaxed);
+        self.dispatcher.set_cutting(false);
         self.dispatcher
             .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
         info!(
@@ -1857,14 +2084,12 @@ pub async fn run_fetch(
         Arc::clone(&fleet),
     ));
     let boost_on = Arc::new(AtomicBool::new(false));
-    let floor = Arc::new(AtomicU64::new(0));
-    let gate = AheadGate::new(ahead, Arc::clone(&floor));
+    // The lowest block not yet handed to the scanner: the ahead gate's floor, and where the
+    // download stands if a worker gives up (see `supervise_fetch`).
+    let unreleased_from = Arc::new(AtomicU64::new(plan.start));
+    let gate = AheadGate::new(ahead, Arc::clone(&unreleased_from));
     // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
     let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
-
-    // The lowest block not yet handed to the scanner: where the download stands if a worker
-    // gives up (see `supervise_fetch`).
-    let unreleased_from = AtomicU64::new(plan.start);
 
     let mut workers = JoinSet::new();
     let slots: Vec<Arc<WorkerSlot>> = (0..plan.streams.max(1))
@@ -1891,7 +2116,7 @@ pub async fn run_fetch(
             queue.meter(),
             Arc::clone(&dispatcher),
             Arc::clone(&boost_on),
-            Arc::clone(&floor),
+            Arc::clone(&unreleased_from),
             gate.clone(),
             ahead,
             &slots,
@@ -1914,7 +2139,6 @@ pub async fn run_fetch(
             &mut rx,
             &queue,
             progress.as_ref(),
-            &floor,
             &unreleased_from,
             started,
             plan.failover,
@@ -2030,6 +2254,90 @@ mod boost_tests {
         let (_, s, e) = d.take().await.expect("chunk");
         assert_eq!(before.elapsed(), Duration::ZERO);
         assert_eq!(e - s + 1, (16u64 << 20) / 100_000);
+    }
+
+    #[test]
+    fn a_chunk_is_cut_only_when_it_carries_twice_its_target_at_the_density_received() {
+        let t = 16u64 << 20;
+        // 2,000 blocks at ~168 KB: 330 MB, cut where a 16 MiB chunk would end.
+        let at = |blocks, bytes, height| chunk_cut_end(t, blocks, bytes, 1000, height, 2999);
+        assert_eq!(at(32, 32 * 168_000, 1031), Some(1000 + t / 168_000 - 1));
+        // Fewer than a sample and less than the target received: go on.
+        assert_eq!(at(31, 31 * 168_000, 1030), None);
+        // Past where it would have ended: cut where the stream stands.
+        assert_eq!(at(200, 200 * 168_000, 1199), Some(1199));
+        // Light blocks: the chunk is far below its target, go on.
+        assert_eq!(at(64, 64 * 600, 1063), None);
+        // A chunk sized at its density (100 blocks of a 16 MiB target) is never cut.
+        assert_eq!(chunk_cut_end(t, 50, 50 * (t / 100), 0, 49, 99), None);
+        // Fewer than BOOST_MIN_SPAN blocks would be left: go on.
+        assert_eq!(
+            chunk_cut_end(t, 32, 32 * t, 0, 31, 31 + BOOST_MIN_SPAN - 1),
+            None
+        );
+        // At or past its end there is nothing to cut.
+        assert_eq!(chunk_cut_end(t, 100, 100 * t, 0, 99, 99), None);
+        assert_eq!(chunk_cut_end(t, 0, 0, 0, 0, 99), None);
+    }
+
+    #[test]
+    fn the_rest_of_a_cut_chunk_is_handed_out_first_lowest_first_and_sized_like_any_chunk() {
+        let plan = FetchPlan::new(0, 99_999, 2000, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet));
+        assert_eq!(d.cut_target(), None, "no cuts before a boost");
+        d.set_cutting(true);
+        assert_eq!(d.cut_target(), Some(16 << 20));
+        let _ = d.take_now();
+        // Light blocks before an onset: full-span chunks.
+        receive(&fleet, 64, 600);
+        assert_eq!(d.take_now(), Some((1, 64, 2063)));
+        assert_eq!(d.take_now(), Some((2, 2064, 4063)));
+        // Both turn out dense and are cut; the rests come back, the higher first.
+        d.give_back(2200, 4063);
+        d.give_back(500, 2063);
+        assert!(d.has_returned());
+        assert_eq!(d.handed_out(), (3, false));
+        // ~116 KB per block now: 144 blocks per chunk, from the lowest rest up.
+        receive(&fleet, 100, 116_000);
+        let span = (16u64 << 20) / 116_000;
+        assert_eq!(d.take_now(), Some((3, 500, 500 + span - 1)));
+        let mut handed = vec![(500, 500 + span - 1)];
+        while let Some((_, s, e)) = d.take_now() {
+            if s >= 4064 {
+                assert_eq!(s, 4064, "the plan goes on after its rests");
+                break;
+            }
+            handed.push((s, e));
+        }
+        assert!(!d.has_returned());
+        let covered: Vec<u64> = handed.iter().flat_map(|&(s, e)| s..=e).collect();
+        let expected: Vec<u64> = (500..=2063).chain(2200..=4063).collect();
+        assert_eq!(
+            covered, expected,
+            "every given-back height exactly once, in height order"
+        );
+        // No chunk runs past the end of the rest it is cut from.
+        assert!(handed.iter().any(|&(_, e)| e == 2063));
+    }
+
+    #[test]
+    fn the_plan_is_out_only_once_no_rest_is_left() {
+        let plan = FetchPlan::new(0, 999, 1000, 1);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet));
+        let _ = d.take_now();
+        receive(&fleet, 64, 600);
+        assert_eq!(d.take_now(), Some((1, 64, 999)));
+        assert_eq!(d.handed_out(), (2, true));
+        d.give_back(700, 999);
+        assert_eq!(d.handed_out(), (2, false), "a rest is still to hand out");
+        assert_eq!(d.take_now(), Some((2, 700, 999)));
+        assert_eq!(d.handed_out(), (3, true));
+        assert_eq!(d.take_now(), None);
+        // Without the adaptive prefetch nothing is ever cut.
+        let fixed = Dispatcher::new(&plan, None, Arc::clone(&fleet));
+        assert_eq!(fixed.cut_target(), None);
     }
 
     #[test]
@@ -2375,10 +2683,13 @@ mod tests {
     fn test_cursor(plan_index: u64, start: u64, end: u64) -> PlanChunkCursor {
         PlanChunkCursor {
             plan_index,
+            start,
             end,
             resume_from: start,
             next_sub_index: 0,
             emitted_this_attempt: false,
+            got_blocks: 0,
+            got_bytes: 0,
         }
     }
 
@@ -2900,6 +3211,7 @@ mod tests {
             None,
             &mut refused,
             None,
+            None,
         )
         .await
         .expect("the window completes");
@@ -2926,6 +3238,7 @@ mod tests {
             &tx,
             None,
             &mut refused,
+            None,
             None,
         )
         .await
@@ -3140,6 +3453,235 @@ mod tests {
         assert!(got.is_none(), "now-floor worker proceeds without a permit");
     }
 
+    /// The floor is a height: the rest of a cut chunk, handed out under a later
+    /// index, waits on the budget until every height below it is released.
+    #[tokio::test]
+    async fn gate_exempts_a_chunk_once_every_height_below_it_is_released() {
+        let floor = Arc::new(AtomicU64::new(100));
+        let gate = AheadGate::new(1000, Arc::clone(&floor));
+        assert!(gate.admit(100, 5000).await.is_none(), "the head chunk");
+        assert!(gate.admit(90, 5000).await.is_none(), "below the floor");
+        let _held = gate
+            .admit(110, 1000)
+            .await
+            .expect("ahead: takes the budget");
+        let gate2 = gate.clone();
+        let waiter = tokio::spawn(async move { gate2.admit(110, 500).await });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(!waiter.is_finished(), "ahead of the floor, no budget");
+        floor.store(110, Ordering::Release);
+        let got = tokio::time::timeout(Duration::from_secs(2), waiter)
+            .await
+            .expect("unblocks once the release reaches it")
+            .expect("join");
+        assert!(got.is_none());
+    }
+
+    /// A plan chunk handed out at a light density that turns out dense is cut once
+    /// it carried its target: its last sub-chunk ends there with `is_last`, the
+    /// attempt completes, and the rest goes back to the dispatcher, handed out next.
+    #[tokio::test]
+    async fn a_chunk_denser_than_it_was_sized_for_is_cut_where_the_stream_stands() {
+        let target = 20_000u64;
+        let plan = FetchPlan::new(36, 999, 100, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(target), Arc::clone(&fleet));
+        d.set_cutting(true);
+        assert_eq!(d.take_now(), Some((0, 36, 99)), "the probe");
+        // The probe was light: the next chunk gets the plan's full span.
+        fleet.blocks.fetch_add(64, Ordering::Relaxed);
+        fleet.bytes.fetch_add(640, Ordering::Relaxed);
+        assert_eq!(d.take_now(), Some((1, 100, 199)));
+
+        let blocks = linked(100, 100, 1000);
+        let per_block = blocks[0].encoded_len() as u64;
+        let cut_at = 100 + target.div_ceil(per_block) - 1;
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(256);
+        let gate = open_gate();
+        let mut cursor = test_cursor(1, 100, 199);
+        let mut refused = false;
+        let mut s = stream::iter(blocks.into_iter().map(Ok::<_, tonic::Status>));
+        let out = pump_block_window(
+            &mut s,
+            &mut cursor,
+            199,
+            4 * per_block as usize,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+            None,
+            Some(&d),
+        )
+        .await
+        .expect("the cut completes the attempt");
+        assert!(matches!(out, PumpOutcome::Completed), "{out:?}");
+        assert_eq!(cursor.end, cut_at);
+        assert_eq!(cursor.resume_from, cut_at + 1);
+        let subs = drain_subs(&mut rx);
+        assert_heights_consecutive(&subs, 100, cut_at);
+        assert_eq!(subs.iter().filter(|s| s.is_last).count(), 1);
+        assert!(subs.last().expect("non-empty").is_last);
+        assert!(subs.iter().all(|s| s.start == s.blocks[0].height));
+        assert!(d.has_returned());
+        let (index, s, e) = d.take_now().expect("the rest");
+        assert_eq!((index, s, e), (2, cut_at + 1, 199));
+        assert!(!d.has_returned());
+    }
+
+    /// A chunk the first sample already shows too dense is cut ahead of the stream,
+    /// where a chunk sized at that density would end: the stream goes on to there,
+    /// then the chunk completes and the request is dropped.
+    #[tokio::test]
+    async fn a_chunk_seen_too_dense_early_is_cut_ahead_of_the_stream() {
+        let target = 20_000u64;
+        let plan = FetchPlan::new(36, 999, 900, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(target), Arc::clone(&fleet));
+        d.set_cutting(true);
+        assert_eq!(d.take_now(), Some((0, 36, 99)), "the probe");
+        fleet.blocks.fetch_add(64, Ordering::Relaxed);
+        fleet.bytes.fetch_add(64, Ordering::Relaxed);
+        assert_eq!(d.take_now(), Some((1, 100, 999)));
+
+        let blocks = linked(100, 900, 100);
+        let per_block = blocks[0].encoded_len() as u64;
+        let cut_at = 100 + target / per_block - 1;
+        assert!(
+            cut_at > 100 + DENSITY_SAMPLE_BLOCKS,
+            "ahead of the first sample"
+        );
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(1024);
+        let gate = open_gate();
+        let mut cursor = test_cursor(1, 100, 999);
+        let mut refused = false;
+        let mut s = stream::iter(blocks.into_iter().map(Ok::<_, tonic::Status>));
+        let out = pump_block_window(
+            &mut s,
+            &mut cursor,
+            999,
+            16 * per_block as usize,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+            None,
+            Some(&d),
+        )
+        .await
+        .expect("the cut chunk completes");
+        assert!(matches!(out, PumpOutcome::Completed), "{out:?}");
+        assert_eq!(cursor.end, cut_at);
+        let subs = drain_subs(&mut rx);
+        assert_heights_consecutive(&subs, 100, cut_at);
+        assert_eq!(subs.iter().filter(|s| s.is_last).count(), 1);
+        assert!(subs.last().expect("non-empty").is_last);
+        assert_eq!(d.take_now().map(|(_, s, _)| s), Some(cut_at + 1));
+    }
+
+    /// Before a boost (the scanner not waiting), a dense chunk streams whole.
+    #[tokio::test]
+    async fn without_a_boost_a_dense_chunk_is_never_cut() {
+        let plan = FetchPlan::new(36, 999, 100, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(20_000), Arc::clone(&fleet));
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(1024);
+        let gate = open_gate();
+        let mut cursor = test_cursor(1, 100, 199);
+        let mut refused = false;
+        let mut s = stream::iter(
+            linked(100, 100, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>),
+        );
+        let out = pump_block_window(
+            &mut s,
+            &mut cursor,
+            199,
+            1 << 20,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+            None,
+            Some(&d),
+        )
+        .await
+        .expect("stream");
+        assert!(matches!(out, PumpOutcome::Completed));
+        assert_eq!(cursor.end, 199);
+        assert!(!d.has_returned());
+        assert_heights_consecutive(&drain_subs(&mut rx), 100, 199);
+    }
+
+    /// A chunk sized by density (below the plan's span) streams whole however much
+    /// denser its blocks are than the estimate it was sized at.
+    #[tokio::test]
+    async fn a_chunk_sized_by_density_is_never_cut() {
+        let plan = FetchPlan::new(36, 999, 2000, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(20_000), Arc::clone(&fleet));
+        d.set_cutting(true);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(1024);
+        let gate = open_gate();
+        let mut cursor = test_cursor(1, 100, 999);
+        let mut refused = false;
+        let mut s = stream::iter(
+            linked(100, 900, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>),
+        );
+        let out = pump_block_window(
+            &mut s,
+            &mut cursor,
+            999,
+            1 << 20,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+            None,
+            Some(&d),
+        )
+        .await
+        .expect("stream");
+        assert!(matches!(out, PumpOutcome::Completed));
+        assert_eq!(cursor.end, 999);
+        assert!(!d.has_returned());
+        assert_heights_consecutive(&drain_subs(&mut rx), 100, 999);
+    }
+
+    /// Without the adaptive prefetch (no dispatcher), a dense chunk streams whole.
+    #[tokio::test]
+    async fn without_a_dispatcher_a_dense_chunk_is_never_cut() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(256);
+        let gate = open_gate();
+        let mut cursor = test_cursor(1, 100, 199);
+        let mut s = stream::iter(
+            linked(100, 100, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>),
+        );
+        let out = pump_block_stream(
+            &mut s,
+            &mut cursor,
+            4000,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+        )
+        .await
+        .expect("stream");
+        assert!(matches!(out, PumpOutcome::Completed));
+        assert_eq!(cursor.end, 199);
+        assert_heights_consecutive(&drain_subs(&mut rx), 100, 199);
+    }
+
     /// Our own backpressure never trips the stream idle timeout: a worker parked
     /// on the ahead budget for longer than `STREAM_IDLE_TIMEOUT` is not polling
     /// its stream, so the timer is not running; once admitted it goes on.
@@ -3214,6 +3756,7 @@ mod tests {
             None,
             &mut refused,
             Some(&slot),
+            None,
         );
         let kicker = async {
             while slot.bytes.load(Ordering::Relaxed) == 0 {
@@ -3272,6 +3815,7 @@ mod tests {
             None,
             &mut refused,
             Some(&slot),
+            None,
         )
         .await;
         let err = out.expect_err("the denial is the attempt's result, not a kick");
@@ -3403,10 +3947,23 @@ mod tests {
     // ── release_ordered ────────────────────────────────────────────────────────
 
     fn sub(plan_index: u64, sub_index: u64, is_last: bool, blocks: Vec<CompactBlock>) -> SubChunk {
+        let start = blocks.first().map_or(0, |b| b.height);
+        sub_from(start, plan_index, sub_index, is_last, blocks)
+    }
+
+    /// A sub-chunk asked from `start` (which its blocks may not start at).
+    fn sub_from(
+        start: u64,
+        plan_index: u64,
+        sub_index: u64,
+        is_last: bool,
+        blocks: Vec<CompactBlock>,
+    ) -> SubChunk {
         let bytes = blocks.iter().map(Message::encoded_len).sum();
         SubChunk {
             plan_index,
             sub_index,
+            start,
             is_last,
             bytes,
             blocks,
@@ -3436,18 +3993,10 @@ mod tests {
         drop(tx);
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
-        let floor = AtomicU64::new(0);
-        let summary = release_ordered(
-            &mut rx,
-            &qtx,
-            None,
-            &floor,
-            &AtomicU64::new(0),
-            Instant::now(),
-            None,
-        )
-        .await
-        .expect("release");
+        let floor = AtomicU64::new(100);
+        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
+            .await
+            .expect("release");
         assert_eq!(summary.plans_released, 3);
         assert_eq!(summary.blocks, 60);
         drop(qtx);
@@ -3471,9 +4020,72 @@ mod tests {
         );
         assert_eq!(
             floor.load(Ordering::Acquire),
-            3,
-            "floor advanced past the last plan chunk"
+            160,
+            "floor advanced past the last released height"
         );
+    }
+
+    /// The rest of a cut plan chunk is handed out again under a later index; the
+    /// release still goes by height: the cut chunk, its rest, then the chunk after.
+    #[tokio::test]
+    async fn release_orders_a_cut_chunks_rest_by_height_not_by_index() {
+        let all = linked(100, 30, 64);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        // plan 1: [120-129]; plan 2: the rest of plan 0, [110-119]; plan 0 cut at 109.
+        tx.send(sub(1, 0, true, all[20..30].to_vec()))
+            .await
+            .expect("send");
+        tx.send(sub(2, 0, true, all[10..20].to_vec()))
+            .await
+            .expect("send");
+        tx.send(sub(0, 1, true, all[5..10].to_vec()))
+            .await
+            .expect("send");
+        tx.send(sub(0, 0, false, all[0..5].to_vec()))
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
+        let floor = AtomicU64::new(100);
+        let summary = release_ordered(&mut rx, &qtx, None, &floor, Instant::now(), None)
+            .await
+            .expect("release");
+        assert_eq!(summary.plans_released, 3);
+        assert_eq!(floor.load(Ordering::Acquire), 130);
+        drop(qtx);
+        let mut released_heights = Vec::new();
+        while let Some((chunk, permit, _boundary)) = qrx.recv().await {
+            released_heights.extend(chunk.blocks.iter().map(|b| b.height));
+            drop(permit);
+        }
+        assert_eq!(released_heights, (100..130).collect::<Vec<_>>());
+    }
+
+    /// A sub-chunk asked from a height the release already passed is a second copy:
+    /// the fetch fails instead of scanning blocks twice.
+    #[tokio::test]
+    async fn release_rejects_a_sub_chunk_below_what_it_released() {
+        let all = linked(100, 20, 64);
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(16);
+        tx.send(sub(0, 0, true, all[0..10].to_vec()))
+            .await
+            .expect("send");
+        tx.send(sub(1, 0, true, all[5..15].to_vec()))
+            .await
+            .expect("send");
+        drop(tx);
+        let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
+        let err = release_ordered(
+            &mut rx,
+            &qtx,
+            None,
+            &AtomicU64::new(100),
+            Instant::now(),
+            None,
+        )
+        .await
+        .expect_err("a second copy fails the fetch");
+        assert!(matches!(err, SlipstreamError::Transport(_)), "{err}");
     }
 
     /// Retry-continuation shape: plan 0's tail (emitted by a resumed attempt)
@@ -3496,13 +4108,11 @@ mod tests {
         drop(tx);
 
         let (qtx, mut qrx) = chunk_queue(usize::MAX >> 8);
-        let floor = AtomicU64::new(0);
         let summary = release_ordered(
             &mut rx,
             &qtx,
             None,
-            &floor,
-            &AtomicU64::new(0),
+            &AtomicU64::new(100),
             Instant::now(),
             None,
         )
@@ -3526,18 +4136,17 @@ mod tests {
         tx.send(sub(0, 0, false, linked(100, 5, 64)))
             .await
             .expect("send");
-        tx.send(sub(0, 1, true, linked(200, 5, 64)))
+        // Asked from 105, the server answered from 200.
+        tx.send(sub_from(105, 0, 1, true, linked(200, 5, 64)))
             .await
             .expect("send");
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
-        let floor = AtomicU64::new(0);
         let err = release_ordered(
             &mut rx,
             &qtx,
             None,
-            &floor,
-            &AtomicU64::new(0),
+            &AtomicU64::new(100),
             Instant::now(),
             None,
         )
@@ -3756,19 +4365,10 @@ mod tests {
             .expect("send");
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
-        let floor = AtomicU64::new(0);
         let unreleased_from = AtomicU64::new(100);
-        release_ordered(
-            &mut rx,
-            &qtx,
-            None,
-            &floor,
-            &unreleased_from,
-            Instant::now(),
-            None,
-        )
-        .await
-        .expect("the release ends when the channel closes");
+        release_ordered(&mut rx, &qtx, None, &unreleased_from, Instant::now(), None)
+            .await
+            .expect("the release ends when the channel closes");
         assert_eq!(
             unreleased_from.load(Ordering::Acquire),
             110,
@@ -3937,13 +4537,11 @@ mod tests {
             .expect("send");
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
-        let floor = AtomicU64::new(0);
         release_ordered(
             &mut rx,
             &qtx,
             Some(&progress),
-            &floor,
-            &AtomicU64::new(0),
+            &AtomicU64::new(100),
             Instant::now(),
             None,
         )
@@ -3968,13 +4566,11 @@ mod tests {
             .expect("send");
         drop(tx);
         let (qtx, _qrx) = chunk_queue(usize::MAX >> 8);
-        let floor = AtomicU64::new(0);
         release_ordered(
             &mut rx,
             &qtx,
             Some(&progress),
-            &floor,
-            &AtomicU64::new(0),
+            &AtomicU64::new(100),
             Instant::now(),
             None,
         )
