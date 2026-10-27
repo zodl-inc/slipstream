@@ -1858,6 +1858,60 @@ mod tests {
         assert_eq!(left, 0, "buffer rows must be cleaned after graft/finish");
     }
 
+    /// An audited shard stores the same bytes whether its completing insertion runs
+    /// shardtree's cap check (`insert_tree`, the path before) or skips it
+    /// (`persist::insert_audited_subtree`): the whole wallet database, shard blobs,
+    /// cap and checkpoints included, is identical. Shard 0 is audited
+    /// (verify_sample = 1) against the seeded server root.
+    /// Heavy: run with `cargo test -p zodl-slipstream --release --lib -- --ignored
+    /// graft_audit_skipping_the_cap_check`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "heavy: 2× 76k-action orchard scans; run explicitly (use --release)"]
+    async fn graft_audit_skipping_the_cap_check_stores_the_same_bytes() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (blocks, _ufvk, seed) = t10b_fixture();
+        let lens = vec![blocks.len()];
+        let mut verdicts = vec![];
+        for (name, checked) in [("checked", true), ("unchecked", false)] {
+            let d = dir.path().join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            crate::persist::AUDITED_INSERT_CHECKED.store(checked, Ordering::Relaxed);
+            let unchecked_before =
+                crate::persist::AUDITED_INSERTS_UNCHECKED.load(Ordering::Relaxed);
+            let v = super::testkit::scan_synthetic_windows_write_behind_with(
+                &d,
+                blocks.clone(),
+                &lens,
+                true,
+                1,
+                t10b_prepare(seed, &blocks, true),
+            )
+            .await;
+            crate::persist::AUDITED_INSERT_CHECKED.store(false, Ordering::Relaxed);
+            verdicts.push(v.expect("audited scan"));
+            if !checked {
+                // Shard 0's 64 built subtrees took the unchecked insertion.
+                assert!(
+                    crate::persist::AUDITED_INSERTS_UNCHECKED.load(Ordering::Relaxed)
+                        >= unchecked_before + 64,
+                    "the audited shard did not take the unchecked insertion"
+                );
+            }
+        }
+        assert_eq!(verdicts[0], verdicts[1]);
+        let report = semantic_diff(
+            &dir.path().join("checked/data.db"),
+            &dir.path().join("unchecked/data.db"),
+        )
+        .expect("diff");
+        assert!(
+            report.is_clean(),
+            "the cap check changed what is stored:\n{}",
+            report.render()
+        );
+    }
+
     /// T10b step 2 — THE SPEND-FROM-GRAFTED-WITNESS PROOF. Restore a wallet with
     /// graft ON (shard 0 installs the seeded server root, never built locally),
     /// then SPEND the owned note that lives in built shard 1. Proving requires the

@@ -1805,7 +1805,19 @@ pub fn sparse_put_blocks(
                         {
                             sap_tree.ensure_retained(h).map_err(map_sparse_err)?;
                         }
-                        sap_tree.insert_tree(subtree, checkpoints).map_err(map_sparse_err)?;
+                        let shard =
+                            u64::from(subtree.root_addr().position_range_start()) >> SAPLING_SHARD_HEIGHT;
+                        let audited = sap_verify_roots
+                            .iter()
+                            .find(|(idx, _)| *idx == shard)
+                            .filter(|_| audited_insert_unchecked());
+                        match audited {
+                            Some((_, server_root)) => {
+                                insert_audited_subtree(sap_tree, subtree, checkpoints, server_root)
+                            }
+                            None => sap_tree.insert_tree(subtree, checkpoints).map(|_| ()),
+                        }
+                        .map_err(map_sparse_err)?;
                     }
                     timers.insert_ms = t.elapsed().as_millis();
                     let t = std::time::Instant::now();
@@ -1940,7 +1952,19 @@ pub fn sparse_put_blocks(
                         {
                             orch_tree.ensure_retained(h).map_err(map_sparse_err)?;
                         }
-                        orch_tree.insert_tree(subtree, checkpoints).map_err(map_sparse_err)?;
+                        let shard =
+                            u64::from(subtree.root_addr().position_range_start()) >> ORCHARD_SHARD_HEIGHT;
+                        let audited = orch_verify_roots
+                            .iter()
+                            .find(|(idx, _)| *idx == shard)
+                            .filter(|_| audited_insert_unchecked());
+                        match audited {
+                            Some((_, server_root)) => {
+                                insert_audited_subtree(orch_tree, subtree, checkpoints, server_root)
+                            }
+                            None => orch_tree.insert_tree(subtree, checkpoints).map(|_| ()),
+                        }
+                        .map_err(map_sparse_err)?;
                     }
                     timers.insert_ms = t.elapsed().as_millis();
                     let t = std::time::Instant::now();
@@ -2522,6 +2546,87 @@ where
             .map_err(|e| SqliteClientError::CorruptedData(format!("{label} insert: {e:?}")))?;
     }
     Ok(true)
+}
+
+/// Test-only: send audited subtrees through `insert_tree` and its cap check, as before
+/// [`insert_audited_subtree`], so a test can compare what both paths store.
+#[cfg(test)]
+pub(crate) static AUDITED_INSERT_CHECKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Test-only: subtrees [`insert_audited_subtree`] inserted without `insert_tree`.
+#[cfg(test)]
+pub(crate) static AUDITED_INSERTS_UNCHECKED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Whether audited subtrees take [`insert_audited_subtree`] (always, outside tests).
+fn audited_insert_unchecked() -> bool {
+    #[cfg(test)]
+    {
+        !AUDITED_INSERT_CHECKED.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(not(test))]
+    {
+        true
+    }
+}
+
+/// Inserts `subtree`, a subtree [`build_subtrees`] built for a shard the graft audit
+/// samples, with its `checkpoints`, into `tree`: exactly what
+/// [`ShardTree::insert_tree`] does with it, without the cap check that
+/// `insert_tree` runs on the shard the subtree completes.
+///
+/// That check computes the root of every node the cap holds on the shard's path
+/// from the roots beneath it, and the cap annotates none of them, so it hashes much
+/// of the cap again on every completed shard: about 4 s of Sapling hashing per
+/// audited shard on a spam-era wallet, on the persist lane, while the scan waits
+/// for the commit. A shard the audit samples is a shard the pass-start ingest
+/// stored the server's root for, so its stored shard is that root (a root-only
+/// leaf, or the annotation the first insertion into it kept): inserting the
+/// subtree into it ([`LocatedPrunableTree::insert_subtree`]) compares the root of
+/// the built leaves with it once they complete the shard, and fails with
+/// `Conflict` on a mismatch as `insert_tree` does. The cap check would only add
+/// the comparisons above the shard that a grafted shard, installed without any
+/// check, never gets either. When the stored shard does not hold `server_root`,
+/// the subtree takes `insert_tree` itself.
+///
+/// The shard is written as `insert_tree` writes it, and the checkpoints are added
+/// and pruned by `insert_tree` too (with an empty subtree, which it skips): the
+/// tree ends in the same state either way.
+fn insert_audited_subtree<H, const DEPTH: u8, const SHARD_HEIGHT: u8>(
+    tree: &mut ShardTree<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>,
+    subtree: LocatedPrunableTree<H>,
+    checkpoints: BTreeMap<BlockHeight, Position>,
+    server_root: &H,
+) -> Result<(), ShardTreeError<SparseStoreError>>
+where
+    H: incrementalmerkletree::Hashable + Clone + PartialEq,
+{
+    let shard_addr = ShardTree::<SparseShardStore<H>, DEPTH, SHARD_HEIGHT>::subtree_addr(
+        subtree.root_addr().position_range_start(),
+    );
+    let current = if shard_addr.contains(&subtree.root_addr()) && !subtree.root().is_empty() {
+        tree.store()
+            .get_shard(shard_addr)
+            .map_err(ShardTreeError::Storage)?
+            .filter(|shard| shard.root().node_value() == Some(server_root))
+    } else {
+        None
+    };
+    let Some(current) = current else {
+        return tree.insert_tree(subtree, checkpoints).map(|_| ());
+    };
+    let contains_marked = subtree.root().contains_marked();
+    let (replacement, _) = current
+        .insert_subtree(subtree, contains_marked)
+        .map_err(ShardTreeError::Insert)?;
+    tree.store_mut()
+        .put_shard(replacement)
+        .map_err(ShardTreeError::Storage)?;
+    #[cfg(test)]
+    AUDITED_INSERTS_UNCHECKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    tree.insert_tree(LocatedTree::empty(shard_addr), checkpoints)
+        .map(|_| ())
 }
 
 /// The root of shard `index`, computed from the leaves and subtree hashes `store` holds
@@ -6542,5 +6647,202 @@ impl WriteBehindFacade {
         timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
     ) {
         self.timings = timings;
+    }
+}
+
+#[cfg(test)]
+mod audited_insert_tests {
+    use super::*;
+    use zcash_primitives::merkle_tree::HashSer as _;
+
+    /// Depth 8, shards of 16 leaves: small enough to hash in a debug build.
+    type SmallTree = ShardTree<SparseShardStore<sapling::Node>, 8, 4>;
+    const SHARD: u8 = 4;
+
+    fn node(n: u64) -> sapling::Node {
+        let mut b = [0u8; 32];
+        b[..8].copy_from_slice(&n.to_le_bytes());
+        sapling::Node::read(&b[..]).expect("small LE ints are canonical nodes")
+    }
+
+    fn shard_addr(index: u64) -> Address {
+        Address::from_parts(Level::from(SHARD), index)
+    }
+
+    /// The root of shard `index` over the leaves `node(p)`.
+    fn shard_root(index: u64) -> sapling::Node {
+        let start = index << SHARD;
+        let built = LocatedPrunableTree::from_iter(
+            Position::from(start)..Position::from(start + 16),
+            Level::from(SHARD),
+            (start..start + 16).map(|p| (node(p), Retention::<BlockHeight>::Ephemeral)),
+        )
+        .expect("non-empty");
+        built
+            .subtree
+            .root_hash(Position::from(start + 16))
+            .expect("complete")
+    }
+
+    /// A tree the way a graft pass finds it: the server's roots of shards 0..6 ingested
+    /// (root-only shards and cap leaves; `ingested(2)` stands for shard 2's), then the
+    /// frontier of a range that starts at 20, with its ommers in the cap.
+    fn tree_with(ingested_2: sapling::Node) -> SmallTree {
+        let mut tree = SmallTree::new(SparseShardStore::new(SHARD), 5);
+        for index in 0..6 {
+            let root = if index == 2 {
+                ingested_2
+            } else {
+                shard_root(index)
+            };
+            let leaf = || {
+                LocatedTree::from_parts(
+                    shard_addr(index),
+                    Tree::leaf((root, RetentionFlags::EPHEMERAL)),
+                )
+                .expect("shard address")
+            };
+            tree.store_mut().put_shard(leaf()).expect("put shard");
+            let cap = LocatedTree::from_parts(
+                Address::from_parts(Level::from(8), 0),
+                tree.store().get_cap().expect("cap"),
+            )
+            .expect("cap address");
+            let (cap, _) = cap.insert_subtree(leaf(), false).expect("cap insert");
+            tree.store_mut()
+                .put_cap(cap.root().clone())
+                .expect("put cap");
+        }
+        let mut frontier = incrementalmerkletree::frontier::NonEmptyFrontier::new(node(0));
+        for p in 1..20 {
+            frontier.append(node(p));
+        }
+        tree.insert_frontier_nodes(
+            frontier,
+            Retention::Checkpoint {
+                id: BlockHeight::from(19),
+                marking: Marking::Reference,
+            },
+        )
+        .expect("frontier");
+        tree
+    }
+
+    /// The range's rows from 20 to 63 (a checkpoint every third leaf), built as the
+    /// persist lane builds them.
+    fn built() -> Vec<(
+        LocatedPrunableTree<sapling::Node>,
+        BTreeMap<BlockHeight, Position>,
+    )> {
+        let mut rows: Vec<Option<(sapling::Node, Retention<BlockHeight>)>> = (20..64)
+            .map(|p| {
+                let retention = if p % 3 == 0 {
+                    Retention::Checkpoint {
+                        id: BlockHeight::from(p as u32),
+                        marking: Marking::None,
+                    }
+                } else {
+                    Retention::Ephemeral
+                };
+                Some((node(p), retention))
+            })
+            .collect();
+        build_subtrees::<_, SHARD>(Position::from(20), &mut rows, 4)
+    }
+
+    /// Inserts the built subtrees, shard 2 audited against `server_root` through
+    /// [`insert_audited_subtree`] when `audited`, through `insert_tree` otherwise.
+    fn insert_all(
+        tree: &mut SmallTree,
+        audited: bool,
+        server_root: &sapling::Node,
+    ) -> Result<(), String> {
+        for (subtree, checkpoints) in built() {
+            let shard = u64::from(subtree.root_addr().position_range_start()) >> SHARD;
+            if audited && shard == 2 {
+                insert_audited_subtree(tree, subtree, checkpoints, server_root)
+            } else {
+                tree.insert_tree(subtree, checkpoints).map(|_| ())
+            }
+            .map_err(|e| format!("{e:?}"))?;
+        }
+        Ok(())
+    }
+
+    fn assert_same_state(a: &SmallTree, b: &SmallTree) {
+        let (a, b) = (a.store(), b.store());
+        assert_eq!(a.shards, b.shards, "shards");
+        assert_eq!(a.dirty_shards, b.dirty_shards, "dirty shards");
+        assert_eq!(a.cap, b.cap, "cap");
+        assert_eq!(a.cap_dirty, b.cap_dirty, "cap dirty");
+        let checkpoints = |s: &SparseShardStore<sapling::Node>| {
+            s.checkpoints
+                .iter()
+                .map(|(id, c)| (*id, c.tree_state(), c.marks_removed().clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(checkpoints(a), checkpoints(b), "checkpoints");
+        assert_eq!(a.retained, b.retained, "retained");
+    }
+
+    /// The audited insertion leaves the store exactly as `insert_tree` does: the same
+    /// shards (the audited one completed and pruned), cap, checkpoints and dirty sets,
+    /// so the flush writes the same rows.
+    #[test]
+    fn an_audited_shard_ends_as_insert_tree_leaves_it() {
+        let root = shard_root(2);
+        let mut checked = tree_with(root);
+        let mut audited = tree_with(root);
+        assert_eq!(
+            audited
+                .store()
+                .get_shard(shard_addr(2))
+                .expect("shard")
+                .and_then(|s| s.root().node_value().cloned()),
+            Some(root),
+            "the audited shard holds the server's root, so the audited path is taken"
+        );
+        insert_all(&mut checked, false, &root).expect("insert_tree");
+        insert_all(&mut audited, true, &root).expect("audited insertion");
+        assert_same_state(&checked, &audited);
+        let completed = audited
+            .store()
+            .get_shard(shard_addr(2))
+            .expect("shard")
+            .expect("present");
+        assert_eq!(
+            completed.root_hash(Position::from(48)),
+            Ok(root),
+            "the completed shard has the server's root"
+        );
+        assert_eq!(
+            checked.root_at_checkpoint_depth(Some(0)).expect("root"),
+            audited.root_at_checkpoint_depth(Some(0)).expect("root"),
+        );
+    }
+
+    /// A server root the built leaves do not hash to fails the insertion with the same
+    /// conflict on both paths.
+    #[test]
+    fn an_audited_shard_with_a_wrong_server_root_fails_as_insert_tree_does() {
+        let wrong = node(999_999);
+        let mut checked = tree_with(wrong);
+        let mut audited = tree_with(wrong);
+        let a = insert_all(&mut checked, false, &wrong).expect_err("conflict");
+        let b = insert_all(&mut audited, true, &wrong).expect_err("conflict");
+        assert_eq!(a, b);
+        assert!(a.contains("Conflict"), "{a}");
+    }
+
+    /// When the stored shard does not hold the audited root, the subtree takes
+    /// `insert_tree` itself.
+    #[test]
+    fn a_shard_without_the_audited_root_takes_insert_tree() {
+        let root = shard_root(2);
+        let mut checked = tree_with(root);
+        let mut audited = tree_with(root);
+        insert_all(&mut checked, false, &root).expect("insert_tree");
+        insert_all(&mut audited, true, &node(5)).expect("falls back to insert_tree");
+        assert_same_state(&checked, &audited);
     }
 }
