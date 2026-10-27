@@ -36,6 +36,22 @@ pub enum SlipstreamError {
     #[error("misbehaving server (invalid or out-of-range data in response)")]
     MisbehavingServer,
 
+    /// The OHTTP gateway refused this operation by policy (an inner 403). Not a sign that the
+    /// server is unreachable: not retried, and never counted towards `EndpointUnreachable`.
+    #[error("policy denied: {0}")]
+    PolicyDenied(String),
+
+    /// The OHTTP relay asked for a pause (an outer 429), or a request was held back while that
+    /// pause runs. A back-off signal: retried with the normal back-off, but never counted
+    /// towards `EndpointUnreachable` nor a reason to switch servers.
+    #[error("rate limited: {0}")]
+    RateLimited(String),
+
+    /// The request is larger than the OHTTP relay and gateway accept (an outer 413, or a sealed
+    /// request over 10 MiB that was not sent). Not retried.
+    #[error("request too large: {0}")]
+    RequestTooLarge(String),
+
     /// A channel inside the engine closed under a sender: the fetch side's chunk queue lost its
     /// scanner (`chunk.rs`), typically because the scan already ended with an error of its own,
     /// which takes precedence (`scheduler.rs`). Engine lifecycle, not a request from the host:
@@ -54,7 +70,8 @@ pub enum SlipstreamError {
     /// returns, with no `Error` state, no tag-4 event, no revival and no retry
     /// ([`Self::is_stop_for_wallet_change`] is what the session checks). The scan call it
     /// interrupted wrote nothing, because upstream `scan_cached_blocks` writes only in its final
-    /// `put_blocks` (earlier sub-batches of a chunk stay committed), so the next pass scans those
+    /// `put_blocks` (earlier units stay committed; on the write-behind path the scanned blocks of
+    /// a unit still below its commit limits are dropped with it), so the next pass scans those
     /// blocks again.
     ///
     /// Not to be confused with [`Self::Stopped`], an engine channel that closed.
@@ -78,6 +95,15 @@ pub enum SlipstreamError {
     /// full stall).
     #[error("wire collapse: {measured_mbps:.2} MB/s sustained (floor {floor_mbps:.2})")]
     WireCollapse { measured_mbps: f64, floor_mbps: f64 },
+
+    /// The follow-tip loop detected N consecutive probe or catch-up failures
+    /// (transient or non-transient), indicating the endpoint is persistently
+    /// unreachable. Surfaces as `SyncState::Error(3)` + tag-4/value=3 event to
+    /// enable hosts to react (e.g., automatic server switching). The counter
+    /// resets on any successful probe or pass. This is NOT raised during the
+    /// initial sync — only in the follow loop after the first pass succeeds.
+    #[error("endpoint unreachable after {attempts} consecutive failures; last: {last}")]
+    EndpointUnreachable { attempts: u32, last: String },
 }
 
 impl SlipstreamError {
@@ -92,6 +118,9 @@ impl SlipstreamError {
     /// - `ScanContinuity`  → false     (internally handled by the reorg recovery arm)
     /// - `Discontinuity`   → false     (fetch continuity bug; retry would loop)
     /// - `MisbehavingServer` → false   (bad proto / decode error; not a transport transient)
+    /// - `PolicyDenied`    → false     (server policy refusal; not a transport issue)
+    /// - `RateLimited`     → **true**  (back off and retry; not counted as unreachable)
+    /// - `RequestTooLarge` → false     (the same request is refused again)
     /// - `Stopped`         → false     (engine lifecycle; not retryable)
     /// - `StoppedForWalletChange` → false (the host asked for it; a retry would scan the wallet
     ///   the host is about to change — the session ends quietly instead, see
@@ -99,7 +128,22 @@ impl SlipstreamError {
     /// - `WireCollapse`    → false     (handled by the v0.7 failover loop — the generic
     ///   transient-reconnect path would dial the SAME collapsed server again)
     pub fn is_transient(&self) -> bool {
-        matches!(self, SlipstreamError::Transport(_))
+        matches!(
+            self,
+            SlipstreamError::Transport(_) | SlipstreamError::RateLimited(_)
+        )
+    }
+
+    /// Whether this failure says the server could not be reached, as opposed to an OHTTP policy
+    /// denial, a rate limit or an oversized request: only those count towards
+    /// `EndpointUnreachable` (and so towards a server switch).
+    pub fn counts_as_unreachable(&self) -> bool {
+        !matches!(
+            self,
+            SlipstreamError::PolicyDenied(_)
+                | SlipstreamError::RateLimited(_)
+                | SlipstreamError::RequestTooLarge(_)
+        )
     }
 
     /// Returns `true` only for [`SlipstreamError::StoppedForWalletChange`]: the host asked the
@@ -185,6 +229,20 @@ mod tests {
     #[test]
     fn stopped_is_not_transient() {
         assert!(!SlipstreamError::Stopped.is_transient());
+    }
+
+    #[test]
+    fn ohttp_outcomes_are_not_unreachable() {
+        let rate = SlipstreamError::RateLimited("relay/gateway HTTP 429".into());
+        assert!(rate.is_transient());
+        assert!(!rate.counts_as_unreachable());
+        let denied = SlipstreamError::PolicyDenied("inner 403".into());
+        assert!(!denied.is_transient());
+        assert!(!denied.counts_as_unreachable());
+        let big = SlipstreamError::RequestTooLarge("413".into());
+        assert!(!big.is_transient());
+        assert!(!big.counts_as_unreachable());
+        assert!(SlipstreamError::Transport("timeout".into()).counts_as_unreachable());
     }
 
     // ── stop for a wallet change ─────────────────────────────────────────────

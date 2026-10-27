@@ -427,6 +427,14 @@ impl StopReport {
     }
 }
 
+impl Drop for SlipstreamHandle {
+    /// Release the engine Tor client cached for this handle's sessions (`session::TOR_CONNS`)
+    /// while this handle's runtime is still alive.
+    fn drop(&mut self) {
+        crate::session::forget_tor_conns(&self.pass_lock);
+    }
+}
+
 impl SlipstreamHandle {
     /// Push one event onto the ring (v2 bounded policy: overflow evicts the oldest
     /// started/progress event first; done/error/found-transactions survive; loss is logged).

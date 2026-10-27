@@ -97,10 +97,16 @@ pub(crate) const FOLLOW_POLL_MIN_SECS: u64 = 10;
 /// Maximum follow-probe sleep (inclusive). Matches the old-SDK jitter ceiling.
 pub(crate) const FOLLOW_POLL_MAX_SECS: u64 = 30;
 
+/// Consecutive follow-tip probe failures after which the engine surfaces `SyncState::Error(3)`
+/// (endpoint unreachable). This allows hosts to react to persistent outages (e.g., switch servers).
+/// The counter resets on any successful probe. Lower than the old escalation-only cap because
+/// surfacing an error enables the host's automatic recovery, which is more valuable than silently
+/// retrying forever.
+pub(crate) const ENDPOINT_UNREACHABLE_THRESHOLD: u32 = 5;
+
 /// Consecutive follow-iteration failures after which the follow loop logs an ESCALATED warning
-/// (likely a connectivity problem). T8.7: a follow-phase failure NEVER surfaces
-/// `SyncState::Error` — the wallet stays synced to `last_tip` and keeps retrying; only the
-/// INITIAL sync's non-transient errors (and panics, via the supervisor) surface Error.
+/// (likely a connectivity problem). Kept higher than `ENDPOINT_UNREACHABLE_THRESHOLD` for backwards
+/// compatibility with logs, but the Error(3) transition happens first.
 pub(crate) const FOLLOW_FAILURE_CAP: u32 = 8;
 
 /// Consecutive mempool-session failures that turn mempool monitoring off (T8.2). Mempool is a
@@ -427,6 +433,104 @@ impl SessionReporter {
     }
 }
 
+/// One [`TOR_CONNS`] entry: the owning handle's pass lock (weak), the Tor directory and its
+/// `dangerously_trust_everyone` setting, the client.
+type TorConnEntry = (
+    std::sync::Weak<tokio::sync::Mutex<()>>,
+    (std::path::PathBuf, bool),
+    TorConn,
+);
+
+/// Engine Tor clients kept across sessions of one handle. A host stop + start (the app going to
+/// the background and back, a rewind, a resync) used to bootstrap a new arti client every time,
+/// 12-28 s on a device even with a warm directory cache. A client is bound to the runtime it was
+/// bootstrapped on, so it is reused only by a later session of the same handle: the entry keeps a
+/// weak reference to that handle's pass lock, which dies with the handle (and its runtime).
+static TOR_CONNS: std::sync::OnceLock<Mutex<Vec<TorConnEntry>>> = std::sync::OnceLock::new();
+
+fn tor_conns() -> std::sync::MutexGuard<'static, Vec<TorConnEntry>> {
+    TOR_CONNS
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// The Tor client an earlier session of the handle owning `pass_lock` bootstrapped from `dir`.
+fn reusable_tor_conn(
+    pass_lock: &Arc<tokio::sync::Mutex<()>>,
+    dir: &std::path::Path,
+    trust_everyone: bool,
+) -> Option<TorConn> {
+    let mut conns = tor_conns();
+    conns.retain(|(owner, _, _)| owner.strong_count() > 0);
+    conns
+        .iter()
+        .find(|(owner, (d, trust), _)| {
+            d == dir
+                && *trust == trust_everyone
+                && owner.upgrade().is_some_and(|o| Arc::ptr_eq(&o, pass_lock))
+        })
+        .map(|(_, _, tc)| tc.clone())
+}
+
+/// Drop the Tor client kept for the handle owning `pass_lock` (and any entry whose handle is
+/// gone). Called when the handle is dropped, so its arti client and connections are released
+/// with it rather than at the next Tor session of some other handle.
+pub fn forget_tor_conns(pass_lock: &Arc<tokio::sync::Mutex<()>>) {
+    // Mark the handle closed first, so that a session of it still finishing a bootstrap on
+    // the runtime that is about to shut down cannot insert its client after this cleanup.
+    // Lock order everywhere: CLOSED_HANDLES, then TOR_CONNS. Both are held together here and
+    // in `remember_tor_conn`, so the closed check and the insert there are atomic with this.
+    let mut closed = closed_handles();
+    closed.retain(|w| w.strong_count() > 0);
+    closed.push(Arc::downgrade(pass_lock));
+    tor_conns().retain(|(owner, _, _)| {
+        owner.strong_count() > 0 && owner.as_ptr() != Arc::as_ptr(pass_lock)
+    });
+    drop(closed);
+}
+
+/// Pass locks of dropped handles whose sessions may still be running (see
+/// [`forget_tor_conns`]). An entry holds only a weak reference, which also keeps the
+/// allocation (and so the address compared against) from being reused while it is listed; it
+/// is pruned once no session holds the lock any more, at which point no insert can come.
+static CLOSED_HANDLES: std::sync::OnceLock<Mutex<Vec<WeakPassLock>>> = std::sync::OnceLock::new();
+
+/// A weak reference to a handle's pass lock.
+type WeakPassLock = std::sync::Weak<tokio::sync::Mutex<()>>;
+
+fn closed_handles() -> std::sync::MutexGuard<'static, Vec<WeakPassLock>> {
+    CLOSED_HANDLES
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Keep `tc` for later sessions of the handle owning `pass_lock` (see [`TOR_CONNS`]).
+fn remember_tor_conn(
+    pass_lock: &Arc<tokio::sync::Mutex<()>>,
+    dir: &std::path::Path,
+    trust_everyone: bool,
+    tc: &TorConn,
+) {
+    // Held until the insert below (lock order: CLOSED_HANDLES, then TOR_CONNS).
+    let mut closed = closed_handles();
+    closed.retain(|w| w.strong_count() > 0);
+    if closed.iter().any(|w| w.as_ptr() == Arc::as_ptr(pass_lock)) {
+        return;
+    }
+    let mut conns = tor_conns();
+    // One client per handle: a new one replaces whatever the handle had.
+    conns.retain(|(owner, _, _)| {
+        owner.strong_count() > 0 && owner.as_ptr() != Arc::as_ptr(pass_lock)
+    });
+    conns.push((
+        Arc::downgrade(pass_lock),
+        (dir.to_path_buf(), trust_everyone),
+        tc.clone(),
+    ));
+}
+
 /// Run a full sync session: resilient Tor bootstrap (never falls back to direct) → resilient
 /// initial pass (T8.7, with [B4-16] non-transient revival) → tip-following loop with mempool
 /// monitoring, until the future is dropped or aborted by the host (via the `AbortHandle`
@@ -492,11 +596,18 @@ pub async fn run_session(
         Some(ref t) => {
             let mut boot_failures: u32 = 0;
             loop {
-                match TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone).await {
+                if let Some(tc) =
+                    reusable_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone)
+                {
+                    tracing::info!("slipstream Tor client reused from the previous session");
+                    break Some(tc);
+                }
+                match TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone, None).await {
                     Ok(tc) => {
                         tracing::info!(
                             "slipstream Tor bootstrapped (engine-owned isolated circuits)"
                         );
+                        remember_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone, &tc);
                         break Some(tc);
                     }
                     Err(err) => {
@@ -600,6 +711,31 @@ pub async fn run_session(
     follow_loop(&config, &reporter, tor_conn.as_ref(), outcome.chain_tip).await;
 }
 
+/// Follow-loop failure counts, kept apart so a good tip probe cannot clear failing catch-ups.
+#[derive(Debug, Default)]
+struct FollowFailures {
+    probe: u32,
+    catchup: u32,
+}
+
+impl FollowFailures {
+    fn probe_failed(&mut self) {
+        self.probe += 1;
+    }
+    fn probe_ok(&mut self) {
+        self.probe = 0;
+    }
+    fn catchup_failed(&mut self) {
+        self.catchup += 1;
+    }
+    fn catchup_ok(&mut self) {
+        self.catchup = 0;
+    }
+    fn total(&self) -> u32 {
+        self.probe + self.catchup
+    }
+}
+
 /// ── T8.1 follow loop: track the chain while the host keeps the task alive ────
 /// Extracted verbatim from `run_session`'s success arm ([B4-16] revival refactor) —
 /// behaviour unchanged. Returns only when the host stops a catch-up pass for a wallet change
@@ -617,7 +753,7 @@ async fn follow_loop(
     initial_tip: u64,
 ) {
     let mut last_tip = initial_tip;
-    let mut consecutive_failures: u32 = 0;
+    let mut failures = FollowFailures::default();
     // T8.2 mempool monitoring state (per-session). Non-fatal: a persistently failing
     // stream turns mempool off and the loop keeps tip-polling; the gate tries it again
     // after a back-off (`MempoolGate`). `seen_txids` persists across reconnects — and
@@ -691,48 +827,87 @@ async fn follow_loop(
 
         // Fast-path probe: GetLatestBlock only (no subtree roots, no UTXO refresh).
         let observed = match probe_tip(&config.engine, tor_conn).await {
-            Ok(t) => {
-                consecutive_failures = 0;
-                t
-            }
+            Ok(t) => t,
             Err(err) if err.is_transient() => {
-                consecutive_failures += 1;
+                if err.counts_as_unreachable() {
+                    failures.probe_failed();
+                }
                 // The tip check could not reach the server, so no download is failing
                 // (see `Progress::note_attempt_failed`).
                 reporter.progress.note_attempt_failed();
-                // T8.7: a transient probe failure NEVER surfaces Error — the wallet is
-                // already synced; retry on the next tick.
-                if consecutive_failures > FOLLOW_FAILURE_CAP {
+                // After N consecutive failures, surface Error(3) so hosts can react (e.g., switch
+                // servers). Before the threshold, log and retry.
+                let total_failures = failures.total();
+                if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                    tracing::error!(
+                        %err,
+                        probe_failures = failures.probe,
+                        catchup_failures = failures.catchup,
+                        total_failures,
+                        "follow tip probe persistently failing — surfacing endpoint unreachable (host can switch servers)"
+                    );
+                    reporter.set_state(SyncState::Error(3));
+                    reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+                    continue;
+                } else if total_failures > FOLLOW_FAILURE_CAP {
                     tracing::warn!(
                         %err,
-                        consecutive_failures,
+                        probe_failures = failures.probe,
+                        catchup_failures = failures.catchup,
+                        total_failures,
                         "follow tip probe failing repeatedly — wallet stays synced, still retrying (check connectivity)"
                     );
                 } else {
                     tracing::warn!(
                         %err,
-                        consecutive_failures,
+                        probe_failures = failures.probe,
+                        catchup_failures = failures.catchup,
                         "follow tip probe failed (transient) — will retry"
                     );
                 }
                 continue;
             }
             Err(err) => {
-                consecutive_failures += 1;
+                if err.counts_as_unreachable() {
+                    failures.probe_failed();
+                }
                 // The tip check could not reach the server, so no download is failing
                 // (see `Progress::note_attempt_failed`).
                 reporter.progress.note_attempt_failed();
-                // T8.7: even a non-transient probe error stays OUT of Error — the wallet is
-                // synced; surfacing a hard error for a follow-phase blip is exactly what
-                // internal testers must not see. Retry next tick.
+                // After N consecutive failures, surface Error(3) so hosts can react.
+                let total_failures = failures.total();
+                if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                    tracing::error!(
+                        %err,
+                        probe_failures = failures.probe,
+                        catchup_failures = failures.catchup,
+                        total_failures,
+                        "follow tip probe persistently failing (non-transient) — surfacing endpoint unreachable"
+                    );
+                    reporter.set_state(SyncState::Error(3));
+                    reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+                    continue;
+                }
                 tracing::warn!(
                     %err,
-                    consecutive_failures,
+                    probe_failures = failures.probe,
+                    catchup_failures = failures.catchup,
                     "follow tip probe failed (non-transient) — staying synced, will retry"
                 );
                 continue;
             }
         };
+
+        // Probe succeeded: reset probe failures and clear Error(3). Mempool failures
+        // retain their own retry schedule in MempoolGate.
+        failures.probe_ok();
+        {
+            let state = reporter.state.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(*state, SyncState::Error(3)) {
+                drop(state);
+                reporter.set_state(SyncState::Done);
+            }
+        }
 
         if !should_resync(last_tip, observed) {
             tracing::debug!(last_tip, observed, "follow: tip unchanged, no pass needed");
@@ -752,7 +927,7 @@ async fn follow_loop(
         match run_pass_with_retry(&config.engine, &[], &reporter.progress, tor_conn).await {
             Ok(o) => {
                 last_tip = o.chain_tip;
-                consecutive_failures = 0;
+                failures.catchup_ok();
                 reporter.set_state(SyncState::Done);
                 reporter.push_event(FfiSlipstreamEvent {
                     tag: 3,
@@ -773,18 +948,38 @@ async fn follow_loop(
                     );
                     return;
                 }
+                // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
+                // to last_tip. Track failures and surface Error(3) after the threshold.
                 CatchUpFailure::StaySynced => {
-                    consecutive_failures += 1;
-                    // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
-                    // to last_tip. Revert to Done (NOT Error) and retry on the next tick.
-                    tracing::warn!(
-                        %err,
-                        consecutive_failures,
-                        last_tip,
-                        failed_at_utc = %wall_clock_utc(),
-                        "follow catch-up pass failed — staying synced, will retry"
-                    );
-                    reporter.set_state(SyncState::Done);
+                    if err.counts_as_unreachable() {
+                        failures.catchup_failed();
+                    }
+                    // After N consecutive failures, surface Error(3) so hosts can react.
+                    let total_failures = failures.total();
+                    if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                        tracing::error!(
+                            %err,
+                            probe_failures = failures.probe,
+                            catchup_failures = failures.catchup,
+                            total_failures,
+                            last_tip,
+                            failed_at_utc = %wall_clock_utc(),
+                            "follow catch-up pass persistently failing — surfacing endpoint unreachable"
+                        );
+                        reporter.set_state(SyncState::Error(3));
+                        reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+                    } else {
+                        tracing::warn!(
+                            %err,
+                            probe_failures = failures.probe,
+                            catchup_failures = failures.catchup,
+                            total_failures,
+                            last_tip,
+                            failed_at_utc = %wall_clock_utc(),
+                            "follow catch-up pass failed — staying synced, will retry"
+                        );
+                        reporter.set_state(SyncState::Done);
+                    }
                 }
             },
         }
@@ -1204,6 +1399,30 @@ mod tests {
         assert_eq!(*r.state.lock().unwrap(), SyncState::Error(2));
     }
 
+    // ── Endpoint unreachable threshold ───────────────────────────────────────
+
+    #[test]
+    fn endpoint_unreachable_threshold_is_sane() {
+        const {
+            assert!(
+                ENDPOINT_UNREACHABLE_THRESHOLD >= 3,
+                "threshold must be high enough to tolerate brief transient failures"
+            );
+            assert!(
+                ENDPOINT_UNREACHABLE_THRESHOLD <= FOLLOW_FAILURE_CAP,
+                "threshold must be <= escalation cap for coherent log progression"
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_unreachable_threshold_is_five() {
+        assert_eq!(
+            ENDPOINT_UNREACHABLE_THRESHOLD, 5,
+            "threshold must be 5 (roughly 1-2 minutes at 10-30s jitter)"
+        );
+    }
+
     /// The pass-lock contract `run_session` relies on (Keystone restore race fix, 2026-06-30):
     /// an ABORTED task that holds `pass_lock` MUST release it so the next pass can acquire —
     /// otherwise `importAccount`'s `start()`-while-running restart would deadlock instead of
@@ -1271,5 +1490,28 @@ mod tests {
             progress.download_failures().is_empty(),
             "a pass that failed without a give-up ends every run"
         );
+    }
+
+    /// An endpoint that answers tip probes but fails every catch-up pass must reach the
+    /// endpoint-unreachable escalation (Error(3)) after `ENDPOINT_UNREACHABLE_THRESHOLD` passes;
+    /// the probe successes in between must not reset the catch-up count.
+    #[test]
+    fn catchup_failures_survive_successful_tip_probes() {
+        let mut failures = FollowFailures::default();
+        let mut escalated_at = None;
+        for pass in 1..=6 {
+            failures.probe_ok();
+            failures.catchup_failed();
+            if escalated_at.is_none() && failures.total() >= ENDPOINT_UNREACHABLE_THRESHOLD {
+                escalated_at = Some(pass);
+            }
+        }
+        assert_eq!(escalated_at, Some(ENDPOINT_UNREACHABLE_THRESHOLD));
+
+        failures.catchup_ok();
+        assert_eq!(failures.total(), 0, "a successful pass clears the count");
+        failures.probe_failed();
+        failures.probe_ok();
+        assert_eq!(failures.total(), 0);
     }
 }

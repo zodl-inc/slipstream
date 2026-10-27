@@ -51,7 +51,7 @@ use crate::{
     chunk::ChunkQueueReceiver,
     config::{Endpoint, EngineConfig},
     connector::TorConn,
-    enhance::{enhancement_connection, run_enhancement_lazily},
+    enhance::{enhancement_connection, run_enhancement_lazily_isolated},
     error::SlipstreamError,
     events::Progress,
     grpc,
@@ -426,6 +426,58 @@ pub struct ScanStats {
 struct WriteBehind {
     facade: crate::persist::WriteBehindFacade,
     lane: crate::persist::PersistLane,
+    /// `chunk stages` lines waiting for their chunk's commit (see [`StageLine`]).
+    stage_lines: std::collections::VecDeque<StageLine>,
+}
+
+/// A chunk's `chunk stages` line. On the write-behind path the chunk's commit
+/// runs after its scan, so the line is held until the persist unit holding the
+/// chunk is committed and logged then, with the commit's tree/rows/commit
+/// numbers (on the chunk that closed the unit; a chunk whose blocks were carried
+/// into a later chunk's unit logs zeros and `persist_carried=true`).
+struct StageLine {
+    chunk_start: u64,
+    timings: Arc<crate::scan_stages::ChunkStageTimings>,
+    rayon_cpu_ms: u64,
+    rayon_cpu_min: u64,
+    rayon_cpu_median: u64,
+    rayon_cpu_max: u64,
+    wall_ms: u64,
+    util_pct: u64,
+}
+
+impl StageLine {
+    fn log(&self) {
+        let snap = self.timings.snapshot();
+        // Log measured values only (no estimates).
+        // On non-Linux: rayon fields will be 0 (sample_rayon_workers returns empty vec).
+        info!(
+            chunk_start = self.chunk_start,
+            persist_tree_ms = snap.tree_ms,
+            persist_rows_ms = snap.rows_ms,
+            persist_commit_ms = snap.commit_ms,
+            persist_carried = snap.carried,
+            rayon_cpu_ms = self.rayon_cpu_ms,
+            rayon_cpu_min = self.rayon_cpu_min,
+            rayon_cpu_median = self.rayon_cpu_median,
+            rayon_cpu_max = self.rayon_cpu_max,
+            wall_ms = self.wall_ms,
+            util_pct = self.util_pct,
+            "chunk stages"
+        );
+    }
+}
+
+/// Logs the held `chunk stages` lines in order, up to the first chunk whose
+/// commit is still pending (`all`: every line, after the final drain).
+fn flush_stage_lines(lines: &mut std::collections::VecDeque<StageLine>, all: bool) {
+    while let Some(line) = lines.front() {
+        if !all && !line.timings.is_settled() {
+            break;
+        }
+        line.log();
+        lines.pop_front();
+    }
 }
 
 // ── Production scan driver ─────────────────────────────────────────────────────
@@ -510,8 +562,10 @@ pub async fn scan_chunks(
     // nothing is stashed or in flight yet) and open the persist lane's own
     // connection to the wallet file. `None` = today's serialized path.
     let mut wb: Option<WriteBehind> = if config.write_behind {
-        let facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
+        let mut facade = crate::persist::WriteBehindFacade::seed(&*session.db_mut(), range_start)
             .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
+        // Commit size decoupled from the scan call (the OHTTP window, sub-chunks).
+        facade.set_commit_limits(config.persist_commit_limits);
         let mut lane = crate::persist::PersistLane::open(
             &config.wallet_db_path,
             config.network,
@@ -526,7 +580,11 @@ pub async fn scan_chunks(
         if let Some(p) = &progress {
             lane.attach_writer_gate(p.clone());
         }
-        Some(WriteBehind { facade, lane })
+        Some(WriteBehind {
+            facade,
+            lane,
+            stage_lines: std::collections::VecDeque::new(),
+        })
     } else {
         None
     };
@@ -552,11 +610,18 @@ pub async fn scan_chunks(
     // Precedence on double failure: the persist error wins (a failed commit is
     // a DB-integrity signal; a ScanContinuity reorg is retried next pass).
     if let Some(mut wb) = wb {
-        if wb.facade.take_stash().is_some() {
+        if let Some(pending) = wb.facade.take_stash() {
             // A stashed-but-never-submitted unit only exists on error exits
-            // between scan and submit; dropping it is safe (its range is still
-            // marked unscanned — re-suggested next pass).
-            warn!("write-behind: dropping an unsubmitted pending unit on error exit");
+            // (between scan and submit, or a unit still below its commit limits);
+            // dropping it is safe (its range is still marked unscanned —
+            // re-suggested next pass). Not committed here: after a persist error
+            // the lane's database is behind the stash, and a stop must not wait
+            // for another commit.
+            warn!(
+                first_height = pending.first_height,
+                last_height = pending.last_height,
+                "write-behind: dropping an unsubmitted pending unit on error exit"
+            );
         }
         // v0.5 pacer: the end-of-range barrier is inside the scan stage too.
         let final_drain_started = Instant::now();
@@ -573,6 +638,8 @@ pub async fn scan_chunks(
                 stats.final_drain = final_drain_elapsed;
                 stats.persist_wait = wb.lane.total_wait();
                 stats.persist_busy = wb.lane.total_busy();
+                // Every unit is committed: the last chunks' stage lines are final.
+                flush_stage_lines(&mut wb.stage_lines, true);
                 // v0.4 census: the lane's sparse state ran the builds on this path.
                 (stats.census_sapling, stats.census_orchard) = wb.lane.census();
                 info!(
@@ -596,6 +663,51 @@ pub async fn scan_chunks(
         };
     }
     result
+}
+
+/// Smallest chunk (in note commitments) that [`merge_dense_chunks`] merges into:
+/// below it a scan call's fixed cost is not worth amortizing.
+const MERGE_MIN_OUTPUTS: u64 = 16_000;
+
+/// Appends to `chunk` the chunks already waiting in the queue, while each of them
+/// and `chunk` are output-dense (at least [`MERGE_MIN_OUTPUTS`]) and the merged
+/// chunk stays within `max_outputs` (0 = off). Never waits for a chunk: only what
+/// the fetch has already released is merged, so the queue's byte budget is
+/// unchanged (the merged chunk holds every merged chunk's permit). The merged
+/// chunk's boundary prefetch is its last part's; the earlier ones are aborted.
+/// A chunk taken but not merged is left in `held` for the next scan call.
+fn merge_dense_chunks(
+    chunk: &mut crate::chunk::Chunk,
+    permit: &mut crate::chunk::ChunkPermit,
+    boundary: &mut Option<crate::chunk::BoundaryHandle>,
+    held: &mut Option<crate::chunk::QueuedChunk>,
+    rx: &mut ChunkQueueReceiver,
+    max_outputs: u64,
+) {
+    if max_outputs == 0 || chunk.outputs < MERGE_MIN_OUTPUTS || held.is_some() {
+        return;
+    }
+    while chunk.outputs < max_outputs {
+        let Some((next, next_permit, next_boundary)) = rx.try_recv() else {
+            return;
+        };
+        if next.outputs < MERGE_MIN_OUTPUTS || chunk.outputs + next.outputs > max_outputs {
+            *held = Some((next, next_permit, next_boundary));
+            return;
+        }
+        match chunk.append(next) {
+            Ok(()) => {
+                permit.absorb(next_permit);
+                if let Some(h) = std::mem::replace(boundary, next_boundary) {
+                    h.abort();
+                }
+            }
+            Err(next) => {
+                *held = Some((next, next_permit, next_boundary));
+                return;
+            }
+        }
+    }
 }
 
 /// The scan loop body. Extracted so `?`-style early returns land at the
@@ -638,6 +750,8 @@ async fn scan_chunks_inner(
         range_start - 1,
         "initial seed",
         tor,
+        // The range start can be the wallet birthday: keep it on its own circuit.
+        crate::connector::ConnPurpose::MetadataUnique,
         progress.clone(),
     )
     .await?;
@@ -671,13 +785,32 @@ async fn scan_chunks_inner(
     // `DecryptionFence`) is checked before, once per call and never per block.
     let mut first_scan_call = true;
 
+    // A chunk taken from the queue to merge that did not follow on (never expected:
+    // the fetch releases in height order), scanned on its own next.
+    let mut held: Option<crate::chunk::QueuedChunk> = None;
+
     loop {
         // v0.5 pacer: time the chunk wait — fetch/split starvation shows here.
         let recv_started = Instant::now();
-        let Some((chunk, permit, mut chunk_boundary)) = rx.recv().await else {
+        let next = match held.take() {
+            Some(item) => Some(item),
+            None => rx.recv().await,
+        };
+        let Some((mut chunk, mut permit, mut chunk_boundary)) = next else {
             break;
         };
         stats.recv_wait += recv_started.elapsed();
+        // Dense ranges: fold the chunks already waiting in the queue into this scan
+        // call (see `merge_dense_chunks`), so a call's fixed cost and its decryption
+        // tail are paid once per merged chunk.
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut chunk_boundary,
+            &mut held,
+            &mut rx,
+            config.scan_merge_outputs,
+        );
         // Binding note 1: no expect() in non-test code — use structured error extraction.
         let (chunk_start, chunk_end) = match (chunk.start_height(), chunk.end_height()) {
             (Some(s), Some(e)) => (s, e),
@@ -692,6 +825,20 @@ async fn scan_chunks_inner(
         }
 
         let chunk_len = chunk.blocks.len(); // total blocks in this chunk
+
+        // Sandblasting diagnostics: per-chunk stage timings (thread-local, persists
+        // through put_blocks calls).
+        let chunk_timings = std::sync::Arc::new(crate::scan_stages::ChunkStageTimings::new());
+        crate::scan_stages::set_current_chunk_timings(chunk_timings.clone());
+        // The write-behind persist runs on another thread than the thread-local above:
+        // hand it the same timings through the facade so persist_tree/rows are recorded.
+        if let Some(wb) = wb.as_mut() {
+            wb.facade.set_timings(Some(chunk_timings.clone()));
+        }
+
+        // Sample rayon worker CPU time at chunk start (Linux/Android only).
+        let chunk_wall_start = Instant::now();
+        let rayon_start_samples = crate::scan_stages::sample_rayon_workers(None);
 
         // Initialise or reset batch_len.
         // None path: always reset to chunk_len (ensures the loop executes exactly once
@@ -769,6 +916,7 @@ async fn scan_chunks_inner(
                                     sub_end,
                                     "chunk-boundary prefetch",
                                     tor_owned.as_ref(),
+                                    crate::connector::ConnPurpose::SyncShared,
                                     progress,
                                 )
                                 .await
@@ -903,8 +1051,10 @@ async fn scan_chunks_inner(
             // aborts before another unit is ever submitted), then spawns this
             // unit's commit so it overlaps the prefetch await + next recv +
             // next decrypt. The wait delta is this chunk's overlap-quality cost.
+            // With commit limits the unit grows over consecutive scan calls and is
+            // submitted once it reaches them (or at the next barrier).
             if let Some(wb) = wb.as_mut()
-                && let Some(pending) = wb.facade.take_stash()
+                && let Some(pending) = wb.facade.take_full_stash()
             {
                 let submit_started = Instant::now();
                 let wait_before = wb.lane.total_wait();
@@ -1044,11 +1194,57 @@ async fn scan_chunks_inner(
             "chunk scanned"
         );
 
+        // Sandblasting diagnostics: measure real rayon worker CPU time and persist timing.
+        // Sample rayon worker CPU time at chunk end (Linux/Android only).
+        let rayon_end_samples = crate::scan_stages::sample_rayon_workers(None);
+        let chunk_wall_ms = chunk_wall_start.elapsed().as_millis() as u64;
+
+        // Compute rayon CPU statistics from start/end samples.
+        let rayon_stats = crate::scan_stages::RayonCpuStats::from_samples(
+            &rayon_start_samples,
+            &rayon_end_samples,
+        );
+
+        // Calculate utilization from measured rayon CPU time.
+        let util_pct = rayon_stats.utilization_pct(chunk_wall_ms);
+
+        // Log rayon pool size once per pass (not per chunk).
+        if stats.chunks == 1 {
+            info!(pool_size = rayon_stats.num_threads, "rayon global pool");
+        }
+
+        // Persist-side timings (tree + rows from put_blocks): known now on the inline
+        // path; on the write-behind path once the chunk's unit is committed, so the
+        // line is held until then (previous chunks' lines are logged as their commits
+        // complete).
+        let line = StageLine {
+            chunk_start,
+            timings: chunk_timings.clone(),
+            rayon_cpu_ms: rayon_stats.total_cpu_ms,
+            rayon_cpu_min: rayon_stats.min_cpu_ms,
+            rayon_cpu_median: rayon_stats.median_cpu_ms,
+            rayon_cpu_max: rayon_stats.max_cpu_ms,
+            wall_ms: chunk_wall_ms,
+            util_pct,
+        };
+        match wb.as_mut() {
+            Some(wb) => {
+                if !chunk_timings.is_stashed() {
+                    chunk_timings.settle(); // nothing of this chunk to commit
+                }
+                wb.stage_lines.push_back(line);
+                flush_stage_lines(&mut wb.stage_lines, false);
+            }
+            None => line.log(),
+        }
+
+        crate::scan_stages::clear_current_chunk_timings();
+
         // T6.9 note: with write-behind the last sub-batch is SUBMITTED (not yet
         // committed) here; the permit guards the raw chunk bytes, which are
         // dropped with this loop iteration either way — the pending unit holds
         // only the decrypted ScannedBlocks (commitments + wallet data), bounded
-        // at depth 1.
+        // at depth 1 and by the commit limits.
         drop(permit); // release byte budget after the chunk's last sub-batch was handed off
 
         // T6.1 — interleaved enhancement every K chunks. Non-fatal by design:
@@ -1069,16 +1265,21 @@ async fn scan_chunks_inner(
             // v0.5 pacer: this drain is INSIDE the scan stage (suspect #1).
             if let Some(wb) = wb.as_mut() {
                 let drain_started = Instant::now();
+                if let Some(pending) = wb.facade.take_stash() {
+                    wb.lane.submit(pending).await?;
+                }
                 wb.lane.drain().await?;
                 stats.interleave_drain += drain_started.elapsed();
+                flush_stage_lines(&mut wb.stage_lines, true);
             }
             let started = Instant::now();
-            match run_enhancement_lazily(
+            match run_enhancement_lazily_isolated(
                 session,
                 &mut enhance_client,
                 network,
                 progress.clone(),
                 skipped_keys,
+                tor.map(|t| (t, &endpoint)),
             )
             .await
             {
@@ -1108,6 +1309,18 @@ async fn scan_chunks_inner(
                 stats.reseed += reseed_started.elapsed();
             }
         }
+    }
+    // The unit still below its commit limits is submitted at range end (the
+    // drain in `scan_chunks` then commits it).
+    if let Some(wb) = wb.as_mut()
+        && let Some(pending) = wb.facade.take_stash()
+    {
+        let submit_started = Instant::now();
+        let wait_before = wb.lane.total_wait();
+        wb.lane.submit(pending).await?;
+        let waited = wb.lane.total_wait() - wait_before;
+        stats.submit_wait += waited;
+        stats.submit_extra += submit_started.elapsed().saturating_sub(waited);
     }
     // v0.5 local treestate: settle every outstanding boundary audit (the tail
     // costs at most ~one RTT — the fetches ran concurrently with scanning).
@@ -1221,7 +1434,11 @@ pub async fn scan_chunks_from_treestate(
             false,
             None,
         )?;
-        Some(WriteBehind { facade, lane })
+        Some(WriteBehind {
+            facade,
+            lane,
+            stage_lines: std::collections::VecDeque::new(),
+        })
     } else {
         None
     };
@@ -1405,6 +1622,92 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
     use std::sync::atomic::AtomicBool;
+
+    /// Chunk `index` of blocks `from..=to`, each with `outputs` Sapling outputs.
+    fn dense_chunk(index: u64, from: u64, to: u64, outputs: usize) -> crate::chunk::Chunk {
+        use zcash_client_backend::proto::compact_formats::{
+            CompactBlock, CompactSaplingOutput, CompactTx,
+        };
+        let blocks = (from..=to)
+            .map(|height| CompactBlock {
+                height,
+                vtx: vec![CompactTx {
+                    outputs: vec![CompactSaplingOutput::default(); outputs],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        crate::chunk::Chunk::from_blocks(index, blocks)
+    }
+
+    #[tokio::test]
+    async fn dense_chunks_already_queued_merge_up_to_the_cap() {
+        let (tx, mut rx) = crate::chunk::chunk_queue(1 << 30);
+        // 4 chunks of 2 blocks x 10,000 outputs = 20,000 each.
+        for i in 0..4u64 {
+            tx.send(dense_chunk(i, 100 + 2 * i, 101 + 2 * i, 10_000))
+                .await
+                .expect("send");
+        }
+        let (mut chunk, mut permit, mut boundary) = rx.recv().await.expect("first");
+        let mut held = None;
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut boundary,
+            &mut held,
+            &mut rx,
+            70_000,
+        );
+        assert_eq!(chunk.outputs, 60_000);
+        assert_eq!(
+            chunk.blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            (100..=105).collect::<Vec<_>>()
+        );
+        let (next, _, _) = held
+            .take()
+            .expect("the chunk over the cap is held, not lost");
+        assert_eq!(next.start_height(), Some(106));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn sparse_chunks_and_a_zero_cap_never_merge() {
+        let (tx, mut rx) = crate::chunk::chunk_queue(1 << 30);
+        tx.send(dense_chunk(0, 10, 19, 10)).await.expect("send");
+        tx.send(dense_chunk(1, 20, 29, 10)).await.expect("send");
+        let (mut chunk, mut permit, mut boundary) = rx.recv().await.expect("first");
+        let mut held = None;
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut boundary,
+            &mut held,
+            &mut rx,
+            1 << 40,
+        );
+        assert_eq!(
+            chunk.end_height(),
+            Some(19),
+            "a normal-era chunk is scanned alone"
+        );
+        assert!(held.is_none());
+
+        tx.send(dense_chunk(2, 30, 31, 20_000)).await.expect("send");
+        tx.send(dense_chunk(3, 32, 33, 20_000)).await.expect("send");
+        let _ = rx.recv().await.expect("chunk 1");
+        let (mut chunk, mut permit, mut boundary) = rx.recv().await.expect("chunk 2");
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut boundary,
+            &mut held,
+            &mut rx,
+            0,
+        );
+        assert_eq!(chunk.end_height(), Some(31), "0 = off");
+    }
 
     #[test]
     fn scan_stats_default_is_zero() {
@@ -1684,6 +1987,59 @@ mod tests {
     fn controller_stable_when_on_target() {
         let result = next_batch_len(5_000, 3_000, 3_000, 1_000, 10_000);
         assert_eq!(result, 5_000);
+    }
+
+    fn stage_line(chunk_start: u64) -> StageLine {
+        StageLine {
+            chunk_start,
+            timings: Arc::new(crate::scan_stages::ChunkStageTimings::new()),
+            rayon_cpu_ms: 0,
+            rayon_cpu_min: 0,
+            rayon_cpu_median: 0,
+            rayon_cpu_max: 0,
+            wall_ms: 0,
+            util_pct: 0,
+        }
+    }
+
+    /// A chunk's `chunk stages` line waits for its commit and keeps chunk order: a
+    /// later chunk settled first is held behind the earlier one.
+    #[test]
+    fn stage_lines_wait_for_their_commit_in_chunk_order() {
+        let mut lines: std::collections::VecDeque<StageLine> =
+            (0..3).map(|i| stage_line(i * 100)).collect();
+        let timings: Vec<_> = lines.iter().map(|l| l.timings.clone()).collect();
+
+        // Chunk 0 carried into chunk 1's unit, which is still being committed.
+        timings[0].mark_stashed();
+        timings[0].settle_carried();
+        timings[2].settle();
+        flush_stage_lines(&mut lines, false);
+        assert_eq!(
+            lines.len(),
+            2,
+            "chunk 0 logged, chunk 1 waits, chunk 2 behind it"
+        );
+
+        // The commit records its numbers before it settles the chunk.
+        timings[1].add_tree_ms(7);
+        timings[1].add_rows_ms(3);
+        timings[1].settle_committed(12);
+        let snap = timings[1].snapshot();
+        assert_eq!(
+            (snap.tree_ms, snap.rows_ms, snap.commit_ms, snap.carried),
+            (7, 3, 12, false)
+        );
+        assert!(timings[0].snapshot().carried);
+        flush_stage_lines(&mut lines, false);
+        assert!(lines.is_empty());
+
+        // After the final drain everything goes, settled or not.
+        let mut lines: std::collections::VecDeque<StageLine> = [stage_line(0)].into();
+        flush_stage_lines(&mut lines, false);
+        assert_eq!(lines.len(), 1);
+        flush_stage_lines(&mut lines, true);
+        assert!(lines.is_empty());
     }
 
     // T6.1 — interleave cadence helper.

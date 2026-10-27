@@ -50,6 +50,48 @@ pub(crate) type Db = WalletDb<
     rand::rand_core::UnwrapErr<rand::rngs::SysRng>,
 >;
 
+/// Pages the WAL may hold before a committing engine connection checkpoints it (SQLite's
+/// default is 1000, ~4 MiB).
+///
+/// Measured 2026-10-26 (EC2 Graviton, the 231k-block normal-era ChainTip range in 2000-block
+/// units, as over OHTTP): every unit inserts thousands of random-key rows (nullifier map, tx
+/// locators), which dirties most of those indexes' leaf pages, so each commit wrote ~60 MB and
+/// then checkpointed the same pages back into the database file. With the checkpoint every
+/// ~40 MiB instead, a page dirtied by several consecutive commits is copied back once: the pass
+/// took 127 s instead of 148 s (116 s together with [`SCAN_WRITER_CACHE_BYTES`]). The threshold
+/// changes when pages are copied, never what a commit makes durable: `synchronous` and the
+/// atomicity of each transaction are untouched.
+const WAL_AUTOCHECKPOINT_PAGES: i64 = 10_000;
+
+/// Size the WAL file is truncated back to after a checkpoint resets it, so that one large
+/// commit does not leave a file of that size behind.
+const WAL_JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
+
+/// Page cache of the connections that write scan results: the persist lane's (block rows,
+/// nullifier map, commitment tree) and the graft buffer's. SQLite's default is 2 MiB; with 64
+/// MiB the row stage of the range above went from 32 s to 16 s. Memory is taken as pages are
+/// read, up to this bound. Two connections use it, so phones get half (32 MiB each, 64 MiB at
+/// most in total) to keep a restore clear of the low-memory killer.
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub(crate) const SCAN_WRITER_CACHE_BYTES: i64 = 64 * 1024 * 1024;
+/// Mobile value of the page cache bound above (see the desktop/server definition).
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub(crate) const SCAN_WRITER_CACHE_BYTES: i64 = 32 * 1024 * 1024;
+
+/// Applies the engine's checkpoint and WAL size settings to a connection to the wallet file,
+/// and, when `cache_bytes` is set, its page cache size. Both are per connection (never stored
+/// in the file), so every engine connection that writes calls this right after opening: a
+/// connection left at the default would checkpoint for all of them whenever it commits.
+pub(crate) fn tune_connection(conn: &Connection, cache_bytes: Option<i64>) -> rusqlite::Result<()> {
+    conn.pragma_update(None, "wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)?;
+    conn.pragma_update(None, "journal_size_limit", WAL_JOURNAL_SIZE_LIMIT_BYTES)?;
+    if let Some(bytes) = cache_bytes {
+        // A negative cache_size is a size in KiB rather than a page count.
+        conn.pragma_update(None, "cache_size", -(bytes / 1024))?;
+    }
+    Ok(())
+}
+
 pub struct WalletSession {
     pub network: SlipstreamNetwork,
     db: Db,
@@ -133,6 +175,7 @@ impl WalletSession {
         wallet_conn
             .busy_timeout(std::time::Duration::from_secs(15))
             .map_err(|e| wallet_err("set busy_timeout (wallet)", e))?;
+        tune_connection(&wallet_conn, None).map_err(|e| wallet_err("tune wallet connection", e))?;
         rusqlite::vtab::array::load_module(&wallet_conn)
             .map_err(|e| wallet_err("load array vtab", e))?;
         let mut db = WalletDb::from_connection(
@@ -348,6 +391,7 @@ impl WalletSession {
             Connection::open(&self.db_path).map_err(|e| wallet_err("graft buffer open", e))?;
         conn.busy_timeout(std::time::Duration::from_secs(15))
             .map_err(|e| wallet_err("graft buffer busy_timeout", e))?;
+        tune_connection(&conn, None).map_err(|e| wallet_err("graft buffer tune", e))?;
         for (pool, from) in [
             (ShieldedPool::Sapling, sapling),
             (ShieldedPool::Orchard, orchard),
@@ -611,6 +655,27 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .expect("pragma");
         assert_eq!(mode.to_lowercase(), "wal");
+    }
+
+    #[test]
+    fn tune_connection_sets_checkpoint_wal_limit_and_cache() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let _session = WalletSession::open(Network::MainNetwork, &path).expect("open");
+        let conn = Connection::open(&path).expect("reopen");
+        let pragma = |name: &str| -> i64 {
+            conn.query_row(&format!("PRAGMA {name}"), [], |r| r.get(0))
+                .expect("pragma")
+        };
+        let default_cache = pragma("cache_size");
+        tune_connection(&conn, None).expect("tune");
+        assert_eq!(pragma("wal_autocheckpoint"), WAL_AUTOCHECKPOINT_PAGES);
+        assert_eq!(pragma("journal_size_limit"), WAL_JOURNAL_SIZE_LIMIT_BYTES);
+        assert_eq!(pragma("cache_size"), default_cache, "no cache size asked");
+        tune_connection(&conn, Some(SCAN_WRITER_CACHE_BYTES)).expect("tune");
+        assert_eq!(pragma("cache_size"), -(SCAN_WRITER_CACHE_BYTES / 1024));
+        // Durability stays as it was: the tuning never touches `synchronous`.
+        assert_eq!(pragma("synchronous"), 2, "FULL");
     }
 
     /// [API v2.1 E-4] The tx-set signature moves on INSERTS (count) and on reconcile-LINKAGE

@@ -48,10 +48,31 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+libc = "0.2"
+tokio-stream = "0.1"
 tonic = { workspace = true }
 prost = { workspace = true }
 tonic-prost = { workspace = true }
 futures-util = { workspace = true }
+
+
+# Tor and OHTTP transport dependencies
+arti-client = { version = "0.43", default-features = false, features = ["compression", "rustls", "tokio", "onion-service-client"] }
+tor-rtcompat = "0.43"
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tower-service = "0.3"
+webpki-roots = "0.26"
+# Shared sans-IO OHTTP core (HPKE encapsulation, Binary HTTP, signed-config verification, key
+# selection, outer-status classification, size limits). `default-features = false`: the `client`
+# feature would pull reqwest, and Slipstream does its own I/O.
+zodl-ohttp-client = { git = "https://github.com/zodl-inc/ohttp.git", rev = "b0b2087c9d867115f38ddfbd6021988b64abf8f9", default-features = false }
 
 [dev-dependencies]
 tempfile = { workspace = true }
@@ -63,6 +84,11 @@ bls12_381 = { workspace = true }
 # deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = "0.3"
+# For live signed-config verification tests and the hand-built envelopes of the ohttp tests
+reqwest = "0.12"
+serde_json = "1"
+base64 = "0.22"
 
 [features]
 default = ["zcash_client_sqlite"]

@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! Correctness test: slipstream engine finds fixture transactions in a darkside chain.
 //!
 //! Mirrors `BalanceTests.testVerifyIncomingTransaction` from
@@ -423,7 +425,7 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
     );
     let fetch_ep = ep.clone();
 
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
 
     let scan_stats = scan_chunks_from_treestate(
         &mut session,
@@ -657,7 +659,7 @@ async fn sync_enhancement_stores_raw_fields() {
     );
     let fetch_ep = ep.clone();
 
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
 
     let _scan_stats = scan_chunks_from_treestate(
         &mut session,
@@ -1044,7 +1046,7 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
     );
     let fetch_ep = ep.clone();
 
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
 
     let scan_stats = scan_chunks_from_treestate(
         &mut session,

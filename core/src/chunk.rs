@@ -20,6 +20,7 @@
 //! `ChunkPermit`, so the budget covers queued AND in-processing bytes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use tokio::sync::{Semaphore, mpsc};
@@ -64,12 +65,36 @@ impl Chunk {
     pub fn end_height(&self) -> Option<u64> {
         self.blocks.last().map(|b| b.height)
     }
+
+    /// Appends `next`, the chunk that directly follows this one (its first block is
+    /// this one's last + 1); returns `next` back when it does not.
+    pub fn append(&mut self, next: Chunk) -> Result<(), Chunk> {
+        match (self.end_height(), next.start_height()) {
+            (Some(end), Some(start)) if start == end + 1 => {
+                self.estimated_bytes += next.estimated_bytes;
+                self.outputs += next.outputs;
+                self.blocks.extend(next.blocks);
+                Ok(())
+            }
+            _ => Err(next),
+        }
+    }
 }
 
 /// Holds the byte-budget permits for one chunk; drop to release budget.
 #[must_use = "dropping the permit releases the byte budget; hold it until the chunk is fully processed"]
 pub struct ChunkPermit {
     _permits: tokio::sync::OwnedSemaphorePermit,
+    /// Permits of chunks merged into this one ([`ChunkPermit::absorb`]).
+    merged: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ChunkPermit {
+    /// Holds `other`'s budget too, until this permit is dropped.
+    pub fn absorb(&mut self, other: ChunkPermit) {
+        self.merged.push(other._permits);
+        self.merged.extend(other.merged);
+    }
 }
 
 /// v0.5 pacer fix: the boundary-treestate fetch spawned WHEN THE CHUNK IS
@@ -80,6 +105,9 @@ pub type BoundaryHandle = tokio::task::JoinHandle<
     Result<zcash_client_backend::proto::service::TreeState, SlipstreamError>,
 >;
 
+/// One queue item: the chunk, its share of the byte budget, and its boundary fetch.
+pub type QueuedChunk = (Chunk, ChunkPermit, Option<BoundaryHandle>);
+
 /// Injected at queue construction (scheduler): given a chunk's end height,
 /// spawn its boundary treestate fetch, or return `None` when the scan will not
 /// need that state (the range's last block, in server mode). Without a fetcher
@@ -87,14 +115,94 @@ pub type BoundaryHandle = tokio::task::JoinHandle<
 pub type BoundaryFetcher = Arc<dyn Fn(u64) -> Option<BoundaryHandle> + Send + Sync>;
 
 pub struct ChunkQueueSender {
-    tx: mpsc::UnboundedSender<(Chunk, ChunkPermit, Option<BoundaryHandle>)>,
+    tx: mpsc::UnboundedSender<QueuedChunk>,
     budget: Arc<Semaphore>,
     budget_bytes: usize,
     boundary_fetcher: Option<BoundaryFetcher>,
+    meter: Arc<QueueMeter>,
 }
 
 pub struct ChunkQueueReceiver {
-    rx: mpsc::UnboundedReceiver<(Chunk, ChunkPermit, Option<BoundaryHandle>)>,
+    rx: mpsc::UnboundedReceiver<QueuedChunk>,
+    meter: Arc<QueueMeter>,
+}
+
+/// What the fetch side can see of its consumer through one queue: how long the
+/// scanner has waited in [`ChunkQueueReceiver::recv`] for its next chunk, and how
+/// many blocks and estimated bytes were sent. The fetch's adaptive prefetch
+/// (`fetch::FetchBoost`) reads it to tell a fetch-bound scan (the scanner waits)
+/// from a scan-bound one (the queue is full and it never waits).
+#[derive(Debug)]
+pub struct QueueMeter {
+    base: std::time::Instant,
+    /// (completed waits, start of the wait in progress or `None`), microseconds
+    /// since `base`; one lock so a sample is a consistent snapshot.
+    waits: std::sync::Mutex<(u64, Option<u64>)>,
+    sent_blocks: AtomicU64,
+    sent_bytes: AtomicU64,
+}
+
+impl QueueMeter {
+    fn new() -> Self {
+        Self {
+            base: std::time::Instant::now(),
+            waits: std::sync::Mutex::new((0, None)),
+            sent_blocks: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// Total time the consumer has waited for a chunk, the wait in progress included.
+    /// A consistent snapshot: a wait ending meanwhile is counted once.
+    pub fn scan_waited(&self) -> std::time::Duration {
+        // `now` is read under the lock too, so a wait ending right after this
+        // snapshot ends at or after it: samples never run ahead of later ones.
+        let waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        let ongoing = waits
+            .1
+            .map_or(0, |since| self.now_us().saturating_sub(since));
+        std::time::Duration::from_micros(waits.0.saturating_add(ongoing))
+    }
+
+    /// Starts a wait; returns its start for [`Self::end_wait`].
+    fn begin_wait(&self) -> u64 {
+        let since = self.now_us();
+        self.waits.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(since);
+        since
+    }
+
+    /// Ends the wait that started at `since`: moves it from in progress to the
+    /// completed total in one step.
+    fn end_wait(&self, since: u64) {
+        let mut waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        let waited = self.now_us().saturating_sub(since);
+        waits.0 = waits.0.saturating_add(waited);
+        waits.1 = None;
+    }
+
+    /// `(blocks, estimated bytes)` sent into the queue so far.
+    pub fn sent(&self) -> (u64, u64) {
+        (
+            self.sent_blocks.load(Ordering::Relaxed),
+            self.sent_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Ends a wait on the meter when `recv` returns or its future is dropped.
+struct WaitGuard<'a> {
+    meter: &'a QueueMeter,
+    since: u64,
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        self.meter.end_wait(self.since);
+    }
 }
 
 /// `budget_bytes` bounds the estimated bytes in flight (queued + being
@@ -102,6 +210,7 @@ pub struct ChunkQueueReceiver {
 /// budget rather than deadlocking.
 pub fn chunk_queue(budget_bytes: usize) -> (ChunkQueueSender, ChunkQueueReceiver) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let meter = Arc::new(QueueMeter::new());
     (
         // A zero budget degenerates to 1 byte (fully serial) instead of blocking forever.
         ChunkQueueSender {
@@ -109,8 +218,9 @@ pub fn chunk_queue(budget_bytes: usize) -> (ChunkQueueSender, ChunkQueueReceiver
             budget: Arc::new(Semaphore::new(budget_bytes.max(1))),
             budget_bytes: budget_bytes.max(1),
             boundary_fetcher: None,
+            meter: Arc::clone(&meter),
         },
-        ChunkQueueReceiver { rx },
+        ChunkQueueReceiver { rx, meter },
     )
 }
 
@@ -118,6 +228,11 @@ impl ChunkQueueSender {
     /// Install the boundary-treestate fetcher (scheduler, production path).
     pub fn set_boundary_fetcher(&mut self, f: BoundaryFetcher) {
         self.boundary_fetcher = Some(f);
+    }
+
+    /// The queue's [`QueueMeter`], shared with the receiver.
+    pub fn meter(&self) -> Arc<QueueMeter> {
+        Arc::clone(&self.meter)
     }
 
     /// Waits until the byte budget admits the chunk, then enqueues it.
@@ -140,16 +255,41 @@ impl ChunkQueueSender {
             .acquire_many_owned(need)
             .await
             .map_err(|_| SlipstreamError::Stopped)?;
+        let (blocks, bytes) = (chunk.blocks.len() as u64, chunk.estimated_bytes as u64);
         self.tx
-            .send((chunk, ChunkPermit { _permits: permits }, boundary))
+            .send((
+                chunk,
+                ChunkPermit {
+                    _permits: permits,
+                    merged: Vec::new(),
+                },
+                boundary,
+            ))
             .map_err(|_| SlipstreamError::Stopped)?;
+        self.meter.sent_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.meter.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok(())
     }
 }
 
 impl ChunkQueueReceiver {
-    /// `None` when all senders are dropped (fetch finished or aborted).
-    pub async fn recv(&mut self) -> Option<(Chunk, ChunkPermit, Option<BoundaryHandle>)> {
+    /// The next chunk if one is queued right now, without waiting.
+    pub fn try_recv(&mut self) -> Option<QueuedChunk> {
+        self.rx.try_recv().ok()
+    }
+
+    /// The next chunk; `None` when all senders are dropped (fetch finished or
+    /// aborted). The time spent waiting
+    /// here is recorded on the queue's [`QueueMeter`].
+    pub async fn recv(&mut self) -> Option<QueuedChunk> {
+        if let Ok(item) = self.rx.try_recv() {
+            return Some(item);
+        }
+        let since = self.meter.begin_wait();
+        let _guard = WaitGuard {
+            meter: &self.meter,
+            since,
+        };
         self.rx.recv().await
     }
 }
@@ -301,5 +441,81 @@ mod tests {
             chunk.outputs, 10,
             "outputs must sum sapling outputs + orchard actions"
         );
+    }
+
+    #[tokio::test]
+    async fn meter_counts_the_consumers_wait_and_what_was_sent() {
+        let (tx, mut rx) = chunk_queue(1 << 20);
+        let meter = tx.meter();
+        assert_eq!(meter.scan_waited(), Duration::ZERO);
+        assert_eq!(meter.sent(), (0, 0));
+
+        // A chunk already queued is taken without waiting.
+        let c = chunk_of(0, 1..=10);
+        let bytes = c.estimated_bytes as u64;
+        tx.send(c).await.expect("send");
+        assert_eq!(meter.sent(), (10, bytes));
+        let _first = rx.recv().await.expect("first");
+        assert_eq!(meter.scan_waited(), Duration::ZERO);
+
+        // A wait in progress counts before it ends, and once.
+        let waiter = tokio::spawn(async move {
+            let got = rx.recv().await.map(|(c, _, _)| c.index);
+            (got, rx)
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let ongoing = meter.scan_waited();
+        assert!(
+            ongoing >= Duration::from_millis(50),
+            "ongoing wait {ongoing:?}"
+        );
+        tx.send(chunk_of(1, 11..=12)).await.expect("send");
+        let (got, mut rx) = waiter.await.expect("join");
+        assert_eq!(got, Some(1));
+        let done = meter.scan_waited();
+        assert!(done >= ongoing && done < Duration::from_secs(5), "{done:?}");
+
+        // A dropped recv future ends its wait.
+        let dropped = tokio::time::timeout(Duration::from_millis(30), rx.recv()).await;
+        assert!(dropped.is_err());
+        let after = meter.scan_waited();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            meter.scan_waited(),
+            after,
+            "no wait is in progress any more"
+        );
+    }
+
+    /// A wait that ends while the booster samples is counted once: samples are
+    /// consistent snapshots, so one never runs ahead of a later one (counting a
+    /// wait both in progress and completed would).
+    #[test]
+    fn a_wait_ending_during_a_sample_is_never_counted_twice() {
+        let meter = Arc::new(QueueMeter::new());
+        let waiter = {
+            let meter = Arc::clone(&meter);
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    let since = meter.begin_wait();
+                    let spin = std::time::Instant::now();
+                    while spin.elapsed() < Duration::from_micros(20) {
+                        std::hint::spin_loop();
+                    }
+                    meter.end_wait(since);
+                }
+            })
+        };
+        let mut last = Duration::ZERO;
+        while !waiter.is_finished() {
+            let now = meter.scan_waited();
+            assert!(
+                now >= last,
+                "sample {now:?} after {last:?}: a wait was counted twice"
+            );
+            last = now;
+        }
+        waiter.join().expect("waiter");
+        assert!(meter.scan_waited() >= last);
     }
 }

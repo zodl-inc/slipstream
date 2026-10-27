@@ -10,6 +10,78 @@ workspace.
 
 ## [Unreleased]
 
+### Added
+- `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
+  endpoint whose host has a relay (`ohttp::relay_for`) is never dialled
+  directly: every RPC is sealed to the gateway's signed key configuration and
+  posted to the relay, over Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08,
+  `message/ohttp-chunked-req` / `message/ohttp-chunked-res`), so the gateway
+  can stream `GetBlockRange` responses as blocks arrive. The protocol core is
+  the shared `zodl-ohttp-client` crate.
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` send a
+  plain HTTP request to a service behind the gateway through the relay, with
+  `ohttp::Dialer` choosing a direct or Tor leg to the relay.
+  `http_round_trip_with_dispatch` takes a `max_response_bytes` ceiling and stops
+  reading an answer past it (`ohttp::HttpRoundTripError::ResponseTooLarge`). Its
+  hook runs right before the sealed request is written to the relay connection,
+  so a relay pause, an unreachable relay and a connection that is not ready
+  leave it uncalled.
+- `ohttp::HttpRoundTripError`, the error of
+  `ohttp::http_round_trip_with_dispatch`: `ResponseTooLarge` when the answer is
+  past the ceiling, `Failed` for any other failure.
+- `ohttp::set_default_client_trace_prefix` sets an optional
+  `X-Client-Trace-Id` prefix for end-to-end debug tracing. Gating it to debug
+  builds is the caller's job.
+- `connector::TorConn::from_client`, `TorConn::client`,
+  `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
+- `SlipstreamError::EndpointUnreachable`.
+- `SlipstreamError::{RateLimited, RequestTooLarge}` and
+  `SlipstreamError::counts_as_unreachable`: an OHTTP relay rate limit (outer
+  429, or a request held back while its `Retry-After` pause runs; transient),
+  an oversized request (outer 413, or a sealed request over 10 MiB, which is
+  not sent) and an inner 403 (`PolicyDenied`) never count towards
+  `EndpointUnreachable`.
+- `enhance::run_enhancement_isolated`: with Tor on, each `GetTransaction` and
+  `GetTaddressTxids` of the enhancement step opens its own isolated circuit;
+  `GetAddressUtxos` does too.
+
+### Changed
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` take the
+  wallet's network (`ohttp::NetworkType`, re-exported from `zcash_protocol`)
+  as their second argument and refuse a gateway that serves another network
+  before anything is sent.
+- `EngineConfig::validate` refuses an OHTTP gateway (endpoint or alternate)
+  that serves a network other than the wallet's; the signed key configuration
+  is checked against the network of the gateway's exact host name.
+- OHTTP: an outer 429's `Retry-After` holds every request through that relay
+  until it has run (no sleep inside the call), a 429 without one for 30 s; an
+  outer answer that is not a success (a relay or gateway error page) is read
+  within a fixed 64 KiB guard and keeps its status whatever ceiling the caller
+  set for the answer; an outer 413 and a local size
+  refusal are `RESOURCE_EXHAUSTED`; a response that ends before its final chunk
+  is `UNAVAILABLE`; an inner status other than 200 or a non-gRPC content type
+  is `INTERNAL`; the gRPC status is delivered only once the final chunk has
+  opened; the verified key configuration is shared by every connection to the
+  same gateway and relay until its `not_after`; `http_round_trip` is bounded
+  (100 s overall, 30 s idle body read, 15 s direct dial); a pooled relay
+  connection is replaced after 10 minutes with Tor off; a `GetBlockRange` the
+  gateway refuses with `INVALID_ARGUMENT` is split into smaller windows.
+- `connector::TorConn::bootstrap` takes the client trace prefix as a third
+  argument, and `TorConn` wraps an `Arc<arti_client::TorClient>` (same
+  `arti-data` / `arti-cache` directory layout as
+  `zcash_client_backend::tor::Client`).
+- `fetch::run_fetch` takes the session's `Option<TorConn>` as its second
+  argument.
+- With Tor on, the bulk block fetch rides the default Tor circuit instead of
+  going direct, and an OHTTP gateway is reached with the relay leg dialled
+  through Tor.
+- The follow loop surfaces `SyncState::Error(3)` (event tag 4, value 3) after
+  5 consecutive tip-probe or catch-up failures, so a host can switch servers.
+  Follow-phase failures previously never surfaced an error.
+- Tor transport dependencies use the 0.43 family required by the released NU7 backend.
+- OHTTP channels and split block-range attempts contribute to per-pass network counts;
+  adaptive prefetch retains a single initial connection for a one-block follow range.
+
 ## [0.4.0] - 2026-10-27
 
 ### Added

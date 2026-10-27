@@ -55,8 +55,47 @@ pub(crate) const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream means the connection is dead.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Response-headers deadline for `GetBlockRange` against an OHTTP gateway. An OHTTP response is
+/// whole-body-buffered (gateway → relay → client as ONE message), so "headers arrived" means
+/// "the entire chunk has been transferred": [`UNARY_TIMEOUT`] would then bound the full download
+/// of a 10k-block chunk, which a ~34 MB spam-era chunk over Tor (~0.4 MB/s) cannot meet (field
+/// evidence 2026-09-10: the tip range looped `timed out after 30s` forever). Sized just above the
+/// connector's own round-trip cap (100 s) so the pipe's UNAVAILABLE wins when the gateway stalls.
+pub(crate) const OHTTP_RANGE_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Deadline for opening a `GetBlockRange` stream to `endpoint` (see [`OHTTP_RANGE_OPEN_TIMEOUT`]).
+pub(crate) fn range_open_timeout(endpoint: &Endpoint) -> Duration {
+    if crate::ohttp::relay_for(&endpoint.host).is_some() {
+        OHTTP_RANGE_OPEN_TIMEOUT
+    } else {
+        UNARY_TIMEOUT
+    }
+}
+
 fn transport_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Transport(format!("{context}: {e}"))
+}
+
+/// A gRPC status as an engine error. The OHTTP connector marks its own outcomes (an inner
+/// 403, a relay rate limit, an oversized request) in the status metadata; every other status is
+/// a transport error, as before.
+pub(crate) fn status_err(context: &str, status: tonic::Status) -> SlipstreamError {
+    let outcome = status
+        .metadata()
+        .get(crate::ohttp::OHTTP_OUTCOME_HEADER)
+        .and_then(|v| v.to_str().ok());
+    match outcome {
+        Some(crate::ohttp::OUTCOME_POLICY_DENIED) => {
+            SlipstreamError::PolicyDenied(format!("{context}: {status}"))
+        }
+        Some(crate::ohttp::OUTCOME_RATE_LIMITED) => {
+            SlipstreamError::RateLimited(format!("{context}: {status}"))
+        }
+        Some(crate::ohttp::OUTCOME_TOO_LARGE) => {
+            SlipstreamError::RequestTooLarge(format!("{context}: {status}"))
+        }
+        _ => transport_err(context, status),
+    }
 }
 
 // ── T6.8-H2 scan-path transient retries ───────────────────────────────────────
@@ -94,19 +133,20 @@ pub(crate) async fn retry_get_tree_state(
     height: u64,
     context: &str,
     tor: Option<&crate::connector::TorConn>,
+    purpose: crate::connector::ConnPurpose,
     progress: Option<Arc<crate::events::Progress>>,
 ) -> Result<zcash_client_backend::proto::service::TreeState, SlipstreamError> {
     let mut attempt: u32 = 0;
     loop {
-        // For the first attempt, connect fresh; for retries, also fresh (reconnect
-        // semantics — avoids reusing a wedged channel). Tor-aware: treestate is
-        // `.uniqueTor` (isolated circuit) when Tor is on, direct otherwise.
-        let mut client = crate::connector::connect_via(
-            endpoint,
-            tor,
-            crate::connector::ConnPurpose::MetadataUnique,
-        )
-        .await?;
+        // First attempt: `purpose` (with Tor on, `SyncShared` reuses the session connection,
+        // `MetadataUnique` an isolated circuit). Retries always connect fresh on an isolated
+        // circuit, so a wedged (or shared) channel is never retried into.
+        let purpose = if attempt == 0 {
+            purpose
+        } else {
+            crate::connector::ConnPurpose::MetadataUnique
+        };
+        let mut client = crate::connector::connect_via(endpoint, tor, purpose).await?;
         match get_tree_state(&mut client, height).await {
             Ok(ts) => {
                 // Liveness: a server response is forward progress (tree states ride
@@ -116,7 +156,17 @@ pub(crate) async fn retry_get_tree_state(
                 }
                 return Ok(ts);
             }
-            Err(err) if err.is_transient() && attempt < TREESTATE_RETRY_MAX => {
+            Err(err) => {
+                // A shared connection is replaced after any failed request (ZIP "Circuit
+                // isolation policy"), whether or not the call is retried.
+                if purpose == crate::connector::ConnPurpose::SyncShared
+                    && let Some(t) = tor
+                {
+                    t.forget_shared(endpoint);
+                }
+                if !err.is_transient() || attempt >= TREESTATE_RETRY_MAX {
+                    return Err(err);
+                }
                 attempt += 1;
                 let backoff = treestate_retry_backoff(attempt);
                 tracing::warn!(
@@ -129,20 +179,19 @@ pub(crate) async fn retry_get_tree_state(
                 );
                 tokio::time::sleep(backoff).await;
             }
-            Err(err) => return Err(err),
         }
     }
 }
 
-/// Awaits a unary gRPC call under [`UNARY_TIMEOUT`]; maps both the gRPC status
-/// and a deadline expiry into [`SlipstreamError::Transport`].
+/// Awaits a unary gRPC call under [`UNARY_TIMEOUT`]; maps the gRPC status
+/// into [`SlipstreamError::Transport`] or [`SlipstreamError::PolicyDenied`].
 async fn with_unary_timeout<T>(
     context: &str,
     fut: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 ) -> Result<T, SlipstreamError> {
     match tokio::time::timeout(UNARY_TIMEOUT, fut).await {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
-        Ok(Err(status)) => Err(transport_err(context, status)),
+        Ok(Err(status)) => Err(status_err(context, status)),
         Err(_) => Err(SlipstreamError::Transport(format!(
             "{context}: timed out after {}s",
             UNARY_TIMEOUT.as_secs()
@@ -189,8 +238,7 @@ where
 {
     let mut collected = Vec::new();
     while let Some(item) = next_with_idle_timeout(stream, context).await? {
-        let message =
-            item.map_err(|e| SlipstreamError::Transport(format!("{stream_label}: {e}")))?;
+        let message = item.map_err(|e| status_err(stream_label, e))?;
         if let Some(p) = progress {
             p.touch(); // liveness: a message from the server arrived
         }
@@ -202,6 +250,48 @@ where
 /// Open a channel to lightwalletd. TLS uses webpki roots (same trust source
 /// as the upstream tor module).
 pub async fn connect(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    connect_with(endpoint, true).await
+}
+
+/// [`connect`], except that an OHTTP gateway is reached over a relay connection of this client's
+/// own instead of the process-wide one. For bulk block streams, whose unread bodies hold HTTP/2
+/// flow-control window and would stall every other call sharing their connection.
+pub async fn connect_dedicated(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    connect_with(endpoint, false).await
+}
+
+async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, SlipstreamError> {
+    // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
+    // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
+    if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
+        tracing::info!(gateway = %endpoint.host, relay, "lightwalletd via OHTTP (RFC 9458)");
+        let connector = if shared {
+            crate::ohttp::OhttpConnector::new(&endpoint.host, relay)
+        } else {
+            crate::ohttp::OhttpConnector::dedicated(&endpoint.host, relay)
+        }
+        .map_err(|e| transport_err("ohttp connector", e))?;
+        // Plain `http://` on purpose: the transport tonic sees is an in-memory pipe to the
+        // in-process h2 server; TLS happens inside the connector, towards the relay. (tonic
+        // refuses an `https://` URI without a tls_config.)
+        let pipe_uri = format!("http://{}:{}", endpoint.host, endpoint.port);
+        let channel = TonicEndpoint::from_shared(pipe_uri)
+            .map_err(|e| transport_err("endpoint uri", e))?
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| {
+                let source = std::error::Error::source(&e)
+                    .map(|s| format!(" ({s})"))
+                    .unwrap_or_default();
+                transport_err(
+                    &format!("ohttp connect {}", endpoint.host),
+                    format!("{e}{source}"),
+                )
+            })?;
+        net_stats::record(net_stats::NetEvent::DirectChannel);
+        return Ok(CompactTxStreamerClient::new(channel));
+    }
     let mut ep = TonicEndpoint::from_shared(endpoint.uri())
         .map_err(|e| transport_err("endpoint uri", e))?
         .connect_timeout(std::time::Duration::from_secs(10));
@@ -411,7 +501,7 @@ pub async fn get_transaction(
             {
                 Ok(None)
             } else {
-                Err(transport_err("get_transaction", status))
+                Err(status_err("get_transaction", status))
             }
         }
     }
@@ -459,7 +549,7 @@ pub async fn open_mempool_stream(
         .get_mempool_stream(Empty {})
         .await
         .map(tonic::Response::into_inner)
-        .map_err(|status| SlipstreamError::Transport(format!("get_mempool_stream: {status}")))
+        .map_err(|status| status_err("get_mempool_stream", status))
 }
 
 /// Collect UTXOs for the given transparent addresses from `start_height`; every UTXO received
@@ -629,6 +719,23 @@ pub mod net_stats {
 
 #[cfg(test)]
 mod tests {
+
+    /// The in-process OHTTP channel is still a direct channel when its relay leg
+    /// does not use Tor. Opening the pipe performs no relay or gateway network request.
+    #[tokio::test]
+    async fn ohttp_channel_is_included_in_direct_channel_accounting() {
+        let before = net_stats::totals();
+        let endpoint = Endpoint {
+            host: "ohttp-gateway-testnet.example".into(),
+            port: 443,
+            tls: true,
+        };
+        let _client = connect(&endpoint).await.expect("open OHTTP pipe");
+        assert!(
+            net_stats::totals().delta_since(&before).direct_channels >= 1,
+            "an OHTTP channel without Tor must be counted once it connects"
+        );
+    }
     use super::*;
     use crate::config::Endpoint;
 
@@ -795,7 +902,15 @@ mod tests {
         // PASS_RETRY_MAX=2 means 3 total attempts; all will fail with Transport.
         // The test just confirms that: (a) it returns a Transport error (not panic),
         // and (b) the function exists and is callable.
-        let result = retry_get_tree_state(&ep, 1_000_000, "test-context", None, None).await;
+        let result = retry_get_tree_state(
+            &ep,
+            1_000_000,
+            "test-context",
+            None,
+            crate::connector::ConnPurpose::MetadataUnique,
+            None,
+        )
+        .await;
         assert!(
             matches!(result, Err(SlipstreamError::Transport(_))),
             "unroutable endpoint must yield Transport error, got: {result:?}"

@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! T8.1 darkside test: probe_tip + should_resync + follow-pass catch-up.
 //!
 //! Tests the exact probe → pass primitive that the FFI follow loop composes:
@@ -241,7 +243,7 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         cfg.fetch_streams,
     );
     let fetch_ep = ep.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
 
     scan_chunks_from_treestate(
         &mut session,
@@ -347,7 +349,8 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         cfg.fetch_streams,
     );
     let fetch_ep2 = ep.clone();
-    let fetch_task2 = tokio::spawn(async move { run_fetch(&fetch_ep2, plan2, tx2, None).await });
+    let fetch_task2 =
+        tokio::spawn(async move { run_fetch(&fetch_ep2, None, plan2, tx2, None).await });
 
     // The continuation treestate is the block at initial_tip (663188) as seen by the scanner.
     // Use a zero hash (accepted for continuation — the chain continuity check uses DB state).

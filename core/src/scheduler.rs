@@ -30,7 +30,7 @@ use crate::{
     chunk::chunk_queue,
     config::EngineConfig,
     connector::TorConn,
-    enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily},
+    enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily_isolated},
     error::SlipstreamError,
     events::Progress,
     fetch::{FetchPlan, FetchStats, run_fetch},
@@ -292,7 +292,7 @@ pub struct SyncReport {
     /// Total wall-clock time spent in scan_chunks (across all ranges).
     /// Measured around the scan call per range. Default: zero.
     pub scan_elapsed: Duration,
-    /// Total wall-clock time spent in per-range run_enhancement_lazily calls (F3).
+    /// Total wall-clock time spent in per-range run_enhancement_lazily_isolated calls (F3).
     /// The engine's final post-loop enhancement adds its own elapsed to SyncOutcome
     /// directly; this field covers the scheduler's interleaved runs only.
     pub enhance_elapsed: Duration,
@@ -523,13 +523,18 @@ pub async fn run_to_completion(
                         end_height,
                         "boundary prefetch (fetch-side)",
                         tor_owned.as_ref(),
+                        crate::connector::ConnPurpose::SyncShared,
                         progress,
                     )
                     .await
                 }))
             }));
         }
-        let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
+        // Smaller plan chunks when bulk rides OHTTP (whole-chunk buffered responses, gateway
+        // response cap) — connector::bulk_chunk_blocks; unchanged for direct gRPC.
+        let chunk_blocks =
+            crate::connector::bulk_chunk_blocks(config.chunk_blocks, &config.endpoint);
+        let mut plan = FetchPlan::new(start, end, chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
         // [v0.7 P2] Arm the wire-collapse detector only when the engine has
@@ -538,9 +543,27 @@ pub async fn run_to_completion(
         if config.wire_failover && !config.alternate_endpoints.is_empty() {
             plan.failover = Some(crate::fetch::WireFailoverArm::default());
         }
+        // Adaptive prefetch while the scan waits for blocks (fetch::FetchBoost). Extra
+        // block streams only through an OHTTP gateway and where the memory budget is
+        // not derated for a small device.
+        if config.fetch_boost {
+            let gateway = crate::ohttp::relay_for(&config.endpoint.host).is_some();
+            let roomy =
+                config.memory_budget_bytes >= crate::config::EngineConfig::DEFAULT_MEMORY_BUDGET;
+            plan.boost = Some(crate::fetch::FetchBoost {
+                extra_streams: if gateway && roomy {
+                    crate::fetch::BOOST_EXTRA_OHTTP_STREAMS
+                } else {
+                    0
+                },
+            });
+        }
         let endpoint = config.endpoint.clone();
         // Clone the progress Arc for the fetch task so it can bump fetched_blocks.
         let fetch_progress = progress.clone();
+        // Tor handle for the bulk workers: only used when the endpoint is an OHTTP gateway
+        // (bulk stays direct for plain hosts — connector::route).
+        let fetch_tor = tor.cloned();
 
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
@@ -549,7 +572,7 @@ pub async fn run_to_completion(
         // the session, not this task), the fetch task is aborted instead of orphaned (see
         // `AbortOnDrop`'s doc).
         let fetch_task = AbortOnDrop(tokio::spawn(async move {
-            run_fetch(&endpoint, plan, tx, fetch_progress).await
+            run_fetch(&endpoint, fetch_tor, plan, tx, fetch_progress).await
         }));
 
         // scan_chunks runs in the current task. Its interleaved enhancement opens its own
@@ -769,12 +792,13 @@ pub async fn run_to_completion(
         {
             let enhance_started = std::time::Instant::now();
             let mut enhance_client = enhancement_connection(&config.endpoint, tor);
-            let enhance_result = run_enhancement_lazily(
+            let enhance_result = run_enhancement_lazily_isolated(
                 session,
                 &mut enhance_client,
                 config.network,
                 progress.clone(),
                 skipped_keys,
+                tor.map(|t| (t, &config.endpoint)),
             )
             .await;
             match enhance_result {

@@ -26,7 +26,7 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::{
     config::{Endpoint, EngineConfig},
     connector::{ConnPurpose, TorConn, connect_via},
-    enhance::{EnhanceStats, run_enhancement},
+    enhance::{EnhanceStats, run_enhancement_isolated},
     error::SlipstreamError,
     events::Progress,
     grpc,
@@ -157,15 +157,23 @@ pub fn should_resync(last_synced_tip: u64, observed_tip: u64) -> bool {
 /// One cheap tip probe (T8.1 fast path): connect + GetLatestBlock ONLY —
 /// none of the preflight work of a full pass (subtree roots, UTXO refresh).
 ///
-/// Fresh connection per probe (TLS ~100-300 ms every FOLLOW_POLL; a held
-/// connection would need its own keepalive/staleness handling). All awaits
-/// carry the hardening1 deadlines (connect 10 s, unary 30 s).
+/// Direct: fresh connection per probe (TLS ~100-300 ms every FOLLOW_POLL; a held
+/// connection would need its own keepalive/staleness handling). Tor: the session's
+/// shared connection (`SyncShared`), dropped after a failed probe so the next one
+/// reconnects. All awaits carry the hardening1 deadlines (connect 10 s, unary 30 s).
 pub async fn probe_tip(
     config: &EngineConfig,
     tor: Option<&TorConn>,
 ) -> Result<u64, SlipstreamError> {
-    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-    grpc::get_latest_block_height(&mut client).await
+    // Public tip data (ZIP circuit isolation policy): the session's shared connection.
+    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::SyncShared).await?;
+    let tip = grpc::get_latest_block_height(&mut client).await;
+    if tip.is_err()
+        && let Some(t) = tor
+    {
+        t.forget_shared(&config.endpoint);
+    }
+    tip
 }
 
 /// One sync pass. `accounts` bootstraps the wallet: each `(ufvk, birthday)` is imported
@@ -315,7 +323,14 @@ pub async fn sync_once(
     // sync.rs:108-121 ("We do this before we perform any shielded scanning, to ensure
     // that we discover any UTXOs between the old fully-scanned height and the current
     // chain tip.").
-    let transparent = refresh_utxos(&mut session, &mut client, progress.as_deref()).await?;
+    // GetAddressUtxos names the wallet's addresses: with Tor on it gets a circuit of its own.
+    let transparent = match tor {
+        Some(t) => {
+            let mut utxo_client = t.connect_isolated(&config.endpoint).await?;
+            refresh_utxos(&mut session, &mut utxo_client, progress.as_deref()).await?
+        }
+        None => refresh_utxos(&mut session, &mut client, progress.as_deref()).await?,
+    };
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -361,9 +376,14 @@ pub async fn sync_once(
                     "wire collapse — failing over"
                 );
                 cooled.push(attempt_config.endpoint.clone());
+                let current_is_gateway =
+                    crate::ohttp::relay_for(&attempt_config.endpoint.host).is_some();
                 let mut candidates: Vec<Endpoint> = std::iter::once(config.endpoint.clone())
                     .chain(config.alternate_endpoints.iter().cloned())
-                    .filter(|e| !cooled.contains(e))
+                    .filter(|e| {
+                        !cooled.contains(e)
+                            && crate::ohttp::relay_for(&e.host).is_some() == current_is_gateway
+                    })
                     .collect();
                 if candidates.is_empty() {
                     // Everything configured has collapsed at least once this
@@ -371,7 +391,10 @@ pub async fn sync_once(
                     cooled.clear();
                     candidates = std::iter::once(config.endpoint.clone())
                         .chain(config.alternate_endpoints.iter().cloned())
-                        .filter(|e| *e != attempt_config.endpoint)
+                        .filter(|e| {
+                            *e != attempt_config.endpoint
+                                && crate::ohttp::relay_for(&e.host).is_some() == current_is_gateway
+                        })
                         .collect();
                 }
                 let next = if candidates.len() == 1 {
@@ -408,12 +431,13 @@ pub async fn sync_once(
     // Stats are merged into the report's `enhance` field so the stage-split log
     // reports total enhancement time (per-range runs + this final run) correctly.
     let enhance_started = Instant::now();
-    let final_enhance = run_enhancement(
+    let final_enhance = run_enhancement_isolated(
         &mut session,
         &mut client,
         config.network,
         progress.clone(),
         &mut skipped_keys,
+        tor.map(|t| (t, &config.endpoint)),
     )
     .await?;
     let final_enhance_elapsed = enhance_started.elapsed();

@@ -148,9 +148,7 @@ pub async fn run_session(
             Err(_elapsed) => return Ok((SessionEnd::IdleReconnect, stats)),
             Ok(None) => return Ok((SessionEnd::BlockBoundary, stats)),
             Ok(Some(Err(status))) => {
-                return Err(SlipstreamError::Transport(format!(
-                    "mempool stream: {status}"
-                )));
+                return Err(crate::grpc::status_err("mempool stream", status));
             }
             Ok(Some(Ok(raw))) => raw,
         };

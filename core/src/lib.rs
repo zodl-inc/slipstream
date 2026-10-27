@@ -14,6 +14,9 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+#![doc(test(attr(recursion_limit = "256")))]
+
 //! Slipstream sync engine core (platform-neutral).
 //! See HOSTING.md for the integration contract and REVIEWING.md for the
 //! module map.
@@ -31,6 +34,7 @@ pub mod events;
 pub mod fetch;
 pub mod grpc;
 pub mod network;
+pub mod ohttp;
 pub mod probe;
 pub mod throttle;
 pub mod treestate;
@@ -70,6 +74,8 @@ pub mod report;
 pub mod scan;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod scan_queue;
+#[cfg(feature = "zcash_client_sqlite")]
+pub(crate) mod scan_stages;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod scheduler;
 #[cfg(feature = "zcash_client_sqlite")]
