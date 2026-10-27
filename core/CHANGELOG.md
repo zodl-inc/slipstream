@@ -10,6 +10,8 @@ workspace.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-27
+
 ### Added
 - `wallet_session::WalletSession::truncate_to_height`: upstream's
   `WalletWrite::truncate_to_height` and the removal of the graft-buffer rows of the blocks
