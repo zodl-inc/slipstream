@@ -243,6 +243,18 @@ pub struct EngineConfig {
     /// on an error exit or stop and scanned again by the next pass, so the
     /// limits also bound that rework.
     pub persist_commit_limits: Option<crate::persist::CommitLimits>,
+
+    /// Dense ranges: the most note commitments one scan call takes when the scan
+    /// merges chunks already waiting in the queue into it (only chunks of at least
+    /// 16,000 commitments merge). Each scan call ends in a barrier: the decryption
+    /// threads finish the call's last batches and wait while the call's results
+    /// are assembled and handed to persistence and the next call starts. Fewer,
+    /// larger calls pay it less often (dense range on an 8-core Graviton: +14 % at
+    /// [`Self::DEFAULT_SCAN_MERGE_OUTPUTS`], three byte-split sub-chunks); the
+    /// queue's byte budget is unchanged, as merged chunks are already in it.
+    /// Derated to [`Self::SMALL_DEVICE_SCAN_MERGE_OUTPUTS`] on small devices. 0 = one
+    /// scan call per queued chunk.
+    pub scan_merge_outputs: u64,
 }
 
 impl EngineConfig {
@@ -253,6 +265,12 @@ impl EngineConfig {
     /// the default path emits exactly one sub-chunk per plan chunk; a
     /// sandblasting-era chunk (~hundreds of MB) splits into many (T6.8-S).
     pub const DEFAULT_CHUNK_SPLIT_BYTES: usize = 8 * 1024 * 1024;
+    /// `scan_merge_outputs`: three sandblasting-era sub-chunks of the default split (~67,000
+    /// note commitments each).
+    pub const DEFAULT_SCAN_MERGE_OUTPUTS: u64 = 210_000;
+    /// `scan_merge_outputs` on devices under [`Self::SMALL_DEVICE_THRESHOLD_BYTES`] (half,
+    /// like their split).
+    pub const SMALL_DEVICE_SCAN_MERGE_OUTPUTS: u64 = 105_000;
     /// Run an interleaved enhancement pass every 3 completed chunks by default (T6.1).
     pub const DEFAULT_ENHANCE_EVERY_CHUNKS: u32 = 3;
 
@@ -288,6 +306,7 @@ impl EngineConfig {
                 max_blocks: crate::persist::CommitLimits::DEFAULT_MAX_BLOCKS,
                 max_outputs: crate::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
             }),
+            scan_merge_outputs: Self::DEFAULT_SCAN_MERGE_OUTPUTS,
         }
     }
 
@@ -386,6 +405,9 @@ impl EngineConfig {
         if total_memory_bytes > 0 && total_memory_bytes < Self::SMALL_DEVICE_THRESHOLD_BYTES {
             self.memory_budget_bytes = Self::SMALL_DEVICE_MEMORY_BUDGET;
             self.chunk_split_bytes = Self::SMALL_DEVICE_CHUNK_SPLIT_BYTES;
+            self.scan_merge_outputs = self
+                .scan_merge_outputs
+                .min(Self::SMALL_DEVICE_SCAN_MERGE_OUTPUTS);
         }
         self
     }
@@ -731,6 +753,10 @@ mod tests {
         assert_eq!(
             small.chunk_split_bytes,
             EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES
+        );
+        assert_eq!(
+            small.scan_merge_outputs,
+            EngineConfig::SMALL_DEVICE_SCAN_MERGE_OUTPUTS
         );
         small.validate().expect("derated config must validate");
     }

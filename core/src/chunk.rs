@@ -64,12 +64,36 @@ impl Chunk {
     pub fn end_height(&self) -> Option<u64> {
         self.blocks.last().map(|b| b.height)
     }
+
+    /// Appends `next`, the chunk that directly follows this one (its first block is
+    /// this one's last + 1); returns `next` back when it does not.
+    pub fn append(&mut self, next: Chunk) -> Result<(), Chunk> {
+        match (self.end_height(), next.start_height()) {
+            (Some(end), Some(start)) if start == end + 1 => {
+                self.estimated_bytes += next.estimated_bytes;
+                self.outputs += next.outputs;
+                self.blocks.extend(next.blocks);
+                Ok(())
+            }
+            _ => Err(next),
+        }
+    }
 }
 
 /// Holds the byte-budget permits for one chunk; drop to release budget.
 #[must_use = "dropping the permit releases the byte budget; hold it until the chunk is fully processed"]
 pub struct ChunkPermit {
     _permits: tokio::sync::OwnedSemaphorePermit,
+    /// Permits of chunks merged into this one ([`ChunkPermit::absorb`]).
+    merged: Vec<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl ChunkPermit {
+    /// Holds `other`'s budget too, until this permit is dropped.
+    pub fn absorb(&mut self, other: ChunkPermit) {
+        self.merged.push(other._permits);
+        self.merged.extend(other.merged);
+    }
 }
 
 /// v0.5 pacer fix: the boundary-treestate fetch spawned WHEN THE CHUNK IS
@@ -80,6 +104,9 @@ pub type BoundaryHandle = tokio::task::JoinHandle<
     Result<zcash_client_backend::proto::service::TreeState, SlipstreamError>,
 >;
 
+/// One queue item: the chunk, its share of the byte budget, and its boundary fetch.
+pub type QueuedChunk = (Chunk, ChunkPermit, Option<BoundaryHandle>);
+
 /// Injected at queue construction (scheduler): given a chunk's end height,
 /// spawn its boundary treestate fetch, or return `None` when the scan will not
 /// need that state (the range's last block, in server mode). Without a fetcher
@@ -87,14 +114,14 @@ pub type BoundaryHandle = tokio::task::JoinHandle<
 pub type BoundaryFetcher = Arc<dyn Fn(u64) -> Option<BoundaryHandle> + Send + Sync>;
 
 pub struct ChunkQueueSender {
-    tx: mpsc::UnboundedSender<(Chunk, ChunkPermit, Option<BoundaryHandle>)>,
+    tx: mpsc::UnboundedSender<QueuedChunk>,
     budget: Arc<Semaphore>,
     budget_bytes: usize,
     boundary_fetcher: Option<BoundaryFetcher>,
 }
 
 pub struct ChunkQueueReceiver {
-    rx: mpsc::UnboundedReceiver<(Chunk, ChunkPermit, Option<BoundaryHandle>)>,
+    rx: mpsc::UnboundedReceiver<QueuedChunk>,
 }
 
 /// `budget_bytes` bounds the estimated bytes in flight (queued + being
@@ -141,15 +168,27 @@ impl ChunkQueueSender {
             .await
             .map_err(|_| SlipstreamError::Stopped)?;
         self.tx
-            .send((chunk, ChunkPermit { _permits: permits }, boundary))
+            .send((
+                chunk,
+                ChunkPermit {
+                    _permits: permits,
+                    merged: Vec::new(),
+                },
+                boundary,
+            ))
             .map_err(|_| SlipstreamError::Stopped)?;
         Ok(())
     }
 }
 
 impl ChunkQueueReceiver {
+    /// The next chunk if one is queued right now, without waiting.
+    pub fn try_recv(&mut self) -> Option<QueuedChunk> {
+        self.rx.try_recv().ok()
+    }
+
     /// `None` when all senders are dropped (fetch finished or aborted).
-    pub async fn recv(&mut self) -> Option<(Chunk, ChunkPermit, Option<BoundaryHandle>)> {
+    pub async fn recv(&mut self) -> Option<QueuedChunk> {
         self.rx.recv().await
     }
 }

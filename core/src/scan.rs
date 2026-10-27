@@ -665,6 +665,51 @@ pub async fn scan_chunks(
     result
 }
 
+/// Smallest chunk (in note commitments) that [`merge_dense_chunks`] merges into:
+/// below it a scan call's fixed cost is not worth amortizing.
+const MERGE_MIN_OUTPUTS: u64 = 16_000;
+
+/// Appends to `chunk` the chunks already waiting in the queue, while each of them
+/// and `chunk` are output-dense (at least [`MERGE_MIN_OUTPUTS`]) and the merged
+/// chunk stays within `max_outputs` (0 = off). Never waits for a chunk: only what
+/// the fetch has already released is merged, so the queue's byte budget is
+/// unchanged (the merged chunk holds every merged chunk's permit). The merged
+/// chunk's boundary prefetch is its last part's; the earlier ones are aborted.
+/// A chunk taken but not merged is left in `held` for the next scan call.
+fn merge_dense_chunks(
+    chunk: &mut crate::chunk::Chunk,
+    permit: &mut crate::chunk::ChunkPermit,
+    boundary: &mut Option<crate::chunk::BoundaryHandle>,
+    held: &mut Option<crate::chunk::QueuedChunk>,
+    rx: &mut ChunkQueueReceiver,
+    max_outputs: u64,
+) {
+    if max_outputs == 0 || chunk.outputs < MERGE_MIN_OUTPUTS || held.is_some() {
+        return;
+    }
+    while chunk.outputs < max_outputs {
+        let Some((next, next_permit, next_boundary)) = rx.try_recv() else {
+            return;
+        };
+        if next.outputs < MERGE_MIN_OUTPUTS || chunk.outputs + next.outputs > max_outputs {
+            *held = Some((next, next_permit, next_boundary));
+            return;
+        }
+        match chunk.append(next) {
+            Ok(()) => {
+                permit.absorb(next_permit);
+                if let Some(h) = std::mem::replace(boundary, next_boundary) {
+                    h.abort();
+                }
+            }
+            Err(next) => {
+                *held = Some((next, next_permit, next_boundary));
+                return;
+            }
+        }
+    }
+}
+
 /// The scan loop body. Extracted so `?`-style early returns land at the
 /// write-behind barrier in [`scan_chunks`] instead of skipping it.
 #[allow(clippy::too_many_arguments)] // internal seam of scan_chunks; bundling would obscure the borrow structure
@@ -740,13 +785,32 @@ async fn scan_chunks_inner(
     // `DecryptionFence`) is checked before, once per call and never per block.
     let mut first_scan_call = true;
 
+    // A chunk taken from the queue to merge that did not follow on (never expected:
+    // the fetch releases in height order), scanned on its own next.
+    let mut held: Option<crate::chunk::QueuedChunk> = None;
+
     loop {
         // v0.5 pacer: time the chunk wait — fetch/split starvation shows here.
         let recv_started = Instant::now();
-        let Some((chunk, permit, mut chunk_boundary)) = rx.recv().await else {
+        let next = match held.take() {
+            Some(item) => Some(item),
+            None => rx.recv().await,
+        };
+        let Some((mut chunk, mut permit, mut chunk_boundary)) = next else {
             break;
         };
         stats.recv_wait += recv_started.elapsed();
+        // Dense ranges: fold the chunks already waiting in the queue into this scan
+        // call (see `merge_dense_chunks`), so a call's fixed cost and its decryption
+        // tail are paid once per merged chunk.
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut chunk_boundary,
+            &mut held,
+            &mut rx,
+            config.scan_merge_outputs,
+        );
         // Binding note 1: no expect() in non-test code — use structured error extraction.
         let (chunk_start, chunk_end) = match (chunk.start_height(), chunk.end_height()) {
             (Some(s), Some(e)) => (s, e),
@@ -1558,6 +1622,92 @@ mod tests {
     use super::*;
     use futures_util::FutureExt;
     use std::sync::atomic::AtomicBool;
+
+    /// Chunk `index` of blocks `from..=to`, each with `outputs` Sapling outputs.
+    fn dense_chunk(index: u64, from: u64, to: u64, outputs: usize) -> crate::chunk::Chunk {
+        use zcash_client_backend::proto::compact_formats::{
+            CompactBlock, CompactSaplingOutput, CompactTx,
+        };
+        let blocks = (from..=to)
+            .map(|height| CompactBlock {
+                height,
+                vtx: vec![CompactTx {
+                    outputs: vec![CompactSaplingOutput::default(); outputs],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })
+            .collect();
+        crate::chunk::Chunk::from_blocks(index, blocks)
+    }
+
+    #[tokio::test]
+    async fn dense_chunks_already_queued_merge_up_to_the_cap() {
+        let (tx, mut rx) = crate::chunk::chunk_queue(1 << 30);
+        // 4 chunks of 2 blocks x 10,000 outputs = 20,000 each.
+        for i in 0..4u64 {
+            tx.send(dense_chunk(i, 100 + 2 * i, 101 + 2 * i, 10_000))
+                .await
+                .expect("send");
+        }
+        let (mut chunk, mut permit, mut boundary) = rx.recv().await.expect("first");
+        let mut held = None;
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut boundary,
+            &mut held,
+            &mut rx,
+            70_000,
+        );
+        assert_eq!(chunk.outputs, 60_000);
+        assert_eq!(
+            chunk.blocks.iter().map(|b| b.height).collect::<Vec<_>>(),
+            (100..=105).collect::<Vec<_>>()
+        );
+        let (next, _, _) = held
+            .take()
+            .expect("the chunk over the cap is held, not lost");
+        assert_eq!(next.start_height(), Some(106));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn sparse_chunks_and_a_zero_cap_never_merge() {
+        let (tx, mut rx) = crate::chunk::chunk_queue(1 << 30);
+        tx.send(dense_chunk(0, 10, 19, 10)).await.expect("send");
+        tx.send(dense_chunk(1, 20, 29, 10)).await.expect("send");
+        let (mut chunk, mut permit, mut boundary) = rx.recv().await.expect("first");
+        let mut held = None;
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut boundary,
+            &mut held,
+            &mut rx,
+            1 << 40,
+        );
+        assert_eq!(
+            chunk.end_height(),
+            Some(19),
+            "a normal-era chunk is scanned alone"
+        );
+        assert!(held.is_none());
+
+        tx.send(dense_chunk(2, 30, 31, 20_000)).await.expect("send");
+        tx.send(dense_chunk(3, 32, 33, 20_000)).await.expect("send");
+        let _ = rx.recv().await.expect("chunk 1");
+        let (mut chunk, mut permit, mut boundary) = rx.recv().await.expect("chunk 2");
+        merge_dense_chunks(
+            &mut chunk,
+            &mut permit,
+            &mut boundary,
+            &mut held,
+            &mut rx,
+            0,
+        );
+        assert_eq!(chunk.end_height(), Some(31), "0 = off");
+    }
 
     #[test]
     fn scan_stats_default_is_zero() {
