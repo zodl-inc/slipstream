@@ -156,11 +156,16 @@ pub(crate) async fn retry_get_tree_state(
                 }
                 return Ok(ts);
             }
-            Err(err) if err.is_transient() && attempt < TREESTATE_RETRY_MAX => {
+            Err(err) => {
+                // A shared connection is replaced after any failed request (ZIP "Circuit
+                // isolation policy"), whether or not the call is retried.
                 if purpose == crate::connector::ConnPurpose::SyncShared
                     && let Some(t) = tor
                 {
                     t.forget_shared(endpoint);
+                }
+                if !err.is_transient() || attempt >= TREESTATE_RETRY_MAX {
+                    return Err(err);
                 }
                 attempt += 1;
                 let backoff = treestate_retry_backoff(attempt);
@@ -174,7 +179,6 @@ pub(crate) async fn retry_get_tree_state(
                 );
                 tokio::time::sleep(backoff).await;
             }
-            Err(err) => return Err(err),
         }
     }
 }
