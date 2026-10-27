@@ -81,9 +81,10 @@ pub type BoundaryHandle = tokio::task::JoinHandle<
 >;
 
 /// Injected at queue construction (scheduler): given a chunk's end height,
-/// spawn its boundary treestate fetch. `None` (tests, darkside) keeps the
-/// scan-side late-spawn fallback.
-pub type BoundaryFetcher = Arc<dyn Fn(u64) -> BoundaryHandle + Send + Sync>;
+/// spawn its boundary treestate fetch, or return `None` when the scan will not
+/// need that state (the range's last block, in server mode). Without a fetcher
+/// (tests, darkside) the scan side spawns the fetches it needs itself.
+pub type BoundaryFetcher = Arc<dyn Fn(u64) -> Option<BoundaryHandle> + Send + Sync>;
 
 pub struct ChunkQueueSender {
     tx: mpsc::UnboundedSender<(Chunk, ChunkPermit, Option<BoundaryHandle>)>,
@@ -126,7 +127,7 @@ impl ChunkQueueSender {
         // more scan it hides under. At most (queued chunks + 1) fetches are
         // ever in flight, so a slow server sees a trickle, never a burst.
         let boundary = match (&self.boundary_fetcher, chunk.end_height()) {
-            (Some(f), Some(end)) => Some(f(end)),
+            (Some(f), Some(end)) => f(end),
             _ => None,
         };
         // Saturate: budgets beyond u32::MAX simply cap the per-chunk acquisition;
@@ -251,6 +252,25 @@ mod tests {
             .expect("send completes under zero budget")
             .expect("send ok");
         assert!(rx.recv().await.is_some());
+    }
+
+    /// A boundary fetcher may decline a boundary; that chunk then carries no fetch.
+    #[tokio::test]
+    async fn boundary_fetcher_may_decline_a_boundary() {
+        let (mut tx, mut rx) = chunk_queue(1 << 20);
+        tx.set_boundary_fetcher(Arc::new(|end: u64| -> Option<BoundaryHandle> {
+            (end < 20).then(|| {
+                tokio::spawn(async move {
+                    Err(SlipstreamError::Transport(format!("test fetch at {end}")))
+                })
+            })
+        }));
+        tx.send(chunk_of(0, 1..=10)).await.expect("send");
+        tx.send(chunk_of(1, 11..=20)).await.expect("send");
+        let (_, _first_permit, first) = rx.recv().await.expect("first chunk");
+        assert!(first.is_some(), "a boundary below the range end is fetched");
+        let (_, _last_permit, last) = rx.recv().await.expect("last chunk");
+        assert!(last.is_none(), "the declined boundary carries no fetch");
     }
 
     #[test]

@@ -113,7 +113,7 @@ impl BlockSource for MemBlockSource<'_> {
     ///   `Option` test when no stop was given.
     /// * An early exit writes nothing. While it walks, upstream `scan_cached_blocks` only reads
     ///   the wallet, and it writes in one final `put_blocks` that an error from either walk
-    ///   never reaches (`zcash_client_backend-0.25.0-pre.1/src/data_api/chain.rs`: the walks at
+    ///   never reaches (`zcash_client_backend-0.25.0/src/data_api/chain.rs`: the walks at
     ///   lines 644 and 672, `put_blocks` at 713).
     ///
     /// The walk wall is recorded on every exit, a stopped walk included.
