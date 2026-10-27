@@ -397,8 +397,10 @@ pub(crate) enum EndCheck<H> {
     /// so the next commitment on the chain is that range's.
     LastLeaf,
     /// The run completes its shard, and the wallet stores a root for that shard: the
-    /// server's, which every pass start ingests before the sweep. Once the run is in the
-    /// tree, the shard's root computed from it must be this one.
+    /// server's, which a pass start ingests before the sweep, in this pass or an earlier
+    /// one. A pass with `Historic` scan work ingests every root; any other pass ingests only
+    /// those from each pool's next subtree index on (`engine::sync_once`). Once the run is
+    /// in the tree, the shard's root computed from it must be this one.
     ShardRoot(H),
 }
 

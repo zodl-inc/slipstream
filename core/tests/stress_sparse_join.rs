@@ -56,6 +56,7 @@ use zcash_client_backend::proto::compact_formats::{
 };
 use zcash_client_backend::proto::service::TreeState;
 use zcash_protocol::consensus::BlockHeight;
+use zcash_protocol::zip318::BlockSpacing;
 
 use zodl_slipstream::block_source::MemBlockSource;
 use zodl_slipstream::chunk::Chunk;
@@ -369,7 +370,11 @@ fn run_anchor_retention_pair() -> Result<(), String> {
         first_grid + grid < SYNTH_START + 650,
         "grid must fall well below the window"
     );
-    let retention = AnchorRetention::new(BlockHeight::from(SYNTH_START as u32), interval);
+    let retention = AnchorRetention::new(
+        BlockHeight::from(SYNTH_START as u32),
+        BlockSpacing::UNIFORM,
+        interval,
+    );
 
     let query = |dir: &Path, id: u64| -> Result<bool, String> {
         let conn = rusqlite::Connection::open(dir.join("data.db"))

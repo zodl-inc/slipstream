@@ -194,6 +194,7 @@ async fn sample_range_bytes(
         }),
         ..Default::default()
     };
+    grpc::net_stats::record(grpc::net_stats::NetEvent::GetBlockRange);
     let Ok(Ok(resp)) = timeout(remaining(deadline), client.get_block_range(req)).await else {
         return 0;
     };
