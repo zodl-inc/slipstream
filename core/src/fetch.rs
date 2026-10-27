@@ -27,7 +27,7 @@ use std::{
     collections::BTreeMap,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -46,7 +46,7 @@ use zcash_client_backend::proto::{
 };
 
 use crate::{
-    chunk::{Chunk, ChunkQueueSender},
+    chunk::{Chunk, ChunkQueueSender, QueueMeter},
     config::{Endpoint, EngineConfig},
     connector::{ConnPurpose, TorConn, connect_via},
     error::SlipstreamError,
@@ -81,7 +81,82 @@ pub struct FetchPlan {
     /// [v0.7 P2] Arm the wire-collapse detector (Some ⇔ the engine has
     /// alternates to fail over to; None = pre-v0.7 behavior verbatim).
     pub failover: Option<WireFailoverArm>,
+    /// Adaptive prefetch for a fetch-bound scan (see [`FetchBoost`]). `None`
+    /// = the fixed plan: `streams` workers, the fixed ahead budget, plan chunks
+    /// of `chunk_blocks`.
+    pub boost: Option<FetchBoost>,
 }
+
+/// Adaptive prefetch, armed per fetch by the scheduler.
+///
+/// Armed, the fetch sizes its plan chunks by bytes from the start: the first is a
+/// 64-block probe, every later one about one worker's share of the ahead budget
+/// at the density being received, at most `chunk_blocks`. Normal-era chunks keep
+/// the plan's span; in a dense range a fixed 2,000-block OHTTP chunk is 75-200
+/// MB, and with four in flight the head chunk the scan needs gets a quarter of
+/// the link while the others fill the ahead budget and park, after which the
+/// download runs on one connection. With byte-sized chunks no worker parks for
+/// long and every connection works on blocks the scan needs soon.
+///
+/// On top of that, while the scanner measurably waits for blocks:
+///
+/// The fetch watches the scanner's wait on the chunk queue
+/// ([`crate::chunk::QueueMeter`]) in [`BOOST_WINDOW`] windows. After
+/// [`BOOST_HOT_WINDOWS`] consecutive windows in which the scanner waited for at
+/// least [`BOOST_ON_FRACTION`] of the time, it boosts:
+///
+/// * `extra_streams` more workers, each on its own connection (OHTTP gateway
+///   and a memory budget not derated for a small device only: 4 + 2 block
+///   streams stay far below a gateway's per-client limits). More connections
+///   help where one connection cannot fill the link (loss, long RTT); plan
+///   chunks handed out from then on are cut to the smaller share of the ahead
+///   budget, so the added workers do not park on it;
+/// * while the scanner waits for at least [`KICK_SCAN_WAIT_FRACTION`] of a
+///   window, a head stream (the plan chunk the release waits for) that
+///   delivered far less than the best window of any stream of this fetch
+///   ([`KICK_RATE_FRACTION`], or under 64 KiB) is cut and requested again from
+///   its resume height on a fresh connection: a mobile link leaves single
+///   connections trickling (TCP backoff) while new ones are fine, and a
+///   trickle never trips the idle timeout. The blocks it received are handed on
+///   first; the restart does not count against the chunk's retry budget.
+///
+/// The ahead budget is unchanged (the head chunk never waits on it), so memory
+/// stays bounded as without the boost. After [`BOOST_COLD_WINDOWS`] consecutive
+/// windows in which the scanner waited for less than [`BOOST_OFF_FRACTION`] of
+/// the time, the boost ends: extra workers finish their plan chunk and stop. A
+/// scanner that never waits (a fast network) never boosts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FetchBoost {
+    /// Workers added while boosted.
+    pub extra_streams: usize,
+}
+
+/// Length of one starvation window.
+pub const BOOST_WINDOW: Duration = Duration::from_secs(10);
+/// Scanner-wait fraction of a window that counts as fetch-bound.
+pub const BOOST_ON_FRACTION: f64 = 0.25;
+/// Consecutive fetch-bound windows before boosting.
+pub const BOOST_HOT_WINDOWS: u32 = 2;
+/// Scanner-wait fraction of a window below which the scan is no longer fetch-bound.
+pub const BOOST_OFF_FRACTION: f64 = 0.05;
+/// Consecutive windows below [`BOOST_OFF_FRACTION`] before the boost ends.
+pub const BOOST_COLD_WINDOWS: u32 = 6;
+/// Smallest plan chunk the dispatcher cuts to, in blocks.
+const BOOST_MIN_SPAN: u64 = 10;
+/// Scanner-wait fraction of a window above which a slow head stream is restarted.
+pub const KICK_SCAN_WAIT_FRACTION: f64 = 0.5;
+/// A head stream that delivered less than this fraction of the best window any
+/// stream of the fetch delivered is restarted.
+pub const KICK_RATE_FRACTION: f64 = 0.125;
+/// Below this many bytes in a window a head stream counts as slow whatever the
+/// best window was.
+const KICK_MIN_WINDOW_BYTES: u64 = 64 * 1024;
+/// Shortest time between two restarts of the same worker's stream.
+const KICK_COOLDOWN: Duration = Duration::from_secs(30);
+/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, far below
+/// a regional gateway's per-client limits (96 in flight, 12 heavy; a block range
+/// counts as a normal request).
+pub const BOOST_EXTRA_OHTTP_STREAMS: usize = 2;
 
 /// [v0.7 P2] Detector thresholds. Defaults are the shipped policy; the
 /// throttle-proxy gates (P4) exercise them deterministically.
@@ -129,6 +204,7 @@ impl FetchPlan {
             chunk_timeout: Duration::from_secs(120),
             split_bytes: EngineConfig::DEFAULT_CHUNK_SPLIT_BYTES,
             failover: None,
+            boost: None,
         }
     }
 
@@ -137,6 +213,7 @@ impl FetchPlan {
         span.div_ceil(self.chunk_blocks as u64)
     }
 
+    #[cfg(test)]
     fn chunk_range(&self, index: u64) -> (u64, u64) {
         let s = self.start + index * self.chunk_blocks as u64;
         let e = (s + self.chunk_blocks as u64 - 1).min(self.end);
@@ -151,18 +228,151 @@ impl FetchPlan {
         let chunks = usize::try_from(self.chunk_count()).unwrap_or(usize::MAX);
         self.streams.max(1).min(chunks)
     }
+}
 
-    /// Claims the next plan chunk from the shared cursor `next`: `(index, start, end)`, or
-    /// `None` once every chunk is claimed. Every worker claims until `None`, so each chunk is
-    /// fetched exactly once, whatever the worker count.
-    fn claim_chunk(&self, next: &AtomicU64) -> Option<(u64, u64, u64)> {
-        let index = next.fetch_add(1, Ordering::Relaxed);
-        if index >= self.chunk_count() {
+/// Blocks and bytes all workers of one fetch have received, for the dispatcher's
+/// density estimate.
+#[derive(Debug, Default)]
+struct FleetStats {
+    blocks: AtomicU64,
+    bytes: AtomicU64,
+}
+
+impl FleetStats {
+    fn snapshot(&self) -> (u64, u64) {
+        (
+            self.blocks.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Blocks in a fetch's first plan chunk, handed out before anything is known of
+/// the range's density.
+const PROBE_SPAN: u64 = 64;
+/// Blocks the fleet must have received before the second plan chunk is sized
+/// by density (or [`DENSITY_WAIT`] passes).
+const DENSITY_MIN_BLOCKS: u64 = 8;
+/// Longest a worker waits for the density estimate before its first chunk.
+const DENSITY_WAIT: Duration = Duration::from_secs(3);
+/// Blocks received since the previous chunk was handed out that make a fresh
+/// density sample; fewer and the fetch's running average is used.
+const DENSITY_SAMPLE_BLOCKS: u64 = 32;
+
+/// Hands out plan chunks in height order, consecutive indices from 0, sized by
+/// the bytes they will carry rather than by a fixed block count.
+///
+/// Every plan chunk after the first is about `target_bytes` (one worker's share
+/// of the ahead budget) at the density the workers are receiving, between
+/// [`BOOST_MIN_SPAN`] and the plan's `chunk_blocks`. Normal-era chunks are far
+/// below the share, so they keep the plan's span; in a dense range a fixed
+/// 2,000-block OHTTP chunk is 75-200 MB, and with four of them in flight the
+/// head chunk the scan needs gets a quarter of the link while the others fill
+/// the ahead budget and park (the download then runs on one connection). Chunks
+/// of a share of the ahead budget are all needed soon: no worker parks for long,
+/// every connection works for the scan, and the head chunk is small.
+///
+/// The first chunk is [`PROBE_SPAN`] blocks, so a range that starts dense does
+/// not open with such chunks; the other workers wait for the first blocks
+/// (at most [`DENSITY_WAIT`]) before taking theirs.
+struct Dispatcher {
+    end: u64,
+    base_span: u64,
+    /// `false`: every chunk is the plan's `chunk_blocks` (no adaptive prefetch).
+    sized: bool,
+    target_bytes: AtomicU64,
+    fleet: Arc<FleetStats>,
+    created: tokio::time::Instant,
+    /// (next index, its first height, fleet snapshot at the previous hand-out).
+    next: std::sync::Mutex<(u64, u64, (u64, u64))>,
+}
+
+impl Dispatcher {
+    /// `target_bytes`: `None` hands out the plan's fixed chunks.
+    fn new(plan: &FetchPlan, target_bytes: Option<u64>, fleet: Arc<FleetStats>) -> Self {
+        Self {
+            end: plan.end,
+            base_span: u64::from(plan.chunk_blocks).max(1),
+            sized: target_bytes.is_some(),
+            target_bytes: AtomicU64::new(target_bytes.unwrap_or(1).max(1)),
+            fleet,
+            created: tokio::time::Instant::now(),
+            next: std::sync::Mutex::new((0, plan.start, (0, 0))),
+        }
+    }
+
+    /// The next plan chunk `(index, start, end)`, or `None` once the plan is out.
+    async fn take(&self) -> Option<(u64, u64, u64)> {
+        loop {
+            let (handed, out) = self.handed_out();
+            let waiting = self.sized
+                && handed > 0
+                && !out
+                && self.fleet.snapshot().0 < DENSITY_MIN_BLOCKS
+                && self.created.elapsed() < DENSITY_WAIT;
+            if !waiting {
+                // The density may still be unknown here when another worker took
+                // the probe in between: `take_now` then hands out the probe.
+                return self.take_now();
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// [`Self::take`] without waiting for the density estimate.
+    fn take_now(&self) -> Option<(u64, u64, u64)> {
+        let mut next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (index, start, seen) = *next;
+        if start > self.end {
             return None;
         }
-        let (start, end) = self.chunk_range(index);
+        let now = self.fleet.snapshot();
+        let unknown = now.0 < DENSITY_MIN_BLOCKS && self.created.elapsed() < DENSITY_WAIT;
+        let span = if !self.sized {
+            self.base_span
+        } else if index == 0 || unknown {
+            PROBE_SPAN.min(self.base_span)
+        } else {
+            let (blocks, bytes) = if now.0.saturating_sub(seen.0) >= DENSITY_SAMPLE_BLOCKS {
+                (now.0 - seen.0, now.1.saturating_sub(seen.1))
+            } else {
+                now
+            };
+            match bytes.checked_div(blocks) {
+                None => self.base_span,
+                Some(per_block) => plan_span(
+                    self.target_bytes.load(Ordering::Relaxed),
+                    per_block,
+                    self.base_span,
+                ),
+            }
+        };
+        let end = start.saturating_add(span - 1).min(self.end);
+        *next = (index + 1, end + 1, now);
         Some((index, start, end))
     }
+
+    /// Plan chunks handed out so far, and whether that is all of them.
+    fn handed_out(&self) -> (u64, bool) {
+        let next = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        (next.0, next.1 > self.end)
+    }
+
+    fn set_target_bytes(&self, bytes: u64) {
+        self.target_bytes.store(bytes.max(1), Ordering::Relaxed);
+    }
+}
+
+/// One worker's share of the ahead budget: the bytes a plan chunk is cut to.
+fn chunk_target_bytes(ahead: usize, workers: usize) -> u64 {
+    (ahead / workers.max(1)) as u64
+}
+
+/// Blocks per plan chunk: `target_bytes` at `bytes_per_block`, between
+/// [`BOOST_MIN_SPAN`] and the plan's own span.
+fn plan_span(target_bytes: u64, bytes_per_block: u64, base_span: u64) -> u64 {
+    let span = target_bytes / bytes_per_block.max(1);
+    span.clamp(BOOST_MIN_SPAN.min(base_span), base_span)
 }
 
 #[derive(Debug, Default, Clone)]
@@ -506,6 +716,7 @@ where
         out,
         progress,
         &mut refused,
+        None,
     )
     .await
 }
@@ -545,6 +756,7 @@ async fn pump_block_window<S>(
     out: &mpsc::Sender<SubChunk>,
     progress: Option<&Progress>,
     refused: &mut bool,
+    slot: Option<&WorkerSlot>,
 ) -> Result<PumpOutcome, SlipstreamError>
 where
     S: futures_util::Stream<Item = Result<CompactBlock, tonic::Status>> + Unpin,
@@ -557,7 +769,18 @@ where
     // tokio Instant (not std) so start_paused tests drive the deadline.
     let mut last_emit = tokio::time::Instant::now();
     loop {
-        let item = match grpc::next_with_idle_timeout(stream, &ctx).await {
+        let next = match slot {
+            // A kick (see `WorkerSlot`) ends the attempt like a stream error.
+            Some(slot) => tokio::select! {
+                biased;
+                () = slot.kick.notified() => Err(SlipstreamError::Transport(format!(
+                    "{ctx}: cut as a slow head stream"
+                ))),
+                next = grpc::next_with_idle_timeout(stream, &ctx) => next,
+            },
+            None => grpc::next_with_idle_timeout(stream, &ctx).await,
+        };
+        let item = match next {
             Ok(item) => item,
             // Idle timeout: the stream went silent.
             Err(err) => return flush_then_fail(splitter.finish(), cursor, gate, out, err).await,
@@ -602,6 +825,9 @@ where
         // sub-chunk is still accumulating (the stall clock hosts watch).
         if let Some(p) = progress {
             p.touch();
+        }
+        if let Some(slot) = slot {
+            slot.received(block.encoded_len() as u64);
         }
         if let Some((blocks, bytes)) = splitter.push(block) {
             if !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await {
@@ -652,6 +878,7 @@ async fn open_and_pump(
     progress: Option<&Progress>,
     max_span: &mut u64,
     split_on_invalid: bool,
+    slot: Option<&WorkerSlot>,
 ) -> Result<PumpOutcome, SlipstreamError> {
     loop {
         let window_end = cursor
@@ -725,6 +952,7 @@ async fn open_and_pump(
             out,
             progress,
             &mut refused,
+            slot,
         )
         .await;
         match pumped {
@@ -736,28 +964,91 @@ async fn open_and_pump(
     }
 }
 
+/// What the booster sees of one worker, and how it restarts the worker's stream.
+#[derive(Debug)]
+struct WorkerSlot {
+    /// The plan chunk being streamed (`u64::MAX` before the first).
+    plan_index: AtomicU64,
+    /// Bytes received on the worker's streams.
+    bytes: AtomicU64,
+    kicked: AtomicBool,
+    kick: tokio::sync::Notify,
+    /// The whole fetch's receive counters (the dispatcher's density estimate).
+    fleet: Arc<FleetStats>,
+}
+
+impl WorkerSlot {
+    fn new(fleet: Arc<FleetStats>) -> Self {
+        Self {
+            plan_index: AtomicU64::new(u64::MAX),
+            bytes: AtomicU64::new(0),
+            kicked: AtomicBool::new(false),
+            kick: tokio::sync::Notify::new(),
+            fleet,
+        }
+    }
+
+    /// Records one received block of `bytes`.
+    fn received(&self, bytes: u64) {
+        self.bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.fleet.blocks.fetch_add(1, Ordering::Relaxed);
+        self.fleet.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Asks the worker to cut its stream and request the rest again.
+    fn kick(&self) {
+        self.kicked.store(true, Ordering::SeqCst);
+        self.kick.notify_one();
+    }
+
+    /// Whether a kick ended the attempt (and clears it).
+    fn take_kick(&self) -> bool {
+        self.kicked.swap(false, Ordering::SeqCst)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn worker(
     worker_id: usize,
     endpoint: Endpoint,
     tor: Option<TorConn>,
     plan: FetchPlan,
-    next: Arc<AtomicU64>,
+    dispatcher: Arc<Dispatcher>,
+    boost_on: Arc<AtomicBool>,
+    slot: Arc<WorkerSlot>,
     gate: AheadGate,
     out: mpsc::Sender<SubChunk>,
     progress: Option<Arc<Progress>>,
 ) -> Result<(), SlipstreamError> {
     // Bulk is direct (with bounded retry) for plain hosts even with Tor on; for an OHTTP gateway
     // with Tor on, `connect_via` routes it OHTTP-over-Tor so nothing bypasses the relay/Tor.
-    let mut client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
+    let mut client = match connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await {
+        Ok(client) => client,
+        // A worker added by a boost holds no plan chunk yet: the fetch goes on without it.
+        Err(err) if worker_id >= plan.streams => {
+            warn!(worker_id, %err, "boost worker could not connect — fetch continues without it");
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     let open_timeout = grpc::range_open_timeout(&endpoint);
     let split_on_invalid = crate::ohttp::relay_for(&endpoint.host).is_some();
     let mut max_span = u64::MAX;
     loop {
-        let Some((index, s, e)) = plan.claim_chunk(&next) else {
+        // A worker added by a boost stops once the boost has ended.
+        if worker_id >= plan.streams && !boost_on.load(Ordering::Relaxed) {
+            debug!(worker_id, "boost over — extra worker stops");
+            return Ok(());
+        }
+        let Some((index, s, e)) = dispatcher.take().await else {
             debug!(worker_id, "no more chunks");
             return Ok(());
         };
+        // A kick meant for the previous chunk's stream does not carry over.
+        if slot.take_kick() {
+            let _ = futures_util::FutureExt::now_or_never(slot.kick.notified());
+        }
+        slot.plan_index.store(index, Ordering::Relaxed);
         let mut cursor = PlanChunkCursor {
             plan_index: index,
             end: e,
@@ -782,11 +1073,28 @@ async fn worker(
                 progress.as_deref(),
                 &mut max_span,
                 split_on_invalid,
+                Some(&slot),
             )
             .await
             {
-                Ok(PumpOutcome::Completed) => break,
+                Ok(PumpOutcome::Completed) => {
+                    slot.plan_index.store(u64::MAX, Ordering::Relaxed);
+                    break;
+                }
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
+                // The booster cut a slow head stream: request the rest again on a fresh
+                // connection at once. Not an attempt: the stream was alive, only slow.
+                Err(err) if slot.take_kick() => {
+                    attempt -= 1;
+                    info!(
+                        worker_id,
+                        index,
+                        resume_from = cursor.resume_from,
+                        %err,
+                        "slow head stream cut; requesting the rest on a fresh connection"
+                    );
+                    client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
+                }
                 // An OHTTP policy denial or an oversized request is refused again on a retry.
                 Err(err) if !err.is_transient() && !err.counts_as_unreachable() => {
                     return Err(err);
@@ -1098,14 +1406,15 @@ fn note_give_up(progress: Option<&Progress>, unreleased_from: &AtomicU64, plan_e
 /// Every worker failure — an error or a panic, armed or not — is also recorded on `progress` as
 /// a download give-up at `unreleased_from`, the lowest block the ordered release has not handed
 /// to the scanner (see `Progress::note_download_gave_up`), as long as that block is within the
-/// plan (`unreleased_from <= plan_end`). A worker connects before it claims a chunk, so one
-/// that cannot connect can fail the fetch after the others already released every block; the
-/// cursor then reads `plan_end + 1`, a block no release of this plan will ever cover, and
-/// nothing is recorded — the fetch still fails. A release error is not a download give-up and
-/// is not recorded.
+/// plan (`unreleased_from <= plan_end`). The fetch starts a worker per stream whatever its chunk
+/// count, so an idle spare worker that cannot connect can fail it after every block was
+/// already released; the cursor then reads `plan_end + 1`, a block no release of this plan will
+/// ever cover, and nothing is recorded — the fetch still fails. A release error is not a
+/// download give-up and is not recorded.
+#[cfg(test)]
 async fn supervise_fetch<R>(
     release: R,
-    mut workers: JoinSet<Result<(), SlipstreamError>>,
+    workers: JoinSet<Result<(), SlipstreamError>>,
     failover: Option<WireFailoverArm>,
     progress: Option<&Progress>,
     unreleased_from: &AtomicU64,
@@ -1114,8 +1423,37 @@ async fn supervise_fetch<R>(
 where
     R: std::future::Future<Output = Result<ReleaseSummary, SlipstreamError>>,
 {
+    supervise_fetch_boosted(
+        release,
+        workers,
+        failover,
+        progress,
+        unreleased_from,
+        plan_end,
+        None,
+    )
+    .await
+}
+
+/// `supervise_fetch` with the adaptive prefetch's [`Booster`], when armed:
+/// it is evaluated every [`BOOST_WINDOW`] and may add workers to `workers`.
+async fn supervise_fetch_boosted<R>(
+    release: R,
+    mut workers: JoinSet<Result<(), SlipstreamError>>,
+    failover: Option<WireFailoverArm>,
+    progress: Option<&Progress>,
+    unreleased_from: &AtomicU64,
+    plan_end: u64,
+    mut booster: Option<Booster>,
+) -> Result<ReleaseSummary, SlipstreamError>
+where
+    R: std::future::Future<Output = Result<ReleaseSummary, SlipstreamError>>,
+{
     tokio::pin!(release);
     let mut released: Option<ReleaseSummary> = None;
+    let mut ticks =
+        tokio::time::interval_at(tokio::time::Instant::now() + BOOST_WINDOW, BOOST_WINDOW);
+    ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         if workers.is_empty()
             && let Some(summary) = released.take()
@@ -1125,7 +1463,13 @@ where
         tokio::select! {
             biased;
             Some(joined) = workers.join_next(), if !workers.is_empty() => match joined {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => {
+                    // The plan may be out: the booster then lets go of its sender, so
+                    // the release ends once the workers have.
+                    if let Some(b) = booster.as_mut() {
+                        b.drop_sender_if_plan_out();
+                    }
+                }
                 Ok(Err(err)) => {
                     workers.abort_all();
                     note_give_up(progress, unreleased_from, plan_end);
@@ -1153,13 +1497,298 @@ where
                     return Err(err);
                 }
             },
+            _ = ticks.tick(), if booster.is_some() => {
+                if let Some(b) = booster.as_mut() {
+                    b.evaluate(&mut workers);
+                }
+            },
         }
     }
 }
 
-/// Fetch `plan.start..=plan.end` with [`FetchPlan::worker_count`] workers — one per plan
-/// chunk, up to `plan.streams`; emits ordered, continuity-verified chunks into `queue`.
-/// Returns stats on success.
+/// Everything a boost needs to start one more worker. Dropped (with its
+/// sender) once every plan chunk is handed out.
+struct WorkerSpawn {
+    endpoint: Endpoint,
+    tor: Option<TorConn>,
+    plan: FetchPlan,
+    tx: mpsc::Sender<SubChunk>,
+    progress: Option<Arc<Progress>>,
+}
+
+/// One worker as the booster tracks it.
+struct TrackedWorker {
+    slot: Arc<WorkerSlot>,
+    /// `slot.bytes` at the start of the window.
+    window_bytes: u64,
+    last_kick: Option<Instant>,
+}
+
+/// The adaptive prefetch of one fetch (see [`FetchBoost`]).
+struct Booster {
+    cfg: FetchBoost,
+    meter: Arc<QueueMeter>,
+    dispatcher: Arc<Dispatcher>,
+    boost_on: Arc<AtomicBool>,
+    /// The plan chunk the release stage waits for.
+    floor: Arc<AtomicU64>,
+    gate: AheadGate,
+    base_streams: usize,
+    ahead: usize,
+    spawn: Option<WorkerSpawn>,
+    workers: Vec<TrackedWorker>,
+    /// Extra workers started by boosts (finished ones included).
+    extras: Vec<tokio::task::AbortHandle>,
+    next_extra_id: usize,
+    window_started: Instant,
+    window_waited: Duration,
+    window_sent: (u64, u64),
+    state: BoostState,
+    /// Most bytes one stream delivered in a window so far.
+    best_window_bytes: u64,
+}
+
+impl Booster {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        cfg: FetchBoost,
+        meter: Arc<QueueMeter>,
+        dispatcher: Arc<Dispatcher>,
+        boost_on: Arc<AtomicBool>,
+        floor: Arc<AtomicU64>,
+        gate: AheadGate,
+        ahead: usize,
+        slots: &[Arc<WorkerSlot>],
+        spawn: WorkerSpawn,
+    ) -> Self {
+        let base_streams = spawn.plan.streams.max(1);
+        let window_waited = meter.scan_waited();
+        let window_sent = meter.sent();
+        Self {
+            cfg,
+            meter,
+            dispatcher,
+            boost_on,
+            floor,
+            gate,
+            base_streams,
+            ahead,
+            spawn: Some(spawn),
+            workers: slots
+                .iter()
+                .map(|slot| TrackedWorker {
+                    slot: Arc::clone(slot),
+                    window_bytes: 0,
+                    last_kick: None,
+                })
+                .collect(),
+            extras: Vec::new(),
+            next_extra_id: base_streams,
+            window_started: Instant::now(),
+            window_waited,
+            window_sent,
+            state: BoostState::default(),
+            best_window_bytes: 0,
+        }
+    }
+
+    fn boosted(&self) -> bool {
+        self.boost_on.load(Ordering::Relaxed)
+    }
+
+    fn drop_sender_if_plan_out(&mut self) {
+        if self.spawn.is_some() && self.dispatcher.handed_out().1 {
+            self.spawn = None;
+        }
+    }
+
+    /// Closes one window: decides to boost, retune or end the boost, and cuts a
+    /// slow head stream.
+    fn evaluate(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>) {
+        self.drop_sender_if_plan_out();
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.window_started);
+        let waited_total = self.meter.scan_waited();
+        let sent_total = self.meter.sent();
+        let waited = waited_total.saturating_sub(self.window_waited);
+        self.window_started = now;
+        self.window_waited = waited_total;
+        self.window_sent = sent_total;
+        let per_stream = self.close_stream_windows();
+        // Nothing released yet: the first chunk's latency, not a fetch-bound scan.
+        if sent_total.0 == 0 || elapsed.is_zero() {
+            return;
+        }
+        let fraction = waited.as_secs_f64() / elapsed.as_secs_f64();
+        match self.state.observe(fraction) {
+            BoostStep::Start => self.start(workers, fraction),
+            BoostStep::Stop => self.stop(fraction),
+            BoostStep::Stay if self.boosted() => self.top_up_workers(workers),
+            BoostStep::Stay => {}
+        }
+        if self.boosted() && fraction >= KICK_SCAN_WAIT_FRACTION {
+            self.kick_slow_head(&per_stream, now);
+        }
+    }
+
+    /// Bytes each tracked worker received in the window that just closed (in
+    /// `self.workers` order); updates the best window.
+    fn close_stream_windows(&mut self) -> Vec<u64> {
+        let mut got = Vec::with_capacity(self.workers.len());
+        for w in &mut self.workers {
+            let total = w.slot.bytes.load(Ordering::Relaxed);
+            let delta = total.saturating_sub(w.window_bytes);
+            w.window_bytes = total;
+            got.push(delta);
+        }
+        self.best_window_bytes = got.iter().copied().fold(self.best_window_bytes, u64::max);
+        got
+    }
+
+    /// Restarts the stream of the head plan chunk when it is slow (see [`FetchBoost`]).
+    fn kick_slow_head(&mut self, per_stream: &[u64], now: Instant) {
+        let floor = self.floor.load(Ordering::Acquire);
+        let best = self.best_window_bytes;
+        for (w, &delta) in self.workers.iter_mut().zip(per_stream) {
+            if w.slot.plan_index.load(Ordering::Relaxed) != floor {
+                continue;
+            }
+            let cooling = w
+                .last_kick
+                .is_some_and(|t| now.duration_since(t) < KICK_COOLDOWN);
+            if !cooling && head_is_slow(delta, best) {
+                info!(
+                    plan_index = floor,
+                    window_kb = delta / 1024,
+                    best_window_kb = best / 1024,
+                    "head stream slow while the scanner waits — restarting it"
+                );
+                w.slot.kick();
+                w.last_kick = Some(now);
+            }
+        }
+    }
+
+    fn start(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>, fraction: f64) {
+        self.boost_on.store(true, Ordering::Relaxed);
+        self.top_up_workers(workers);
+        // The ahead budget's share shrinks with the added workers.
+        self.dispatcher.set_target_bytes(chunk_target_bytes(
+            self.ahead,
+            self.base_streams + self.cfg.extra_streams,
+        ));
+        info!(
+            scan_wait_pct = (fraction * 100.0) as u64,
+            workers = self.base_streams + self.live_extras(),
+            "fetch boost on: the scanner is waiting for blocks"
+        );
+    }
+
+    fn stop(&mut self, fraction: f64) {
+        self.boost_on.store(false, Ordering::Relaxed);
+        self.dispatcher
+            .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
+        info!(
+            scan_wait_pct = (fraction * 100.0) as u64,
+            "fetch boost off: the scanner no longer waits"
+        );
+    }
+
+    fn live_extras(&self) -> usize {
+        self.extras.iter().filter(|h| !h.is_finished()).count()
+    }
+
+    /// Starts extra workers up to `extra_streams` live ones, while the plan has
+    /// chunks left to hand out.
+    fn top_up_workers(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>) {
+        let Some(spawn) = &self.spawn else { return };
+        self.extras.retain(|h| !h.is_finished());
+        while self.extras.len() < self.cfg.extra_streams {
+            let id = self.next_extra_id;
+            self.next_extra_id += 1;
+            let slot = Arc::new(WorkerSlot::new(Arc::clone(&self.dispatcher.fleet)));
+            let handle = workers.spawn(worker(
+                id,
+                spawn.endpoint.clone(),
+                spawn.tor.clone(),
+                spawn.plan.clone(),
+                Arc::clone(&self.dispatcher),
+                Arc::clone(&self.boost_on),
+                Arc::clone(&slot),
+                self.gate.clone(),
+                spawn.tx.clone(),
+                spawn.progress.clone(),
+            ));
+            self.extras.push(handle);
+            self.workers.push(TrackedWorker {
+                slot,
+                window_bytes: 0,
+                last_kick: None,
+            });
+        }
+    }
+}
+
+/// Whether a head stream that received `window_bytes` in a window is slow next to
+/// the best window `best_window_bytes` of any stream of the fetch.
+fn head_is_slow(window_bytes: u64, best_window_bytes: u64) -> bool {
+    window_bytes < KICK_MIN_WINDOW_BYTES
+        || (window_bytes as f64) < KICK_RATE_FRACTION * best_window_bytes as f64
+}
+
+/// What one closed window asks of the booster.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoostStep {
+    Start,
+    Stop,
+    Stay,
+}
+
+/// The booster's on/off hysteresis over closed windows (see [`FetchBoost`]).
+#[derive(Debug, Default)]
+struct BoostState {
+    on: bool,
+    /// Consecutive fetch-bound windows while off.
+    hot: u32,
+    /// Consecutive windows without waiting while on.
+    cold: u32,
+}
+
+impl BoostState {
+    /// Records one window in which the scanner waited for `fraction` of the time.
+    fn observe(&mut self, fraction: f64) -> BoostStep {
+        if !self.on {
+            self.hot = if fraction >= BOOST_ON_FRACTION {
+                self.hot + 1
+            } else {
+                0
+            };
+            if self.hot >= BOOST_HOT_WINDOWS {
+                *self = Self {
+                    on: true,
+                    hot: 0,
+                    cold: 0,
+                };
+                return BoostStep::Start;
+            }
+        } else {
+            self.cold = if fraction < BOOST_OFF_FRACTION {
+                self.cold + 1
+            } else {
+                0
+            };
+            if self.cold >= BOOST_COLD_WINDOWS {
+                *self = Self::default();
+                return BoostStep::Stop;
+            }
+        }
+        BoostStep::Stay
+    }
+}
+
+/// Fetch `plan.start..=plan.end` with [`FetchPlan::worker_count`] initial workers,
+/// adding adaptive workers when configured. Emits ordered, continuity-verified chunks
+/// into `queue` and returns stats on success.
 ///
 /// `progress` — if `Some`, bumps `fetched_blocks` by the block count of each
 /// ordered sub-chunk as it is released (Relaxed atomic; no cross-counter guarantees).
@@ -1186,38 +1815,73 @@ pub async fn run_fetch(
         "fetch begin"
     );
 
-    let next = Arc::new(AtomicU64::new(0));
+    // Keep main's initial worker cap even when the dispatcher sizes later chunks
+    // adaptively. The booster uses the same base count when it starts/stops extras.
+    let mut plan = plan;
+    plan.streams = worker_count;
+    let ahead = plan.split_bytes.saturating_mul(AHEAD_BUDGET_FACTOR);
+    let fleet = Arc::new(FleetStats::default());
+    // Byte-sized plan chunks come with the adaptive prefetch (see `Dispatcher`).
+    let dispatcher = Arc::new(Dispatcher::new(
+        &plan,
+        plan.boost
+            .map(|_| chunk_target_bytes(ahead, plan.streams.max(1))),
+        Arc::clone(&fleet),
+    ));
+    let boost_on = Arc::new(AtomicBool::new(false));
     let floor = Arc::new(AtomicU64::new(0));
-    let gate = AheadGate::new(
-        plan.split_bytes.saturating_mul(AHEAD_BUDGET_FACTOR),
-        Arc::clone(&floor),
-    );
-    // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes), one per worker.
-    let (tx, mut rx) = mpsc::channel::<SubChunk>(worker_count);
+    let gate = AheadGate::new(ahead, Arc::clone(&floor));
+    // Small reorder margin: each message is one sub-chunk (≤ ~split_bytes).
+    let (tx, mut rx) = mpsc::channel::<SubChunk>(plan.streams.max(1));
 
     // The lowest block not yet handed to the scanner: where the download stands if a worker
     // gives up (see `supervise_fetch`).
     let unreleased_from = AtomicU64::new(plan.start);
 
     let mut workers = JoinSet::new();
-    for worker_id in 0..worker_count {
+    let slots: Vec<Arc<WorkerSlot>> = (0..plan.streams.max(1))
+        .map(|_| Arc::new(WorkerSlot::new(Arc::clone(&fleet))))
+        .collect();
+    for (worker_id, slot) in slots.iter().enumerate() {
         workers.spawn(worker(
             worker_id,
             endpoint.clone(),
             tor.clone(),
             plan.clone(),
-            Arc::clone(&next),
+            Arc::clone(&dispatcher),
+            Arc::clone(&boost_on),
+            Arc::clone(slot),
             gate.clone(),
             tx.clone(),
             progress.clone(),
         ));
     }
-    drop(tx); // release loop ends when all workers finish
+    // The booster keeps a sender for the workers it may add, until the plan is out.
+    let booster = plan.boost.map(|cfg| {
+        Booster::new(
+            cfg,
+            queue.meter(),
+            Arc::clone(&dispatcher),
+            Arc::clone(&boost_on),
+            Arc::clone(&floor),
+            gate.clone(),
+            ahead,
+            &slots,
+            WorkerSpawn {
+                endpoint: endpoint.clone(),
+                tor: tor.clone(),
+                plan: plan.clone(),
+                tx: tx.clone(),
+                progress: progress.clone(),
+            },
+        )
+    });
+    drop(tx); // release loop ends when all workers (and the booster) let go of theirs
 
     // Workers are supervised WHILE the ordered release runs: one that gives up
     // fails the fetch now (see `supervise_fetch`) instead of after a release
     // that is waiting for its chunk.
-    let summary = supervise_fetch(
+    let summary = supervise_fetch_boosted(
         release_ordered(
             &mut rx,
             &queue,
@@ -1232,12 +1896,14 @@ pub async fn run_fetch(
         progress.as_deref(),
         &unreleased_from,
         plan.end,
+        booster,
     )
     .await?;
 
-    if summary.plans_released != chunk_count {
+    let (handed_out, plan_out) = dispatcher.handed_out();
+    if !plan_out || summary.plans_released != handed_out {
         return Err(SlipstreamError::Transport(format!(
-            "fetch incomplete: released {}/{chunk_count} plan chunks",
+            "fetch incomplete: released {}/{handed_out} plan chunks (plan out: {plan_out})",
             summary.plans_released
         )));
     }
@@ -1256,6 +1922,157 @@ pub async fn run_fetch(
         "fetch done"
     );
     Ok(stats)
+}
+
+#[cfg(test)]
+mod boost_tests {
+    use super::*;
+
+    /// Records `blocks` received blocks of `bytes_each` on the fleet.
+    fn receive(fleet: &FleetStats, blocks: u64, bytes_each: u64) {
+        fleet.blocks.fetch_add(blocks, Ordering::Relaxed);
+        fleet
+            .bytes
+            .fetch_add(blocks * bytes_each, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn the_first_chunk_is_a_probe_and_normal_era_chunks_keep_the_plans_span() {
+        let plan = FetchPlan::new(1000, 9999, 2000, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet));
+        assert_eq!(
+            d.take_now(),
+            Some((0, 1000, 1063)),
+            "probe of PROBE_SPAN blocks"
+        );
+        // Normal era: ~600 bytes per block, 16 MiB covers far more than 2,000 blocks.
+        receive(&fleet, 64, 600);
+        assert_eq!(d.take_now(), Some((1, 1064, 3063)));
+        assert_eq!(d.take_now(), Some((2, 3064, 5063)));
+        assert_eq!(d.take_now(), Some((3, 5064, 7063)));
+        assert_eq!(d.take_now(), Some((4, 7064, 9063)));
+        assert_eq!(
+            d.take_now(),
+            Some((5, 9064, 9999)),
+            "the last chunk ends at the plan's end"
+        );
+        assert_eq!(d.take_now(), None);
+        assert_eq!(d.handed_out(), (6, true));
+    }
+
+    #[test]
+    fn dense_chunks_are_cut_to_the_target_bytes_and_follow_the_density() {
+        let plan = FetchPlan::new(0, 99_999, 2000, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet));
+        let _ = d.take_now();
+        // Orchard spam: ~37 KB per block -> 16 MiB is ~453 blocks.
+        receive(&fleet, 64, 37_000);
+        assert_eq!(d.take_now(), Some((1, 64, 64 + 453 - 1)));
+        // A fresh sample of a denser stretch (~116 KB per block) wins over the average.
+        receive(&fleet, 200, 116_000);
+        let (_, s, e) = d.take_now().expect("chunk");
+        assert_eq!(e - s + 1, (16u64 << 20) / 116_000);
+        // Fewer new blocks than a sample: the fetch's running average.
+        receive(&fleet, 2, 116_000);
+        let (_, s, e) = d.take_now().expect("chunk");
+        let (blocks, bytes) = fleet.snapshot();
+        assert_eq!(e - s + 1, (16u64 << 20) / (bytes / blocks));
+        // A smaller share (more workers) cuts the chunks further.
+        d.set_target_bytes(8 << 20);
+        receive(&fleet, 100, 116_000);
+        let (_, s, e) = d.take_now().expect("chunk");
+        assert_eq!(e - s + 1, (8u64 << 20) / 116_000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn workers_after_the_first_wait_for_the_density_then_go_on_without_it() {
+        let plan = FetchPlan::new(0, 99_999, 2000, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Arc::new(Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet)));
+        assert_eq!(d.take().await, Some((0, 0, 63)));
+        let started = tokio::time::Instant::now();
+        // Nothing ever arrives: after DENSITY_WAIT the plan's own span.
+        assert_eq!(d.take().await, Some((1, 64, 2063)));
+        assert!(started.elapsed() >= DENSITY_WAIT);
+        // With the density known there is no wait.
+        receive(&fleet, 64, 100_000);
+        let before = tokio::time::Instant::now();
+        let (_, s, e) = d.take().await.expect("chunk");
+        assert_eq!(before.elapsed(), Duration::ZERO);
+        assert_eq!(e - s + 1, (16u64 << 20) / 100_000);
+    }
+
+    #[test]
+    fn without_the_adaptive_prefetch_the_plans_fixed_chunks() {
+        let plan = FetchPlan::new(1000, 1999, 300, 4);
+        let fleet = Arc::new(FleetStats::default());
+        let d = Dispatcher::new(&plan, None, Arc::clone(&fleet));
+        receive(&fleet, 100, 1 << 20);
+        for i in 0..plan.chunk_count() {
+            let (s, e) = plan.chunk_range(i);
+            assert_eq!(d.take_now(), Some((i, s, e)));
+        }
+        assert_eq!(d.take_now(), None);
+        assert_eq!(d.handed_out(), (plan.chunk_count(), true));
+    }
+
+    #[test]
+    fn plan_span_is_bounded_by_the_floor_and_the_plans_span() {
+        assert_eq!(plan_span(16 << 20, 600, 2_000), 2_000);
+        assert_eq!(plan_span(1 << 20, 10 << 20, 2_000), BOOST_MIN_SPAN);
+        assert_eq!(plan_span(1 << 20, 10 << 20, 4), 4);
+        assert_eq!(plan_span(1 << 20, 0, 2_000), 2_000);
+        assert_eq!(chunk_target_bytes(64 << 20, 4), 16 << 20);
+        assert_eq!(chunk_target_bytes(64 << 20, 0), 64 << 20);
+    }
+
+    #[test]
+    fn boost_starts_after_consecutive_fetch_bound_windows_only() {
+        let mut st = BoostState::default();
+        assert_eq!(st.observe(0.9), BoostStep::Stay);
+        assert_eq!(
+            st.observe(0.1),
+            BoostStep::Stay,
+            "a calm window resets the count"
+        );
+        assert_eq!(st.observe(0.3), BoostStep::Stay);
+        assert_eq!(st.observe(BOOST_ON_FRACTION), BoostStep::Start);
+        assert!(st.on);
+    }
+
+    #[test]
+    fn a_scanner_that_never_waits_never_boosts() {
+        let mut st = BoostState::default();
+        for _ in 0..1000 {
+            assert_eq!(st.observe(0.0), BoostStep::Stay);
+            assert_eq!(st.observe(BOOST_ON_FRACTION - 0.01), BoostStep::Stay);
+        }
+        assert!(!st.on);
+    }
+
+    #[test]
+    fn boost_ends_after_consecutive_calm_windows() {
+        let mut st = BoostState {
+            on: true,
+            hot: 0,
+            cold: 0,
+        };
+        for _ in 0..BOOST_COLD_WINDOWS - 1 {
+            assert_eq!(st.observe(0.0), BoostStep::Stay);
+        }
+        assert_eq!(
+            st.observe(0.2),
+            BoostStep::Stay,
+            "a waiting window resets the count"
+        );
+        for _ in 0..BOOST_COLD_WINDOWS - 1 {
+            assert_eq!(st.observe(0.01), BoostStep::Stay);
+        }
+        assert_eq!(st.observe(0.0), BoostStep::Stop);
+        assert!(!st.on);
+    }
 }
 
 #[cfg(test)]
@@ -1352,6 +2169,13 @@ mod tests {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let incoming = TcpIncoming::bind(([127, 0, 0, 1], 0).into()).expect("bind loopback");
         let port = incoming.local_addr().expect("bound address").port();
+        let connections = Arc::new(AtomicU64::new(0));
+        let connected = Arc::clone(&connections);
+        let incoming = incoming.inspect(move |connection| {
+            if connection.is_ok() {
+                connected.fetch_add(1, Ordering::Relaxed);
+            }
+        });
         let server = tokio::spawn(
             Server::builder()
                 .add_service(Ranges(Arc::clone(&requests)))
@@ -1378,6 +2202,7 @@ mod tests {
             None,
             &mut max_span,
             true,
+            None,
         )
         .await
         .expect("split completes");
@@ -1389,13 +2214,30 @@ mod tests {
         assert_eq!(max_span, 2);
         drop(tx);
         assert_heights_consecutive(&drain_subs(&mut rx), 100, 103);
-        server.abort();
         assert!(
             grpc::net_stats::totals()
                 .delta_since(&before)
                 .get_block_range
                 >= 3,
             "every issued range, including the refused request, must be counted"
+        );
+        let before_connections = connections.load(Ordering::Relaxed);
+        let mut follow = FetchPlan::new(100, 100, 2_000, 4);
+        follow.boost = Some(FetchBoost { extra_streams: 0 });
+        let (queue, mut received) = chunk_queue(1 << 20);
+        let fetched = run_fetch(&endpoint, None, follow, queue, None)
+            .await
+            .expect("follow fetch");
+        assert_eq!(fetched.blocks, 1);
+        assert!(
+            received.recv().await.is_some(),
+            "the follow block is released"
+        );
+        server.abort();
+        assert_eq!(
+            connections.load(Ordering::Relaxed) - before_connections,
+            1,
+            "adaptive prefetch must retain one connection for a one-block follow range"
         );
     }
     use super::*;
@@ -1446,13 +2288,13 @@ mod tests {
     #[test]
     fn workers_claim_every_chunk_exactly_once() {
         let plan = FetchPlan::new(1_000, 1_999, 100, 4); // 10 chunks, 4 workers
-        let next = AtomicU64::new(0);
+        let dispatcher = Dispatcher::new(&plan, None, Arc::new(FleetStats::default()));
         let mut claimed: Vec<Vec<(u64, u64, u64)>> = vec![Vec::new(); plan.worker_count()];
         let mut idle = 0;
         while idle < claimed.len() {
             idle = 0;
             for worker in claimed.iter_mut() {
-                match plan.claim_chunk(&next) {
+                match dispatcher.take_now() {
                     Some(chunk) => worker.push(chunk),
                     None => idle += 1,
                 }
@@ -1473,7 +2315,7 @@ mod tests {
         for pair in all.windows(2) {
             assert_eq!(pair[1].1, pair[0].2 + 1, "chunks tile the range");
         }
-        assert_eq!(plan.claim_chunk(&next), None, "the cursor stays exhausted");
+        assert_eq!(dispatcher.take_now(), None, "the cursor stays exhausted");
     }
 
     // ── T6.8-S helpers ─────────────────────────────────────────────────────────
@@ -2029,6 +2871,7 @@ mod tests {
             &tx,
             None,
             &mut refused,
+            None,
         )
         .await
         .expect("the window completes");
@@ -2055,6 +2898,7 @@ mod tests {
             &tx,
             None,
             &mut refused,
+            None,
         )
         .await
         .expect_err("the refusal fails the window");
@@ -2266,6 +3110,115 @@ mod tests {
             .expect("waiter must unblock after floor advance")
             .expect("join");
         assert!(got.is_none(), "now-floor worker proceeds without a permit");
+    }
+
+    /// Our own backpressure never trips the stream idle timeout: a worker parked
+    /// on the ahead budget for longer than `STREAM_IDLE_TIMEOUT` is not polling
+    /// its stream, so the timer is not running; once admitted it goes on.
+    #[tokio::test(start_paused = true)]
+    async fn parked_on_the_ahead_budget_longer_than_the_idle_timeout_is_not_idle() {
+        let floor = Arc::new(AtomicU64::new(0));
+        // Budget of one sub-chunk; plan chunk 1 is not the floor.
+        let gate = AheadGate::new(2500, Arc::clone(&floor));
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let mut cursor = test_cursor(1, 100, 109);
+        let mut s = stream::iter(
+            linked(100, 10, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        );
+        let pump = tokio::spawn(async move {
+            let out = pump_block_stream(
+                &mut s,
+                &mut cursor,
+                2500,
+                Duration::from_secs(120),
+                &gate,
+                &tx,
+                None,
+            )
+            .await;
+            (out, cursor)
+        });
+        // The first sub-chunk takes the whole budget; the second parks.
+        let first = rx.recv().await.expect("first sub-chunk");
+        tokio::time::sleep(grpc::STREAM_IDLE_TIMEOUT * 3).await;
+        assert!(!pump.is_finished(), "parked, not failed");
+        drop(first); // releases its budget
+        // Each sub-chunk's budget is released as it is taken (dropped here).
+        let mut last = false;
+        while let Some(sub) = rx.recv().await {
+            last = sub.is_last;
+        }
+        let (out, cursor) = pump.await.expect("join");
+        assert!(matches!(out, Ok(PumpOutcome::Completed)), "{out:?}");
+        assert_eq!(cursor.resume_from, 110);
+        assert!(last, "the plan chunk completes");
+    }
+
+    /// A kick ends the attempt like a stream error: the blocks received so far
+    /// are handed on, the cursor resumes after them, and the worker can tell the
+    /// kick from a failure.
+    #[tokio::test]
+    async fn a_kicked_stream_hands_on_its_blocks_and_ends_the_attempt() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 119);
+        let slot = WorkerSlot::new(Arc::default());
+        let mut refused = false;
+        // Five blocks, then the stream goes silent (pending forever).
+        let mut s = stream::iter(
+            linked(100, 5, 1000)
+                .into_iter()
+                .map(Ok::<_, tonic::Status>)
+                .collect::<Vec<_>>(),
+        )
+        .chain(stream::pending());
+        let pump = pump_block_window(
+            &mut s,
+            &mut cursor,
+            119,
+            1 << 30,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+            Some(&slot),
+        );
+        let kicker = async {
+            while slot.bytes.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            slot.kick();
+        };
+        let (out, ()) = tokio::join!(pump, kicker);
+        let err = out.expect_err("the kick ends the attempt");
+        assert!(err.to_string().contains("slow head stream"), "{err}");
+        assert!(slot.take_kick(), "the worker sees a kick, not a failure");
+        assert!(!slot.take_kick());
+        assert!(slot.bytes.load(Ordering::Relaxed) > 5000);
+        let subs = drain_subs(&mut rx);
+        assert_heights_consecutive(&subs, 100, 104);
+        assert!(subs.iter().all(|s| !s.is_last));
+        assert_eq!(cursor.resume_from, 105);
+    }
+
+    #[test]
+    fn a_head_stream_is_slow_next_to_the_best_window_only() {
+        let best = 10 << 20;
+        assert!(
+            !head_is_slow(best / 4, best),
+            "a quarter of the link is fair"
+        );
+        assert!(head_is_slow(best / 10, best));
+        assert!(
+            head_is_slow(KICK_MIN_WINDOW_BYTES - 1, 0),
+            "a trickle is slow"
+        );
+        assert!(!head_is_slow(KICK_MIN_WINDOW_BYTES, KICK_MIN_WINDOW_BYTES));
     }
 
     // ── v0.7 P2: wire-collapse detector (clock-free trigger matrix) ────────────

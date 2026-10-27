@@ -20,6 +20,7 @@
 //! `ChunkPermit`, so the budget covers queued AND in-processing bytes.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use prost::Message;
 use tokio::sync::{Semaphore, mpsc};
@@ -118,10 +119,82 @@ pub struct ChunkQueueSender {
     budget: Arc<Semaphore>,
     budget_bytes: usize,
     boundary_fetcher: Option<BoundaryFetcher>,
+    meter: Arc<QueueMeter>,
 }
 
 pub struct ChunkQueueReceiver {
     rx: mpsc::UnboundedReceiver<QueuedChunk>,
+    meter: Arc<QueueMeter>,
+}
+
+/// What the fetch side can see of its consumer through one queue: how long the
+/// scanner has waited in [`ChunkQueueReceiver::recv`] for its next chunk, and how
+/// many blocks and estimated bytes were sent. The fetch's adaptive prefetch
+/// (`fetch::FetchBoost`) reads it to tell a fetch-bound scan (the scanner waits)
+/// from a scan-bound one (the queue is full and it never waits).
+#[derive(Debug)]
+pub struct QueueMeter {
+    base: std::time::Instant,
+    /// Completed waits, microseconds.
+    waited_us: AtomicU64,
+    /// Start of the wait in progress, microseconds since `base` plus one; 0 = not waiting.
+    waiting_since_us: AtomicU64,
+    sent_blocks: AtomicU64,
+    sent_bytes: AtomicU64,
+}
+
+impl QueueMeter {
+    fn new() -> Self {
+        Self {
+            base: std::time::Instant::now(),
+            waited_us: AtomicU64::new(0),
+            waiting_since_us: AtomicU64::new(0),
+            sent_blocks: AtomicU64::new(0),
+            sent_bytes: AtomicU64::new(0),
+        }
+    }
+
+    fn now_us(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_micros())
+            .unwrap_or(u64::MAX - 1)
+            .saturating_add(1)
+    }
+
+    /// Total time the consumer has waited for a chunk, the wait in progress included.
+    /// Approximate under races (a wait that ends while this reads may be left out),
+    /// never counted twice.
+    pub fn scan_waited(&self) -> std::time::Duration {
+        let done = self.waited_us.load(Ordering::SeqCst);
+        let since = self.waiting_since_us.load(Ordering::SeqCst);
+        let ongoing = if since == 0 {
+            0
+        } else {
+            self.now_us().saturating_sub(since)
+        };
+        std::time::Duration::from_micros(done.saturating_add(ongoing))
+    }
+
+    /// `(blocks, estimated bytes)` sent into the queue so far.
+    pub fn sent(&self) -> (u64, u64) {
+        (
+            self.sent_blocks.load(Ordering::Relaxed),
+            self.sent_bytes.load(Ordering::Relaxed),
+        )
+    }
+}
+
+/// Ends a wait on the meter when `recv` returns or its future is dropped.
+struct WaitGuard<'a> {
+    meter: &'a QueueMeter,
+    since: u64,
+}
+
+impl Drop for WaitGuard<'_> {
+    fn drop(&mut self) {
+        let waited = self.meter.now_us().saturating_sub(self.since);
+        self.meter.waited_us.fetch_add(waited, Ordering::SeqCst);
+        self.meter.waiting_since_us.store(0, Ordering::SeqCst);
+    }
 }
 
 /// `budget_bytes` bounds the estimated bytes in flight (queued + being
@@ -129,6 +202,7 @@ pub struct ChunkQueueReceiver {
 /// budget rather than deadlocking.
 pub fn chunk_queue(budget_bytes: usize) -> (ChunkQueueSender, ChunkQueueReceiver) {
     let (tx, rx) = mpsc::unbounded_channel();
+    let meter = Arc::new(QueueMeter::new());
     (
         // A zero budget degenerates to 1 byte (fully serial) instead of blocking forever.
         ChunkQueueSender {
@@ -136,8 +210,9 @@ pub fn chunk_queue(budget_bytes: usize) -> (ChunkQueueSender, ChunkQueueReceiver
             budget: Arc::new(Semaphore::new(budget_bytes.max(1))),
             budget_bytes: budget_bytes.max(1),
             boundary_fetcher: None,
+            meter: Arc::clone(&meter),
         },
-        ChunkQueueReceiver { rx },
+        ChunkQueueReceiver { rx, meter },
     )
 }
 
@@ -145,6 +220,11 @@ impl ChunkQueueSender {
     /// Install the boundary-treestate fetcher (scheduler, production path).
     pub fn set_boundary_fetcher(&mut self, f: BoundaryFetcher) {
         self.boundary_fetcher = Some(f);
+    }
+
+    /// The queue's [`QueueMeter`], shared with the receiver.
+    pub fn meter(&self) -> Arc<QueueMeter> {
+        Arc::clone(&self.meter)
     }
 
     /// Waits until the byte budget admits the chunk, then enqueues it.
@@ -167,6 +247,7 @@ impl ChunkQueueSender {
             .acquire_many_owned(need)
             .await
             .map_err(|_| SlipstreamError::Stopped)?;
+        let (blocks, bytes) = (chunk.blocks.len() as u64, chunk.estimated_bytes as u64);
         self.tx
             .send((
                 chunk,
@@ -177,6 +258,8 @@ impl ChunkQueueSender {
                 boundary,
             ))
             .map_err(|_| SlipstreamError::Stopped)?;
+        self.meter.sent_blocks.fetch_add(blocks, Ordering::Relaxed);
+        self.meter.sent_bytes.fetch_add(bytes, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -187,8 +270,19 @@ impl ChunkQueueReceiver {
         self.rx.try_recv().ok()
     }
 
-    /// `None` when all senders are dropped (fetch finished or aborted).
+    /// The next chunk; `None` when all senders are dropped (fetch finished or
+    /// aborted). The time spent waiting
+    /// here is recorded on the queue's [`QueueMeter`].
     pub async fn recv(&mut self) -> Option<QueuedChunk> {
+        if let Ok(item) = self.rx.try_recv() {
+            return Some(item);
+        }
+        let since = self.meter.now_us();
+        self.meter.waiting_since_us.store(since, Ordering::SeqCst);
+        let _guard = WaitGuard {
+            meter: &self.meter,
+            since,
+        };
         self.rx.recv().await
     }
 }
@@ -339,6 +433,50 @@ mod tests {
         assert_eq!(
             chunk.outputs, 10,
             "outputs must sum sapling outputs + orchard actions"
+        );
+    }
+
+    #[tokio::test]
+    async fn meter_counts_the_consumers_wait_and_what_was_sent() {
+        let (tx, mut rx) = chunk_queue(1 << 20);
+        let meter = tx.meter();
+        assert_eq!(meter.scan_waited(), Duration::ZERO);
+        assert_eq!(meter.sent(), (0, 0));
+
+        // A chunk already queued is taken without waiting.
+        let c = chunk_of(0, 1..=10);
+        let bytes = c.estimated_bytes as u64;
+        tx.send(c).await.expect("send");
+        assert_eq!(meter.sent(), (10, bytes));
+        let _first = rx.recv().await.expect("first");
+        assert_eq!(meter.scan_waited(), Duration::ZERO);
+
+        // A wait in progress counts before it ends, and once.
+        let waiter = tokio::spawn(async move {
+            let got = rx.recv().await.map(|(c, _, _)| c.index);
+            (got, rx)
+        });
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        let ongoing = meter.scan_waited();
+        assert!(
+            ongoing >= Duration::from_millis(50),
+            "ongoing wait {ongoing:?}"
+        );
+        tx.send(chunk_of(1, 11..=12)).await.expect("send");
+        let (got, mut rx) = waiter.await.expect("join");
+        assert_eq!(got, Some(1));
+        let done = meter.scan_waited();
+        assert!(done >= ongoing && done < Duration::from_secs(5), "{done:?}");
+
+        // A dropped recv future ends its wait.
+        let dropped = tokio::time::timeout(Duration::from_millis(30), rx.recv()).await;
+        assert!(dropped.is_err());
+        let after = meter.scan_waited();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            meter.scan_waited(),
+            after,
+            "no wait is in progress any more"
         );
     }
 }

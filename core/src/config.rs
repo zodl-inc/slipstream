@@ -244,6 +244,14 @@ pub struct EngineConfig {
     /// limits also bound that rework.
     pub persist_commit_limits: Option<crate::persist::CommitLimits>,
 
+    /// Adaptive prefetch (`fetch::FetchBoost`): plan chunks sized by bytes (a
+    /// share of the ahead budget, so normal-era chunks keep `chunk_blocks`)
+    /// instead of a fixed block count; and while the scan measurably waits for
+    /// blocks, slow head streams restarted on a fresh connection and, through an
+    /// OHTTP gateway on a device whose memory budget is not derated, two more
+    /// block streams. Default on; `false` is the kill switch (fixed plan chunks).
+    pub fetch_boost: bool,
+
     /// Dense ranges: the most note commitments one scan call takes when the scan
     /// merges chunks already waiting in the queue into it (only chunks of at least
     /// 16,000 commitments merge). Each scan call ends in a barrier: the decryption
@@ -306,6 +314,7 @@ impl EngineConfig {
                 max_blocks: crate::persist::CommitLimits::DEFAULT_MAX_BLOCKS,
                 max_outputs: crate::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
             }),
+            fetch_boost: true,
             scan_merge_outputs: Self::DEFAULT_SCAN_MERGE_OUTPUTS,
         }
     }
