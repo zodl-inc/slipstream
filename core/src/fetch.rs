@@ -2070,7 +2070,7 @@ pub async fn run_fetch(
         "fetch begin"
     );
 
-    // Keep main's initial worker cap even when the dispatcher sizes later chunks
+    // Cap initial workers to the plan chunks even when later chunks are sized
     // adaptively. The booster uses the same base count when it starts/stops extras.
     let mut plan = plan;
     plan.streams = worker_count;
@@ -2538,6 +2538,7 @@ mod tests {
             None,
             &mut max_span,
             true,
+            None,
             None,
         )
         .await

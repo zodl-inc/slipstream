@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! T8.1 darkside test: probe_tip + should_resync + follow-pass catch-up.
 //!
 //! Tests the exact probe → pass primitive that the FFI follow loop composes:

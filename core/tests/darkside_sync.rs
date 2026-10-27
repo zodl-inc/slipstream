@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! Correctness test: slipstream engine finds fixture transactions in a darkside chain.
 //!
 //! Mirrors `BalanceTests.testVerifyIncomingTransaction` from

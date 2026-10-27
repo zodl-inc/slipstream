@@ -15,6 +15,7 @@
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
 #![recursion_limit = "256"]
+#![doc(test(attr(recursion_limit = "256")))]
 
 //! Slipstream sync engine core (platform-neutral).
 //! See HOSTING.md for the integration contract and REVIEWING.md for the

@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! Slipstream developer CLI: the primary harness for engine work (decision D5).
 //! Subcommands land per phase: `fetch` (P1), `sync` (P2+), `report` (P5).
 
