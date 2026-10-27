@@ -29,12 +29,12 @@ use zcash_protocol::consensus::BlockHeight;
 use crate::{
     chunk::chunk_queue,
     config::EngineConfig,
-    connector::{ConnPurpose, TorConn, connect_via},
-    enhance::{EnhanceStats, run_enhancement},
+    connector::TorConn,
+    enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily},
     error::SlipstreamError,
     events::Progress,
     fetch::{FetchPlan, FetchStats, run_fetch},
-    scan::{ScanStats, scan_chunks},
+    scan::{ScanStats, local_treestate_active, needs_server_boundary_state, scan_chunks},
     wallet_session::WalletSession,
 };
 
@@ -292,7 +292,7 @@ pub struct SyncReport {
     /// Total wall-clock time spent in scan_chunks (across all ranges).
     /// Measured around the scan call per range. Default: zero.
     pub scan_elapsed: Duration,
-    /// Total wall-clock time spent in per-range run_enhancement calls (F3).
+    /// Total wall-clock time spent in per-range run_enhancement_lazily calls (F3).
     /// The engine's final post-loop enhancement adds its own elapsed to SyncOutcome
     /// directly; this field covers the scheduler's interleaved runs only.
     pub enhance_elapsed: Duration,
@@ -372,7 +372,7 @@ impl<T> std::future::Future for AbortOnDrop<T> {
 }
 
 /// Process every suggested range until none remain. The caller has already
-/// run update_chain_tip + put_subtree_roots (engine.rs).
+/// run put_subtree_roots_at + update_chain_tip (engine.rs).
 ///
 /// `progress` — if `Some`, bumps `fetched_blocks`, `scanned_blocks`, `reorgs_recovered`,
 /// and `current_range_end` atomics so poll-based consumers (CLI ticker, iOS D8) get
@@ -501,16 +501,23 @@ pub async fn run_to_completion(
         // v0.5 pacer fix: boundary treestate fetches start when the chunk is
         // EMITTED (fetch side), so the RTT hides under queue wait + scan
         // instead of racing one scan call (P1: that overhang was 62 % of the
-        // Mac scan wall on a slow-treestate day).
+        // Mac scan wall on a slow-treestate day). In server mode the range's
+        // last boundary is never read, so it is not fetched. Whether a
+        // local-mode boundary is audited is decided scan-side, so local mode
+        // still fetches every boundary here.
         {
             let ep = config.endpoint.clone();
             let tor_owned = tor.cloned();
             let boundary_progress = progress.clone();
+            let local_mode = local_treestate_active(config);
             tx.set_boundary_fetcher(std::sync::Arc::new(move |end_height| {
+                if !needs_server_boundary_state(local_mode, true, end_height, end) {
+                    return None;
+                }
                 let ep = ep.clone();
                 let tor_owned = tor_owned.clone();
                 let progress = boundary_progress.clone();
-                tokio::spawn(async move {
+                Some(tokio::spawn(async move {
                     crate::grpc::retry_get_tree_state(
                         &ep,
                         end_height,
@@ -519,7 +526,7 @@ pub async fn run_to_completion(
                         progress,
                     )
                     .await
-                })
+                }))
             }));
         }
         let mut plan = FetchPlan::new(start, end, config.chunk_blocks, config.fetch_streams);
@@ -538,23 +545,20 @@ pub async fn run_to_completion(
         // Spawn the fetch task so it runs concurrently with scan_chunks below.
         // The tx is moved into the task; when the task finishes, tx is dropped, which
         // closes the channel and causes scan_chunks's rx.recv() loop to terminate.
-        // Wrapped in AbortOnDrop: if `connect_via` below fails (`?` returns early) or this
-        // whole future is dropped (a host restart aborts the session, not this task), the
-        // fetch task is aborted instead of orphaned (see `AbortOnDrop`'s doc).
+        // Wrapped in AbortOnDrop: if this whole future is dropped (a host restart aborts
+        // the session, not this task), the fetch task is aborted instead of orphaned (see
+        // `AbortOnDrop`'s doc).
         let fetch_task = AbortOnDrop(tokio::spawn(async move {
             run_fetch(&endpoint, plan, tx, fetch_progress).await
         }));
 
-        // scan_chunks runs in the current task using a SEPARATE grpc client so it
-        // does not contend with the fetch workers' connections.
-        let mut scan_client =
-            connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-
+        // scan_chunks runs in the current task. Its interleaved enhancement opens its own
+        // connection when it first needs the server, separate from the fetch workers'.
         let scan_started = std::time::Instant::now();
         let scan_result: Result<ScanStats, SlipstreamError> = scan_chunks(
             session,
-            &mut scan_client,
             start,
+            end,
             rx,
             progress.clone(),
             config,
@@ -637,11 +641,11 @@ pub async fn run_to_completion(
 
             // B3 (#1755): give a desynced load-balanced cluster a heal window before
             // retrying — see reorg_backoff_ms. Connection freshness on retry is
-            // structural, not added here: the next loop iteration creates a NEW
-            // scan-side client (grpc::connect per range, above) and run_fetch spawns
-            // NEW per-worker connections (fetch.rs worker() connects per worker, per
-            // range) — no gRPC channel survives into the retry, so the retry cannot
-            // be pinned to the same stale backend.
+            // structural, not added here: every client a range uses is opened within
+            // that range (scan_chunks' tree states and interleaved enhancement, and
+            // run_fetch's per-worker connections — fetch.rs worker() connects per
+            // worker, per range) — no gRPC channel survives into the retry, so the
+            // retry cannot be pinned to the same stale backend.
             let backoff_ms = reorg_backoff_ms(consecutive_reorgs);
             warn!(
                 backoff_ms,
@@ -754,7 +758,9 @@ pub async fn run_to_completion(
         // This makes transactions visible progressively during the sync, not just at
         // the very end. The engine's final post-loop run_enhancement still fires
         // (catches any leftovers) and its stats are accumulated into SyncOutcome
-        // separately. We reuse a fresh gRPC client per call (same pattern as engine.rs).
+        // separately. The connection is opened at the first request that needs the
+        // server, so a range with nothing to fetch — a follow pass on a quiet wallet,
+        // whose only requests are address checks the run skips — opens none.
         //
         // NON-FATAL: interleaved enhancement is an optimization (progressive tx
         // visibility), not a correctness guarantee — that is the final post-loop run's
@@ -762,18 +768,14 @@ pub async fn run_to_completion(
         // sync at a range boundary; we log and continue scanning.
         {
             let enhance_started = std::time::Instant::now();
-            let enhance_result = async {
-                let mut enhance_client =
-                    connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-                run_enhancement(
-                    session,
-                    &mut enhance_client,
-                    config.network,
-                    progress.clone(),
-                    skipped_keys,
-                )
-                .await
-            }
+            let mut enhance_client = enhancement_connection(&config.endpoint, tor);
+            let enhance_result = run_enhancement_lazily(
+                session,
+                &mut enhance_client,
+                config.network,
+                progress.clone(),
+                skipped_keys,
+            )
             .await;
             match enhance_result {
                 Ok(enhance_stats) => {

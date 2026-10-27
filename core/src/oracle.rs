@@ -1523,7 +1523,8 @@ mod tests {
 
     /// Prepare hook: create the SPENDING account from `seed`, then seed the
     /// shard-0 "server" root (only when `with_root`) — mirroring the engine's
-    /// pass-start `put_subtree_roots` ingest.
+    /// pass-start `put_subtree_roots_at` ingest, from index 0 as in a pass with
+    /// `Historic` scan work.
     fn t10b_prepare(
         seed: [u8; 32],
         blocks: &[zcash_client_backend::proto::compact_formats::CompactBlock],
@@ -1989,6 +1990,7 @@ mod tests {
         use zcash_primitives::block::BlockHash;
         use zcash_primitives::merkle_tree::HashSer;
         use zcash_protocol::consensus::BlockHeight;
+        use zcash_protocol::zip318::BlockSpacing;
 
         use crate::block_source::MemBlockSource;
         use crate::chunk::Chunk;
@@ -2423,6 +2425,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             // Unit 2 [40, 80) holds block 50's anchor; unit 3 [80, 150) holds block 100's.
@@ -2507,6 +2510,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + tip_lead;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let mut dirs = vec![];
@@ -2653,6 +2657,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             open_wallet(dir, &base, &blocks, tip);
@@ -2913,6 +2918,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let root = tempfile::tempdir().expect("tempdir");
@@ -3016,7 +3022,8 @@ mod tests {
         /// Its one unit ends on shard 1's last position, so no shard close builds them, and
         /// the stop skips the range-end finish. The tree holds no leaf where they end (R's own
         /// `from_state` frontier sits right before them). The subtree roots are ingested
-        /// before R is scanned, as every pass start ingests them.
+        /// before R is scanned, from index 0, as the start of a pass with `Historic` scan
+        /// work ingests them.
         ///
         /// - With the server's root for shard 1 stored, the sweep builds the run: the shard's
         ///   root computed from the run and R's frontier is that root.
@@ -3691,6 +3698,7 @@ mod tests {
             let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
             let anchors = AnchorRetention::new(
                 height(0),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let root = tempfile::tempdir().expect("tempdir");
@@ -3803,6 +3811,7 @@ mod tests {
             let height = |i: u64| BlockHeight::from(u32::try_from(START + i).expect("fits"));
             let anchors = AnchorRetention::new(
                 height(0),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let root = tempfile::tempdir().expect("tempdir");
@@ -3898,6 +3907,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             open_wallet(dir, &base, &blocks, tip);
@@ -4116,6 +4126,7 @@ mod tests {
             let blocks = chain(base_size, 150);
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             open_wallet(dir, &base, &blocks, STOPPED_R_TIP);
@@ -4601,6 +4612,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(ORCHARD_START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let r_anchors = [ORCHARD_START + 50, ORCHARD_START + 100];
@@ -4692,6 +4704,7 @@ mod tests {
             let tip = blocks.last().expect("blocks").height + 20_000;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(ORCHARD_START).expect("fits")),
+                BlockSpacing::UNIFORM,
                 AnchorRetentionInterval::custom(NonZeroU32::new(50).expect("nonzero")),
             );
             let r_anchors = [ORCHARD_START + 50, ORCHARD_START + 100];

@@ -390,6 +390,9 @@ owns the policy so every host provisions identically (`intent`: 1 = restore, 0 =
   activation) as `{height, treestate protobuf bytes}` to create the account from; offline
   ⇒ height 0/no treestate, keep your bundled checkpoint.
 
+A server that reports a tip or tree-state height above `i32::MAX` counts as unreachable,
+so the returned `height` never exceeds `i32::MAX` unless your own inputs do.
+
 Pass the same `tor_dir` you give `start` when your user enabled Tor — these fetches are
 identifying (they reveal birthday interest). A requested-but-failed Tor bootstrap
 resolves **offline**, never via a silent direct connection. Rust hosts call

@@ -2101,9 +2101,11 @@ pub fn sparse_put_blocks(
         flush_ms,
         downgraded,
         // [B6] retention observability: the active floor and grid, plus how many
-        // anchors the orchard store currently pins (None = retention off).
+        // anchors the orchard store currently pins (None = retention off). The grid
+        // is the intervals themselves, in reference blocks, not blocks: from NU7
+        // activation each reference block spans three blocks.
         anchor_floor = anchor_floor.map(|r| u32::from(r.from_height())),
-        anchor_grid = anchor_floor
+        anchor_grid_reference_blocks = anchor_floor
             .map(|r| {
                 r.intervals()
                     .iter()
@@ -2485,7 +2487,7 @@ where
 /// The root of shard `index`, computed from the leaves and subtree hashes `store` holds
 /// for it, or `None` while some of the shard is missing. The annotation on the shard's own
 /// root is ignored: the SQLite store puts its stored root there on every shard it loads
-/// (`get_shard` reads the `root_hash` that the pass-start `put_subtree_roots` ingest wrote),
+/// (`get_shard` reads the `root_hash` that a pass-start `put_subtree_roots_at` ingest wrote),
 /// so reading it would only return the root it is compared with.
 fn shard_content_root<H>(store: &SparseShardStore<H>, index: u64) -> Option<H>
 where
@@ -2695,7 +2697,9 @@ trait SweptTree: Sized {
         wdb: &mut zcash_client_sqlite::WalletDb<zcash_client_sqlite::SqlTransaction<'_>, P, CL, R>,
     ) -> Result<(), SqliteClientError>;
     /// The root the wallet stores for shard `index`, as the graft verdict reads it: the
-    /// server's, which every pass start ingests (`put_subtree_roots`) before the sweep.
+    /// server's, which a pass start ingests (`put_subtree_roots_at`) before the sweep, in
+    /// this pass or an earlier one. A pass with `Historic` scan work ingests every root,
+    /// and any other pass only those from each pool's next subtree index on.
     fn stored_root(db: &mut Db, index: u64) -> Result<Option<Self::Node>, SqliteClientError>;
 }
 
@@ -3407,6 +3411,13 @@ impl WalletWrite for SparseFacade<'_> {
     ) -> Result<(), <Self as WalletRead>::Error> {
         self.inner.delete_account(account)
     }
+    fn set_account_name(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+        name: &str,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.inner.set_account_name(account, name)
+    }
     fn get_next_available_address(
         &mut self,
         account: <Self as WalletRead>::AccountId,
@@ -3584,7 +3595,7 @@ pub(crate) fn apply_nullifier_delta<A: Copy, Nf: PartialEq + Copy>(
 }
 
 /// Mirror of upstream `SpendIdentifiers::update_with`'s transparent half for ONE
-/// block's worth of deltas (zcash_client_backend-0.25.0-pre.0 src/scanning.rs:697-722):
+/// block's worth of deltas (zcash_client_backend-0.25.0 src/scanning.rs:697-722):
 /// remove the spent outpoints, then insert the received ones. Generic so the
 /// semantics are unit-testable without `ScannedBlock` values.
 pub(crate) fn apply_outpoint_delta<K: Eq + std::hash::Hash + Clone, A: Copy>(
@@ -3638,7 +3649,7 @@ fn unvirtualized(name: &str) -> SqliteClientError {
 /// 4. `get_orchard_nullifiers(NullifierQuery::Unspent)` — same as (3),
 ///    scanning.rs:366.
 /// 5. `get_unspent_transparent_outpoints` — via `SpendIdentifiers::unspent`
-///    (zcash_client_backend-0.25.0-pre.0 scanning.rs:655-664). Served from a
+///    (zcash_client_backend-0.25.0 scanning.rs:655-663). Served from a
 ///    running view seeded and re-seeded like (3), advanced per stashed block by
 ///    `apply_outpoint_delta` (upstream `SpendIdentifiers::update_with` semantics,
 ///    scanning.rs:697-722). EXACT, as for (3).
@@ -4132,6 +4143,13 @@ impl WalletWrite for WriteBehindFacade {
         _account: <Self as WalletRead>::AccountId,
     ) -> Result<(), <Self as WalletRead>::Error> {
         Err(unvirtualized("delete_account"))
+    }
+    fn set_account_name(
+        &mut self,
+        _account: <Self as WalletRead>::AccountId,
+        _name: &str,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        Err(unvirtualized("set_account_name"))
     }
     fn get_next_available_address(
         &mut self,
@@ -4649,6 +4667,7 @@ mod store_tests {
     use super::*;
     use incrementalmerkletree::{Address, Hashable as _};
     use zcash_client_backend::data_api::anchor_retention::AnchorRetentionInterval;
+    use zcash_protocol::zip318::BlockSpacing;
 
     type Store = SparseShardStore<sapling::Node>;
 
@@ -4830,7 +4849,13 @@ mod store_tests {
         };
 
         // Retention ON, floor below the anchors: grid ids survive, off-grid is doomed.
-        let zip318 = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
+        let zip318 = |floor: u32| {
+            AnchorRetention::new(
+                h(floor),
+                BlockSpacing::UNIFORM,
+                AnchorRetentionInterval::ZIP_318,
+            )
+        };
         let mut commitments = fresh(&[1152, 1300, 1440]);
         let n = downgrade_doomed_checkpoints(&mut commitments, h(2000), Some(&zip318(1000)));
         assert_eq!(n, 1, "only the off-grid checkpoint is doomed");
@@ -4862,6 +4887,7 @@ mod store_tests {
         // test network needs, and what a mirrored constant could never express.
         let short = AnchorRetention::new(
             h(1000),
+            BlockSpacing::UNIFORM,
             AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
         );
         let mut commitments = fresh(&[1152, 1300, 1440]);
@@ -4879,7 +4905,13 @@ mod store_tests {
     #[test]
     fn should_retain_anchor_matches_upstream_predicate() {
         let h = |n: u32| BlockHeight::from(n);
-        let at = |floor: u32| AnchorRetention::new(h(floor), AnchorRetentionInterval::ZIP_318);
+        let at = |floor: u32| {
+            AnchorRetention::new(
+                h(floor),
+                BlockSpacing::UNIFORM,
+                AnchorRetentionInterval::ZIP_318,
+            )
+        };
         assert!(should_retain_anchor(Some(&at(1000)), h(1152)));
         assert!(
             should_retain_anchor(Some(&at(1152)), h(1152)),
@@ -4898,10 +4930,45 @@ mod store_tests {
         // the interval configurable rather than mirroring a constant.
         let short = AnchorRetention::new(
             h(1000),
+            BlockSpacing::UNIFORM,
             AnchorRetentionInterval::custom(NonZeroU32::new(12).expect("nonzero")),
         );
         assert!(should_retain_anchor(Some(&short), h(1308)));
         assert!(!should_retain_anchor(Some(&at(1000)), h(1308)));
+    }
+
+    /// [B6] The policy's block spacing is part of what it retains. With NU7 active from
+    /// 1000, the ZIP 318 interval of 144 reference blocks puts boundaries on multiples of
+    /// 144 below 1000 and on multiples of 432 (three times as many blocks) from 1000. So
+    /// 1152 = 8 x 144 is retained on a chain whose spacing never scales and discarded once
+    /// NU7 is active; a predicate that ignored the spacing would keep it.
+    #[test]
+    fn should_retain_anchor_follows_the_nu7_scaled_grid() {
+        let h = |n: u32| BlockHeight::from(n);
+        let policy = |spacing: BlockSpacing| {
+            AnchorRetention::new(h(0), spacing, AnchorRetentionInterval::ZIP_318)
+        };
+
+        let nu7 = policy(BlockSpacing::with_nu7_activation(h(1000)));
+        assert!(
+            should_retain_anchor(Some(&nu7), h(864)),
+            "below NU7 activation: 864 = 6 x 144"
+        );
+        assert!(
+            should_retain_anchor(Some(&nu7), h(1296)),
+            "from NU7 activation: 1296 = 3 x 432"
+        );
+        assert!(
+            !should_retain_anchor(Some(&nu7), h(1152)),
+            "from NU7 activation: 1152 = 8 x 144 is not a multiple of 432"
+        );
+
+        // The same height where the spacing never scales: the grid stays on 144.
+        let uniform = policy(BlockSpacing::UNIFORM);
+        assert!(
+            should_retain_anchor(Some(&uniform), h(1152)),
+            "UNIFORM spacing: 1152 = 8 x 144"
+        );
     }
 
     #[test]
@@ -5140,6 +5207,16 @@ mod write_behind_tests {
             .queue_rescan(BlockHeight::from(1u32)..BlockHeight::from(5u32))
             .unwrap_err();
         assert!(err.to_string().contains("queue_rescan"));
+    }
+
+    /// The write-behind facade holds no connection, so a rename through it is refused
+    /// like every other account mutation; renames reach the wallet db outside a scan.
+    #[test]
+    fn facade_set_account_name_fails_loudly() {
+        let mut f = WriteBehindFacade::test_new(BlockHeight::from(1u32), None);
+        let account = zcash_client_sqlite::AccountUuid::from_uuid(uuid::Uuid::nil());
+        let err = f.set_account_name(account, "renamed").unwrap_err();
+        assert!(err.to_string().contains("set_account_name"), "got: {err}");
     }
 
     // ── PersistLane: serial order, depth-1 backpressure, errors, drain ─────────
@@ -5562,6 +5639,53 @@ mod flush_retained_tests {
         assert_eq!(
             ranges[0].priority(),
             zcash_client_backend::data_api::scanning::ScanPriority::Historic
+        );
+    }
+
+    /// `set_account_name` reaches the wallet db: the sparse facade forwards it straight to
+    /// `Db`, so the new name is what the wallet then reports, and an account the wallet does
+    /// not know is refused with upstream's error.
+    #[test]
+    fn sparse_facade_set_account_name_reaches_the_wallet_db() {
+        use zcash_client_backend::data_api::Account as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut db = fresh_db(dir.path());
+        let birthday = AccountBirthday::from_parts(
+            ChainState::empty(BlockHeight::from(1_000u32), BlockHash([0; 32])),
+            None,
+        );
+        let (account, _) = db
+            .create_account("original", &SecretVec::new(vec![7u8; 32]), &birthday, None)
+            .expect("creates the account");
+
+        let mut sparse = SparseTreeState::default();
+        let mut facade = SparseFacade {
+            inner: &mut db,
+            sparse: &mut sparse,
+        };
+        facade
+            .set_account_name(account, "renamed")
+            .expect("renames");
+        assert_eq!(
+            db.get_account(account)
+                .expect("reads")
+                .expect("account exists")
+                .name(),
+            Some("renamed")
+        );
+
+        db.delete_account(account).expect("deletes the account");
+        let mut facade = SparseFacade {
+            inner: &mut db,
+            sparse: &mut sparse,
+        };
+        let err = facade
+            .set_account_name(account, "renamed again")
+            .unwrap_err();
+        assert!(
+            matches!(err, SqliteClientError::AccountUnknown),
+            "got: {err}"
         );
     }
 }
