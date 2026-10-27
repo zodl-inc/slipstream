@@ -543,6 +543,21 @@ pub async fn run_to_completion(
         if config.wire_failover && !config.alternate_endpoints.is_empty() {
             plan.failover = Some(crate::fetch::WireFailoverArm::default());
         }
+        // Adaptive prefetch while the scan waits for blocks (fetch::FetchBoost). Extra
+        // block streams only through an OHTTP gateway and where the memory budget is
+        // not derated for a small device.
+        if config.fetch_boost {
+            let gateway = crate::ohttp::relay_for(&config.endpoint.host).is_some();
+            let roomy =
+                config.memory_budget_bytes >= crate::config::EngineConfig::DEFAULT_MEMORY_BUDGET;
+            plan.boost = Some(crate::fetch::FetchBoost {
+                extra_streams: if gateway && roomy {
+                    crate::fetch::BOOST_EXTRA_OHTTP_STREAMS
+                } else {
+                    0
+                },
+            });
+        }
         let endpoint = config.endpoint.clone();
         // Clone the progress Arc for the fetch task so it can bump fetched_blocks.
         let fetch_progress = progress.clone();

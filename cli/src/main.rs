@@ -197,6 +197,14 @@ enum Cmd {
         /// commitments). 0 = one commit per scan call.
         #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_BLOCKS)]
         persist_commit_blocks: u64,
+        /// Adaptive prefetch while the scan waits for blocks (slow head stream restarts, more
+        /// OHTTP block streams). `--fetch-boost false` is the kill switch.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        fetch_boost: bool,
+        /// Dense ranges: merge queued chunks into one scan call up to this many note
+        /// commitments (0 = off). Default: the engine's (`EngineConfig::DEFAULT_SCAN_MERGE_OUTPUTS`).
+        #[arg(long)]
+        scan_merge_outputs: Option<u64>,
         /// T8.1: after reaching tip, keep the wallet tracking the chain.
         /// Probes the tip every 10–30 s (jittered); runs a full pass whenever a
         /// new block arrives. Cancellable with Ctrl-C. Useful for Mac CLI validation
@@ -1027,6 +1035,8 @@ fn cmd_sync(
     gpu_subtree: bool,
     persist_depth: usize,
     persist_commit_blocks: u64,
+    fetch_boost: bool,
+    scan_merge_outputs: Option<u64>,
     follow: bool,
     anchor_retention: Option<u32>,
     anchor_retention_interval: u32,
@@ -1052,6 +1062,10 @@ fn cmd_sync(
     cfg.sparse_persistence = sparse;
     cfg.chunk_split_bytes = chunk_split_bytes;
     cfg.memory_budget_bytes = memory_budget_bytes;
+    cfg.fetch_boost = fetch_boost;
+    if let Some(n) = scan_merge_outputs {
+        cfg.scan_merge_outputs = n;
+    }
     // [B6] The floor and the grid together are the retention policy; an interval
     // of zero is not a grid, so it is rejected rather than silently defaulted.
     cfg.anchor_retention = match anchor_retention {
@@ -1646,6 +1660,8 @@ fn main() {
             gpu_subtree,
             persist_depth,
             persist_commit_blocks,
+            fetch_boost,
+            scan_merge_outputs,
             follow,
             tor_dir,
         } => {
@@ -1664,6 +1680,8 @@ fn main() {
                 gpu_subtree,
                 persist_depth,
                 persist_commit_blocks,
+                fetch_boost,
+                scan_merge_outputs,
                 follow,
                 anchor_retention,
                 anchor_retention_interval,
