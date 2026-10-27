@@ -619,6 +619,10 @@ enum PumpOutcome {
     Completed,
     /// The reorder stage hung up (abort path) — stop quietly.
     ConsumerGone,
+    /// The booster cut this stream as a slow head stream (see `WorkerSlot`): the
+    /// blocks received were handed on and the rest is to be requested again.
+    /// Only the kick itself yields this; a stream or request error never does.
+    Kicked,
 }
 
 /// Sends one sub-chunk through the ahead gate into the reorder channel.
@@ -688,6 +692,24 @@ async fn flush_then_fail(
         }
     }
     Err(err)
+}
+
+/// Ends a kicked attempt: hands on the blocks received so far like
+/// [`flush_then_fail`] (never the plan chunk's final block), then reports
+/// [`PumpOutcome::Kicked`].
+async fn hand_on_then_kicked(
+    tail: Option<(Vec<CompactBlock>, usize)>,
+    cursor: &mut PlanChunkCursor,
+    gate: &AheadGate,
+    out: &mpsc::Sender<SubChunk>,
+) -> Result<PumpOutcome, SlipstreamError> {
+    if let Some((blocks, bytes)) = tail
+        && blocks.last().map(|b| b.height) != Some(cursor.end)
+        && !emit_sub_chunk(cursor, blocks, bytes, false, gate, out).await
+    {
+        return Ok(PumpOutcome::ConsumerGone);
+    }
+    Ok(PumpOutcome::Kicked)
 }
 
 /// `pump_block_window` over the whole plan chunk (the request ends at `cursor.end`).
@@ -770,13 +792,18 @@ where
     let mut last_emit = tokio::time::Instant::now();
     loop {
         let next = match slot {
-            // A kick (see `WorkerSlot`) ends the attempt like a stream error.
+            // A kick (see `WorkerSlot`) ends the attempt with `Kicked`, but only
+            // while the stream has nothing ready: whatever the stream yields first,
+            // an error included, is handled as without a kick (the pending kick is
+            // then dropped when the next attempt starts).
             Some(slot) => tokio::select! {
                 biased;
-                () = slot.kick.notified() => Err(SlipstreamError::Transport(format!(
-                    "{ctx}: cut as a slow head stream"
-                ))),
                 next = grpc::next_with_idle_timeout(stream, &ctx) => next,
+                () = slot.kick.notified() => {
+                    slot.kicked.store(false, Ordering::SeqCst);
+                    debug!(plan_index = cursor.plan_index, "{ctx}: cut as a slow head stream");
+                    return hand_on_then_kicked(splitter.finish(), cursor, gate, out).await;
+                }
             },
             None => grpc::next_with_idle_timeout(stream, &ctx).await,
         };
@@ -1001,9 +1028,11 @@ impl WorkerSlot {
         self.kick.notify_one();
     }
 
-    /// Whether a kick ended the attempt (and clears it).
-    fn take_kick(&self) -> bool {
-        self.kicked.swap(false, Ordering::SeqCst)
+    /// Drops a kick that was requested but not acted on (its stream is gone).
+    fn clear_kick(&self) {
+        if self.kicked.swap(false, Ordering::SeqCst) {
+            let _ = futures_util::FutureExt::now_or_never(self.kick.notified());
+        }
     }
 }
 
@@ -1044,10 +1073,6 @@ async fn worker(
             debug!(worker_id, "no more chunks");
             return Ok(());
         };
-        // A kick meant for the previous chunk's stream does not carry over.
-        if slot.take_kick() {
-            let _ = futures_util::FutureExt::now_or_never(slot.kick.notified());
-        }
         slot.plan_index.store(index, Ordering::Relaxed);
         let mut cursor = PlanChunkCursor {
             plan_index: index,
@@ -1063,6 +1088,9 @@ async fn worker(
         loop {
             attempt += 1;
             cursor.emitted_this_attempt = false;
+            // A kick meant for a stream that is gone (the previous chunk's, or an
+            // attempt that ended otherwise) does not cut this one.
+            slot.clear_kick();
             match open_and_pump(
                 &mut client,
                 &mut cursor,
@@ -1084,13 +1112,13 @@ async fn worker(
                 Ok(PumpOutcome::ConsumerGone) => return Ok(()), // reorder stage gone (abort)
                 // The booster cut a slow head stream: request the rest again on a fresh
                 // connection at once. Not an attempt: the stream was alive, only slow.
-                Err(err) if slot.take_kick() => {
+                // Only `Kicked` gets here; every error takes the arms below.
+                Ok(PumpOutcome::Kicked) => {
                     attempt -= 1;
                     info!(
                         worker_id,
                         index,
                         resume_from = cursor.resume_from,
-                        %err,
                         "slow head stream cut; requesting the rest on a fresh connection"
                     );
                     client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
@@ -3195,15 +3223,70 @@ mod tests {
             slot.kick();
         };
         let (out, ()) = tokio::join!(pump, kicker);
-        let err = out.expect_err("the kick ends the attempt");
-        assert!(err.to_string().contains("slow head stream"), "{err}");
-        assert!(slot.take_kick(), "the worker sees a kick, not a failure");
-        assert!(!slot.take_kick());
+        assert!(
+            matches!(out, Ok(PumpOutcome::Kicked)),
+            "the kick ends the attempt as a kick: {out:?}"
+        );
+        assert!(
+            !slot.kicked.load(Ordering::SeqCst),
+            "the kick was acted on and cleared"
+        );
         assert!(slot.bytes.load(Ordering::Relaxed) > 5000);
         let subs = drain_subs(&mut rx);
         assert_heights_consecutive(&subs, 100, 104);
         assert!(subs.iter().all(|s| !s.is_last));
         assert_eq!(cursor.resume_from, 105);
+    }
+
+    /// A kick that is pending when the stream fails with a permanent error (an
+    /// OHTTP policy denial) does not turn the error into a restart: the error
+    /// comes back as the attempt's result, non-transient, so the worker returns
+    /// it at once instead of retrying.
+    #[tokio::test]
+    async fn a_pending_kick_never_hides_a_permanent_error() {
+        let (tx, mut rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 119);
+        let slot = WorkerSlot::new(Arc::default());
+        slot.kick();
+        let mut denied = tonic::Status::permission_denied("inner 403");
+        denied.metadata_mut().insert(
+            crate::ohttp::OHTTP_OUTCOME_HEADER,
+            crate::ohttp::OUTCOME_POLICY_DENIED
+                .parse()
+                .expect("ascii metadata"),
+        );
+        let mut items: Vec<Result<CompactBlock, tonic::Status>> =
+            linked(100, 3, 1000).into_iter().map(Ok).collect();
+        items.push(Err(denied));
+        let mut s = stream::iter(items);
+        let mut refused = false;
+        let out = pump_block_window(
+            &mut s,
+            &mut cursor,
+            119,
+            1 << 30,
+            Duration::from_secs(120),
+            &gate,
+            &tx,
+            None,
+            &mut refused,
+            Some(&slot),
+        )
+        .await;
+        let err = out.expect_err("the denial is the attempt's result, not a kick");
+        assert!(matches!(err, SlipstreamError::PolicyDenied(_)), "{err:?}");
+        assert!(!err.is_transient() && !err.counts_as_unreachable());
+        // The blocks before it were handed on; the kick is still pending and the
+        // next attempt drops it.
+        assert_heights_consecutive(&drain_subs(&mut rx), 100, 102);
+        assert!(slot.kicked.load(Ordering::SeqCst));
+        slot.clear_kick();
+        assert!(!slot.kicked.load(Ordering::SeqCst));
+        assert!(
+            futures_util::FutureExt::now_or_never(slot.kick.notified()).is_none(),
+            "no stale kick is left to cut the next stream"
+        );
     }
 
     #[test]

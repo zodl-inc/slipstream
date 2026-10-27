@@ -135,10 +135,9 @@ pub struct ChunkQueueReceiver {
 #[derive(Debug)]
 pub struct QueueMeter {
     base: std::time::Instant,
-    /// Completed waits, microseconds.
-    waited_us: AtomicU64,
-    /// Start of the wait in progress, microseconds since `base` plus one; 0 = not waiting.
-    waiting_since_us: AtomicU64,
+    /// (completed waits, start of the wait in progress or `None`), microseconds
+    /// since `base`; one lock so a sample is a consistent snapshot.
+    waits: std::sync::Mutex<(u64, Option<u64>)>,
     sent_blocks: AtomicU64,
     sent_bytes: AtomicU64,
 }
@@ -147,31 +146,42 @@ impl QueueMeter {
     fn new() -> Self {
         Self {
             base: std::time::Instant::now(),
-            waited_us: AtomicU64::new(0),
-            waiting_since_us: AtomicU64::new(0),
+            waits: std::sync::Mutex::new((0, None)),
             sent_blocks: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
         }
     }
 
     fn now_us(&self) -> u64 {
-        u64::try_from(self.base.elapsed().as_micros())
-            .unwrap_or(u64::MAX - 1)
-            .saturating_add(1)
+        u64::try_from(self.base.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
     /// Total time the consumer has waited for a chunk, the wait in progress included.
-    /// Approximate under races (a wait that ends while this reads may be left out),
-    /// never counted twice.
+    /// A consistent snapshot: a wait ending meanwhile is counted once.
     pub fn scan_waited(&self) -> std::time::Duration {
-        let done = self.waited_us.load(Ordering::SeqCst);
-        let since = self.waiting_since_us.load(Ordering::SeqCst);
-        let ongoing = if since == 0 {
-            0
-        } else {
-            self.now_us().saturating_sub(since)
-        };
-        std::time::Duration::from_micros(done.saturating_add(ongoing))
+        // `now` is read under the lock too, so a wait ending right after this
+        // snapshot ends at or after it: samples never run ahead of later ones.
+        let waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        let ongoing = waits
+            .1
+            .map_or(0, |since| self.now_us().saturating_sub(since));
+        std::time::Duration::from_micros(waits.0.saturating_add(ongoing))
+    }
+
+    /// Starts a wait; returns its start for [`Self::end_wait`].
+    fn begin_wait(&self) -> u64 {
+        let since = self.now_us();
+        self.waits.lock().unwrap_or_else(|e| e.into_inner()).1 = Some(since);
+        since
+    }
+
+    /// Ends the wait that started at `since`: moves it from in progress to the
+    /// completed total in one step.
+    fn end_wait(&self, since: u64) {
+        let mut waits = self.waits.lock().unwrap_or_else(|e| e.into_inner());
+        let waited = self.now_us().saturating_sub(since);
+        waits.0 = waits.0.saturating_add(waited);
+        waits.1 = None;
     }
 
     /// `(blocks, estimated bytes)` sent into the queue so far.
@@ -191,9 +201,7 @@ struct WaitGuard<'a> {
 
 impl Drop for WaitGuard<'_> {
     fn drop(&mut self) {
-        let waited = self.meter.now_us().saturating_sub(self.since);
-        self.meter.waited_us.fetch_add(waited, Ordering::SeqCst);
-        self.meter.waiting_since_us.store(0, Ordering::SeqCst);
+        self.meter.end_wait(self.since);
     }
 }
 
@@ -277,8 +285,7 @@ impl ChunkQueueReceiver {
         if let Ok(item) = self.rx.try_recv() {
             return Some(item);
         }
-        let since = self.meter.now_us();
-        self.meter.waiting_since_us.store(since, Ordering::SeqCst);
+        let since = self.meter.begin_wait();
         let _guard = WaitGuard {
             meter: &self.meter,
             since,
@@ -478,5 +485,37 @@ mod tests {
             after,
             "no wait is in progress any more"
         );
+    }
+
+    /// A wait that ends while the booster samples is counted once: samples are
+    /// consistent snapshots, so one never runs ahead of a later one (counting a
+    /// wait both in progress and completed would).
+    #[test]
+    fn a_wait_ending_during_a_sample_is_never_counted_twice() {
+        let meter = Arc::new(QueueMeter::new());
+        let waiter = {
+            let meter = Arc::clone(&meter);
+            std::thread::spawn(move || {
+                for _ in 0..20_000 {
+                    let since = meter.begin_wait();
+                    let spin = std::time::Instant::now();
+                    while spin.elapsed() < Duration::from_micros(20) {
+                        std::hint::spin_loop();
+                    }
+                    meter.end_wait(since);
+                }
+            })
+        };
+        let mut last = Duration::ZERO;
+        while !waiter.is_finished() {
+            let now = meter.scan_waited();
+            assert!(
+                now >= last,
+                "sample {now:?} after {last:?}: a wait was counted twice"
+            );
+            last = now;
+        }
+        waiter.join().expect("waiter");
+        assert!(meter.scan_waited() >= last);
     }
 }
