@@ -2526,6 +2526,8 @@ mod boost_tests {
             on: true,
             hot: 0,
             cold: 0,
+            cooldown_windows: 0,
+            ineffective_count: 0,
         };
         for _ in 0..BOOST_COLD_WINDOWS - 1 {
             assert_eq!(st.observe(0.0), BoostStep::Stay);
@@ -2558,12 +2560,12 @@ mod boost_tests {
     #[test]
     fn best_window_decays_gradually() {
         let plan = FetchPlan::new(0, 9999, 2000, 4);
-        let meter = Arc::new(QueueMeter::default());
+        let meter = Arc::new(QueueMeter::new());
         let fleet = Arc::new(FleetStats::default());
         let dispatcher = Arc::new(Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet)));
         let boost_on = Arc::new(AtomicBool::new(false));
         let floor = Arc::new(AtomicU64::new(0));
-        let gate = AheadGate::new(Arc::new(Semaphore::new(100)));
+        let gate = AheadGate::new(16 << 20, Arc::clone(&floor));
         let slots: Vec<_> = (0..4)
             .map(|_| Arc::new(WorkerSlot::new(Arc::clone(&fleet))))
             .collect();
