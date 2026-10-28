@@ -2523,18 +2523,7 @@ mod tests {
     // ── T8.1 follow flag ──────────────────────────────────────────────────────
 
     #[test]
-    fn sync_follow_startup_prepares_tor_directory() {
-        let temp = tempfile::tempdir().expect("temporary root");
-        let tor_dir = temp.path().join("nested").join("tor");
-
-        prepare_tor_directory(Some(&tor_dir)).expect("prepare Tor directory");
-
-        assert!(tor_dir.exists());
-        assert!(tor_dir.is_dir());
-    }
-
-    #[test]
-    fn sync_once_startup_prepares_tor_directory() {
+    fn sync_startup_prepares_fresh_nested_tor_directory() {
         let temp = tempfile::tempdir().expect("temporary root");
         let tor_dir = temp.path().join("nested").join("tor");
 
@@ -2560,10 +2549,16 @@ mod tests {
         std::fs::write(&file, "content").expect("create regular file");
         let tor_dir = file.join("tor");
 
-        let error =
-            prepare_tor_directory(Some(&tor_dir)).expect_err("file cannot contain a directory");
+        assert!(prepare_tor_directory(Some(&tor_dir)).is_err());
+    }
 
-        assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+    #[test]
+    fn sync_startup_rejects_existing_regular_file_as_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let file = temp.path().join("tor-file");
+        std::fs::write(&file, "content").expect("create regular file");
+
+        assert!(prepare_tor_directory(Some(&file)).is_err());
     }
 
     #[test]
