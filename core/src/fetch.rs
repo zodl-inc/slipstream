@@ -2553,8 +2553,9 @@ mod boost_tests {
     fn head_is_slow_relative_to_best() {
         // Head received 32 KB, best was 640 KB: head is slow (< 12.5% of best).
         assert!(head_is_slow(32 * 1024, 640 * 1024));
-        // Head received 80 KB, best was 640 KB: still slow.
-        assert!(head_is_slow(80 * 1024, 640 * 1024));
+        // Exactly 12.5 % of the best is not slow; just under it is.
+        assert!(!head_is_slow(80 * 1024, 640 * 1024));
+        assert!(head_is_slow(79 * 1024, 640 * 1024));
         // Head received 100 KB, best was 640 KB: not slow (>= 12.5% of best).
         assert!(!head_is_slow(100 * 1024, 640 * 1024));
         // Head received < 64 KB: always slow regardless of best.
