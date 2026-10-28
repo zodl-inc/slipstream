@@ -199,6 +199,10 @@ enum Cmd {
         /// commitments). 0 = one commit per scan call.
         #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_BLOCKS)]
         persist_commit_blocks: u64,
+        /// Write-behind commit size in note commitments (all pools): a unit is committed
+        /// once it holds this many, or `--persist-commit-blocks` blocks.
+        #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_OUTPUTS)]
+        persist_commit_outputs: u64,
         /// Adaptive prefetch while the scan waits for blocks (slow head stream restarts, more
         /// OHTTP block streams). `--fetch-boost false` is the kill switch.
         #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
@@ -1037,6 +1041,7 @@ fn cmd_sync(
     gpu_subtree: bool,
     persist_depth: usize,
     persist_commit_blocks: u64,
+    persist_commit_outputs: u64,
     fetch_boost: bool,
     scan_merge_outputs: Option<u64>,
     follow: bool,
@@ -1096,7 +1101,7 @@ fn cmd_sync(
     cfg.persist_commit_limits =
         (persist_commit_blocks > 0).then_some(zodl_slipstream::persist::CommitLimits {
             max_blocks: persist_commit_blocks,
-            max_outputs: zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
+            max_outputs: persist_commit_outputs,
         });
 
     if let Err(error) = prepare_tor_directory(tor_dir.as_deref()) {
@@ -1674,6 +1679,7 @@ fn main() {
             gpu_subtree,
             persist_depth,
             persist_commit_blocks,
+            persist_commit_outputs,
             fetch_boost,
             scan_merge_outputs,
             follow,
@@ -1694,6 +1700,7 @@ fn main() {
                 gpu_subtree,
                 persist_depth,
                 persist_commit_blocks,
+                persist_commit_outputs,
                 fetch_boost,
                 scan_merge_outputs,
                 follow,
