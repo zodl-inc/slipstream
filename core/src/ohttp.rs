@@ -441,11 +441,29 @@ impl OhttpConnector {
     /// relay, so that the caller can bound (and retry on a fresh circuit) the slow part of a Tor
     /// connect instead of paying it inside the first RPC's deadline. Idempotent.
     pub async fn warm_up(&self) -> Result<(), String> {
-        self.client
-            .key_config(false)
+        self.warm_up_inner()
             .await
-            .map_err(RoundTripError::into_message)?;
-        if self.client.h2_sender(&self.client.relay).await?.is_none() {
+            .map_err(RoundTripError::into_message)
+    }
+
+    /// Engine connection setup preserves a relay pause as backoff, rather than an
+    /// unreachable endpoint. The public string-returning API remains compatible.
+    pub(crate) async fn warm_up_typed(&self) -> Result<(), crate::error::SlipstreamError> {
+        self.warm_up_inner().await.map_err(Into::into)
+    }
+
+    async fn warm_up_inner(&self) -> Result<(), RoundTripError> {
+        // A cached key must not bypass a known relay pause and open another circuit.
+        self.client.check_relay_pause()?;
+        self.client.key_config(false).await?;
+        self.client.check_relay_pause()?;
+        if self
+            .client
+            .h2_sender(&self.client.relay)
+            .await
+            .map_err(RoundTripError::Transport)?
+            .is_none()
+        {
             tracing::debug!("ohttp: relay did not negotiate h2; will use HTTP/1.1 per request");
         }
         Ok(())
@@ -898,6 +916,19 @@ enum RoundTripError {
     /// at it, or its opened body is longer than the caller allowed (gRPC `RESOURCE_EXHAUSTED`,
     /// not retried). The request had been sent.
     ResponseTooLarge(String),
+}
+
+impl From<RoundTripError> for crate::error::SlipstreamError {
+    fn from(error: RoundTripError) -> Self {
+        match error {
+            RoundTripError::Transport(detail) => Self::Transport(detail),
+            RoundTripError::Decode(_) => Self::MisbehavingServer,
+            RoundTripError::RateLimited { detail, .. } => Self::RateLimited(detail),
+            RoundTripError::TooLarge(detail) | RoundTripError::ResponseTooLarge(detail) => {
+                Self::RequestTooLarge(detail)
+            }
+        }
+    }
 }
 
 impl RoundTripError {
@@ -2543,13 +2574,47 @@ fn grpc_error_with(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use base64::Engine;
     use std::cell::Cell;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use zodl_ohttp_client::encode_bhttp_request;
+
+    #[test]
+    fn typed_warm_up_errors_use_variants_instead_of_message_text() {
+        use crate::error::SlipstreamError;
+
+        let transport = SlipstreamError::from(RoundTripError::Transport(
+            "HTTP 429 mentioned by an unrelated transport failure".into(),
+        ));
+        assert!(matches!(transport, SlipstreamError::Transport(_)));
+        assert!(transport.is_transient());
+        assert!(transport.counts_as_unreachable());
+
+        let rate_limit = SlipstreamError::from(RoundTripError::RateLimited {
+            detail: "pause".into(),
+            retry_after: None,
+        });
+        assert!(matches!(rate_limit, SlipstreamError::RateLimited(_)));
+        assert!(rate_limit.is_transient());
+        assert!(!rate_limit.counts_as_unreachable());
+
+        let decode = SlipstreamError::from(RoundTripError::Decode("invalid answer".into()));
+        assert!(matches!(decode, SlipstreamError::MisbehavingServer));
+        assert!(!decode.is_transient());
+
+        for error in [
+            RoundTripError::TooLarge("request limit".into()),
+            RoundTripError::ResponseTooLarge("response limit".into()),
+        ] {
+            let error = SlipstreamError::from(error);
+            assert!(matches!(error, SlipstreamError::RequestTooLarge(_)));
+            assert!(!error.is_transient());
+            assert!(!error.counts_as_unreachable());
+        }
+    }
 
     /// `http_round_trip` refuses a gateway of another network before anything is sent.
     #[tokio::test]
@@ -4031,6 +4096,64 @@ mod tests {
             format!("{}:{}", client.relay.host, client.relay.port),
             (sender, std::time::Instant::now()),
         );
+    }
+
+    /// Hermetic real connector for the Tor channel/retry boundary: a relay pause
+    /// with a valid key already cached must stop warm-up before opening a channel.
+    pub(crate) async fn connector_with_cached_relay_pause() -> OhttpConnector {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://tor-warm-up-cached-pause.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        cache_a_key(&client).await;
+        serve_in_process_relay(&client, |_req| async {
+            panic!("a cached pause must prevent relay requests")
+        })
+        .await;
+        client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new());
+        OhttpConnector {
+            client: Arc::new(client),
+        }
+    }
+
+    /// No cached key: the real signed-config GET receives a relay 429 over in-process h2.
+    pub(crate) async fn connector_with_fresh_key_fetch_rate_limit()
+    -> (OhttpConnector, Arc<AtomicUsize>) {
+        let client = OhttpClient::new(
+            "ohttp-gateway-testnet.example",
+            "https://tor-warm-up-fresh-key-429.invalid/relay",
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let gets = Arc::new(AtomicUsize::new(0));
+        serve_in_process_relay(&client, {
+            let gets = Arc::clone(&gets);
+            move |req| {
+                assert_eq!(req.method(), Method::GET);
+                gets.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let mut answer = Response::new(Full::new(Bytes::new()).boxed());
+                    *answer.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                    answer
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+                    answer
+                }
+            }
+        })
+        .await;
+        (
+            OhttpConnector {
+                client: Arc::new(client),
+            },
+            gets,
+        )
     }
 
     /// A relay's answer of `len` bytes of filler under the sealed-response media type, in 8 KiB

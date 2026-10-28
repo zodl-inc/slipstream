@@ -134,7 +134,8 @@ const TOR_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
 
 /// Fresh-circuit attempts before giving up a single connect. With `Isolated` mode each attempt
 /// draws a NEW isolated circuit, so a transient bad circuit recovers on the next try. The error
-/// returned after all attempts is still `Transport` (transient) — every higher resilience layer
+/// returned after all broken-circuit attempts is still `Transport` (transient); a relay pause
+/// returns `RateLimited` immediately for caller backoff. Every higher resilience layer
 /// (scan treestate retry, the per-range enhancement's non-fatal defer, the initial-pass
 /// never-Error retry loop) still stacks on top. 3 attempts ⇒ ≤45s worst case vs the old single
 /// ~58s-then-fail, and ~0 overhead in the healthy case (attempt 1 connects fast).
@@ -265,8 +266,7 @@ impl TorConn {
         // circuit is cut at the per-attempt timeout and the next attempt draws a new isolated
         // circuit, instead of blocking on arti's long internal timeout. The healthy case connects
         // on attempt 1 with no added latency.
-        let mut last_err: Option<String> = None;
-        for attempt in 1..=TOR_CONNECT_ATTEMPTS {
+        retry_tor_connect(per_attempt, |attempt| {
             // `.uniqueTor` (and a bulk worker's own circuit) = a fresh isolated circuit EACH
             // attempt (so a retry escapes a stuck circuit); `.defaultTor` = the default circuit
             // (a retry still gets a fresh isolated one, since the default one just failed us).
@@ -275,40 +275,16 @@ impl TorConn {
                 _ => self.client.isolated_client(),
             };
             let client_trace_prefix = self.client_trace_prefix.clone();
-            let attempt_fut = async {
+            async move {
                 match relay {
                     Some(relay) => {
                         Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
                     }
                     None => Self::connect_direct_over_tor(client, endpoint).await,
                 }
-            };
-            match tokio::time::timeout(per_attempt, attempt_fut).await {
-                Ok(Ok(c)) => {
-                    grpc::net_stats::record(grpc::net_stats::NetEvent::TorChannel);
-                    return Ok(c);
-                }
-                Ok(Err(e)) => {
-                    tracing::warn!(attempt, err = %e, "tor connect failed — retrying on a fresh circuit");
-                    last_err = Some(format!("tor connect: {e}"));
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        attempt,
-                        timeout_secs = per_attempt.as_secs(),
-                        "tor circuit build timed out — retrying on a fresh circuit"
-                    );
-                    last_err = Some(format!(
-                        "tor connect: circuit build exceeded {}s",
-                        per_attempt.as_secs()
-                    ));
-                }
             }
-        }
-        // Still transient — callers retry/defer (the build never silently de-anonymises to direct).
-        Err(SlipstreamError::Transport(last_err.unwrap_or_else(|| {
-            "tor connect: failed to obtain a circuit".to_string()
-        })))
+        })
+        .await
     }
 
     /// Drop the cached shared (`SyncShared`) connection to `endpoint` after a call on it failed, so
@@ -367,10 +343,14 @@ impl TorConn {
             client_trace_prefix,
         )
         .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
-        connector
-            .warm_up()
-            .await
-            .map_err(|e| SlipstreamError::Transport(format!("ohttp over tor warm-up: {e}")))?;
+        Self::connect_ohttp_channel(connector, endpoint).await
+    }
+
+    async fn connect_ohttp_channel(
+        connector: OhttpConnector,
+        endpoint: &Endpoint,
+    ) -> Result<LwdClient, SlipstreamError> {
+        connector.warm_up_typed().await?;
         // Plain `http://`: the transport tonic sees is an in-memory pipe; TLS happens inside the
         // connector, towards the relay (tonic refuses `https://` without a tls_config).
         let pipe_uri = format!("http://{}:{}", endpoint.host, endpoint.port);
@@ -593,6 +573,55 @@ pub async fn connect_direct_with_retry(endpoint: &Endpoint) -> Result<LwdClient,
     .await
 }
 
+/// Bound each circuit attempt independently; callers supply the circuit-specific operation.
+async fn retry_tor_connect<T, F, Fut>(
+    per_attempt: Duration,
+    mut connect: F,
+) -> Result<T, SlipstreamError>
+where
+    F: FnMut(u32) -> Fut,
+    Fut: Future<Output = Result<T, SlipstreamError>>,
+{
+    let mut last_err: Option<SlipstreamError> = None;
+    for attempt in 1..=TOR_CONNECT_ATTEMPTS {
+        match tokio::time::timeout(per_attempt, connect(attempt)).await {
+            Ok(Ok(c)) => {
+                grpc::net_stats::record(grpc::net_stats::NetEvent::TorChannel);
+                return Ok(c);
+            }
+            Ok(Err(e @ SlipstreamError::RateLimited(_))) => {
+                // A new circuit still reaches the same paused relay. Let the caller's
+                // existing backoff run without counting this as an unreachable endpoint.
+                return Err(e);
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(attempt, err = %e, "tor connect failed — retrying on a fresh circuit");
+                last_err = Some(match e {
+                    SlipstreamError::Transport(detail) => {
+                        SlipstreamError::Transport(format!("tor connect: {detail}"))
+                    }
+                    other => other,
+                });
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    attempt,
+                    timeout_secs = per_attempt.as_secs(),
+                    "tor circuit build timed out — retrying on a fresh circuit"
+                );
+                last_err = Some(SlipstreamError::Transport(format!(
+                    "tor connect: circuit build exceeded {}s",
+                    per_attempt.as_secs()
+                )));
+            }
+        }
+    }
+    // Preserve the final error's class for caller retry and endpoint-reachability decisions.
+    Err(last_err.unwrap_or_else(|| {
+        SlipstreamError::Transport("tor connect: failed to obtain a circuit".to_string())
+    }))
+}
+
 /// A lightwalletd connection opened on first use and reused after that.
 ///
 /// For connections a range often never needs: opened up front, each one costs a TLS
@@ -643,6 +672,146 @@ pub async fn connect_direct_dedicated_with_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ohttp_endpoint() -> Endpoint {
+        Endpoint {
+            host: "ohttp-gateway-testnet.example".into(),
+            port: 443,
+            tls: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_relay_pause_stays_typed_through_tor_warm_up_and_retry() {
+        let connector = crate::ohttp::tests::connector_with_cached_relay_pause().await;
+        let endpoint = ohttp_endpoint();
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_tor_connect(TOR_OHTTP_CONNECT_TIMEOUT, |_| {
+            attempts.set(attempts.get() + 1);
+            TorConn::connect_ohttp_channel(connector.clone(), &endpoint)
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("the relay's cached pause must hold warm-up");
+        };
+        assert!(
+            matches!(error, SlipstreamError::RateLimited(_)),
+            "{error:?}"
+        );
+        assert!(error.is_transient());
+        assert!(!error.counts_as_unreachable());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a fresh circuit cannot escape a relay pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_key_fetch_rate_limit_stays_typed_through_tor_warm_up_and_retry() {
+        let (connector, gets) =
+            crate::ohttp::tests::connector_with_fresh_key_fetch_rate_limit().await;
+        let endpoint = ohttp_endpoint();
+        let attempts = std::cell::Cell::new(0);
+        let result = retry_tor_connect(TOR_OHTTP_CONNECT_TIMEOUT, |_| {
+            attempts.set(attempts.get() + 1);
+            TorConn::connect_ohttp_channel(connector.clone(), &endpoint)
+        })
+        .await;
+        let Err(error) = result else {
+            panic!("the relay refused the key fetch");
+        };
+        assert!(
+            matches!(error, SlipstreamError::RateLimited(_)),
+            "{error:?}"
+        );
+        assert!(error.is_transient());
+        assert!(!error.counts_as_unreachable());
+        assert_eq!(attempts.get(), 1, "return to caller backoff immediately");
+        assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tor_connect_rate_limit_does_not_spend_fresh_circuit_retries() {
+        let attempts = std::cell::Cell::new(0);
+        let error = retry_tor_connect::<(), _, _>(TOR_CONNECT_TIMEOUT, |_| {
+            attempts.set(attempts.get() + 1);
+            async { Err(SlipstreamError::RateLimited("relay pause".into())) }
+        })
+        .await
+        .expect_err("held by relay");
+        assert!(
+            matches!(error, SlipstreamError::RateLimited(_)),
+            "{error:?}"
+        );
+        assert_eq!(attempts.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn tor_connect_recovers_on_a_fresh_circuit_before_the_budget_is_spent() {
+        let attempts = std::cell::Cell::new(0);
+        let client = retry_tor_connect(TOR_CONNECT_TIMEOUT, |attempt| {
+            attempts.set(attempts.get() + 1);
+            async move {
+                if attempt == 1 {
+                    Err(SlipstreamError::Transport("broken circuit".into()))
+                } else {
+                    Ok("connected")
+                }
+            }
+        })
+        .await
+        .expect("the next circuit succeeds");
+        assert_eq!(client, "connected");
+        assert_eq!(attempts.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn tor_connect_transport_failures_use_all_circuit_attempts() {
+        let attempts = std::cell::Cell::new(0);
+        let error = retry_tor_connect::<(), _, _>(TOR_CONNECT_TIMEOUT, |attempt| {
+            attempts.set(attempts.get() + 1);
+            async move {
+                Err(SlipstreamError::Transport(format!(
+                    "broken circuit {attempt}"
+                )))
+            }
+        })
+        .await
+        .expect_err("no usable circuit");
+        assert!(
+            matches!(&error, SlipstreamError::Transport(detail) if detail.contains("broken circuit 3")),
+            "{error:?}"
+        );
+        assert_eq!(attempts.get(), TOR_CONNECT_ATTEMPTS);
+    }
+
+    #[tokio::test]
+    async fn tor_connect_preserves_non_rate_error_classification() {
+        let error = retry_tor_connect::<(), _, _>(TOR_CONNECT_TIMEOUT, |_| async {
+            Err(SlipstreamError::Config("invalid endpoint".into()))
+        })
+        .await
+        .expect_err("invalid configuration");
+        assert!(matches!(error, SlipstreamError::Config(_)), "{error:?}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_connect_timeouts_remain_transport_and_retry_fresh_circuits() {
+        let attempts = std::cell::Cell::new(0);
+        let start = tokio::time::Instant::now();
+        let error = retry_tor_connect::<(), _, _>(TOR_CONNECT_TIMEOUT, |_| {
+            attempts.set(attempts.get() + 1);
+            std::future::pending()
+        })
+        .await
+        .expect_err("all circuit attempts timed out");
+        assert!(matches!(error, SlipstreamError::Transport(_)), "{error:?}");
+        assert!(error.is_transient());
+        assert!(error.counts_as_unreachable());
+        assert_eq!(attempts.get(), TOR_CONNECT_ATTEMPTS);
+        assert_eq!(start.elapsed(), TOR_CONNECT_TIMEOUT * TOR_CONNECT_ATTEMPTS);
+    }
 
     #[test]
     fn plain_hosts_route_every_purpose_through_tor_too() {

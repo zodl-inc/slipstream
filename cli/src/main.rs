@@ -1099,16 +1099,21 @@ fn cmd_sync(
             max_outputs: zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
         });
 
+    if let Err(error) = prepare_tor_directory(tor_dir.as_deref()) {
+        let path = tor_dir.as_deref().map_or_else(
+            || "<unspecified>".to_owned(),
+            |dir| dir.display().to_string(),
+        );
+        eprintln!("error: tor dir {path}: {error}");
+        std::process::exit(2);
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
         // Tor mode: the engine-owned arti client, bootstrapped on this runtime.
         // (`--follow` hands the directory to the session instead, which bootstraps its own.)
         let tor = match tor_dir.as_ref().filter(|_| !follow) {
             Some(dir) => {
-                if let Err(e) = std::fs::create_dir_all(dir) {
-                    eprintln!("error: tor dir {}: {e}", dir.display());
-                    std::process::exit(2);
-                }
                 let started = std::time::Instant::now();
                 match zodl_slipstream::connector::TorConn::bootstrap(dir, false, None).await {
                     Ok(t) => {
@@ -1254,6 +1259,13 @@ fn cmd_sync(
             }
         }
     });
+}
+
+fn prepare_tor_directory(tor_dir: Option<&std::path::Path>) -> std::io::Result<()> {
+    if let Some(dir) = tor_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2509,6 +2521,50 @@ mod tests {
     }
 
     // ── T8.1 follow flag ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_startup_prepares_fresh_nested_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let tor_dir = temp.path().join("nested").join("tor");
+
+        prepare_tor_directory(Some(&tor_dir)).expect("prepare Tor directory");
+
+        assert!(tor_dir.exists());
+        assert!(tor_dir.is_dir());
+    }
+
+    #[test]
+    fn sync_startup_accepts_existing_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+
+        prepare_tor_directory(Some(temp.path())).expect("existing directory is valid");
+
+        assert!(temp.path().is_dir());
+    }
+
+    #[test]
+    fn sync_startup_reports_tor_path_that_is_a_regular_file() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, "content").expect("create regular file");
+        let tor_dir = file.join("tor");
+
+        assert!(prepare_tor_directory(Some(&tor_dir)).is_err());
+    }
+
+    #[test]
+    fn sync_startup_rejects_existing_regular_file_as_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let file = temp.path().join("tor-file");
+        std::fs::write(&file, "content").expect("create regular file");
+
+        assert!(prepare_tor_directory(Some(&file)).is_err());
+    }
+
+    #[test]
+    fn sync_startup_without_tor_directory_does_not_create_one() {
+        prepare_tor_directory(None).expect("no Tor directory requested");
+    }
 
     #[test]
     fn sync_follow_flag_parses() {
