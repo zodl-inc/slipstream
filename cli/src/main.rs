@@ -195,8 +195,8 @@ enum Cmd {
         #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=64))]
         persist_depth: usize,
         /// Write-behind commit size in blocks: consecutive scan calls (chunks or
-        /// sub-chunks) are committed together until this many blocks (or 50,000 note
-        /// commitments). 0 = one commit per scan call.
+        /// sub-chunks) are committed together until this many blocks (or
+        /// `--persist-commit-outputs` note commitments). 0 = one commit per scan call.
         #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_BLOCKS)]
         persist_commit_blocks: u64,
         /// Write-behind commit size in note commitments (all pools): a unit is committed

@@ -3755,7 +3755,9 @@ pub struct WriteBehindFacade {
 /// the state the previous calls left), and the unit keeps the first call's
 /// `from_state`. Larger units amortize the per-commit cost (transaction, the
 /// frontier insert and its checks, flush) — normal-era 10,000-block units
-/// were 26 % faster than 2,000-block ones.
+/// were 26 % faster than 2,000-block ones, and 20,000-block / 100,000-commitment
+/// units another 10 % faster than those (3,300,000 to the tip on an 8-core
+/// Graviton: 49.8 -> 45.2 s, the scan's wait on the persist lane 22 -> 13 s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitLimits {
     pub max_blocks: u64,
@@ -3763,13 +3765,15 @@ pub struct CommitLimits {
 }
 
 impl CommitLimits {
-    /// 10,000 blocks: the gRPC chunk size, whose commit unit the OHTTP window
-    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`) would otherwise shrink fivefold.
-    pub const DEFAULT_MAX_BLOCKS: u64 = 10_000;
-    /// 50,000 commitments: about one normal-era 10,000-block unit, and below one
-    /// sandblasting-era byte-split sub-chunk (~67,000), so dense chunks still
-    /// commit one by one and a unit's tree work and memory stay bounded.
-    pub const DEFAULT_MAX_OUTPUTS: u64 = 50_000;
+    /// 20,000 blocks: two gRPC chunks, ten OHTTP windows
+    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`). Also the most blocks a stop or an error
+    /// exit leaves to be scanned again.
+    pub const DEFAULT_MAX_BLOCKS: u64 = 20_000;
+    /// 100,000 commitments (all pools, Ironwood included): about two normal-era units,
+    /// and below one merged dense scan call (`EngineConfig::DEFAULT_SCAN_MERGE_OUTPUTS`),
+    /// so dense calls still commit one by one. A unit's scanned blocks (commitments
+    /// and wallet data, a few MB at this size) stay bounded.
+    pub const DEFAULT_MAX_OUTPUTS: u64 = 100_000;
 
     fn reached(&self, pending: &PendingPersist) -> bool {
         pending.last_height + 1 - pending.first_height >= self.max_blocks
