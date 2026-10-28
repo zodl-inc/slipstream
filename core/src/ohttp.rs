@@ -437,26 +437,6 @@ impl OhttpConnector {
         })
     }
 
-    /// Like [`Self::with_dialer`], but creates a dedicated client with its own relay connection.
-    /// For bulk block streams over Tor: each worker gets its own relay connection to avoid
-    /// clustered stream cuts when the shared pooled h2 connection fails.
-    pub fn with_dialer_dedicated(
-        gateway_host: &str,
-        relay_url: &str,
-        dialer: Dialer,
-        client_trace_prefix: Option<String>,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            client: Arc::new(OhttpClient::new(
-                gateway_host,
-                relay_url,
-                dialer,
-                client_trace_prefix.or_else(get_default_client_trace_prefix),
-                ClientProfile::SLIPSTREAM,
-            )?),
-        })
-    }
-
     /// Eagerly fetch the gateway key configuration and open the pooled h2 connection to the
     /// relay, so that the caller can bound (and retry on a fresh circuit) the slow part of a Tor
     /// connect instead of paying it inside the first RPC's deadline. Idempotent.

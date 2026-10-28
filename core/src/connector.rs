@@ -275,12 +275,10 @@ impl TorConn {
                 _ => self.client.isolated_client(),
             };
             let client_trace_prefix = self.client_trace_prefix.clone();
-            let dedicated = mode == TorMode::OwnCircuit;
             async move {
                 match relay {
                     Some(relay) => {
-                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix, dedicated)
-                            .await
+                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
                     }
                     None => Self::connect_direct_over_tor(client, endpoint).await,
                 }
@@ -326,37 +324,24 @@ impl TorConn {
     /// [`grpc::connect`]; the connector's TCP legs (relay POSTs, gateway key fetch) go through
     /// `client`. `warm_up` pulls the key config and opens the pooled relay connection NOW, inside
     /// the caller's per-attempt timeout, so a stuck circuit is retried instead of eating the first
-    /// RPC's deadline. When `dedicated` is true, the connector gets its own relay connection
-    /// instead of sharing the pooled one (for bulk fetch workers, to avoid clustered stream cuts).
+    /// RPC's deadline.
     async fn connect_ohttp(
         client: Arc<TorClient<PreferredRuntime>>,
         endpoint: &Endpoint,
         relay: &str,
         client_trace_prefix: Option<String>,
-        dedicated: bool,
     ) -> Result<LwdClient, SlipstreamError> {
         tracing::info!(
             gateway = %endpoint.host,
             relay,
-            via_tor = true,
-            dedicated,
-            "lightwalletd via OHTTP (RFC 9458) — relay leg dialled through Tor"
+            "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
         );
-        let connector = if dedicated {
-            OhttpConnector::with_dialer_dedicated(
-                &endpoint.host,
-                relay,
-                Dialer::Tor(client),
-                client_trace_prefix,
-            )
-        } else {
-            OhttpConnector::with_dialer(
-                &endpoint.host,
-                relay,
-                Dialer::Tor(client),
-                client_trace_prefix,
-            )
-        }
+        let connector = OhttpConnector::with_dialer(
+            &endpoint.host,
+            relay,
+            Dialer::Tor(client),
+            client_trace_prefix,
+        )
         .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
         Self::connect_ohttp_channel(connector, endpoint).await
     }

@@ -1810,6 +1810,9 @@ struct Booster {
     boost_window_count: u32,
     /// Aggregate bytes in the first full window after boost started.
     first_boost_window_bytes: Option<u64>,
+    /// Set when boost was just retracted as ineffective. Cleared after one window.
+    /// Used to skip head-kick when the link is known to be saturated.
+    boost_just_retracted: bool,
 }
 
 impl Booster {
@@ -1858,6 +1861,7 @@ impl Booster {
             pre_boost_bytes: None,
             boost_window_count: 0,
             first_boost_window_bytes: None,
+            boost_just_retracted: false,
         }
     }
 
@@ -1891,6 +1895,9 @@ impl Booster {
 
         let aggregate_bytes: u64 = per_stream.iter().sum();
 
+        // Clear the retraction flag after one window (unless we retract again this window).
+        let mut retracted_this_window = false;
+
         // Track boost effectiveness: if boosted and we have a baseline, check
         // if the boost actually improved throughput.
         if self.boosted() {
@@ -1907,12 +1914,21 @@ impl Booster {
                             current_kb = aggregate_bytes / 1024,
                             "boost did not improve throughput — retracting extra workers"
                         );
-                        self.stop(0.0);
-                        // Don't boost again for several windows.
+                        // Retract boost without logging a fake "boost off" message.
+                        self.boost_on.store(false, Ordering::Relaxed);
+                        self.dispatcher.set_cutting(false);
+                        self.dispatcher
+                            .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
                         self.state.force_cooldown();
+                        retracted_this_window = true;
+                        self.boost_just_retracted = true;
                     }
                 }
             }
+        }
+
+        if !retracted_this_window {
+            self.boost_just_retracted = false;
         }
 
         let fraction = waited.as_secs_f64() / elapsed.as_secs_f64();
@@ -1922,13 +1938,14 @@ impl Booster {
                 self.pre_boost_bytes = Some(aggregate_bytes);
                 self.boost_window_count = 0;
                 self.first_boost_window_bytes = None;
+                self.boost_just_retracted = false;
                 self.start(workers, fraction);
             }
             BoostStep::Stop => self.stop(fraction),
             BoostStep::Stay if self.boosted() => self.top_up_workers(workers),
             BoostStep::Stay => {}
         }
-        if self.boosted() && fraction >= KICK_SCAN_WAIT_FRACTION {
+        if self.boosted() && fraction >= KICK_SCAN_WAIT_FRACTION && !self.boost_just_retracted {
             self.kick_slow_head(&per_stream, now);
         }
     }
@@ -2092,11 +2109,22 @@ struct BoostState {
     hot: u32,
     /// Consecutive windows without waiting while on.
     cold: u32,
+    /// Windows remaining in a cooldown period after ineffective boost.
+    /// While > 0, `Start` is blocked and this counter decrements each window.
+    cooldown_windows: u32,
+    /// Number of times boost has been retracted as ineffective. Used for exponential backoff.
+    ineffective_count: u32,
 }
 
 impl BoostState {
     /// Records one window in which the scanner waited for `fraction` of the time.
     fn observe(&mut self, fraction: f64) -> BoostStep {
+        // Decrement cooldown if active.
+        if self.cooldown_windows > 0 {
+            self.cooldown_windows -= 1;
+            return BoostStep::Stay;
+        }
+
         if !self.on {
             self.hot = if fraction >= BOOST_ON_FRACTION {
                 self.hot + 1
@@ -2108,6 +2136,8 @@ impl BoostState {
                     on: true,
                     hot: 0,
                     cold: 0,
+                    cooldown_windows: 0,
+                    ineffective_count: self.ineffective_count,
                 };
                 return BoostStep::Start;
             }
@@ -2118,20 +2148,28 @@ impl BoostState {
                 0
             };
             if self.cold >= BOOST_COLD_WINDOWS {
-                *self = Self::default();
+                *self = Self {
+                    on: false,
+                    hot: 0,
+                    cold: 0,
+                    cooldown_windows: 0,
+                    ineffective_count: self.ineffective_count,
+                };
                 return BoostStep::Stop;
             }
         }
         BoostStep::Stay
     }
 
-    /// Force a cooldown period: don't boost again for several windows.
-    /// Used when boost was ineffective (didn't improve throughput).
+    /// Force a cooldown after an ineffective boost: exponential backoff.
+    /// First retraction: 12 windows (~2 min). Each subsequent: doubled.
     fn force_cooldown(&mut self) {
-        *self = Self::default();
-        // Set hot to a negative value so we need BOOST_COLD_WINDOWS more
-        // windows of waiting before boosting again.
+        self.on = false;
         self.hot = 0;
+        self.cold = 0;
+        self.ineffective_count += 1;
+        // 12 windows = ~2 minutes at 10s per window. Exponential backoff: 12, 24, 48, ...
+        self.cooldown_windows = 12 * (1 << (self.ineffective_count - 1).min(4));
     }
 }
 
@@ -2578,21 +2616,107 @@ mod boost_tests {
     }
 
     #[test]
-    fn boost_state_force_cooldown() {
+    fn boost_state_force_cooldown_blocks_start_for_12_windows() {
         let mut st = BoostState::default();
         // Warm up to boost.
         assert_eq!(st.observe(0.30), BoostStep::Stay);
         assert_eq!(st.observe(0.30), BoostStep::Start);
         assert!(st.on);
 
-        // Force cooldown.
+        // Force cooldown (first time: 12 windows).
         st.force_cooldown();
         assert!(!st.on);
-        assert_eq!(st.hot, 0);
+        assert_eq!(st.cooldown_windows, 12);
+        assert_eq!(st.ineffective_count, 1);
 
-        // Should not boost again immediately even with high wait fractions.
-        assert_eq!(st.observe(0.99), BoostStep::Stay);
-        assert_eq!(st.observe(0.99), BoostStep::Start);
+        // Next 11 windows: all Stay, even with high wait fractions.
+        for i in 0..11 {
+            assert_eq!(
+                st.observe(0.99),
+                BoostStep::Stay,
+                "window {} during cooldown",
+                i
+            );
+            assert_eq!(st.cooldown_windows, 11 - i);
+        }
+
+        // After 11 windows, cooldown_windows = 1.
+        assert_eq!(st.cooldown_windows, 1);
+        assert_eq!(st.observe(0.99), BoostStep::Stay); // This clears cooldown to 0.
+        assert_eq!(st.cooldown_windows, 0);
+
+        // Now can warm up again.
+        assert_eq!(st.observe(0.30), BoostStep::Stay);
+        assert_eq!(st.observe(0.30), BoostStep::Start);
+        assert!(st.on);
+    }
+
+    #[test]
+    fn boost_state_force_cooldown_exponential_backoff() {
+        let mut st = BoostState::default();
+
+        // First ineffective boost: 12 windows cooldown.
+        st.observe(0.30);
+        st.observe(0.30); // Start
+        st.force_cooldown();
+        assert_eq!(st.cooldown_windows, 12);
+        assert_eq!(st.ineffective_count, 1);
+
+        // Burn through the cooldown.
+        for _ in 0..12 {
+            st.observe(0.99);
+        }
+        assert_eq!(st.cooldown_windows, 0);
+
+        // Second ineffective boost: 24 windows cooldown (12 * 2).
+        st.observe(0.30);
+        st.observe(0.30); // Start
+        st.force_cooldown();
+        assert_eq!(st.cooldown_windows, 24);
+        assert_eq!(st.ineffective_count, 2);
+
+        // Burn through again.
+        for _ in 0..24 {
+            st.observe(0.99);
+        }
+        assert_eq!(st.cooldown_windows, 0);
+
+        // Third ineffective boost: 48 windows cooldown (12 * 4).
+        st.observe(0.30);
+        st.observe(0.30); // Start
+        st.force_cooldown();
+        assert_eq!(st.cooldown_windows, 48);
+        assert_eq!(st.ineffective_count, 3);
+
+        // Fourth: 96 windows (12 * 8).
+        for _ in 0..48 {
+            st.observe(0.99);
+        }
+        st.observe(0.30);
+        st.observe(0.30);
+        st.force_cooldown();
+        assert_eq!(st.cooldown_windows, 96);
+        assert_eq!(st.ineffective_count, 4);
+
+        // Fifth and beyond: capped at 192 windows (12 * 16).
+        for _ in 0..96 {
+            st.observe(0.99);
+        }
+        st.observe(0.30);
+        st.observe(0.30);
+        st.force_cooldown();
+        assert_eq!(st.cooldown_windows, 192); // 12 * (1 << 4) = 192
+        assert_eq!(st.ineffective_count, 5);
+
+        // Sixth: still capped.
+        for _ in 0..192 {
+            st.observe(0.99);
+        }
+        st.observe(0.30);
+        st.observe(0.30);
+        st.force_cooldown();
+        assert_eq!(st.cooldown_windows, 192); // Still capped at 12 * 16.
+        assert_eq!(st.ineffective_count, 6);
     }
 }
 
