@@ -1775,6 +1775,10 @@ struct TrackedWorker {
     /// `slot.bytes` at the start of the window.
     window_bytes: u64,
     last_kick: Option<Instant>,
+    /// Plan index of the chunk this worker kicked most recently.
+    last_kicked_plan_index: Option<u64>,
+    /// Number of times we kicked this plan chunk.
+    kick_count: u32,
 }
 
 /// The adaptive prefetch of one fetch (see [`FetchBoost`]).
@@ -1797,8 +1801,15 @@ struct Booster {
     window_waited: Duration,
     window_sent: (u64, u64),
     state: BoostState,
-    /// Most bytes one stream delivered in a window so far.
+    /// Most bytes one stream delivered in a window so far. Decays gradually
+    /// so the head is compared against recent performance, not an all-time peak.
     best_window_bytes: u64,
+    /// Aggregate bytes received in the last pre-boost window (for boost effectiveness check).
+    pre_boost_bytes: Option<u64>,
+    /// Windows since boost started (to measure boost effectiveness).
+    boost_window_count: u32,
+    /// Aggregate bytes in the first full window after boost started.
+    first_boost_window_bytes: Option<u64>,
 }
 
 impl Booster {
@@ -1833,6 +1844,8 @@ impl Booster {
                     slot: Arc::clone(slot),
                     window_bytes: 0,
                     last_kick: None,
+                    last_kicked_plan_index: None,
+                    kick_count: 0,
                 })
                 .collect(),
             extras: Vec::new(),
@@ -1842,6 +1855,9 @@ impl Booster {
             window_sent,
             state: BoostState::default(),
             best_window_bytes: 0,
+            pre_boost_bytes: None,
+            boost_window_count: 0,
+            first_boost_window_bytes: None,
         }
     }
 
@@ -1856,7 +1872,7 @@ impl Booster {
     }
 
     /// Closes one window: decides to boost, retune or end the boost, and cuts a
-    /// slow head stream.
+    /// slow head stream. Retracts boost if it doesn't improve aggregate throughput.
     fn evaluate(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>) {
         self.drop_sender_if_plan_out();
         let now = Instant::now();
@@ -1872,9 +1888,42 @@ impl Booster {
         if sent_total.0 == 0 || elapsed.is_zero() {
             return;
         }
+
+        let aggregate_bytes: u64 = per_stream.iter().sum();
+
+        // Track boost effectiveness: if boosted and we have a baseline, check
+        // if the boost actually improved throughput.
+        if self.boosted() {
+            self.boost_window_count += 1;
+            if self.first_boost_window_bytes.is_none() {
+                self.first_boost_window_bytes = Some(aggregate_bytes);
+            } else if self.boost_window_count >= 2 {
+                // After at least one full window with extra workers, check if throughput improved.
+                if let Some(baseline) = self.pre_boost_bytes {
+                    let improved = aggregate_bytes > (baseline as f64 * 1.2) as u64;
+                    if !improved {
+                        info!(
+                            baseline_kb = baseline / 1024,
+                            current_kb = aggregate_bytes / 1024,
+                            "boost did not improve throughput — retracting extra workers"
+                        );
+                        self.stop(0.0);
+                        // Don't boost again for several windows.
+                        self.state.force_cooldown();
+                    }
+                }
+            }
+        }
+
         let fraction = waited.as_secs_f64() / elapsed.as_secs_f64();
         match self.state.observe(fraction) {
-            BoostStep::Start => self.start(workers, fraction),
+            BoostStep::Start => {
+                // Capture pre-boost baseline for effectiveness check.
+                self.pre_boost_bytes = Some(aggregate_bytes);
+                self.boost_window_count = 0;
+                self.first_boost_window_bytes = None;
+                self.start(workers, fraction);
+            }
             BoostStep::Stop => self.stop(fraction),
             BoostStep::Stay if self.boosted() => self.top_up_workers(workers),
             BoostStep::Stay => {}
@@ -1885,7 +1934,7 @@ impl Booster {
     }
 
     /// Bytes each tracked worker received in the window that just closed (in
-    /// `self.workers` order); updates the best window.
+    /// `self.workers` order); updates the best window with gradual decay.
     fn close_stream_windows(&mut self) -> Vec<u64> {
         let mut got = Vec::with_capacity(self.workers.len());
         for w in &mut self.workers {
@@ -1894,30 +1943,66 @@ impl Booster {
             w.window_bytes = total;
             got.push(delta);
         }
-        self.best_window_bytes = got.iter().copied().fold(self.best_window_bytes, u64::max);
+        // Decay the best window: max of (current best * 0.9, this window's max).
+        // This allows the "best" to fall gradually when link conditions worsen,
+        // so the head is compared against recent performance, not an all-time peak.
+        let window_max = got.iter().copied().max().unwrap_or(0);
+        let decayed = (self.best_window_bytes as f64 * 0.9) as u64;
+        self.best_window_bytes = decayed.max(window_max);
         got
     }
 
     /// Restarts the stream of the head plan chunk when it is slow (see [`FetchBoost`]).
+    /// Applies exponential backoff per plan chunk to avoid thrashing on saturated links.
     fn kick_slow_head(&mut self, per_stream: &[u64], now: Instant) {
         let floor = self.floor.load(Ordering::Acquire);
         let best = self.best_window_bytes;
+
+        // Only kick when other streams are demonstrably faster: compare the head
+        // against the CURRENT window's best, not an all-time max. If everything is
+        // slow, the link is saturated and kicking won't help.
+        let current_window_max = per_stream.iter().copied().max().unwrap_or(0);
+        if current_window_max < KICK_MIN_WINDOW_BYTES {
+            // All streams are slow — saturated link. Don't kick anything.
+            return;
+        }
+
         for (w, &delta) in self.workers.iter_mut().zip(per_stream) {
             if !w.slot.holds(floor) {
                 continue;
             }
+
+            let plan_index = w.slot.plan_index.load(Ordering::Relaxed);
+
+            // Reset kick count if we moved to a new plan chunk.
+            if w.last_kicked_plan_index != Some(plan_index) {
+                w.kick_count = 0;
+                w.last_kicked_plan_index = Some(plan_index);
+            }
+
+            // Exponential backoff: after each kick, wait longer before the next one
+            // for the same plan chunk. Max 3 kicks per chunk.
+            let max_kicks = 3;
+            if w.kick_count >= max_kicks {
+                continue;
+            }
+
+            let backoff = KICK_COOLDOWN * 2u32.saturating_pow(w.kick_count);
             let cooling = w
                 .last_kick
-                .is_some_and(|t| now.duration_since(t) < KICK_COOLDOWN);
+                .is_some_and(|t| now.duration_since(t) < backoff);
+
             if !cooling && head_is_slow(delta, best) {
                 info!(
-                    plan_index = w.slot.plan_index.load(Ordering::Relaxed),
+                    plan_index,
                     window_kb = delta / 1024,
                     best_window_kb = best / 1024,
+                    kick_count = w.kick_count + 1,
                     "head stream slow while the scanner waits — restarting it"
                 );
                 w.slot.kick();
                 w.last_kick = Some(now);
+                w.kick_count += 1;
             }
         }
     }
@@ -1979,6 +2064,8 @@ impl Booster {
                 slot,
                 window_bytes: 0,
                 last_kick: None,
+                last_kicked_plan_index: None,
+                kick_count: 0,
             });
         }
     }
@@ -2038,6 +2125,15 @@ impl BoostState {
             }
         }
         BoostStep::Stay
+    }
+
+    /// Force a cooldown period: don't boost again for several windows.
+    /// Used when boost was ineffective (didn't improve throughput).
+    fn force_cooldown(&mut self) {
+        *self = Self::default();
+        // Set hot to a negative value so we need BOOST_COLD_WINDOWS more
+        // windows of waiting before boosting again.
+        self.hot = 0;
     }
 }
 
@@ -2408,6 +2504,97 @@ mod boost_tests {
         }
         assert_eq!(st.observe(0.0), BoostStep::Stop);
         assert!(!st.on);
+    }
+
+    #[test]
+    fn head_is_slow_relative_to_best() {
+        // Head received 32 KB, best was 640 KB: head is slow (< 12.5% of best).
+        assert!(head_is_slow(32 * 1024, 640 * 1024));
+        // Head received 80 KB, best was 640 KB: still slow.
+        assert!(head_is_slow(80 * 1024, 640 * 1024));
+        // Head received 100 KB, best was 640 KB: not slow (>= 12.5% of best).
+        assert!(!head_is_slow(100 * 1024, 640 * 1024));
+        // Head received < 64 KB: always slow regardless of best.
+        assert!(head_is_slow(32 * 1024, 64 * 1024));
+        assert!(head_is_slow(60 * 1024, 1_000_000));
+    }
+
+    #[test]
+    fn best_window_decays_gradually() {
+        let plan = FetchPlan::new(0, 9999, 2000, 4);
+        let meter = Arc::new(QueueMeter::default());
+        let fleet = Arc::new(FleetStats::default());
+        let dispatcher = Arc::new(Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet)));
+        let boost_on = Arc::new(AtomicBool::new(false));
+        let floor = Arc::new(AtomicU64::new(0));
+        let gate = AheadGate::new(Arc::new(Semaphore::new(100)));
+        let slots: Vec<_> = (0..4)
+            .map(|_| Arc::new(WorkerSlot::new(Arc::clone(&fleet))))
+            .collect();
+
+        // Create a dummy WorkerSpawn (we won't actually spawn workers).
+        let (tx, _rx) = mpsc::channel(1);
+        let spawn = WorkerSpawn {
+            endpoint: crate::config::Endpoint {
+                host: "test".into(),
+                port: 443,
+                tls: true,
+            },
+            tor: None,
+            plan: plan.clone(),
+            tx,
+            progress: None,
+        };
+
+        let mut booster = Booster::new(
+            FetchBoost { extra_streams: 2 },
+            meter,
+            dispatcher,
+            boost_on,
+            floor,
+            gate,
+            16 << 20,
+            &slots,
+            spawn,
+        );
+
+        // Simulate one slot receiving 640 KB in a window.
+        slots[0].bytes.store(640 * 1024, Ordering::Relaxed);
+        booster.close_stream_windows();
+        assert_eq!(booster.best_window_bytes, 640 * 1024);
+
+        // Next window: only 100 KB. Best decays to max(640*0.9, 100) = 576 KB.
+        slots[0].bytes.store((640 + 100) * 1024, Ordering::Relaxed);
+        booster.close_stream_windows();
+        let expected = std::cmp::max((640.0 * 0.9) as u64, 100) * 1024;
+        assert_eq!(booster.best_window_bytes, expected);
+
+        // Several slow windows: best keeps decaying.
+        for _ in 0..5 {
+            let prev = booster.best_window_bytes;
+            slots[0].bytes.fetch_add(50 * 1024, Ordering::Relaxed);
+            booster.close_stream_windows();
+            let expected_new = std::cmp::max((prev as f64 * 0.9) as u64, 50 * 1024);
+            assert_eq!(booster.best_window_bytes, expected_new);
+        }
+    }
+
+    #[test]
+    fn boost_state_force_cooldown() {
+        let mut st = BoostState::default();
+        // Warm up to boost.
+        assert_eq!(st.observe(0.30), BoostStep::Stay);
+        assert_eq!(st.observe(0.30), BoostStep::Start);
+        assert!(st.on);
+
+        // Force cooldown.
+        st.force_cooldown();
+        assert!(!st.on);
+        assert_eq!(st.hot, 0);
+
+        // Should not boost again immediately even with high wait fractions.
+        assert_eq!(st.observe(0.99), BoostStep::Stay);
+        assert_eq!(st.observe(0.99), BoostStep::Start);
     }
 }
 
