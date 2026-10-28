@@ -691,9 +691,9 @@ mod tests {
             TorConn::connect_ohttp_channel(connector.clone(), &endpoint)
         })
         .await;
-        let error = result
-            .err()
-            .expect("the relay's cached pause must hold warm-up");
+        let Err(error) = result else {
+            panic!("the relay's cached pause must hold warm-up");
+        };
         assert!(
             matches!(error, SlipstreamError::RateLimited(_)),
             "{error:?}"
@@ -718,7 +718,9 @@ mod tests {
             TorConn::connect_ohttp_channel(connector.clone(), &endpoint)
         })
         .await;
-        let error = result.err().expect("the relay refused the key fetch");
+        let Err(error) = result else {
+            panic!("the relay refused the key fetch");
+        };
         assert!(
             matches!(error, SlipstreamError::RateLimited(_)),
             "{error:?}"
