@@ -113,12 +113,23 @@ pub struct FetchPlan {
 ///   budget, so the added workers do not park on it;
 /// * while the scanner waits for at least [`KICK_SCAN_WAIT_FRACTION`] of a
 ///   window, a head stream (the plan chunk the release waits for) that
-///   delivered far less than the best window of any stream of this fetch
+///   delivered far less than the other streams did in the same window
 ///   ([`KICK_RATE_FRACTION`], or under 64 KiB) is cut and requested again from
 ///   its resume height on a fresh connection: a mobile link leaves single
 ///   connections trickling (TCP backoff) while new ones are fine, and a
 ///   trickle never trips the idle timeout. The blocks it received are handed on
-///   first; the restart does not count against the chunk's retry budget.
+///   first; the restart does not count against the chunk's retry budget. A
+///   restart after which the chunk stays slow doubles the wait before the next
+///   one, up to [`KICK_MAX_COOLDOWN`]: on a full link a fresh connection gets no
+///   more of it, and every restart costs a new request (over Tor, a new circuit).
+///
+/// A boost has to pay for itself: in its second window, while the scanner still
+/// waits and extra workers run, the fetch's byte rate must be at least
+/// [`BOOST_MIN_GAIN`] times the rate of the window before the boost. If it is not,
+/// the link is already full (more streams only split it, and the head chunk gets
+/// a smaller share), so the boost is withdrawn like an ended one and not retried
+/// for [`BOOST_RETRY_WINDOWS`] windows, doubling with each further withdrawal; a
+/// boost that pays off clears the doubling.
 ///
 /// The ahead budget is unchanged (the head chunk never waits on it), so memory
 /// stays bounded as without the boost. After [`BOOST_COLD_WINDOWS`] consecutive
@@ -153,6 +164,14 @@ pub const KICK_RATE_FRACTION: f64 = 0.125;
 const KICK_MIN_WINDOW_BYTES: u64 = 64 * 1024;
 /// Shortest time between two restarts of the same worker's stream.
 const KICK_COOLDOWN: Duration = Duration::from_secs(30);
+/// Longest time between two restarts of a plan chunk that stays slow after them.
+pub const KICK_MAX_COOLDOWN: Duration = Duration::from_secs(120);
+/// Factor by which a boost must raise the fetch's byte rate, or it is withdrawn.
+pub const BOOST_MIN_GAIN: f64 = 1.2;
+/// Windows a withdrawn boost waits before it may start again (first withdrawal).
+pub const BOOST_RETRY_WINDOWS: u32 = 12;
+/// The retry wait doubles with each withdrawal in a row, at most this many times.
+const BOOST_RETRY_MAX_DOUBLINGS: u32 = 4;
 /// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, far below
 /// a regional gateway's per-client limits (96 in flight, 12 heavy; a block range
 /// counts as a normal request).
@@ -1775,10 +1794,10 @@ struct TrackedWorker {
     /// `slot.bytes` at the start of the window.
     window_bytes: u64,
     last_kick: Option<Instant>,
-    /// Plan index of the chunk this worker kicked most recently.
-    last_kicked_plan_index: Option<u64>,
-    /// Number of times we kicked this plan chunk.
-    kick_count: u32,
+    /// Plan chunk the worker held at the last window, and the restarts of it
+    /// after which it stayed slow.
+    kick_plan_index: Option<u64>,
+    slow_kicks: u32,
 }
 
 /// The adaptive prefetch of one fetch (see [`FetchBoost`]).
@@ -1801,18 +1820,10 @@ struct Booster {
     window_waited: Duration,
     window_sent: (u64, u64),
     state: BoostState,
-    /// Most bytes one stream delivered in a window so far. Decays gradually
-    /// so the head is compared against recent performance, not an all-time peak.
-    best_window_bytes: u64,
-    /// Aggregate bytes received in the last pre-boost window (for boost effectiveness check).
-    pre_boost_bytes: Option<u64>,
-    /// Windows since boost started (to measure boost effectiveness).
-    boost_window_count: u32,
-    /// Aggregate bytes in the first full window after boost started.
-    first_boost_window_bytes: Option<u64>,
-    /// Set when boost was just retracted as ineffective. Cleared after one window.
-    /// Used to skip head-kick when the link is known to be saturated.
-    boost_just_retracted: bool,
+    /// Byte rate of the window before the current boost started.
+    pre_boost_rate: Option<f64>,
+    /// Windows closed since the current boost started.
+    boost_windows: u32,
 }
 
 impl Booster {
@@ -1847,8 +1858,8 @@ impl Booster {
                     slot: Arc::clone(slot),
                     window_bytes: 0,
                     last_kick: None,
-                    last_kicked_plan_index: None,
-                    kick_count: 0,
+                    kick_plan_index: None,
+                    slow_kicks: 0,
                 })
                 .collect(),
             extras: Vec::new(),
@@ -1857,11 +1868,8 @@ impl Booster {
             window_waited,
             window_sent,
             state: BoostState::default(),
-            best_window_bytes: 0,
-            pre_boost_bytes: None,
-            boost_window_count: 0,
-            first_boost_window_bytes: None,
-            boost_just_retracted: false,
+            pre_boost_rate: None,
+            boost_windows: 0,
         }
     }
 
@@ -1875,8 +1883,8 @@ impl Booster {
         }
     }
 
-    /// Closes one window: decides to boost, retune or end the boost, and cuts a
-    /// slow head stream. Retracts boost if it doesn't improve aggregate throughput.
+    /// Closes one window: decides to boost, retune, withdraw or end the boost,
+    /// and cuts a slow head stream.
     fn evaluate(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>) {
         self.drop_sender_if_plan_out();
         let now = Instant::now();
@@ -1892,66 +1900,28 @@ impl Booster {
         if sent_total.0 == 0 || elapsed.is_zero() {
             return;
         }
-
-        let aggregate_bytes: u64 = per_stream.iter().sum();
-
-        // Clear the retraction flag after one window (unless we retract again this window).
-        let mut retracted_this_window = false;
-
-        // Track boost effectiveness: if boosted and we have a baseline, check
-        // if the boost actually improved throughput.
-        if self.boosted() {
-            self.boost_window_count += 1;
-            if self.first_boost_window_bytes.is_none() {
-                self.first_boost_window_bytes = Some(aggregate_bytes);
-            } else if self.boost_window_count >= 2 {
-                // After at least one full window with extra workers, check if throughput improved.
-                if let Some(baseline) = self.pre_boost_bytes {
-                    let improved = aggregate_bytes > (baseline as f64 * 1.2) as u64;
-                    if !improved {
-                        info!(
-                            baseline_kb = baseline / 1024,
-                            current_kb = aggregate_bytes / 1024,
-                            "boost did not improve throughput — retracting extra workers"
-                        );
-                        // Retract boost without logging a fake "boost off" message.
-                        self.boost_on.store(false, Ordering::Relaxed);
-                        self.dispatcher.set_cutting(false);
-                        self.dispatcher
-                            .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
-                        self.state.force_cooldown();
-                        retracted_this_window = true;
-                        self.boost_just_retracted = true;
-                    }
-                }
-            }
-        }
-
-        if !retracted_this_window {
-            self.boost_just_retracted = false;
-        }
-
         let fraction = waited.as_secs_f64() / elapsed.as_secs_f64();
+        let rate = per_stream.iter().sum::<u64>() as f64 / elapsed.as_secs_f64();
+        if self.boosted() {
+            self.check_boost_gain(rate, fraction);
+        }
         match self.state.observe(fraction) {
             BoostStep::Start => {
-                // Capture pre-boost baseline for effectiveness check.
-                self.pre_boost_bytes = Some(aggregate_bytes);
-                self.boost_window_count = 0;
-                self.first_boost_window_bytes = None;
-                self.boost_just_retracted = false;
+                self.pre_boost_rate = (rate > 0.0).then_some(rate);
+                self.boost_windows = 0;
                 self.start(workers, fraction);
             }
             BoostStep::Stop => self.stop(fraction),
             BoostStep::Stay if self.boosted() => self.top_up_workers(workers),
             BoostStep::Stay => {}
         }
-        if self.boosted() && fraction >= KICK_SCAN_WAIT_FRACTION && !self.boost_just_retracted {
+        if self.boosted() && fraction >= KICK_SCAN_WAIT_FRACTION {
             self.kick_slow_head(&per_stream, now);
         }
     }
 
     /// Bytes each tracked worker received in the window that just closed (in
-    /// `self.workers` order); updates the best window with gradual decay.
+    /// `self.workers` order).
     fn close_stream_windows(&mut self) -> Vec<u64> {
         let mut got = Vec::with_capacity(self.workers.len());
         for w in &mut self.workers {
@@ -1960,63 +1930,76 @@ impl Booster {
             w.window_bytes = total;
             got.push(delta);
         }
-        // Decay the best window: max of (current best * 0.9, this window's max).
-        // This allows the "best" to fall gradually when link conditions worsen,
-        // so the head is compared against recent performance, not an all-time peak.
-        let window_max = got.iter().copied().max().unwrap_or(0);
-        self.best_window_bytes = decayed_best_window(self.best_window_bytes, window_max);
         got
     }
 
-    /// Restarts the stream of the head plan chunk when it is slow (see [`FetchBoost`]).
-    /// Applies exponential backoff per plan chunk to avoid thrashing on saturated links.
-    fn kick_slow_head(&mut self, per_stream: &[u64], now: Instant) {
-        let floor = self.floor.load(Ordering::Acquire);
-        let best = self.best_window_bytes;
-
-        // Only kick when other streams are demonstrably faster: compare the head
-        // against the CURRENT window's best, not an all-time max. If everything is
-        // slow, the link is saturated and kicking won't help.
-        let current_window_max = per_stream.iter().copied().max().unwrap_or(0);
-        if current_window_max < KICK_MIN_WINDOW_BYTES {
-            // All streams are slow — saturated link. Don't kick anything.
+    /// Withdraws a boost that did not raise the fetch's byte rate (see [`FetchBoost`]).
+    /// Checked once, in the boost's second window (the first one is partly spent
+    /// connecting the extra workers), and only while the scanner still waits (else
+    /// the boost did its job and ends the usual way) and extra workers run (a boost
+    /// that could not add any only restarts slow head streams).
+    fn check_boost_gain(&mut self, rate: f64, fraction: f64) {
+        self.boost_windows += 1;
+        if self.boost_windows != 2 || fraction < BOOST_ON_FRACTION || self.live_extras() == 0 {
             return;
         }
+        let Some(base) = self.pre_boost_rate else {
+            return;
+        };
+        if rate >= base * BOOST_MIN_GAIN {
+            self.state.boost_paid_off();
+            return;
+        }
+        let retry_windows = self.state.withdraw();
+        self.boost_on.store(false, Ordering::Relaxed);
+        self.dispatcher.set_cutting(false);
+        self.dispatcher
+            .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
+        info!(
+            before_kbps = (base / 1024.0) as u64,
+            boosted_kbps = (rate / 1024.0) as u64,
+            retry_windows,
+            "fetch boost withdrawn: more streams did not speed up the download"
+        );
+    }
 
-        for (w, &delta) in self.workers.iter_mut().zip(per_stream) {
+    /// Restarts the stream of the head plan chunk when it is slow (see [`FetchBoost`]).
+    fn kick_slow_head(&mut self, per_stream: &[u64], now: Instant) {
+        let floor = self.floor.load(Ordering::Acquire);
+        for (i, (w, &delta)) in self.workers.iter_mut().zip(per_stream).enumerate() {
             if !w.slot.holds(floor) {
                 continue;
             }
-
+            // The other streams of this window: a head as slow as they are is on a
+            // full link, where a fresh connection gets no more of it.
+            let others_best = per_stream
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, &b)| b)
+                .max()
+                .unwrap_or(0);
+            let slow = head_is_slow(delta, others_best);
             let plan_index = w.slot.plan_index.load(Ordering::Relaxed);
-
-            // Reset kick count if we moved to a new plan chunk.
-            if w.last_kicked_plan_index != Some(plan_index) {
-                w.kick_count = 0;
-                w.last_kicked_plan_index = Some(plan_index);
+            if w.kick_plan_index != Some(plan_index) || !slow {
+                // A new chunk, or the last restart helped.
+                w.kick_plan_index = Some(plan_index);
+                w.slow_kicks = 0;
             }
-
-            // Exponential backoff: after each kick, wait longer before the next one
-            // for the same plan chunk. Max 3 kicks per chunk.
-            let max_kicks = 3;
-            if w.kick_count >= max_kicks {
-                continue;
-            }
-
-            let backoff = KICK_COOLDOWN * 2u32.saturating_pow(w.kick_count);
-            let cooling = w.last_kick.is_some_and(|t| now.duration_since(t) < backoff);
-
-            if !cooling && head_is_slow(delta, best) {
+            let cooling = w
+                .last_kick
+                .is_some_and(|t| now.duration_since(t) < kick_cooldown(w.slow_kicks));
+            if !cooling && slow {
                 info!(
                     plan_index,
                     window_kb = delta / 1024,
-                    best_window_kb = best / 1024,
-                    kick_count = w.kick_count + 1,
+                    others_best_kb = others_best / 1024,
+                    restarts = w.slow_kicks + 1,
                     "head stream slow while the scanner waits — restarting it"
                 );
                 w.slot.kick();
                 w.last_kick = Some(now);
-                w.kick_count += 1;
+                w.slow_kicks += 1;
             }
         }
     }
@@ -2078,21 +2061,24 @@ impl Booster {
                 slot,
                 window_bytes: 0,
                 last_kick: None,
-                last_kicked_plan_index: None,
-                kick_count: 0,
+                kick_plan_index: None,
+                slow_kicks: 0,
             });
         }
     }
 }
 
-/// The best per-stream window after one more window: the previous best decayed by 10 %,
-/// or this window's best stream if higher.
-fn decayed_best_window(prev_best: u64, window_max: u64) -> u64 {
-    ((prev_best as f64 * 0.9) as u64).max(window_max)
+/// Wait before restarting a head stream again after `slow_kicks` restarts of its
+/// plan chunk after which it stayed slow: [`KICK_COOLDOWN`], doubling from the
+/// second such restart on, up to [`KICK_MAX_COOLDOWN`].
+fn kick_cooldown(slow_kicks: u32) -> Duration {
+    KICK_COOLDOWN
+        .saturating_mul(1 << slow_kicks.saturating_sub(1).min(8))
+        .min(KICK_MAX_COOLDOWN)
 }
 
 /// Whether a head stream that received `window_bytes` in a window is slow next to
-/// the best window `best_window_bytes` of any stream of the fetch.
+/// the best window `best_window_bytes` of the other streams of the fetch.
 fn head_is_slow(window_bytes: u64, best_window_bytes: u64) -> bool {
     window_bytes < KICK_MIN_WINDOW_BYTES
         || (window_bytes as f64) < KICK_RATE_FRACTION * best_window_bytes as f64
@@ -2114,22 +2100,19 @@ struct BoostState {
     hot: u32,
     /// Consecutive windows without waiting while on.
     cold: u32,
-    /// Windows remaining in a cooldown period after ineffective boost.
-    /// While > 0, `Start` is blocked and this counter decrements each window.
-    cooldown_windows: u32,
-    /// Number of times boost has been retracted as ineffective. Used for exponential backoff.
-    ineffective_count: u32,
+    /// Windows left before a withdrawn boost may start again.
+    retry_in: u32,
+    /// Boosts withdrawn in a row (see [`Self::withdraw`]).
+    withdrawals: u32,
 }
 
 impl BoostState {
     /// Records one window in which the scanner waited for `fraction` of the time.
     fn observe(&mut self, fraction: f64) -> BoostStep {
-        // Decrement cooldown if active.
-        if self.cooldown_windows > 0 {
-            self.cooldown_windows -= 1;
+        if self.retry_in > 0 {
+            self.retry_in -= 1;
             return BoostStep::Stay;
         }
-
         if !self.on {
             self.hot = if fraction >= BOOST_ON_FRACTION {
                 self.hot + 1
@@ -2141,8 +2124,7 @@ impl BoostState {
                     on: true,
                     hot: 0,
                     cold: 0,
-                    cooldown_windows: 0,
-                    ineffective_count: self.ineffective_count,
+                    ..*self
                 };
                 return BoostStep::Start;
             }
@@ -2154,11 +2136,8 @@ impl BoostState {
             };
             if self.cold >= BOOST_COLD_WINDOWS {
                 *self = Self {
-                    on: false,
-                    hot: 0,
-                    cold: 0,
-                    cooldown_windows: 0,
-                    ineffective_count: self.ineffective_count,
+                    withdrawals: self.withdrawals,
+                    ..Self::default()
                 };
                 return BoostStep::Stop;
             }
@@ -2166,15 +2145,21 @@ impl BoostState {
         BoostStep::Stay
     }
 
-    /// Force a cooldown after an ineffective boost: exponential backoff.
-    /// First retraction: 12 windows (~2 min). Each subsequent: doubled.
-    fn force_cooldown(&mut self) {
-        self.on = false;
-        self.hot = 0;
-        self.cold = 0;
-        self.ineffective_count += 1;
-        // 12 windows = ~2 minutes at 10s per window. Exponential backoff: 12, 24, 48, ...
-        self.cooldown_windows = 12 * (1 << (self.ineffective_count - 1).min(4));
+    /// Ends a boost that did not pay off; returns the windows it waits before it may
+    /// start again ([`BOOST_RETRY_WINDOWS`], doubling with each withdrawal in a row).
+    fn withdraw(&mut self) -> u32 {
+        let doublings = self.withdrawals.min(BOOST_RETRY_MAX_DOUBLINGS);
+        *self = Self {
+            retry_in: BOOST_RETRY_WINDOWS << doublings,
+            withdrawals: self.withdrawals + 1,
+            ..Self::default()
+        };
+        self.retry_in
+    }
+
+    /// A boost raised the byte rate: the next withdrawal waits the shortest time again.
+    fn boost_paid_off(&mut self) {
+        self.withdrawals = 0;
     }
 }
 
@@ -2529,10 +2514,7 @@ mod boost_tests {
     fn boost_ends_after_consecutive_calm_windows() {
         let mut st = BoostState {
             on: true,
-            hot: 0,
-            cold: 0,
-            cooldown_windows: 0,
-            ineffective_count: 0,
+            ..BoostState::default()
         };
         for _ in 0..BOOST_COLD_WINDOWS - 1 {
             assert_eq!(st.observe(0.0), BoostStep::Stay);
@@ -2550,138 +2532,52 @@ mod boost_tests {
     }
 
     #[test]
-    fn head_is_slow_relative_to_best() {
-        // Head received 32 KB, best was 640 KB: head is slow (< 12.5% of best).
-        assert!(head_is_slow(32 * 1024, 640 * 1024));
-        // Exactly 12.5 % of the best is not slow; just under it is.
-        assert!(!head_is_slow(80 * 1024, 640 * 1024));
-        assert!(head_is_slow(79 * 1024, 640 * 1024));
-        // Head received 100 KB, best was 640 KB: not slow (>= 12.5% of best).
-        assert!(!head_is_slow(100 * 1024, 640 * 1024));
-        // Head received < 64 KB: always slow regardless of best.
-        assert!(head_is_slow(32 * 1024, 64 * 1024));
-        assert!(head_is_slow(60 * 1024, 1_000_000));
-    }
-
-    #[test]
-    fn best_window_decays_gradually() {
-        // A fast window sets the best.
-        let best = decayed_best_window(0, 640 * 1024);
-        assert_eq!(best, 640 * 1024);
-        // Slower windows let it fall 10 % per window, never below the current window.
-        let best = decayed_best_window(best, 100 * 1024);
-        assert_eq!(best, (640.0 * 1024.0 * 0.9) as u64);
-        let mut b = best;
-        for _ in 0..30 {
-            b = decayed_best_window(b, 50 * 1024);
-        }
-        assert_eq!(b, 50 * 1024);
-        // A new faster window raises it at once.
-        assert_eq!(decayed_best_window(b, 700 * 1024), 700 * 1024);
-    }
-
-    #[test]
-    fn boost_state_force_cooldown_blocks_start_for_12_windows() {
+    fn a_withdrawn_boost_waits_longer_each_time_until_one_pays_off() {
         let mut st = BoostState::default();
-        // Warm up to boost.
-        assert_eq!(st.observe(0.30), BoostStep::Stay);
-        assert_eq!(st.observe(0.30), BoostStep::Start);
-        assert!(st.on);
-
-        // Force cooldown (first time: 12 windows).
-        st.force_cooldown();
-        assert!(!st.on);
-        assert_eq!(st.cooldown_windows, 12);
-        assert_eq!(st.ineffective_count, 1);
-
-        // Next 11 windows: all Stay, even with high wait fractions.
-        for i in 0..11 {
+        for round in 0..=BOOST_RETRY_MAX_DOUBLINGS + 1 {
+            assert_eq!(st.observe(1.0), BoostStep::Stay);
+            assert_eq!(st.observe(1.0), BoostStep::Start);
+            let wait = st.withdraw();
             assert_eq!(
-                st.observe(0.99),
-                BoostStep::Stay,
-                "window {} during cooldown",
-                i
+                wait,
+                BOOST_RETRY_WINDOWS << round.min(BOOST_RETRY_MAX_DOUBLINGS)
             );
-            assert_eq!(st.cooldown_windows, 11 - i);
+            assert!(!st.on);
+            for _ in 0..wait {
+                assert_eq!(st.observe(1.0), BoostStep::Stay, "no boost while waiting");
+            }
         }
-
-        // After 11 windows, cooldown_windows = 1.
-        assert_eq!(st.cooldown_windows, 1);
-        assert_eq!(st.observe(0.99), BoostStep::Stay); // This clears cooldown to 0.
-        assert_eq!(st.cooldown_windows, 0);
-
-        // Now can warm up again.
-        assert_eq!(st.observe(0.30), BoostStep::Stay);
-        assert_eq!(st.observe(0.30), BoostStep::Start);
-        assert!(st.on);
+        assert_eq!(st.observe(1.0), BoostStep::Stay);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+        st.boost_paid_off();
+        assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS);
     }
 
     #[test]
-    fn boost_state_force_cooldown_exponential_backoff() {
+    fn an_ended_boost_keeps_its_withdrawal_count() {
         let mut st = BoostState::default();
-
-        // First ineffective boost: 12 windows cooldown.
-        st.observe(0.30);
-        st.observe(0.30); // Start
-        st.force_cooldown();
-        assert_eq!(st.cooldown_windows, 12);
-        assert_eq!(st.ineffective_count, 1);
-
-        // Burn through the cooldown.
-        for _ in 0..12 {
-            st.observe(0.99);
+        st.observe(1.0);
+        st.observe(1.0);
+        st.withdraw();
+        for _ in 0..BOOST_RETRY_WINDOWS {
+            st.observe(1.0);
         }
-        assert_eq!(st.cooldown_windows, 0);
-
-        // Second ineffective boost: 24 windows cooldown (12 * 2).
-        st.observe(0.30);
-        st.observe(0.30); // Start
-        st.force_cooldown();
-        assert_eq!(st.cooldown_windows, 24);
-        assert_eq!(st.ineffective_count, 2);
-
-        // Burn through again.
-        for _ in 0..24 {
-            st.observe(0.99);
+        st.observe(1.0);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+        for _ in 0..BOOST_COLD_WINDOWS - 1 {
+            st.observe(0.0);
         }
-        assert_eq!(st.cooldown_windows, 0);
+        assert_eq!(st.observe(0.0), BoostStep::Stop);
+        assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS << 1);
+    }
 
-        // Third ineffective boost: 48 windows cooldown (12 * 4).
-        st.observe(0.30);
-        st.observe(0.30); // Start
-        st.force_cooldown();
-        assert_eq!(st.cooldown_windows, 48);
-        assert_eq!(st.ineffective_count, 3);
-
-        // Fourth: 96 windows (12 * 8).
-        for _ in 0..48 {
-            st.observe(0.99);
-        }
-        st.observe(0.30);
-        st.observe(0.30);
-        st.force_cooldown();
-        assert_eq!(st.cooldown_windows, 96);
-        assert_eq!(st.ineffective_count, 4);
-
-        // Fifth and beyond: capped at 192 windows (12 * 16).
-        for _ in 0..96 {
-            st.observe(0.99);
-        }
-        st.observe(0.30);
-        st.observe(0.30);
-        st.force_cooldown();
-        assert_eq!(st.cooldown_windows, 192); // 12 * (1 << 4) = 192
-        assert_eq!(st.ineffective_count, 5);
-
-        // Sixth: still capped.
-        for _ in 0..192 {
-            st.observe(0.99);
-        }
-        st.observe(0.30);
-        st.observe(0.30);
-        st.force_cooldown();
-        assert_eq!(st.cooldown_windows, 192); // Still capped at 12 * 16.
-        assert_eq!(st.ineffective_count, 6);
+    #[test]
+    fn restarts_of_a_chunk_that_stays_slow_back_off_to_the_cap() {
+        assert_eq!(kick_cooldown(0), KICK_COOLDOWN);
+        assert_eq!(kick_cooldown(1), KICK_COOLDOWN);
+        assert_eq!(kick_cooldown(2), KICK_COOLDOWN * 2);
+        assert_eq!(kick_cooldown(3), KICK_MAX_COOLDOWN);
+        assert_eq!(kick_cooldown(u32::MAX), KICK_MAX_COOLDOWN);
     }
 }
 
