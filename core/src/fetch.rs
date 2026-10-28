@@ -1964,8 +1964,7 @@ impl Booster {
         // This allows the "best" to fall gradually when link conditions worsen,
         // so the head is compared against recent performance, not an all-time peak.
         let window_max = got.iter().copied().max().unwrap_or(0);
-        let decayed = (self.best_window_bytes as f64 * 0.9) as u64;
-        self.best_window_bytes = decayed.max(window_max);
+        self.best_window_bytes = decayed_best_window(self.best_window_bytes, window_max);
         got
     }
 
@@ -2084,6 +2083,12 @@ impl Booster {
             });
         }
     }
+}
+
+/// The best per-stream window after one more window: the previous best decayed by 10 %,
+/// or this window's best stream if higher.
+fn decayed_best_window(prev_best: u64, window_max: u64) -> u64 {
+    ((prev_best as f64 * 0.9) as u64).max(window_max)
 }
 
 /// Whether a head stream that received `window_bytes` in a window is slow next to
@@ -2559,62 +2564,19 @@ mod boost_tests {
 
     #[test]
     fn best_window_decays_gradually() {
-        let plan = FetchPlan::new(0, 9999, 2000, 4);
-        let meter = Arc::new(QueueMeter::new());
-        let fleet = Arc::new(FleetStats::default());
-        let dispatcher = Arc::new(Dispatcher::new(&plan, Some(16 << 20), Arc::clone(&fleet)));
-        let boost_on = Arc::new(AtomicBool::new(false));
-        let floor = Arc::new(AtomicU64::new(0));
-        let gate = AheadGate::new(16 << 20, Arc::clone(&floor));
-        let slots: Vec<_> = (0..4)
-            .map(|_| Arc::new(WorkerSlot::new(Arc::clone(&fleet))))
-            .collect();
-
-        // Create a dummy WorkerSpawn (we won't actually spawn workers).
-        let (tx, _rx) = mpsc::channel(1);
-        let spawn = WorkerSpawn {
-            endpoint: crate::config::Endpoint {
-                host: "test".into(),
-                port: 443,
-                tls: true,
-            },
-            tor: None,
-            plan: plan.clone(),
-            tx,
-            progress: None,
-        };
-
-        let mut booster = Booster::new(
-            FetchBoost { extra_streams: 2 },
-            meter,
-            dispatcher,
-            boost_on,
-            floor,
-            gate,
-            16 << 20,
-            &slots,
-            spawn,
-        );
-
-        // Simulate one slot receiving 640 KB in a window.
-        slots[0].bytes.store(640 * 1024, Ordering::Relaxed);
-        booster.close_stream_windows();
-        assert_eq!(booster.best_window_bytes, 640 * 1024);
-
-        // Next window: only 100 KB. Best decays to max(640*0.9, 100) = 576 KB.
-        slots[0].bytes.store((640 + 100) * 1024, Ordering::Relaxed);
-        booster.close_stream_windows();
-        let expected = std::cmp::max((640.0 * 0.9) as u64, 100) * 1024;
-        assert_eq!(booster.best_window_bytes, expected);
-
-        // Several slow windows: best keeps decaying.
-        for _ in 0..5 {
-            let prev = booster.best_window_bytes;
-            slots[0].bytes.fetch_add(50 * 1024, Ordering::Relaxed);
-            booster.close_stream_windows();
-            let expected_new = std::cmp::max((prev as f64 * 0.9) as u64, 50 * 1024);
-            assert_eq!(booster.best_window_bytes, expected_new);
+        // A fast window sets the best.
+        let best = decayed_best_window(0, 640 * 1024);
+        assert_eq!(best, 640 * 1024);
+        // Slower windows let it fall 10 % per window, never below the current window.
+        let best = decayed_best_window(best, 100 * 1024);
+        assert_eq!(best, (640.0 * 1024.0 * 0.9) as u64);
+        let mut b = best;
+        for _ in 0..30 {
+            b = decayed_best_window(b, 50 * 1024);
         }
+        assert_eq!(b, 50 * 1024);
+        // A new faster window raises it at once.
+        assert_eq!(decayed_best_window(b, 700 * 1024), 700 * 1024);
     }
 
     #[test]
