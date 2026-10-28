@@ -65,6 +65,8 @@ jobs:
       # catches the cross-feature API drift a default-features build would miss.
       - name: cargo check --all-targets --all-features
         run: cargo check --workspace --all-targets --all-features
+      - name: Check without default features
+        run: cargo check --locked -p zodl-slipstream --no-default-features
 
   fmt:
     name: Rustfmt

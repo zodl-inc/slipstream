@@ -242,6 +242,7 @@ pub struct EngineConfig {
     /// the write-behind path. Scanned blocks of a unit not yet submitted are lost
     /// on an error exit or stop and scanned again by the next pass, so the
     /// limits also bound that rework.
+    #[cfg(feature = "zcash_client_sqlite")]
     pub persist_commit_limits: Option<crate::persist::CommitLimits>,
 
     /// Adaptive prefetch (`fetch::FetchBoost`): plan chunks sized by bytes (a
@@ -310,6 +311,7 @@ impl EngineConfig {
             local_treestate: false,
             treestate_verify_sample: 1,
             persist_depth: 1,
+            #[cfg(feature = "zcash_client_sqlite")]
             persist_commit_limits: Some(crate::persist::CommitLimits {
                 max_blocks: crate::persist::CommitLimits::DEFAULT_MAX_BLOCKS,
                 max_outputs: crate::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
