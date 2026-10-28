@@ -1988,9 +1988,7 @@ impl Booster {
             }
 
             let backoff = KICK_COOLDOWN * 2u32.saturating_pow(w.kick_count);
-            let cooling = w
-                .last_kick
-                .is_some_and(|t| now.duration_since(t) < backoff);
+            let cooling = w.last_kick.is_some_and(|t| now.duration_since(t) < backoff);
 
             if !cooling && head_is_slow(delta, best) {
                 info!(

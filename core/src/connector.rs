@@ -279,7 +279,8 @@ impl TorConn {
             async move {
                 match relay {
                     Some(relay) => {
-                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix, dedicated).await
+                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix, dedicated)
+                            .await
                     }
                     None => Self::connect_direct_over_tor(client, endpoint).await,
                 }
