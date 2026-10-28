@@ -46,6 +46,9 @@ workspace.
   `GetAddressUtxos` does too.
 
 ### Changed
+- OHTTP relay pauses and key-fetch rate limits remain typed during Tor
+  connection warm-up. They return to caller backoff without spending fresh
+  circuit retries or falsely marking the endpoint unreachable.
 - `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` take the
   wallet's network (`ohttp::NetworkType`, re-exported from `zcash_protocol`)
   as their second argument and refuse a gateway that serves another network
