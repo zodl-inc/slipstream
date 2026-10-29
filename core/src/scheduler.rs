@@ -32,7 +32,7 @@ use crate::{
     connector::TorConn,
     enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily_isolated},
     error::SlipstreamError,
-    events::Progress,
+    events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress},
     fetch::{FetchPlan, FetchStats, run_fetch},
     scan::{ScanStats, local_treestate_active, needs_server_boundary_state, scan_chunks},
     wallet_session::WalletSession,
@@ -85,6 +85,44 @@ pub(crate) fn global_floor_permille(
     Some(scanned.saturating_mul(1000) / span)
 }
 
+/// B4: Work-unit variant of `global_floor_permille`. When a WorkEstimator is available,
+/// the GLOBAL scan position is computed from work units instead of block counts:
+/// `(total_span_work - remaining_work) * 1000 / total_span_work`.
+pub(crate) fn global_floor_permille_work(
+    tip: u64,
+    birthday: Option<u64>,
+    remaining_work: u64,
+    estimator: &crate::work::WorkEstimator,
+) -> Option<u64> {
+    let birthday = birthday?;
+    if tip == 0 || tip < birthday {
+        return None;
+    }
+    let total_work = estimator.range(birthday, tip);
+    if total_work == 0 {
+        // Empty range or estimator has no data - fall back to None
+        return None;
+    }
+    let scanned_work = total_work.saturating_sub(remaining_work);
+    Some(scanned_work.saturating_mul(1000) / total_work)
+}
+
+/// Estimated work of the suggested ranges (`block_range().end` is END-EXCLUSIVE, so each
+/// range covers `start..=end − 1`).
+pub(crate) fn remaining_work(
+    est: &crate::work::WorkEstimator,
+    ranges: &[zcash_client_backend::data_api::scanning::ScanRange],
+) -> u64 {
+    ranges
+        .iter()
+        .map(|r| {
+            let s = u64::from(r.block_range().start);
+            let e = u64::from(r.block_range().end);
+            if e > s { est.range(s, e - 1) } else { 0 }
+        })
+        .sum()
+}
+
 /// [h16-1] One suggest round's progress bookkeeping: set the pass total and seed/re-baseline
 /// the session floor + pass start from the GLOBAL seed. Extracted from the `run_to_completion`
 /// loop body (behaviour unchanged by the extraction itself) so it can be driven directly in
@@ -97,24 +135,62 @@ pub(crate) fn update_pass_progress(
     scanned_so_far_in_pass: &mut u64,
     sum_remaining: u64,
     wallet_birthday: Option<u64>,
+    scanned_work_so_far_in_pass: &mut u64,
+    sum_remaining_work: u64,
+    work_estimator: Option<&crate::work::WorkEstimator>,
 ) -> bool {
     // [h16-1] Snapshot the pass-local blend baseline BEFORE the pass total is set: from
     // this moment, `derive_snapshot` reads `fetched()`/`scanned()` relative to this
     // baseline instead of raw, so blocks already credited to `scanned_so_far_in_pass`
     // (this pass's completed-range tally) are not counted a second time against the new
     // total. At this instant the pass-local counters equal the work the pass has credited.
+    // The block fields are kept in every pass, also one measured in work: they are the
+    // fallback `derive_snapshot` uses when the work total is 0, and the snapshot's own
+    // `pass_total_blocks`.
     p.set_pass_baseline(
         p.fetched().saturating_sub(*scanned_so_far_in_pass),
         p.scanned().saturating_sub(*scanned_so_far_in_pass),
     );
     p.set_pass_total(*scanned_so_far_in_pass + sum_remaining);
+    // Output-weighted progress: the same bookkeeping in work units. The pass's FIRST suggest
+    // round fixes the unit (work when the estimator can express the global position), and
+    // every later round of the pass keeps it.
+    let work_seed = work_estimator.and_then(|est| {
+        global_floor_permille_work(p.chain_tip(), wallet_birthday, sum_remaining_work, est)
+    });
+    let use_work = p.fix_pass_unit(work_seed.is_some());
+    if !use_work && p.floor_unit() == crate::events::PASS_UNIT_WORK {
+        // The floor is in work units and this pass reports blocks (the estimator could not be
+        // read): a block seed never lowers a work floor, so an expansion of the scope in this
+        // pass (an imported older account) is not shown until the next pass.
+        tracing::warn!(
+            "work estimator unavailable: scope-expansion detection is off for this pass"
+        );
+    }
+    if use_work {
+        // Mirror of the block baseline above: baseline = counter − credited work so far,
+        // total = credited work so far + remaining work.
+        p.set_pass_baseline_work(
+            p.fetched_work()
+                .saturating_sub(*scanned_work_so_far_in_pass),
+            p.scanned_work()
+                .saturating_sub(*scanned_work_so_far_in_pass),
+        );
+        p.set_pass_total_work(*scanned_work_so_far_in_pass + sum_remaining_work);
+    }
     // [API v2 §4.4 / Phase E] Seed the session-monotonic floor with the GLOBAL position.
     // fetch_max semantics: the seed can only RAISE the floor, and re-seeding every suggest
     // round tracks global progress as ranges complete. Two behaviours fall out for free:
     // a cold-launch catch-up starts at ~99.9% instead of flashing 0% (the old Swift
     // summary floor), and a relaunched restore RESUMES near its true position instead of
-    // 0% (the old Swift monotonic floor could not survive a relaunch).
-    let Some(seed) = global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining) else {
+    // 0% (the old Swift monotonic floor could not survive a relaunch). The seed is in the
+    // pass's unit.
+    let seed = if use_work {
+        work_seed
+    } else {
+        global_floor_permille(p.chain_tip(), wallet_birthday, sum_remaining)
+    };
+    let Some(seed) = seed else {
         return false;
     };
     // [API v2.1 E-5] Scope-expansion re-baseline: an imported account with an
@@ -144,7 +220,15 @@ pub(crate) fn update_pass_progress(
     // high/old ones and computes a raw value ABOVE the floor at that instant — that mixed,
     // double-counted read is the bug fixed here (confirmed against this exact seed/credit
     // combination in scheduler::tests::rebaseline_old_order_used_to_latch_a_double_counted_697).
-    if p.scope_expanded(seed) {
+    //
+    // Compute the seed's unit for scope-expansion detection.
+    let unit = if use_work {
+        PASS_UNIT_WORK
+    } else {
+        PASS_UNIT_BLOCKS
+    };
+
+    if p.scope_expanded(seed, unit) {
         // [h16-1] The new start already includes everything credited so far: fold the
         // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
         // counters, so the next blend reads 0 pass-local progress against the fresh
@@ -153,6 +237,11 @@ pub(crate) fn update_pass_progress(
         *scanned_so_far_in_pass = 0;
         p.set_pass_baseline(p.fetched(), p.scanned());
         p.set_pass_total(sum_remaining);
+        *scanned_work_so_far_in_pass = 0;
+        if use_work {
+            p.set_pass_baseline_work(p.fetched_work(), p.scanned_work());
+            p.set_pass_total_work(sum_remaining_work);
+        }
         // [h10] The pass start follows the re-baseline: the scope grew UNDER
         // this running pass, so the pass's own progress must stretch from the
         // re-baselined position too, or it would still stretch from the stale
@@ -164,7 +253,7 @@ pub(crate) fn update_pass_progress(
         // invariant above, nothing a concurrent poll can fetch_max it with in this window
         // exceeds the floor this call is about to compare `seed` against — so this re-check
         // is guaranteed to still see the expansion.
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed, unit);
         debug_assert!(
             rebaselined,
             "scope_expanded just reported an expansion and nothing between here and there \
@@ -181,7 +270,7 @@ pub(crate) fn update_pass_progress(
         // of the same pass keep it — the pass's reported progress is measured
         // from where the GLOBAL position stood when the pass began.
         p.set_pass_start_permille_if_unset(seed);
-        let _ = p.permille_floor(seed);
+        let _ = p.permille_floor(seed, unit);
         false
     }
 }
@@ -203,6 +292,24 @@ pub(crate) fn scan_continuity_repair_credit(
         .min(end_exclusive.saturating_sub(start))
 }
 
+/// B3: Work-unit variant of `scan_continuity_repair_credit`. Returns the work units
+/// in the surviving prefix `[start, rewind_height-1]`, clamped to the aborted range's bounds.
+/// The ScanContinuity branch credits this to `scanned_work_so_far_in_pass` so the next
+/// suggest round's baseline snapshot accounts for it.
+pub(crate) fn scan_continuity_work_credit(
+    est: &crate::work::WorkEstimator,
+    start: u64,
+    end_exclusive: u64,
+    rewind_height: u64,
+) -> u64 {
+    if rewind_height <= start {
+        return 0;
+    }
+    // The surviving prefix is [start, rewind_height-1], clamped to [start, end_exclusive-1].
+    let prefix_end = (rewind_height - 1).min(end_exclusive.saturating_sub(1));
+    est.range(start, prefix_end)
+}
+
 /// [API v2.1 E-3] Seed the snapshot atomics from PERSISTED wallet state, so the snapshot is
 /// truthful from `open()` — before the first suggest round — and hosts never compensate for
 /// a pre-pass snapshot that "lies" (the ENGINE_API_V2.md §0 known gap: `is_recovering` read
@@ -221,6 +328,10 @@ pub(crate) fn scan_continuity_repair_credit(
 ///
 /// A wallet with no accounts seeds nothing — a fresh wallet's zero snapshot IS truthful.
 /// Callers treat errors as "no seed" (presentation state, never correctness state).
+///
+/// The seed uses the subtree roots stored at open, before the pass fetches new ones, so it can
+/// sit up to the scope-expansion epsilon above the first in-pass seed; the reading then holds
+/// until real progress passes it. Larger gaps re-baseline at the first suggest round.
 pub fn seed_progress_from_wallet(
     progress: &Progress,
     session: &WalletSession,
@@ -253,8 +364,21 @@ pub fn seed_progress_from_wallet(
             e.saturating_sub(s)
         })
         .sum();
-    if let Some(seed) = global_floor_permille(tip, Some(birthday), sum_remaining) {
-        let _ = progress.permille_floor(seed);
+    // Same unit choice as the pass's first suggest round: in work when the estimator can
+    // express the position, so the pass's first work seed is not read as a scope expansion
+    // against a higher block-based floor seeded here.
+    let work_estimator = session.build_work_estimator();
+    let work_seed = work_estimator.as_ref().and_then(|est| {
+        global_floor_permille_work(tip, Some(birthday), remaining_work(est, &ranges), est)
+    });
+    let seed = work_seed.or_else(|| global_floor_permille(tip, Some(birthday), sum_remaining));
+    if let Some(seed) = seed {
+        let unit = if work_seed.is_some() {
+            PASS_UNIT_WORK
+        } else {
+            PASS_UNIT_BLOCKS
+        };
+        let _ = progress.permille_floor(seed, unit);
     }
     tracing::info!(
         tip,
@@ -415,6 +539,11 @@ pub async fn run_to_completion(
     // F1: track blocks scanned so far in this pass (local accumulator).
     // Used to compute the whole-pass denominator: scanned_so_far + sum(remaining ranges).
     let mut scanned_so_far_in_pass: u64 = 0;
+    // B1: Build WorkEstimator once per pass for output-weighted progress.
+    // Returns None on any error (logged) or when no usable shard data exists.
+    let work_estimator = session.build_work_estimator();
+    // B1: Track work scanned so far in this pass (parallel to scanned_so_far_in_pass).
+    let mut scanned_work_so_far_in_pass: u64 = 0;
     // [API v2 §4.4] The wallet's recovery ceiling, read once per pass: the snapshot's
     // `is_recovering` is true while any suggested range still starts below it (the restore
     // backfill window). A read failure degrades to "not recovering" rather than failing the
@@ -457,6 +586,10 @@ pub async fn run_to_completion(
                     e.saturating_sub(s)
                 })
                 .sum();
+            // B1: Compute sum_remaining_work when a WorkEstimator is available.
+            let sum_remaining_work = work_estimator
+                .as_ref()
+                .map_or(0, |est| remaining_work(est, &ranges));
             // [h16-4] Read every suggest round, not once per pass: an account imported
             // BETWEEN two rounds of the same pass, with an older birthday, widens the span
             // above (sum_remaining grows) while a pass-level read would still hold the
@@ -470,6 +603,9 @@ pub async fn run_to_completion(
                 &mut scanned_so_far_in_pass,
                 sum_remaining,
                 wallet_birthday,
+                &mut scanned_work_so_far_in_pass,
+                sum_remaining_work,
+                work_estimator.as_ref(),
             );
         }
 
@@ -496,6 +632,11 @@ pub async fn run_to_completion(
         if let Some(ref p) = progress {
             p.set_range_end(end);
         }
+
+        // [B3 fix] Snapshot scanned_work at range start to clamp continuity credit: only credit
+        // the work actually done in THIS attempt, not work from earlier attempts at overlapping
+        // ranges that the counter already holds.
+        let range_start_scanned_work = progress.as_ref().map(|p| p.scanned_work()).unwrap_or(0);
 
         let (mut tx, rx) = chunk_queue(config.memory_budget_bytes);
         // v0.5 pacer fix: boundary treestate fetches start when the chunk is
@@ -656,6 +797,23 @@ pub async fn run_to_completion(
             // small repair range while fetched/scanned still hold the whole aborted range.
             scanned_so_far_in_pass +=
                 scan_continuity_repair_credit(start, end_exclusive, u64::from(rewind_height));
+            // B3: Credit surviving work when using work-based progress. [B3 fix] Clamp to the
+            // work actually done in this attempt (scanned_work_now - range_start snapshot), so we
+            // never credit work from earlier attempts that the counter already holds.
+            if let Some(ref est) = work_estimator {
+                let raw_credit = scan_continuity_work_credit(
+                    est,
+                    start,
+                    end_exclusive,
+                    u64::from(rewind_height),
+                );
+                let actual_work_done = progress
+                    .as_ref()
+                    .map(|p| p.scanned_work().saturating_sub(range_start_scanned_work))
+                    .unwrap_or(0);
+                let clamped_credit = raw_credit.min(actual_work_done);
+                scanned_work_so_far_in_pass += clamped_credit;
+            }
 
             report.reorgs_recovered += 1;
             if let Some(ref p) = progress {
@@ -764,6 +922,8 @@ pub async fn run_to_completion(
 
         // F1: accumulate scanned blocks for next iteration's whole-pass denominator.
         scanned_so_far_in_pass += scan_stats.blocks;
+        // B1: accumulate scanned work when using work-based progress.
+        scanned_work_so_far_in_pass += scan_stats.work;
 
         // Spendable latch: if this range was ChainTip priority, funds are now likely
         // spendable (SBS semantics — the tip-priority range covers the most-recent
@@ -939,8 +1099,15 @@ mod tests {
 
         // Round 1: the pass's first suggest round, no expansion yet — a 1,000,000-block
         // span with everything still remaining, so the seed (and the latched start) is 0.
-        let rebaselined =
-            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            1_000_000,
+            Some(B1),
+            &mut 0,
+            0,
+            None,
+        );
         assert!(!rebaselined, "first round of a pass is never a re-baseline");
         assert_eq!(p.pass_start_permille(), Some(0));
 
@@ -961,8 +1128,15 @@ mod tests {
         // 2,000,000-block span with 1,100,000 remaining (the reviewer's own example).
         // seed = (2,000,000 − 1,100,000) × 1000 / 2,000,000 = 450, far enough below the
         // 900 floor to read as scope expansion, not noise.
-        let rebaselined =
-            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_100_000, Some(B0));
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            1_100_000,
+            Some(B0),
+            &mut 0,
+            0,
+            None,
+        );
         assert!(
             rebaselined,
             "450 is >50‰ below the 900 floor ⇒ scope expansion"
@@ -980,8 +1154,15 @@ mod tests {
         // is still 450, which must NOT read as a further expansion against the now-correct
         // 450 floor (pre-fix, the round-2 poll above re-inflates the floor and this round
         // wrongly re-baselines again).
-        let rebaselined_again =
-            update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_100_000, Some(B0));
+        let rebaselined_again = update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            1_100_000,
+            Some(B0),
+            &mut 0,
+            0,
+            None,
+        );
         assert!(
             !rebaselined_again,
             "the next suggest round must not re-baseline again"
@@ -1021,7 +1202,15 @@ mod tests {
         const B1: u64 = TIP - 1_000_000 + 1;
         p.set_chain_tip(TIP);
         let mut scanned_so_far_in_pass = 0u64;
-        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            1_000_000,
+            Some(B1),
+            &mut 0,
+            0,
+            None,
+        );
         p.add_fetched(900_000);
         p.add_scanned(900_000);
         // (round 1 credited nothing to `scanned_so_far_in_pass`: the non-expanded branch
@@ -1052,7 +1241,7 @@ mod tests {
             "zero pass-local count under the NEW seed ⇒ raw = 450 ≤ 900, floor still unmoved"
         );
 
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS);
         assert!(rebaselined, "the re-check must still see the expansion");
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1080,7 +1269,15 @@ mod tests {
         const B1: u64 = TIP - 1_000_000 + 1;
         p.set_chain_tip(TIP);
         let mut scanned_so_far_in_pass = 0u64;
-        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_000_000, Some(B1));
+        update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            1_000_000,
+            Some(B1),
+            &mut 0,
+            0,
+            None,
+        );
         p.add_fetched(900_000);
         p.add_scanned(900_000);
         scanned_so_far_in_pass += 900_000;
@@ -1101,7 +1298,7 @@ mod tests {
         p.set_pass_total(scanned_so_far_in_pass + 1_100_000);
 
         // OLD step 1: lower the floor FIRST.
-        assert!(p.rebaseline_floor_if_scope_expanded(SEED));
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS));
 
         // OLD step 2: move the start SECOND, still ahead of the baseline/total refresh.
         p.set_pass_start_permille(SEED);
@@ -1158,7 +1355,15 @@ mod tests {
             Some(663_150),
             "single-account wallet reads that account's birthday"
         );
-        let rebaselined = update_pass_progress(&p, &mut scanned_so_far_in_pass, 3_000, birthday);
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            3_000,
+            birthday,
+            &mut 0,
+            0,
+            None,
+        );
         assert!(!rebaselined, "first round of a pass is never a re-baseline");
         assert_eq!(p.pass_start_permille(), Some(918));
 
@@ -1200,7 +1405,15 @@ mod tests {
             Some(600_000),
             "a fresh read after the mid-pass import returns the NEW minimum birthday"
         );
-        let rebaselined = update_pass_progress(&p, &mut scanned_so_far_in_pass, 60_000, birthday);
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            60_000,
+            birthday,
+            &mut 0,
+            0,
+            None,
+        );
         assert!(
             rebaselined,
             "400 is >50‰ below the 918 floor ⇒ scope expansion"
@@ -1229,7 +1442,15 @@ mod tests {
 
         // Round 1: the range about to break is [0, 10_000) — "a 10k-block range".
         let (start, end_exclusive) = (0u64, 10_000u64);
-        update_pass_progress(&p, &mut scanned_so_far_in_pass, end_exclusive - start, None);
+        update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            end_exclusive - start,
+            None,
+            &mut 0,
+            0,
+            None,
+        );
         assert_eq!(p.pass_total(), 10_000);
 
         // The break: fetch ran ahead to the whole range (f=10,000); scan got to 9,000
@@ -1252,7 +1473,15 @@ mod tests {
         // Next suggest round: the repair range is [8_990, 10_000) -> 1_010 remaining
         // ("T ≈ 1,010" in the reviewer's own notation for the UNCREDITED pre-fix total —
         // post-fix, T is the credited 8_990 plus this 1_010 repair range).
-        update_pass_progress(&p, &mut scanned_so_far_in_pass, 1_010, None);
+        update_pass_progress(
+            &p,
+            &mut scanned_so_far_in_pass,
+            1_010,
+            None,
+            &mut 0,
+            0,
+            None,
+        );
         assert_eq!(
             p.pass_total(),
             10_000,
@@ -1274,6 +1503,484 @@ mod tests {
         assert_eq!(
             snap.progress_permille, 1000,
             "reaches 1000 only once the repair completes"
+        );
+    }
+
+    // ── Output-weighted progress (work units) ───────────────────────────────────
+
+    use crate::work::{BLOCK_WEIGHT, WorkEstimator};
+
+    /// Heights 1..=1000 carry no shielded leaves (4 000 work), 1001..=2000 carry 32 leaves
+    /// each (36 000 work): a 2 000-block pass whose first half is 10 % of its work.
+    fn sparse_then_dense() -> WorkEstimator {
+        WorkEstimator::new_for_test(vec![(1, vec![], vec![(1_000, 0), (2_000, 32_000)])])
+    }
+
+    /// Uniform density: 6 leaves per block, so every block is 10 work units.
+    fn uniform(tip: u64) -> WorkEstimator {
+        WorkEstimator::new_for_test(vec![(1, vec![], vec![(tip, 6 * tip)])])
+    }
+
+    #[test]
+    fn work_fixture_values() {
+        let est = sparse_then_dense();
+        assert_eq!(est.range(1, 1_000), 1_000 * BLOCK_WEIGHT);
+        assert_eq!(est.range(1_001, 2_000), 36_000);
+        assert_eq!(uniform(3_000_000).range(1_000_001, 3_000_000), 20_000_000);
+        assert_eq!(uniform(10_000).range(1, 8_990), 89_900);
+    }
+
+    /// B2: a pass of range A (10 % of the work) then range B (90 %). After A completes the
+    /// next suggest round must keep the reading at ~10 %, not drop it to 0 (the old baseline
+    /// subtracted the work credited so far from neither side).
+    #[test]
+    fn baseline_math_a100_b900_scenario() {
+        let est = sparse_then_dense();
+        let p = Progress::default();
+        p.set_chain_tip(2_000);
+        let (mut blocks_done, mut work_done) = (0u64, 0u64);
+
+        // Round 1: A = [1, 1001), B = [1001, 2001).
+        update_pass_progress(
+            &p,
+            &mut blocks_done,
+            2_000,
+            Some(1),
+            &mut work_done,
+            40_000,
+            Some(&est),
+        );
+        assert!(p.pass_unit_is_work());
+        assert_eq!(p.pass_total_work(), 40_000);
+        assert_eq!(p.pass_start_permille(), Some(0));
+
+        // Range A is fetched and scanned; the scheduler credits its ScanStats.
+        p.add_fetched(1_000);
+        p.add_scanned(1_000);
+        p.add_fetched_work(4_000);
+        p.add_scanned_work(4_000);
+        blocks_done += 1_000;
+        work_done += 4_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            100
+        );
+
+        // Round 2: only B remains.
+        update_pass_progress(
+            &p,
+            &mut blocks_done,
+            1_000,
+            Some(1),
+            &mut work_done,
+            36_000,
+            Some(&est),
+        );
+        assert_eq!(
+            p.pass_total_work(),
+            40_000,
+            "credited 4 000 + remaining 36 000"
+        );
+        assert_eq!(p.pass_base_fetched_work(), 0, "fetched_work − work_so_far");
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            100,
+            "after A the ratio stays at 10 %"
+        );
+
+        p.add_fetched_work(36_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            550
+        );
+        p.add_scanned_work(36_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    /// Over one dense range the permille moves with the work done, not the blocks: the
+    /// sparse first half is 10 %, half of the dense second half another 45 %.
+    #[test]
+    fn derive_snapshot_moves_permille_proportional_to_outputs() {
+        let est = sparse_then_dense();
+        let p = Progress::default();
+        p.set_chain_tip(2_000);
+        update_pass_progress(&p, &mut 0, 2_000, Some(1), &mut 0, 40_000, Some(&est));
+
+        let credit = |blocks: u64, work: u64| {
+            p.add_fetched(blocks);
+            p.add_scanned(blocks);
+            p.add_fetched_work(work);
+            p.add_scanned_work(work);
+            derive_snapshot(&p, SyncState::Syncing).progress_permille
+        };
+        // Heights 1..=1000: half the blocks, a tenth of the work.
+        assert_eq!(
+            credit(1_000, est.range(1, 1_000)),
+            100,
+            "the block ratio would read 500"
+        );
+        // Heights 1001..=1500: three quarters of the blocks, 55 % of the work.
+        assert_eq!(
+            credit(500, est.range(1_001, 1_500)),
+            550,
+            "the block ratio would read 750"
+        );
+        assert_eq!(credit(500, est.range(1_501, 2_000)), 1000);
+    }
+
+    /// Work-unit variant of `scope_expansion_rebaseline_does_not_double_count_or_oscillate`:
+    /// the same three rounds at 10 work units per block, driven only through the work counters.
+    #[test]
+    fn scope_expansion_rebaseline_does_not_double_count_or_oscillate_in_work() {
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1;
+        const B0: u64 = TIP - 2_000_000 + 1;
+        let est = uniform(TIP);
+        let p = Progress::default();
+        p.set_chain_tip(TIP);
+        let (mut blocks_done, mut work_done) = (0u64, 0u64);
+
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut blocks_done,
+            1_000_000,
+            Some(B1),
+            &mut work_done,
+            10_000_000,
+            Some(&est),
+        );
+        assert!(!rebaselined);
+        assert!(p.pass_unit_is_work());
+        assert_eq!(p.pass_start_permille(), Some(0));
+
+        p.add_fetched_work(9_000_000);
+        p.add_scanned_work(9_000_000);
+        work_done += 9_000_000;
+        blocks_done += 900_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        // Import with an older birthday: 20 M work in scope, 11 M remaining ⇒ seed 450.
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut blocks_done,
+            1_100_000,
+            Some(B0),
+            &mut work_done,
+            11_000_000,
+            Some(&est),
+        );
+        assert!(
+            rebaselined,
+            "a 450 seed under a 900 floor is a scope expansion"
+        );
+        assert_eq!(
+            work_done, 0,
+            "the work accumulator folds into the new start"
+        );
+        assert_eq!(blocks_done, 0);
+        assert_eq!(p.pass_total_work(), 11_000_000);
+        assert_eq!(p.pass_start_permille(), Some(450));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            450
+        );
+
+        let rebaselined_again = update_pass_progress(
+            &p,
+            &mut blocks_done,
+            1_100_000,
+            Some(B0),
+            &mut work_done,
+            11_000_000,
+            Some(&est),
+        );
+        assert!(
+            !rebaselined_again,
+            "the next round must not re-baseline again"
+        );
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            450
+        );
+
+        p.add_fetched_work(11_000_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            725
+        );
+        p.add_scanned_work(11_000_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    /// Work-unit variant of `rebaseline_new_order_never_reads_above_the_old_floor_mid_publish`:
+    /// the round-2 publish replayed by hand in the production order, with the work fields.
+    #[test]
+    fn rebaseline_new_order_never_reads_above_the_old_floor_mid_publish_in_work() {
+        const TIP: u64 = 3_000_000;
+        const B1: u64 = TIP - 1_000_000 + 1;
+        let est = uniform(TIP);
+        let p = Progress::default();
+        p.set_chain_tip(TIP);
+        update_pass_progress(
+            &p,
+            &mut 0,
+            1_000_000,
+            Some(B1),
+            &mut 0,
+            10_000_000,
+            Some(&est),
+        );
+        p.add_fetched_work(9_000_000);
+        p.add_scanned_work(9_000_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        const SEED: u64 = 450;
+        p.set_pass_baseline(p.fetched(), p.scanned());
+        p.set_pass_total(1_100_000);
+        p.set_pass_baseline_work(p.fetched_work(), p.scanned_work());
+        p.set_pass_total_work(11_000_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        p.set_pass_start_permille(SEED);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_WORK));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            450
+        );
+    }
+
+    /// Work-unit variant of `continuity_repair_credits_the_surviving_prefix_not_the_whole_range`
+    /// (B3): range [1, 10 001) at 10 work per block breaks at 9 001 (rewind 8 991). The
+    /// surviving prefix 1..=8990 is credited in work; the aborted attempt's fetch above the
+    /// rewind, and its re-fetch, do not push the reading past the true position.
+    #[test]
+    fn continuity_repair_credits_the_surviving_prefix_not_the_whole_range_in_work() {
+        let est = uniform(10_000);
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        let (mut blocks_done, mut work_done) = (0u64, 0u64);
+        let (start, end_exclusive) = (1u64, 10_001u64);
+        update_pass_progress(
+            &p,
+            &mut blocks_done,
+            10_000,
+            Some(1),
+            &mut work_done,
+            100_000,
+            Some(&est),
+        );
+        assert!(p.pass_unit_is_work());
+        assert_eq!(p.pass_total_work(), 100_000);
+
+        // Fetch ran ahead over the whole range; scan reached 9 000 blocks.
+        p.add_fetched(10_000);
+        p.add_scanned(9_000);
+        p.add_fetched_work(100_000);
+        p.add_scanned_work(90_000);
+
+        let rewind_height = 9_001u64 - 10;
+        blocks_done += scan_continuity_repair_credit(start, end_exclusive, rewind_height);
+        work_done += scan_continuity_work_credit(&est, start, end_exclusive, rewind_height);
+        assert_eq!(blocks_done, 8_990);
+        assert_eq!(work_done, 89_900);
+
+        // Repair range [8 991, 10 001): 1 010 blocks, 10 100 work.
+        update_pass_progress(
+            &p,
+            &mut blocks_done,
+            1_010,
+            Some(1),
+            &mut work_done,
+            10_100,
+            Some(&est),
+        );
+        assert_eq!(
+            p.pass_total_work(),
+            100_000,
+            "credited 89 900 + repair 10 100"
+        );
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            899
+        );
+
+        // The repair re-fetches its 1 010 blocks: no jump to 1000 before they are scanned.
+        p.add_fetched_work(10_100);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            949
+        );
+        p.add_scanned_work(10_100);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    /// The unit is fixed by the pass's first suggest round: a later round that could not
+    /// express the position in work (here: no birthday) does not switch the pass to blocks.
+    #[test]
+    fn unit_fixed_per_pass() {
+        let est = sparse_then_dense();
+        let p = Progress::default();
+        p.set_chain_tip(2_000);
+        let (mut b, mut w) = (0u64, 0u64);
+        update_pass_progress(&p, &mut b, 2_000, Some(1), &mut w, 40_000, Some(&est));
+        assert!(p.pass_unit_is_work());
+        p.add_fetched_work(4_000);
+        p.add_scanned_work(4_000);
+        b += 1_000;
+        w += 4_000;
+        update_pass_progress(&p, &mut b, 1_000, None, &mut w, 36_000, Some(&est));
+        assert!(p.pass_unit_is_work(), "still work");
+        assert_eq!(p.pass_total_work(), 40_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            100
+        );
+    }
+
+    /// A pass whose first round ran in blocks stays in blocks even if an estimator shows up
+    /// later, and reads exactly what the block path read before work progress existed.
+    #[test]
+    fn work_unit_regression_if_pass_starts_in_blocks() {
+        let est = sparse_then_dense();
+        let p = Progress::default();
+        p.set_chain_tip(2_000);
+        let (mut b, mut w) = (0u64, 0u64);
+        update_pass_progress(&p, &mut b, 2_000, Some(1), &mut w, 0, None);
+        assert!(!p.pass_unit_is_work());
+        p.add_fetched(1_000);
+        p.add_scanned(1_000);
+        p.add_fetched_work(4_000);
+        p.add_scanned_work(4_000);
+        b += 1_000;
+        w += 4_000;
+        update_pass_progress(&p, &mut b, 1_000, Some(1), &mut w, 36_000, Some(&est));
+        assert!(!p.pass_unit_is_work(), "still blocks");
+        assert_eq!(
+            p.pass_total_work(),
+            0,
+            "the work total is never set in a block pass"
+        );
+        assert_eq!(p.pass_total(), 2_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            500,
+            "1 000 of 2 000 blocks, as before"
+        );
+        // The next pass picks its own unit.
+        p.begin_pass();
+        update_pass_progress(&p, &mut 0, 1_000, Some(1), &mut 0, 36_000, Some(&est));
+        assert!(p.pass_unit_is_work());
+    }
+
+    #[test]
+    fn continuity_work_credit_clamped_to_range() {
+        let est = uniform(10_000);
+        assert_eq!(
+            scan_continuity_work_credit(&est, 1_000, 2_000, 1_000),
+            0,
+            "rewind at start"
+        );
+        assert_eq!(
+            scan_continuity_work_credit(&est, 1_000, 2_000, 500),
+            0,
+            "rewind below start"
+        );
+        assert_eq!(
+            scan_continuity_work_credit(&est, 1_000, 2_000, 5_000),
+            est.range(1_000, 1_999),
+            "rewind above the range credits the whole range, not beyond it"
+        );
+        assert_eq!(
+            scan_continuity_work_credit(&est, 1_000, 1_000, 1_500),
+            0,
+            "empty range"
+        );
+    }
+
+    #[test]
+    fn continuity_work_credit_prefix_only() {
+        let est = uniform(10_000);
+        let credit = scan_continuity_work_credit(&est, 1_000, 2_000, 1_500);
+        assert_eq!(credit, est.range(1_000, 1_499));
+        assert_eq!(credit, 500 * 10);
+    }
+
+    /// Each work term clamps to the work total, like the block terms.
+    #[test]
+    fn clamp_fetched_work_exceeds_total() {
+        let p = Progress::default();
+        assert!(p.fix_pass_unit(true));
+        p.set_pass_total_work(1_000);
+        p.add_fetched_work(5_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            500,
+            "the fetched term is capped at its half share"
+        );
+        p.add_scanned_work(5_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    /// A work pass with a zero work total reads the block terms.
+    #[test]
+    fn zero_total_work_falls_back_to_blocks() {
+        let p = Progress::default();
+        assert!(p.fix_pass_unit(true));
+        p.set_pass_total(100);
+        p.add_fetched(50);
+        p.add_scanned(50);
+        p.add_fetched_work(999);
+        assert_eq!(p.pass_total_work(), 0);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            500
+        );
+    }
+
+    /// B4: the global seed in work units.
+    #[test]
+    fn global_floor_in_work_units() {
+        let est = sparse_then_dense();
+        assert_eq!(
+            global_floor_permille_work(2_000, Some(1), 36_000, &est),
+            Some(100)
+        );
+        assert_eq!(
+            global_floor_permille_work(2_000, Some(1), 40_000, &est),
+            Some(0)
+        );
+        assert_eq!(global_floor_permille_work(2_000, None, 0, &est), None);
+        assert_eq!(global_floor_permille_work(0, Some(1), 0, &est), None);
+        assert_eq!(
+            global_floor_permille_work(2_000, Some(1), 99_999, &est),
+            Some(0),
+            "clamps"
         );
     }
 
@@ -1505,4 +2212,71 @@ mod tests {
             "the aborted task must never set the flag"
         );
     }
+}
+
+#[test]
+fn empty_first_pass_then_work_seed_rebaselines() {
+    // Empty first pass (e.g. synced wallet, cold start, run_to_completion before update_pass_progress)
+    // stores floor_unit = UNSET. Importing an older account then seeds in WORK must re-baseline.
+    use crate::events::{PASS_UNIT_UNSET, PASS_UNIT_WORK, Progress};
+    use crate::ffi_handle::{SyncState, derive_snapshot};
+
+    let p = Progress::default();
+
+    // Empty first pass: Done immediately, pass_unit stays UNSET.
+    // derive_snapshot calls permille_floor(1000, UNSET) which should store floor using floor's own unit.
+    p.begin_pass();
+    assert_eq!(p.pass_unit(), PASS_UNIT_UNSET);
+    let _ = derive_snapshot(&p, SyncState::Done);
+
+    // Floor is now 1000, floor_unit should be UNSET (since pass_unit was UNSET).
+    // But derive_snapshot must have used floor's own unit, so floor_unit should still allow seeds.
+
+    // Import an older account: WORK seed at 300‰ must re-baseline (not blocked by unit mismatch).
+    assert!(p.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_WORK));
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        300
+    );
+}
+
+#[test]
+fn unit_guard_one_directional() {
+    // BLOCKS seed rejected against WORK floor (transient failure).
+    // WORK seed can re-baseline BLOCKS floor.
+    use crate::events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress};
+
+    let p = Progress::default();
+
+    // WORK floor at 900‰.
+    let _ = p.permille_floor(900, PASS_UNIT_WORK);
+
+    // BLOCKS seed at 700‰: rejected (one-directional guard).
+    assert!(!p.rebaseline_floor_if_scope_expanded(700, PASS_UNIT_BLOCKS));
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        900
+    );
+
+    // WORK seed at 950‰: advances normally (same unit).
+    let _ = p.permille_floor(950, PASS_UNIT_WORK);
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        950
+    );
+
+    // Start fresh with BLOCKS floor.
+    let p2 = Progress::default();
+    let _ = p2.permille_floor(800, PASS_UNIT_BLOCKS);
+
+    // WORK seed at 300‰: CAN re-baseline BLOCKS floor (one-directional allows this).
+    assert!(p2.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_WORK));
+    assert_eq!(
+        p2.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        300
+    );
 }

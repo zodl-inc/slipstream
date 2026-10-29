@@ -360,6 +360,10 @@ fn map_scan_error<WE: std::fmt::Display>(
 pub struct ScanStats {
     pub blocks: u64,
     pub chunks: u64,
+    /// Work units scanned (BLOCK_WEIGHT per block + pool outputs/actions).
+    /// Credited per sub-batch from the height range's blocks (B8). When a
+    /// WorkEstimator is available, progress is measured in work instead of blocks.
+    pub work: u64,
     pub sapling_received: u64,
     pub orchard_received: u64,
     /// Stats from interleaved (per-K-chunk) enhancement runs (T6.1).
@@ -860,6 +864,8 @@ async fn scan_chunks_inner(
         let mut chunk_elapsed_ms: u64 = 0;
         // T6.9: time this chunk's submits spent blocked on previous commits.
         let mut chunk_persist_wait_ms: u64 = 0;
+        // B8: work units credited per sub-batch from the blocks in sub_start..=sub_end.
+        let mut chunk_work: u64 = 0;
 
         loop {
             // How many blocks remain in this chunk from sub_start?
@@ -1075,6 +1081,8 @@ async fn scan_chunks_inner(
             chunk_scanned_blocks += scanned;
             chunk_sapling += summary.received_sapling_note_count() as u64;
             chunk_orchard += summary.received_orchard_note_count() as u64;
+            // B8: credit the work of the blocks in this sub-batch's height range.
+            chunk_work += crate::work::work_in_heights(&chunk.blocks, sub_start, sub_end);
 
             debug!(
                 batch_start = sub_start,
@@ -1170,6 +1178,7 @@ async fn scan_chunks_inner(
         // Accumulate chunk totals into global stats.
         stats.blocks += chunk_scanned_blocks;
         stats.chunks += 1;
+        stats.work += chunk_work;
         stats.sapling_received += chunk_sapling;
         stats.orchard_received += chunk_orchard;
         notes_since_enhance += chunk_sapling + chunk_orchard;
@@ -1177,6 +1186,7 @@ async fn scan_chunks_inner(
         // Bump the shared progress counter (poll-based; Relaxed ordering).
         if let Some(ref p) = progress {
             p.add_scanned(chunk_scanned_blocks);
+            p.add_scanned_work(chunk_work);
         }
 
         // T5.1 per-chunk info log (kept at chunk granularity — would spam on fast devices
@@ -1587,6 +1597,8 @@ async fn scan_chunks_from_treestate_inner(
             - u64::from(u32::from(summary.scanned_range().start));
         stats.blocks += scanned;
         stats.chunks += 1;
+        // The whole chunk is one scan call on this path, so its work is the credit.
+        stats.work += chunk.work;
         stats.sapling_received += summary.received_sapling_note_count() as u64;
         stats.orchard_received += summary.received_orchard_note_count() as u64;
         info!(
