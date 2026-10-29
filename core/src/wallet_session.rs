@@ -623,9 +623,8 @@ impl WalletSession {
     /// Progress is presentation state: any error is logged and yields `None`, and the caller
     /// then reports progress in blocks. This never fails a pass.
     ///
-    /// E-5 fix: caches the last good estimator and reuses it on transient failure instead of
-    /// has subtree data (the scheduler uses block progress instead). On read error, logs and
-    /// returns None (progress falls back to blocks).
+    /// Returns `None` when no pool has subtree data (the scheduler then reports progress in
+    /// blocks). On a read error it logs and returns `None` as well.
     pub fn build_work_estimator(&self) -> Option<crate::work::WorkEstimator> {
         match self.read_work_estimator() {
             Ok(est) => est,
@@ -638,7 +637,7 @@ impl WalletSession {
 
     fn read_work_estimator(&self) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
         // Wrap blocking sqlite operations in block_in_place so they don't block the runtime.
-        // Mirror the runtime_flavor guard used for the sweep ~14 lines above.
+        // Same runtime_flavor guard as the graft sweep in `scheduler::run_to_completion`.
         if tokio::runtime::Handle::try_current().ok().is_some_and(|h| {
             matches!(
                 h.runtime_flavor(),

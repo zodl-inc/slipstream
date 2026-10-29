@@ -159,6 +159,14 @@ pub(crate) fn update_pass_progress(
         global_floor_permille_work(p.chain_tip(), wallet_birthday, sum_remaining_work, est)
     });
     let use_work = p.fix_pass_unit(work_seed.is_some());
+    if !use_work && p.floor_unit() == crate::events::PASS_UNIT_WORK {
+        // The floor is in work units and this pass reports blocks (the estimator could not be
+        // read): a block seed never lowers a work floor, so an expansion of the scope in this
+        // pass (an imported older account) is not shown until the next pass.
+        tracing::warn!(
+            "work estimator unavailable: scope-expansion detection is off for this pass"
+        );
+    }
     if use_work {
         // Mirror of the block baseline above: baseline = counter − credited work so far,
         // total = credited work so far + remaining work.
@@ -320,6 +328,10 @@ pub(crate) fn scan_continuity_work_credit(
 ///
 /// A wallet with no accounts seeds nothing — a fresh wallet's zero snapshot IS truthful.
 /// Callers treat errors as "no seed" (presentation state, never correctness state).
+///
+/// The seed uses the subtree roots stored at open, before the pass fetches new ones, so it can
+/// sit up to the scope-expansion epsilon above the first in-pass seed; the reading then holds
+/// until real progress passes it. Larger gaps re-baseline at the first suggest round.
 pub fn seed_progress_from_wallet(
     progress: &Progress,
     session: &WalletSession,

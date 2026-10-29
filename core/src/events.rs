@@ -707,6 +707,11 @@ impl Progress {
     /// Unit guard is one-directional: rejects a BLOCKS seed against a WORK floor (transient
     /// estimator failure), but allows a WORK seed to re-baseline a BLOCKS floor. UNSET floor
     /// acts as a wildcard (any seed unit accepted).
+    ///
+    /// Accepted cost of the asymmetry: a BLOCKS floor left by a pass that ran in blocks and
+    /// stopped mid-way can be re-baselined by the next pass's WORK seed when the two units
+    /// disagree by more than the epsilon, without a change of scope. The drop is display-only
+    /// and the next readings climb from the truthful position.
     #[inline]
     pub fn scope_expanded(&self, seed: u64, seed_unit: u64) -> bool {
         let current = self.progress_permille_floor.load(Ordering::Relaxed);
