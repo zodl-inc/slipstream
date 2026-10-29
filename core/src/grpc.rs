@@ -55,12 +55,12 @@ pub(crate) const UNARY_TIMEOUT: Duration = Duration::from_secs(30);
 /// stream means the connection is dead.
 pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Response-headers deadline for `GetBlockRange` against an OHTTP gateway. An OHTTP response is
-/// whole-body-buffered (gateway → relay → client as ONE message), so "headers arrived" means
-/// "the entire chunk has been transferred": [`UNARY_TIMEOUT`] would then bound the full download
-/// of a 10k-block chunk, which a ~34 MB spam-era chunk over Tor (~0.4 MB/s) cannot meet (field
-/// evidence 2026-09-10: the tip range looped `timed out after 30s` forever). Sized just above the
-/// connector's own round-trip cap (100 s) so the pipe's UNAVAILABLE wins when the gateway stalls.
+/// Response-headers deadline for `GetBlockRange` against an OHTTP gateway. OHTTP responses stream
+/// as chunks, but the initial headers arrive only after the gateway has collected some content
+/// from the upstream. Sized just above the connector's own round-trip cap (100 s) so the pipe's
+/// UNAVAILABLE wins when the gateway stalls. A shorter [`UNARY_TIMEOUT`] would timeout large
+/// chunks prematurely (field evidence 2026-09-10: ~34 MB spam-era chunks over Tor at ~0.4 MB/s
+/// looped `timed out after 30s` forever).
 pub(crate) const OHTTP_RANGE_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Deadline for opening a `GetBlockRange` stream to `endpoint` (see [`OHTTP_RANGE_OPEN_TIMEOUT`]).
