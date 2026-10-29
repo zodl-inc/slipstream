@@ -639,10 +639,12 @@ impl WalletSession {
     fn read_work_estimator(&self) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
         // Wrap blocking sqlite operations in block_in_place so they don't block the runtime.
         // Mirror the runtime_flavor guard used for the sweep ~14 lines above.
-        if matches!(
-            tokio::runtime::Handle::current().runtime_flavor(),
-            tokio::runtime::RuntimeFlavor::MultiThread
-        ) {
+        if tokio::runtime::Handle::try_current().ok().is_some_and(|h| {
+            matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        }) {
             tokio::task::block_in_place(|| self.read_work_estimator_blocking())
         } else {
             self.read_work_estimator_blocking()
