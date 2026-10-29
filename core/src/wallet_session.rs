@@ -583,7 +583,7 @@ impl WalletSession {
         start_index: u64,
         roots: &[zcash_client_backend::data_api::chain::CommitmentTreeRoot<Node>],
     ) -> Result<(), SlipstreamError> {
-        use zcash_primitives::consensus::BlockHeight;
+        use zcash_protocol::consensus::BlockHeight;
         let conn = Connection::open(&self.db_path)
             .map_err(|e| wallet_err("subtree_ends conn", e))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))

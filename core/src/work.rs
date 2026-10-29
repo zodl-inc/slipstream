@@ -18,7 +18,7 @@
 //! to match trial-decryption wall time instead of letting spam ranges crawl.
 
 use zcash_client_backend::proto::compact_formats::CompactBlock;
-use zcash_primitives::consensus::NetworkUpgrade;
+use zcash_protocol::consensus::NetworkUpgrade;
 
 /// Base weight assigned to each block, regardless of its shielded outputs.
 /// Added to the per-pool leaves so that even transparent blocks contribute
@@ -355,12 +355,12 @@ mod tests {
     #[test]
     fn block_work_counts_all_pools() {
         // Construct a CompactBlock with 2 sapling outputs, 3 orchard actions, 1 ironwood action.
-        use zcash_client_backend::proto::compact_formats::{CompactSaplingOutput, CompactTx};
+        use zcash_client_backend::proto::compact_formats::{CompactSaplingOutput, CompactOrchardAction, CompactTx};
         let mut tx = CompactTx::default();
         tx.outputs.push(CompactSaplingOutput::default());
         tx.outputs.push(CompactSaplingOutput::default());
-        tx.actions = vec![vec![]; 3]; // 3 empty action bytes
-        tx.ironwood_actions = vec![vec![]; 1]; // 1 empty ironwood action
+        tx.actions = vec![CompactOrchardAction::default(); 3];
+        tx.ironwood_actions = vec![CompactOrchardAction::default(); 1];
         let mut block = CompactBlock::default();
         block.vtx.push(tx);
         let work = block_work(&block);

@@ -241,8 +241,8 @@ pub(crate) fn scan_continuity_repair_credit(
 fn build_work_estimator(
     session: &WalletSession,
 ) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
-    use zcash_primitives::consensus::{NetworkUpgrade, Parameters};
-    let network = session.network();
+    use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+    let network = &session.network;
     let mut pool_data = Vec::new();
     for pool in crate::work::POOLS {
         let activation_height = network
