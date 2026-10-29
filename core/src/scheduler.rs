@@ -238,10 +238,11 @@ pub(crate) fn scan_continuity_repair_credit(
 
 /// Build a `WorkEstimator` from the wallet's network, subtree ends, and chain metadata.
 /// Returns `None` if no usable data is available (no subtree roots persisted).
+#[allow(dead_code)]
 fn build_work_estimator(
     session: &WalletSession,
 ) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
-    use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
+    use zcash_protocol::consensus::Parameters;
     let network = &session.network;
     let mut pool_data = Vec::new();
     for pool in crate::work::POOLS {
