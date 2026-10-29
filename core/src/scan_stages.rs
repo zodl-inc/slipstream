@@ -226,9 +226,8 @@ pub fn sample_rayon_workers(pool: Option<&rayon::ThreadPool>) -> Vec<ThreadCpuSa
 
     match pool {
         Some(pool) => pool.broadcast(broadcast_fn),
-        None => sample_global_workers().unwrap_or_else(|| {
-            vec![ThreadCpuSample::default(); rayon::current_num_threads()]
-        }),
+        None => sample_global_workers()
+            .unwrap_or_else(|| vec![ThreadCpuSample::default(); rayon::current_num_threads()]),
     }
 }
 
