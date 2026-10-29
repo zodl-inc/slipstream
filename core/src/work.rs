@@ -207,11 +207,6 @@ impl PoolEstimate {
         // or one anchor with non-zero size.
         self.anchors.len() > 1 || self.anchors.first().is_some_and(|a| a.size > 0)
     }
-
-    /// Number of anchors in this pool estimate.
-    pub fn anchor_count(&self) -> u64 {
-        self.anchors.len() as u64
-    }
 }
 
 /// Per-pool data for building a WorkEstimator: (activation_height, subtree_ends).
@@ -277,12 +272,6 @@ impl WorkEstimator {
     /// Number of pools the estimator covers (inactive pools are not included).
     pub fn pool_count(&self) -> usize {
         self.pools.len()
-    }
-
-    /// Total number of anchors across all pools. Used as the estimator identity for
-    /// scope-expansion false-positive prevention (E-5 fix).
-    pub fn total_anchor_count(&self) -> u64 {
-        self.pools.iter().map(|p| p.anchor_count()).sum()
     }
 }
 

@@ -177,15 +177,11 @@ pub struct Progress {
     /// pass never switches unit mid-way (the floor and the pass start would otherwise mix
     /// block and work permille).
     pass_unit: AtomicU64,
-    /// The unit (blocks or work) of the current `progress_permille_floor`. Prevents scope-expansion
-    /// false positives when comparing a work seed against a block floor or vice versa (E-5 fix).
-    /// Set by `set_floor_unit` when the floor is updated.
+    /// The unit (blocks or work) of the current `progress_permille_floor`. Can be UNSET before
+    /// the first floor update. Scope expansion compares units one-directionally: a BLOCKS seed
+    /// is rejected against a WORK floor (transient failure), but a WORK seed can re-baseline
+    /// a BLOCKS floor. UNSET acts as a wildcard (accepts any seed).
     floor_unit: AtomicU64,
-    /// Estimator identity of the current floor: the anchor count or 0 for blocks/no estimator.
-    /// Prevents false positives when a stale extrapolation or transient failure produces a lower
-    /// seed from an incomplete estimator. Only allow re-baseline when the new seed comes from an
-    /// equally complete or more complete estimator (E-5 fix).
-    floor_estimator_identity: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -272,8 +268,7 @@ impl Default for Progress {
             pass_base_fetched_work: AtomicU64::new(0),
             pass_base_scanned_work: AtomicU64::new(0),
             pass_unit: AtomicU64::new(PASS_UNIT_UNSET),
-            floor_unit: AtomicU64::new(PASS_UNIT_BLOCKS),
-            floor_estimator_identity: AtomicU64::new(0),
+            floor_unit: AtomicU64::new(PASS_UNIT_UNSET),
             tip_refreshes: AtomicU64::new(0),
             tx_set_version: AtomicU64::new(0),
             wallet_writers: AtomicUsize::new(0),
@@ -681,79 +676,61 @@ impl Progress {
         self.last_progress_unix.load(Ordering::Relaxed)
     }
 
-    /// Get the floor's current estimator identity (E-5 fix).
-    pub fn floor_estimator_identity(&self) -> u64 {
-        self.floor_estimator_identity.load(Ordering::Relaxed)
+    /// Get the floor's unit: PASS_UNIT_UNSET, PASS_UNIT_BLOCKS, or PASS_UNIT_WORK.
+    pub fn floor_unit(&self) -> u64 {
+        self.floor_unit.load(Ordering::Relaxed)
     }
 
     /// Fold `raw` (0..=1000) into the session-monotonic floor and return the floor.
     /// fetch_max keeps reported progress from ever regressing while the handle lives.
-    ///
-    /// E-5 fix: Also updates floor_unit and floor_estimator_identity when advancing the floor.
+    /// Updates floor_unit when the floor advances.
     #[inline]
-    pub fn permille_floor(&self, raw: u64, unit: u64, estimator_identity: u64) -> u64 {
+    pub fn permille_floor(&self, raw: u64, unit: u64) -> u64 {
         let clamped = raw.min(1000);
         let old = self
             .progress_permille_floor
             .fetch_max(clamped, Ordering::Relaxed);
         if clamped > old {
-            // Floor advanced: update its unit and estimator identity.
+            // Floor advanced: update its unit.
+            // Relaxed ordering is sufficient: no cross-field invariants are promised to
+            // concurrent readers. Each field is independent, and the consumer needs only
+            // an eventually-consistent view for UI display.
             self.floor_unit.store(unit, Ordering::Relaxed);
-            self.floor_estimator_identity
-                .store(estimator_identity, Ordering::Relaxed);
         }
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
-    /// [h17-1] Pure read of the scope-expansion condition: true when `seed` lands materially
-    /// BELOW the current session floor (see [`Self::rebaseline_floor_if_scope_expanded`]'s doc
-    /// for what that means and why). Stores nothing — [`Self::rebaseline_floor_if_scope_expanded`]
-    /// checks exactly this same condition (it calls this method) before it stores. Lets a
-    /// caller decide which branch to take, and publish every field a re-baseline touches in a
-    /// safe order, before the floor itself moves — see `update_pass_progress`
-    /// (`core/src/scheduler.rs`), which calls this first and calls
-    /// [`Self::rebaseline_floor_if_scope_expanded`] last for exactly that reason.
+    /// Pure read of the scope-expansion condition: true when `seed` lands materially
+    /// BELOW the current session floor. Stores nothing; lets a caller decide which branch
+    /// to take and publish fields in a safe order before the floor moves.
     ///
-    /// E-5 fix: Only reports expansion when the seed's unit matches the floor's unit AND the
-    /// seed's estimator is at least as complete as the floor's (same or more anchors). This
-    /// prevents false positives from: (a) stale open-time extrapolation before new roots are
-    /// fetched, (b) transient estimator failure producing a block seed against a work floor.
+    /// Unit guard is one-directional: rejects a BLOCKS seed against a WORK floor (transient
+    /// estimator failure), but allows a WORK seed to re-baseline a BLOCKS floor. UNSET floor
+    /// acts as a wildcard (any seed unit accepted).
     #[inline]
-    pub fn scope_expanded(&self, seed: u64, seed_unit: u64, seed_estimator_identity: u64) -> bool {
+    pub fn scope_expanded(&self, seed: u64, seed_unit: u64) -> bool {
         let current = self.progress_permille_floor.load(Ordering::Relaxed);
         let floor_unit = self.floor_unit.load(Ordering::Relaxed);
-        let floor_identity = self.floor_estimator_identity.load(Ordering::Relaxed);
 
-        // Only compare seeds in the same unit and when the new estimator is >= as complete.
-        seed_unit == floor_unit
-            && seed_estimator_identity >= floor_identity
-            && seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
+        // One-directional unit guard: only block BLOCKS seed vs WORK floor.
+        let unit_compatible = floor_unit == PASS_UNIT_UNSET
+            || seed_unit == floor_unit
+            || (seed_unit == PASS_UNIT_WORK && floor_unit == PASS_UNIT_BLOCKS);
+
+        unit_compatible && seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
     }
 
-    /// [API v2.1 E-5] When a suggest round's GLOBAL seed lands materially BELOW the current
-    /// session floor, the scan SCOPE EXPANDED under the floor's feet — an imported account
-    /// with an older birthday, or a rewind re-growing the queue — and the old floor (folded
-    /// to ~1000 by the previous scope's Done) would MASK the whole re-scan at ~100%. Reset
-    /// the floor to the new truthful seed so the blessed permille reads a genuine climb.
-    /// Normal operation can never trigger it: within one scope the seed is monotone (the
-    /// queue only shrinks between suggest rounds) and tip drift moves it by <1‰ — the
-    /// epsilon is 50× above that noise and far below any real expansion (an import drops
-    /// the seed by hundreds of permille). Returns whether a re-baseline happened.
-    ///
-    /// E-5 fix: Only rebaselines when the seed and floor are in the same unit and the seed's
-    /// estimator is at least as complete. Updates floor_unit and floor_estimator_identity.
-    pub fn rebaseline_floor_if_scope_expanded(
-        &self,
-        seed: u64,
-        seed_unit: u64,
-        seed_estimator_identity: u64,
-    ) -> bool {
-        if self.scope_expanded(seed, seed_unit, seed_estimator_identity) {
+    /// When a suggest round's GLOBAL seed lands materially BELOW the current session floor,
+    /// the scan scope expanded — an imported account with an older birthday, or a rewind
+    /// re-growing the queue. Reset the floor to the new truthful seed. Normal operation
+    /// never triggers this: within one scope the seed is monotone and tip drift is <1‰.
+    /// The epsilon is far above that noise and far below a real expansion.
+    /// Returns whether a re-baseline happened.
+    pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64, seed_unit: u64) -> bool {
+        if self.scope_expanded(seed, seed_unit) {
             self.progress_permille_floor
                 .store(seed.min(1000), Ordering::Relaxed);
             self.floor_unit.store(seed_unit, Ordering::Relaxed);
-            self.floor_estimator_identity
-                .store(seed_estimator_identity, Ordering::Relaxed);
             return true;
         }
         false
@@ -1457,37 +1434,36 @@ mod tests {
     #[test]
     fn floor_rebaseline_on_scope_expansion_only() {
         let p = Progress::default();
-        assert_eq!(p.permille_floor(990, PASS_UNIT_BLOCKS, 0), 990);
+        assert_eq!(p.permille_floor(990, PASS_UNIT_BLOCKS), 990);
         // Within-scope drift up to the epsilon never re-baselines (tip drift is <1‰).
         assert!(
-            !p.rebaseline_floor_if_scope_expanded(989, PASS_UNIT_BLOCKS, 0),
+            !p.rebaseline_floor_if_scope_expanded(989, PASS_UNIT_BLOCKS),
             "1‰ dip is noise"
         );
         assert!(
             !p.rebaseline_floor_if_scope_expanded(
                 990 - FLOOR_REBASELINE_EPSILON_PERMILLE,
-                PASS_UNIT_BLOCKS,
-                0
+                PASS_UNIT_BLOCKS
             ),
             "exactly-epsilon dip is still within scope"
         );
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             990,
             "floor held through noise"
         );
         // Import with an older birthday: the seed plummets → re-baseline to the truth.
         assert!(
-            p.rebaseline_floor_if_scope_expanded(120, PASS_UNIT_BLOCKS, 0),
+            p.rebaseline_floor_if_scope_expanded(120, PASS_UNIT_BLOCKS),
             "material drop = scope expansion"
         );
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             120,
             "floor re-baselined to the expanded-scope seed"
         );
         // …and climbs monotonically again within the new scope.
-        assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS, 0), 300);
+        assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS), 300);
     }
 
     /// [h17-1] `scope_expanded` answers exactly like its mutating sibling
@@ -1497,15 +1473,15 @@ mod tests {
     #[test]
     fn scope_expanded_reads_true_and_false_without_mutating_the_floor() {
         let p = Progress::default();
-        assert_eq!(p.permille_floor(900, PASS_UNIT_BLOCKS, 0), 900);
+        assert_eq!(p.permille_floor(900, PASS_UNIT_BLOCKS), 900);
 
         // Within-scope noise reads false, and a pure read must not move the floor.
         assert!(
-            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE, PASS_UNIT_BLOCKS, 0),
+            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE, PASS_UNIT_BLOCKS),
             "exactly-epsilon dip is still within scope"
         );
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             900,
             "a pure read must not lower the floor"
         );
@@ -1513,11 +1489,11 @@ mod tests {
         // A material drop reads true — and is STILL just a read: the floor holds until a
         // caller separately chooses to act on it.
         assert!(
-            p.scope_expanded(450, PASS_UNIT_BLOCKS, 0),
+            p.scope_expanded(450, PASS_UNIT_BLOCKS),
             "450 is >50‰ below the 900 floor ⇒ scope expansion"
         );
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             900,
             "scope_expanded alone must never lower (or raise) the floor"
         );
@@ -1525,17 +1501,16 @@ mod tests {
         // Agrees with the mutating sibling on both the false and the true case.
         assert!(!p.rebaseline_floor_if_scope_expanded(
             900 - FLOOR_REBASELINE_EPSILON_PERMILLE,
-            PASS_UNIT_BLOCKS,
-            0
+            PASS_UNIT_BLOCKS
         ));
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             900,
             "still not expanded ⇒ still untouched"
         );
-        assert!(p.rebaseline_floor_if_scope_expanded(450, PASS_UNIT_BLOCKS, 0));
+        assert!(p.rebaseline_floor_if_scope_expanded(450, PASS_UNIT_BLOCKS));
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             450,
             "the mutating sibling now re-baselines"
         );
@@ -1557,7 +1532,7 @@ mod tests {
         // First suggest round of the pass: ordinary progress, no scope expansion.
         assert!(!p.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_BLOCKS, 0));
         p.set_pass_start_permille_if_unset(300);
-        let _ = p.permille_floor(300, PASS_UNIT_BLOCKS, 0);
+        let _ = p.permille_floor(300, PASS_UNIT_BLOCKS);
         assert_eq!(p.pass_start_permille(), Some(300));
 
         // A later round of the SAME pass, still no expansion — the start must hold.

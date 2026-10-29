@@ -213,17 +213,14 @@ pub(crate) fn update_pass_progress(
     // double-counted read is the bug fixed here (confirmed against this exact seed/credit
     // combination in scheduler::tests::rebaseline_old_order_used_to_latch_a_double_counted_697).
     //
-    // [E-5] Compute the seed's unit and estimator identity for scope-expansion false-positive
-    // prevention: scope_expanded only reports true when seed and floor are in the same unit
-    // and the seed's estimator is at least as complete.
+    // Compute the seed's unit for scope-expansion detection.
     let unit = if use_work {
         PASS_UNIT_WORK
     } else {
         PASS_UNIT_BLOCKS
     };
-    let estimator_identity = work_estimator.map(|e| e.total_anchor_count()).unwrap_or(0);
 
-    if p.scope_expanded(seed, unit, estimator_identity) {
+    if p.scope_expanded(seed, unit) {
         // [h16-1] The new start already includes everything credited so far: fold the
         // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
         // counters, so the next blend reads 0 pass-local progress against the fresh
@@ -248,7 +245,7 @@ pub(crate) fn update_pass_progress(
         // invariant above, nothing a concurrent poll can fetch_max it with in this window
         // exceeds the floor this call is about to compare `seed` against — so this re-check
         // is guaranteed to still see the expansion.
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed, unit, estimator_identity);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed, unit);
         debug_assert!(
             rebaselined,
             "scope_expanded just reported an expansion and nothing between here and there \
@@ -265,7 +262,7 @@ pub(crate) fn update_pass_progress(
         // of the same pass keep it — the pass's reported progress is measured
         // from where the GLOBAL position stood when the pass began.
         p.set_pass_start_permille_if_unset(seed);
-        let _ = p.permille_floor(seed, unit, estimator_identity);
+        let _ = p.permille_floor(seed, unit);
         false
     }
 }
@@ -364,17 +361,12 @@ pub fn seed_progress_from_wallet(
     });
     let seed = work_seed.or_else(|| global_floor_permille(tip, Some(birthday), sum_remaining));
     if let Some(seed) = seed {
-        // [E-5] Compute unit and estimator identity for the floor update.
         let unit = if work_seed.is_some() {
             PASS_UNIT_WORK
         } else {
             PASS_UNIT_BLOCKS
         };
-        let estimator_identity = work_estimator
-            .as_ref()
-            .map(|e| e.total_anchor_count())
-            .unwrap_or(0);
-        let _ = progress.permille_floor(seed, unit, estimator_identity);
+        let _ = progress.permille_floor(seed, unit);
     }
     tracing::info!(
         tip,
@@ -1237,7 +1229,7 @@ mod tests {
             "zero pass-local count under the NEW seed ⇒ raw = 450 ≤ 900, floor still unmoved"
         );
 
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS, 0);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS);
         assert!(rebaselined, "the re-check must still see the expansion");
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1294,7 +1286,7 @@ mod tests {
         p.set_pass_total(scanned_so_far_in_pass + 1_100_000);
 
         // OLD step 1: lower the floor FIRST.
-        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS, 0));
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS));
 
         // OLD step 2: move the start SECOND, still ahead of the baseline/total refresh.
         p.set_pass_start_permille(SEED);
@@ -1758,11 +1750,7 @@ mod tests {
             900
         );
 
-        assert!(p.rebaseline_floor_if_scope_expanded(
-            SEED,
-            PASS_UNIT_WORK,
-            est.total_anchor_count()
-        ));
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_WORK));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             450
@@ -2215,59 +2203,68 @@ mod tests {
 }
 
 #[test]
-fn scope_expansion_false_positive_stale_estimator() {
-    // E-5(a): stale open-time extrapolation (before new roots fetched) should not drop floor.
-    use crate::events::Progress;
+fn empty_first_pass_then_work_seed_rebaselines() {
+    // Empty first pass (e.g. synced wallet, cold start, run_to_completion before update_pass_progress)
+    // stores floor_unit = UNSET. Importing an older account then seeds in WORK must re-baseline.
+    use crate::events::{PASS_UNIT_UNSET, PASS_UNIT_WORK, Progress};
+    use crate::ffi_handle::{SyncState, derive_snapshot};
 
     let p = Progress::default();
 
-    // Initial work-based floor at 800‰ with estimator identity 5.
-    let _ = p.permille_floor(800, PASS_UNIT_WORK, 5);
-    assert_eq!(p.floor_estimator_identity(), 5);
+    // Empty first pass: Done immediately, pass_unit stays UNSET.
+    // derive_snapshot calls permille_floor(1000, UNSET) which should store floor using floor's own unit.
+    p.begin_pass();
+    assert_eq!(p.pass_unit(), PASS_UNIT_UNSET);
+    let _ = derive_snapshot(&p, SyncState::Done);
 
-    // Stale open-time seed at 750‰ from incomplete estimator (identity 3 < 5).
-    // Should NOT rebaseline because estimator is less complete.
-    assert!(!p.rebaseline_floor_if_scope_expanded(750, PASS_UNIT_WORK, 3));
+    // Floor is now 1000, floor_unit should be UNSET (since pass_unit was UNSET).
+    // But derive_snapshot must have used floor's own unit, so floor_unit should still allow seeds.
+
+    // Import an older account: WORK seed at 300‰ must re-baseline (not blocked by unit mismatch).
+    assert!(p.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_WORK));
     assert_eq!(
         p.progress_permille_floor
             .load(std::sync::atomic::Ordering::Relaxed),
-        800
-    );
-
-    // Later, fresh seed at 850‰ from complete estimator (identity 6 > 5).
-    // Should advance floor normally.
-    let _ = p.permille_floor(850, PASS_UNIT_WORK, 6);
-    assert_eq!(
-        p.progress_permille_floor
-            .load(std::sync::atomic::Ordering::Relaxed),
-        850
+        300
     );
 }
 
 #[test]
-fn scope_expansion_false_positive_unit_mismatch() {
-    // E-5(b): transient estimator failure (block seed vs work floor) should not drop floor.
+fn unit_guard_one_directional() {
+    // BLOCKS seed rejected against WORK floor (transient failure).
+    // WORK seed can re-baseline BLOCKS floor.
+    use crate::events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress};
 
     let p = Progress::default();
 
-    // Work-based floor at 900‰.
-    let _ = p.permille_floor(900, PASS_UNIT_WORK, 10);
+    // WORK floor at 900‰.
+    let _ = p.permille_floor(900, PASS_UNIT_WORK);
 
-    // Transient failure produces block seed at 700‰.
-    // Should NOT rebaseline because units don't match.
-    assert!(!p.rebaseline_floor_if_scope_expanded(700, PASS_UNIT_BLOCKS, 0));
+    // BLOCKS seed at 700‰: rejected (one-directional guard).
+    assert!(!p.rebaseline_floor_if_scope_expanded(700, PASS_UNIT_BLOCKS));
     assert_eq!(
         p.progress_permille_floor
             .load(std::sync::atomic::Ordering::Relaxed),
         900
     );
 
-    // Later, work seed at 950‰.
-    // Should advance floor normally (same unit).
-    let _ = p.permille_floor(950, PASS_UNIT_WORK, 10);
+    // WORK seed at 950‰: advances normally (same unit).
+    let _ = p.permille_floor(950, PASS_UNIT_WORK);
     assert_eq!(
         p.progress_permille_floor
             .load(std::sync::atomic::Ordering::Relaxed),
         950
+    );
+
+    // Start fresh with BLOCKS floor.
+    let p2 = Progress::default();
+    let _ = p2.permille_floor(800, PASS_UNIT_BLOCKS);
+
+    // WORK seed at 300‰: CAN re-baseline BLOCKS floor (one-directional allows this).
+    assert!(p2.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_WORK));
+    assert_eq!(
+        p2.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        300
     );
 }

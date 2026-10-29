@@ -634,13 +634,16 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             }
             None => pass_permille,
         };
-        // [E-5] Use the current pass's unit and the floor's estimator identity when folding
-        // the pass-local progress into the session floor.
+        // Use the pass's unit when available, otherwise the floor's own unit (prevents latching UNSET).
         let unit = p.pass_unit();
-        let estimator_identity = p.floor_estimator_identity();
+        let unit_for_floor = if unit == crate::events::PASS_UNIT_UNSET {
+            p.floor_unit()
+        } else {
+            unit
+        };
         let progress_permille = match state {
-            SyncState::Done => p.permille_floor(1000, unit, estimator_identity) as u16,
-            _ => p.permille_floor(raw_permille, unit, estimator_identity) as u16,
+            SyncState::Done => p.permille_floor(1000, unit_for_floor) as u16,
+            _ => p.permille_floor(raw_permille, unit_for_floor) as u16,
         };
         // Fail-safe latch: terminal states force NOT-recovering regardless of the live flag —
         // a dead pass can never wedge a host's "Restoring" UI (previously Swift-side hardening).
@@ -771,20 +774,20 @@ mod tests {
     #[test]
     fn permille_floor_is_monotonic_and_clamped() {
         let p = crate::events::Progress::default();
-        assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS, 0), 300);
+        assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS), 300);
         assert_eq!(
-            p.permille_floor(100, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(100, PASS_UNIT_BLOCKS),
             300,
             "regression must hold the floor"
         );
-        assert_eq!(p.permille_floor(999, PASS_UNIT_BLOCKS, 0), 999);
+        assert_eq!(p.permille_floor(999, PASS_UNIT_BLOCKS), 999);
         assert_eq!(
-            p.permille_floor(5000, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(5000, PASS_UNIT_BLOCKS),
             1000,
             "raw clamps to 1000"
         );
         assert_eq!(
-            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             1000,
             "floor persists at max"
         );
