@@ -71,12 +71,14 @@ use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
 pub use zcash_protocol::consensus::NetworkType;
+#[cfg(test)]
+use zodl_ohttp_client::CONTENT_TYPE_CHUNKED_RES;
 use zodl_ohttp_client::{
-    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseDecoder, ClientProfile,
-    DOH_RESOLVERS, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, GATEWAY_MAX_SEALED_RESPONSE_BYTES,
-    KeyConfig, Network, NetworkRule, RelayBackoff, ResponseEvent, SizeGuard, check_size,
-    doh_query_url, encapsulate_chunked_request, envelope_from_doh_json, key_config_dns_name,
-    signed_config_url, verify_signed_config,
+    BhttpRequest, BhttpResponse, ChunkedResponseDecoder, ClientProfile, DOH_RESOLVERS,
+    GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfig, Network,
+    NetworkRule, RelayBackoff, ResponseEvent, SizeGuard, check_size, doh_query_url,
+    encapsulate_chunked_request, envelope_from_doh_json, key_config_dns_name, signed_config_url,
+    verify_signed_config,
 };
 
 #[cfg(feature = "client-trace")]
@@ -1347,6 +1349,9 @@ impl OhttpClient {
         client_trace_prefix: Option<String>,
         profile: ClientProfile,
     ) -> Result<Self, String> {
+        // Without `client-trace` the prefix is dropped: release builds never send the header.
+        #[cfg(not(feature = "client-trace"))]
+        drop(client_trace_prefix);
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -1590,7 +1595,7 @@ impl OhttpClient {
         #[cfg(feature = "client-trace")]
         let trace = self.client_trace.as_ref().map(|t| t.next());
         #[cfg(not(feature = "client-trace"))]
-        let trace = None;
+        let trace: Option<String> = None;
         let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once(&self.relay, Method::POST, &headers, body, guard, on_send)
             .await
@@ -1607,7 +1612,7 @@ impl OhttpClient {
         #[cfg(feature = "client-trace")]
         let trace = self.client_trace.as_ref().map(|t| t.next());
         #[cfg(not(feature = "client-trace"))]
-        let trace = None;
+        let trace: Option<String> = None;
         let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once_stream(&self.relay, Method::POST, &headers, body, on_send)
             .await
@@ -2228,6 +2233,23 @@ struct HttpTarget {
     path: String,
 }
 
+/// An extension call as Binary HTTP (RFC 9292), header names lowercased (ZIP #10: "Header names
+/// MUST be lowercase").
+fn http_bhttp_request(
+    method: &str,
+    target: HttpTarget,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> BhttpRequest {
+    let mut request = BhttpRequest::new(method, target.host, target.path)
+        .scheme(target.scheme)
+        .body(body);
+    for (name, value) in headers {
+        request = request.header(name.to_ascii_lowercase(), value.as_str());
+    }
+    request
+}
+
 fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
     let uri = url
         .parse::<http::Uri>()
@@ -2493,13 +2515,7 @@ where
     .await
     .map_err(HttpRoundTripError::Failed)?;
 
-    // HTTP request as Binary HTTP (RFC 9292): header names lowercased per ZIP
-    let mut request = BhttpRequest::new(method, target.host, target.path)
-        .scheme(target.scheme)
-        .body(body);
-    for (name, value) in headers {
-        request = request.header(&name.to_lowercase(), value.as_str());
-    }
+    let request = http_bhttp_request(method, target, headers, body);
 
     // Send through OHTTP relay (encapsulate, POST, decapsulate), the whole exchange bounded
     let response = tokio::time::timeout(
@@ -2895,8 +2911,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn both_profiles_lowercase_header_names() {
-        let request = BhttpRequest::new("GET", "h.example", "/").header("X-Custom", "1");
+    fn extension_calls_send_lowercase_header_names() {
+        let target = parse_http_target("https://h.example/path").expect("target");
+        let headers = [("X-Custom".to_string(), "1".to_string())];
+        let request = http_bhttp_request("GET", target, &headers, b"");
         let http = encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM_HTTP.encode).unwrap();
         assert!(contains(&http, b"x-custom") && !contains(&http, b"X-Custom"));
         let grpc = encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).unwrap();
@@ -3392,7 +3410,8 @@ pub(crate) mod tests {
     }
 
     /// The streamed answer goes through the same exchange loop as the buffered one: an outer
-    /// non-success status is final (and names the status), a wrong content-type is rejected.
+    /// non-success status, and any 2xx other than 200, is final (and names the status); a 200 is
+    /// handed on whatever its content-type.
     #[tokio::test]
     async fn streamed_outer_answers_use_the_shared_exchange_checks() {
         fn stream_answer(status: u16, content_type: &str) -> RelayStream {
@@ -3422,16 +3441,27 @@ pub(crate) mod tests {
         let err = run_exchange_chunked(
             test_key(),
             &test_request(),
+            |_sealed| async { Ok(stream_answer(201, CONTENT_TYPE_CHUNKED_RES)) },
+            || async { unreachable!("no refetch on 201") },
+        )
+        .await
+        .err()
+        .expect("a 2xx other than 200 is final");
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m.contains("201")),
+            "{err:?}"
+        );
+
+        // A 200 is decapsulated whatever its content-type: the AEAD authenticates the body.
+        let (_decoder, answer) = run_exchange_chunked(
+            test_key(),
+            &test_request(),
             |_sealed| async { Ok(stream_answer(200, "text/html")) },
             || async { unreachable!("no refetch on 200") },
         )
         .await
-        .err()
-        .expect("wrong content-type is rejected");
-        assert!(
-            matches!(&err, RoundTripError::Transport(m) if m.contains("text/html")),
-            "{err:?}"
-        );
+        .expect("a 200 with another content-type is handed back unread");
+        assert_eq!(answer.status, StatusCode::OK);
 
         let (_decoder, answer) = run_exchange_chunked(
             test_key(),
