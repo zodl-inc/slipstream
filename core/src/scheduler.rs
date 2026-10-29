@@ -32,7 +32,7 @@ use crate::{
     connector::TorConn,
     enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily_isolated},
     error::SlipstreamError,
-    events::{Progress, PASS_UNIT_BLOCKS, PASS_UNIT_WORK},
+    events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress},
     fetch::{FetchPlan, FetchStats, run_fetch},
     scan::{ScanStats, local_treestate_active, needs_server_boundary_state, scan_chunks},
     wallet_session::WalletSession,
@@ -216,7 +216,11 @@ pub(crate) fn update_pass_progress(
     // [E-5] Compute the seed's unit and estimator identity for scope-expansion false-positive
     // prevention: scope_expanded only reports true when seed and floor are in the same unit
     // and the seed's estimator is at least as complete.
-    let unit = if use_work { PASS_UNIT_WORK } else { PASS_UNIT_BLOCKS };
+    let unit = if use_work {
+        PASS_UNIT_WORK
+    } else {
+        PASS_UNIT_BLOCKS
+    };
     let estimator_identity = work_estimator.map(|e| e.total_anchor_count()).unwrap_or(0);
 
     if p.scope_expanded(seed, unit, estimator_identity) {
@@ -361,8 +365,15 @@ pub fn seed_progress_from_wallet(
     let seed = work_seed.or_else(|| global_floor_permille(tip, Some(birthday), sum_remaining));
     if let Some(seed) = seed {
         // [E-5] Compute unit and estimator identity for the floor update.
-        let unit = if work_seed.is_some() { PASS_UNIT_WORK } else { PASS_UNIT_BLOCKS };
-        let estimator_identity = work_estimator.as_ref().map(|e| e.total_anchor_count()).unwrap_or(0);
+        let unit = if work_seed.is_some() {
+            PASS_UNIT_WORK
+        } else {
+            PASS_UNIT_BLOCKS
+        };
+        let estimator_identity = work_estimator
+            .as_ref()
+            .map(|e| e.total_anchor_count())
+            .unwrap_or(0);
         let _ = progress.permille_floor(seed, unit, estimator_identity);
     }
     tracing::info!(
@@ -1747,7 +1758,11 @@ mod tests {
             900
         );
 
-        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_WORK, est.total_anchor_count()));
+        assert!(p.rebaseline_floor_if_scope_expanded(
+            SEED,
+            PASS_UNIT_WORK,
+            est.total_anchor_count()
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             450
@@ -2199,44 +2214,60 @@ mod tests {
     }
 }
 
-    #[test]
-    fn scope_expansion_false_positive_stale_estimator() {
-        // E-5(a): stale open-time extrapolation (before new roots fetched) should not drop floor.
-        use crate::events::{Progress};
+#[test]
+fn scope_expansion_false_positive_stale_estimator() {
+    // E-5(a): stale open-time extrapolation (before new roots fetched) should not drop floor.
+    use crate::events::Progress;
 
-        let p = Progress::default();
-        
-        // Initial work-based floor at 800‰ with estimator identity 5.
-        let _ = p.permille_floor(800, PASS_UNIT_WORK, 5);
-        assert_eq!(p.floor_estimator_identity(), 5);
-        
-        // Stale open-time seed at 750‰ from incomplete estimator (identity 3 < 5).
-        // Should NOT rebaseline because estimator is less complete.
-        assert!(!p.rebaseline_floor_if_scope_expanded(750, PASS_UNIT_WORK, 3));
-        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 800);
-        
-        // Later, fresh seed at 850‰ from complete estimator (identity 6 > 5).
-        // Should advance floor normally.
-        let _ = p.permille_floor(850, PASS_UNIT_WORK, 6);
-        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 850);
-    }
+    let p = Progress::default();
 
-    #[test]
-    fn scope_expansion_false_positive_unit_mismatch() {
-        // E-5(b): transient estimator failure (block seed vs work floor) should not drop floor.
+    // Initial work-based floor at 800‰ with estimator identity 5.
+    let _ = p.permille_floor(800, PASS_UNIT_WORK, 5);
+    assert_eq!(p.floor_estimator_identity(), 5);
 
-        let p = Progress::default();
-        
-        // Work-based floor at 900‰.
-        let _ = p.permille_floor(900, PASS_UNIT_WORK, 10);
-        
-        // Transient failure produces block seed at 700‰.
-        // Should NOT rebaseline because units don't match.
-        assert!(!p.rebaseline_floor_if_scope_expanded(700, PASS_UNIT_BLOCKS, 0));
-        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 900);
-        
-        // Later, work seed at 950‰.
-        // Should advance floor normally (same unit).
-        let _ = p.permille_floor(950, PASS_UNIT_WORK, 10);
-        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 950);
-    }
+    // Stale open-time seed at 750‰ from incomplete estimator (identity 3 < 5).
+    // Should NOT rebaseline because estimator is less complete.
+    assert!(!p.rebaseline_floor_if_scope_expanded(750, PASS_UNIT_WORK, 3));
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        800
+    );
+
+    // Later, fresh seed at 850‰ from complete estimator (identity 6 > 5).
+    // Should advance floor normally.
+    let _ = p.permille_floor(850, PASS_UNIT_WORK, 6);
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        850
+    );
+}
+
+#[test]
+fn scope_expansion_false_positive_unit_mismatch() {
+    // E-5(b): transient estimator failure (block seed vs work floor) should not drop floor.
+
+    let p = Progress::default();
+
+    // Work-based floor at 900‰.
+    let _ = p.permille_floor(900, PASS_UNIT_WORK, 10);
+
+    // Transient failure produces block seed at 700‰.
+    // Should NOT rebaseline because units don't match.
+    assert!(!p.rebaseline_floor_if_scope_expanded(700, PASS_UNIT_BLOCKS, 0));
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        900
+    );
+
+    // Later, work seed at 950‰.
+    // Should advance floor normally (same unit).
+    let _ = p.permille_floor(950, PASS_UNIT_WORK, 10);
+    assert_eq!(
+        p.progress_permille_floor
+            .load(std::sync::atomic::Ordering::Relaxed),
+        950
+    );
+}

@@ -645,7 +645,9 @@ impl WalletSession {
                 tracing::warn!(%e, "work estimator read failed");
                 // Try to reuse cached estimator instead of flipping to blocks.
                 if let Some(cached) = &*self.cached_estimator.borrow() {
-                    tracing::warn!("reusing cached work estimator instead of falling back to blocks");
+                    tracing::warn!(
+                        "reusing cached work estimator instead of falling back to blocks"
+                    );
                     Some(cached.clone())
                 } else {
                     tracing::warn!("no cached estimator; progress falls back to blocks");
@@ -661,7 +663,8 @@ impl WalletSession {
         let conn = tokio::task::block_in_place(|| {
             Connection::open_with_flags(
                 &self.db_path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
             )
             .map_err(|e| wallet_err("work estimator open", e))
         })?;

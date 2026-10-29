@@ -42,7 +42,7 @@ use std::{
 };
 use tokio::{runtime::Runtime, task::AbortHandle};
 
-use crate::{config::Endpoint, events::{Progress}};
+use crate::{config::Endpoint, events::Progress};
 
 /// C-compatible snapshot struct. All fields are C-safe integers.
 /// Maps to `FfiSlipstreamSnapshot` in `zcashlc.h` (cbindgen generates this).
@@ -677,8 +677,8 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use crate::events::PASS_UNIT_BLOCKS;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
     use crate::events::WalletWriterGate;
@@ -772,10 +772,22 @@ mod tests {
     fn permille_floor_is_monotonic_and_clamped() {
         let p = crate::events::Progress::default();
         assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS, 0), 300);
-        assert_eq!(p.permille_floor(100, PASS_UNIT_BLOCKS, 0), 300, "regression must hold the floor");
+        assert_eq!(
+            p.permille_floor(100, PASS_UNIT_BLOCKS, 0),
+            300,
+            "regression must hold the floor"
+        );
         assert_eq!(p.permille_floor(999, PASS_UNIT_BLOCKS, 0), 999);
-        assert_eq!(p.permille_floor(5000, PASS_UNIT_BLOCKS, 0), 1000, "raw clamps to 1000");
-        assert_eq!(p.permille_floor(0, PASS_UNIT_BLOCKS, 0), 1000, "floor persists at max");
+        assert_eq!(
+            p.permille_floor(5000, PASS_UNIT_BLOCKS, 0),
+            1000,
+            "raw clamps to 1000"
+        );
+        assert_eq!(
+            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            1000,
+            "floor persists at max"
+        );
     }
 
     /// A handle around `progress` in `state`, for snapshot tests (no task, no network).

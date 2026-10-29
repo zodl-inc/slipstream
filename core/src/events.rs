@@ -1464,10 +1464,18 @@ mod tests {
             "1‰ dip is noise"
         );
         assert!(
-            !p.rebaseline_floor_if_scope_expanded(990 - FLOOR_REBASELINE_EPSILON_PERMILLE, PASS_UNIT_BLOCKS, 0),
+            !p.rebaseline_floor_if_scope_expanded(
+                990 - FLOOR_REBASELINE_EPSILON_PERMILLE,
+                PASS_UNIT_BLOCKS,
+                0
+            ),
             "exactly-epsilon dip is still within scope"
         );
-        assert_eq!(p.permille_floor(0, PASS_UNIT_BLOCKS, 0), 990, "floor held through noise");
+        assert_eq!(
+            p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
+            990,
+            "floor held through noise"
+        );
         // Import with an older birthday: the seed plummets → re-baseline to the truth.
         assert!(
             p.rebaseline_floor_if_scope_expanded(120, PASS_UNIT_BLOCKS, 0),
@@ -1515,7 +1523,11 @@ mod tests {
         );
 
         // Agrees with the mutating sibling on both the false and the true case.
-        assert!(!p.rebaseline_floor_if_scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE, PASS_UNIT_BLOCKS, 0));
+        assert!(!p.rebaseline_floor_if_scope_expanded(
+            900 - FLOOR_REBASELINE_EPSILON_PERMILLE,
+            PASS_UNIT_BLOCKS,
+            0
+        ));
         assert_eq!(
             p.permille_floor(0, PASS_UNIT_BLOCKS, 0),
             900,

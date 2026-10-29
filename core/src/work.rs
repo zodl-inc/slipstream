@@ -100,10 +100,7 @@ impl PoolEstimate {
     /// subtree root `j` with completing height `e_j` adds `(e_j, (j+1) * 65536)`.
     ///
     /// Production version: builds from subtree-root completing heights only.
-    pub fn new(
-        activation_height: u64,
-        subtree_ends: &[(u64, u64)],
-    ) -> Self {
+    pub fn new(activation_height: u64, subtree_ends: &[(u64, u64)]) -> Self {
         Self::new_with_exact(activation_height, subtree_ends, &[])
     }
 
