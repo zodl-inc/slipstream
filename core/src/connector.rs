@@ -442,12 +442,11 @@ impl Service<Uri> for TorTcpConnector {
 }
 
 /// Plan-chunk cap (blocks per `GetBlockRange`) whenever bulk goes over OHTTP, with or without
-/// Tor. An OHTTP response is one buffered message, so a chunk is downloaded whole before any
-/// block can be scanned, and the gateway rejects upstream responses over its size cap. A
-/// 10k-block spam-era chunk (~height 1.7M+) exceeded the gateway's 256 MiB cap on mainnet and
-/// stalled restores; 2k blocks keep every response bounded and let progress advance (at Tor
-/// throughput, ~0.4 MB/s observed, it also keeps each round trip inside the OHTTP deadlines).
-/// Direct gRPC streams incrementally and keeps the configured size.
+/// Tor. OHTTP responses stream as chunks, but the gateway rejects upstream responses over its
+/// size cap (256 MiB). A 10k-block spam-era chunk (~height 1.7M+) exceeded the gateway's cap on
+/// mainnet and stalled restores; 2k blocks keep every response bounded and let progress advance
+/// (at Tor throughput, ~0.4 MB/s observed, it also keeps each round trip inside the OHTTP
+/// deadlines). Direct gRPC streams incrementally and keeps the configured size.
 pub const OHTTP_MAX_CHUNK_BLOCKS: u32 = 2_000;
 
 /// Effective `chunk_blocks` for a bulk fetch of `endpoint`.

@@ -153,9 +153,8 @@ pub const KICK_RATE_FRACTION: f64 = 0.125;
 const KICK_MIN_WINDOW_BYTES: u64 = 64 * 1024;
 /// Shortest time between two restarts of the same worker's stream.
 const KICK_COOLDOWN: Duration = Duration::from_secs(30);
-/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, far below
-/// a regional gateway's per-client limits (96 in flight, 12 heavy; a block range
-/// counts as a normal request).
+/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, well within
+/// the deployment's per-connection capacity (a block range counts as a normal request).
 pub const BOOST_EXTRA_OHTTP_STREAMS: usize = 2;
 
 /// [v0.7 P2] Detector thresholds. Defaults are the shipped policy; the
