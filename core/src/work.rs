@@ -99,13 +99,24 @@ impl PoolEstimate {
     /// is `(activation - 1, 0)` — no leaves before the pool's activation. Each
     /// subtree root `j` with completing height `e_j` adds `(e_j, (j+1) * 65536)`.
     ///
-    /// Builds from subtree-root completing heights. The `exact_anchors` parameter was removed
-    /// (nit #5): tests now use subtree data only.
+    /// Production version: builds from subtree-root completing heights only.
     pub fn new(
         activation_height: u64,
         subtree_ends: &[(u64, u64)],
     ) -> Self {
         Self::new_with_exact(activation_height, subtree_ends, &[])
+    }
+
+    /// Test-only version: accepts exact anchors that override subtree-derived sizes.
+    /// This allows tests to use precise leaf counts for verification without needing
+    /// to calculate corresponding subtree indices.
+    #[cfg(test)]
+    pub fn new_for_test(
+        activation_height: u64,
+        subtree_ends: &[(u64, u64)],
+        exact_anchors: &[(u64, u64)],
+    ) -> Self {
+        Self::new_with_exact(activation_height, subtree_ends, exact_anchors)
     }
 
     /// Internal implementation used by both test and production versions.
@@ -209,6 +220,10 @@ impl PoolEstimate {
 /// Per-pool data for building a WorkEstimator: (activation_height, subtree_ends).
 pub type PoolData = Vec<(u64, Vec<(u64, u64)>)>;
 
+/// Per-pool data for building a WorkEstimator in tests: (activation_height, subtree_ends, exact_anchors).
+#[cfg(test)]
+pub type PoolDataTest = Vec<(u64, Vec<(u64, u64)>, Vec<(u64, u64)>)>;
+
 /// Multi-pool work estimator: sums each pool's estimate.
 #[derive(Clone, Debug)]
 pub struct WorkEstimator {
@@ -223,6 +238,19 @@ impl WorkEstimator {
             .into_iter()
             .map(|(activation_height, subtree_ends)| {
                 PoolEstimate::new(activation_height, &subtree_ends)
+            })
+            .collect();
+        Self { pools }
+    }
+
+    /// Build from per-pool data in tests: activation heights, subtree-root completing heights,
+    /// and exact anchors. The order of `pool_data` must match `POOLS`.
+    #[cfg(test)]
+    pub fn new_for_test(pool_data: PoolDataTest) -> Self {
+        let pools = pool_data
+            .into_iter()
+            .map(|(activation_height, subtree_ends, exact_anchors)| {
+                PoolEstimate::new_for_test(activation_height, &subtree_ends, &exact_anchors)
             })
             .collect();
         Self { pools }
@@ -317,7 +345,7 @@ mod tests {
     #[test]
     fn pool_estimate_exact_anchors_overwrite() {
         // Subtree 0 at 50, but exact anchor at 50 says 70000.
-        let est = PoolEstimate::new(10, &[(0, 50), (0, 70)]);
+        let est = PoolEstimate::new_for_test(10, &[(0, 50)], &[(50, 70000)]);
         assert_eq!(est.cumulative(50), 70000, "exact overwrites subtree");
     }
 
@@ -325,7 +353,7 @@ mod tests {
     fn pool_estimate_extends_past_last_anchor() {
         // Two anchors: (10, 0) activation, (20, 1000).
         // Slope = 1000 / 10 = 100 leaves/block.
-        let est = PoolEstimate::new(11, &[(0, 20)]);
+        let est = PoolEstimate::new_for_test(11, &[], &[(20, 1000)]);
         assert_eq!(est.cumulative(20), 1000);
         // At 30, extend by 10 blocks: 1000 + 10*100 = 2000.
         assert_eq!(est.cumulative(30), 2000);
@@ -366,9 +394,9 @@ mod tests {
     #[test]
     fn work_estimator_sums_pools() {
         // Two pools: first has 100 leaves at h=10, second has 50.
-        let est = WorkEstimator::new(vec![
-            (5, vec![]),
-            (5, vec![(0, 10)]),
+        let est = WorkEstimator::new_for_test(vec![
+            (5, vec![], vec![(10, 100)]),
+            (5, vec![], vec![(10, 50)]),
         ]);
         // At h=10: block_work = BLOCK_WEIGHT * 11 = 44, pool_work = 100+50 = 150.
         let expected = BLOCK_WEIGHT * 11 + 150;
@@ -377,9 +405,9 @@ mod tests {
 
     #[test]
     fn work_estimator_range_is_additive() {
-        let est = WorkEstimator::new(vec![
-            (5, vec![(0, 50), (1, 100)]),
-            (5, vec![(0, 100)]),
+        let est = WorkEstimator::new_for_test(vec![
+            (5, vec![(0, 50), (1, 100)], vec![]),
+            (5, vec![], vec![(100, 200)]),
         ]);
         let full = est.range(50, 100);
         let left = est.range(50, 75);
@@ -389,9 +417,9 @@ mod tests {
 
     #[test]
     fn work_estimator_is_monotonic() {
-        let est = WorkEstimator::new(vec![
-            (10, vec![(0, 50), (1, 100)]),
-            (10, vec![(0, 60)]),
+        let est = WorkEstimator::new_for_test(vec![
+            (10, vec![(0, 50), (1, 100)], vec![]),
+            (10, vec![(0, 60)], vec![]),
         ]);
         let mut prev = 0;
         for h in 0..200 {
@@ -434,18 +462,18 @@ mod tests {
         assert!(!empty.is_usable(), "no data beyond activation");
         let with_root = PoolEstimate::new(100, &[(0, 200)]);
         assert!(with_root.is_usable(), "has subtree root");
-        let with_exact = PoolEstimate::new(100, &[(0, 200)]);
+        let with_exact = PoolEstimate::new_for_test(100, &[], &[(200, 5000)]);
         assert!(with_exact.is_usable(), "has exact anchor");
     }
 
     #[test]
     fn work_estimator_usable() {
-        let no_data = WorkEstimator::new(vec![(100, vec![]); 3]);
+        let no_data = WorkEstimator::new_for_test(vec![(100, vec![], vec![]); 3]);
         assert!(!no_data.is_usable(), "no pool has data");
-        let one_pool = WorkEstimator::new(vec![
-            (100, vec![(0, 200)]),
-            (100, vec![]),
-            (100, vec![]),
+        let one_pool = WorkEstimator::new_for_test(vec![
+            (100, vec![(0, 200)], vec![]),
+            (100, vec![], vec![]),
+            (100, vec![], vec![]),
         ]);
         assert!(one_pool.is_usable(), "first pool has data");
     }

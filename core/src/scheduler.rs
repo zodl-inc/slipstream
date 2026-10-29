@@ -1498,12 +1498,12 @@ mod tests {
     /// Heights 1..=1000 carry no shielded leaves (4 000 work), 1001..=2000 carry 32 leaves
     /// each (36 000 work): a 2 000-block pass whose first half is 10 % of its work.
     fn sparse_then_dense() -> WorkEstimator {
-        WorkEstimator::new(vec![(1, vec![(0, 1_000), (499, 2_000)])])
+        WorkEstimator::new_for_test(vec![(1, vec![], vec![(1_000, 0), (2_000, 32_000)])])
     }
 
     /// Uniform density: 6 leaves per block, so every block is 10 work units.
     fn uniform(tip: u64) -> WorkEstimator {
-        WorkEstimator::new(vec![(1, vec![(0, tip)])])
+        WorkEstimator::new_for_test(vec![(1, vec![], vec![(tip, 6 * tip)])])
     }
 
     #[test]
