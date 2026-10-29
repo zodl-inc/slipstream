@@ -217,13 +217,7 @@ impl PoolEstimate {
     }
 }
 
-/// Per-pool data for building a WorkEstimator.
-/// Test version: (activation_height, subtree_ends, exact_anchors).
-/// Production version: (activation_height, subtree_ends).
-#[cfg(test)]
-pub type PoolData = Vec<(u64, Vec<(u64, u64)>, Vec<(u64, u64)>)>;
-
-#[cfg(not(test))]
+/// Per-pool data for building a WorkEstimator: (activation_height, subtree_ends).
 pub type PoolData = Vec<(u64, Vec<(u64, u64)>)>;
 
 /// Multi-pool work estimator: sums each pool's estimate.

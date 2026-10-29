@@ -841,6 +841,12 @@ impl Progress {
     /// Fix this pass's unit if no suggest round has fixed it yet (`want_work` decides), and
     /// return the unit in force: `true` = work. Later rounds of the same pass get the unit the
     /// first round chose, whatever they ask for.
+    /// Read the current pass unit: [`PASS_UNIT_UNSET`], [`PASS_UNIT_BLOCKS`], or [`PASS_UNIT_WORK`].
+    #[inline]
+    pub fn pass_unit(&self) -> u64 {
+        self.pass_unit.load(Ordering::Relaxed)
+    }
+
     pub fn fix_pass_unit(&self, want_work: bool) -> bool {
         let want = if want_work {
             PASS_UNIT_WORK

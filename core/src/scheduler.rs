@@ -2202,8 +2202,7 @@ mod tests {
     #[test]
     fn scope_expansion_false_positive_stale_estimator() {
         // E-5(a): stale open-time extrapolation (before new roots fetched) should not drop floor.
-        use crate::events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress};
-        use crate::work::WorkEstimator;
+        use crate::events::{Progress};
 
         let p = Progress::default();
         
@@ -2225,7 +2224,6 @@ mod tests {
     #[test]
     fn scope_expansion_false_positive_unit_mismatch() {
         // E-5(b): transient estimator failure (block seed vs work floor) should not drop floor.
-        use crate::events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress};
 
         let p = Progress::default();
         
