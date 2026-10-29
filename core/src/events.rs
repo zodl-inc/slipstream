@@ -1530,15 +1530,15 @@ mod tests {
         );
 
         // First suggest round of the pass: ordinary progress, no scope expansion.
-        assert!(!p.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_BLOCKS, 0));
+        assert!(!p.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_BLOCKS));
         p.set_pass_start_permille_if_unset(300);
         let _ = p.permille_floor(300, PASS_UNIT_BLOCKS);
         assert_eq!(p.pass_start_permille(), Some(300));
 
         // A later round of the SAME pass, still no expansion — the start must hold.
-        assert!(!p.rebaseline_floor_if_scope_expanded(340, PASS_UNIT_BLOCKS, 0));
+        assert!(!p.rebaseline_floor_if_scope_expanded(340, PASS_UNIT_BLOCKS));
         p.set_pass_start_permille_if_unset(340);
-        let _ = p.permille_floor(340, PASS_UNIT_BLOCKS, 0);
+        let _ = p.permille_floor(340, PASS_UNIT_BLOCKS);
         assert_eq!(
             p.pass_start_permille(),
             Some(300),
@@ -1547,7 +1547,7 @@ mod tests {
 
         // A round where the scope EXPANDS under the pass (an import with an older
         // birthday, or a rewind): the pass start must follow the re-baseline.
-        assert!(p.rebaseline_floor_if_scope_expanded(50, PASS_UNIT_BLOCKS, 0));
+        assert!(p.rebaseline_floor_if_scope_expanded(50, PASS_UNIT_BLOCKS));
         p.set_pass_start_permille(50);
         assert_eq!(
             p.pass_start_permille(),
