@@ -3766,13 +3766,16 @@ pub struct CommitLimits {
 
 impl CommitLimits {
     /// 20,000 blocks: two gRPC chunks, ten OHTTP windows
-    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`). Also the most blocks a stop or an error
-    /// exit leaves to be scanned again.
+    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`). The limit is checked after a scan call is
+    /// added, so a unit can run past it by one call. A stop or an error exit drains the unit
+    /// being committed and drops only the one being filled; a killed process can also lose
+    /// the ones still being committed (`persist_depth` of them), all scanned again.
     pub const DEFAULT_MAX_BLOCKS: u64 = 20_000;
     /// 100,000 commitments (all pools, Ironwood included): about two normal-era units,
     /// and below one merged dense scan call (`EngineConfig::DEFAULT_SCAN_MERGE_OUTPUTS`),
-    /// so dense calls still commit one by one. A unit's scanned blocks (commitments
-    /// and wallet data, a few MB at this size) stay bounded.
+    /// so a dense call closes the unit it is added to (which can then hold up to one dense
+    /// call more than this). A unit's scanned blocks (commitments and wallet data, tens of
+    /// MB at worst) stay bounded.
     pub const DEFAULT_MAX_OUTPUTS: u64 = 100_000;
 
     fn reached(&self, pending: &PendingPersist) -> bool {

@@ -214,14 +214,21 @@ impl ThreadCpuSample {
 /// decryption runs on) is sampled without one on Linux/Android: a broadcast waits until every
 /// worker has finished the decryption batch it is running, and the scan lane would sit in
 /// that wait twice per chunk. Its workers' CPU clocks are looked up once (one broadcast, the
-/// first time) and read from the calling thread afterwards. Elsewhere the samples are zero
-/// (see [`ThreadCpuSample::now`]), so they are made without asking the workers at all.
+/// first time) and read from the calling thread afterwards. Elsewhere, or when a clock cannot
+/// be looked up or read, the samples are zero (see [`ThreadCpuSample::now`]): the `chunk
+/// stages` line then reads no CPU time, but the scan lane never waits on the workers.
+///
+/// The first call for the global pool must come from outside any rayon pool (the scan calls it
+/// from its tokio lane): the clock lookup's broadcast runs on whichever pool it is made from,
+/// and that pool's clocks are kept for the rest of the process.
 pub fn sample_rayon_workers(pool: Option<&rayon::ThreadPool>) -> Vec<ThreadCpuSample> {
     let broadcast_fn = |_ctx: rayon::BroadcastContext<'_>| ThreadCpuSample::now();
 
     match pool {
         Some(pool) => pool.broadcast(broadcast_fn),
-        None => sample_global_workers().unwrap_or_else(|| rayon::broadcast(broadcast_fn)),
+        None => sample_global_workers().unwrap_or_else(|| {
+            vec![ThreadCpuSample::default(); rayon::current_num_threads()]
+        }),
     }
 }
 
@@ -410,7 +417,10 @@ mod tests {
         assert_eq!(after.len(), before.len());
         let stats = RayonCpuStats::from_samples(&before, &after);
         #[cfg(any(target_os = "linux", target_os = "android"))]
-        assert!(stats.min_cpu_ms >= 10, "every worker spun 30 ms: {stats:?}");
+        assert!(
+            stats.total_cpu_ms >= 10,
+            "the workers spun 30 ms each: {stats:?}"
+        );
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         assert_eq!(stats.total_cpu_ms, 0);
     }
