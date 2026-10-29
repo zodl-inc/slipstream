@@ -296,7 +296,7 @@ mod tests {
 
     #[test]
     fn pool_estimate_activation_anchor() {
-        let est = PoolEstimate::new(100, &[], &[]);
+        let est = PoolEstimate::new(100, &[]);
         assert_eq!(est.cumulative(99), 0, "before activation");
         assert_eq!(est.cumulative(100), 0, "at activation with no roots");
         assert_eq!(est.cumulative(200), 0, "past activation with no data");
@@ -306,7 +306,7 @@ mod tests {
     fn pool_estimate_subtree_roots() {
         // Subtree 0 completes at height 50 → 65536 leaves.
         // Subtree 1 completes at height 100 → 131072 leaves.
-        let est = PoolEstimate::new(10, &[(0, 50), (1, 100)], &[]);
+        let est = PoolEstimate::new(10, &[(0, 50), (1, 100)]);
         assert_eq!(est.cumulative(9), 0, "before activation");
         assert_eq!(est.cumulative(50), 65536);
         assert_eq!(est.cumulative(100), 131072);
@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn pool_estimate_exact_anchors_overwrite() {
         // Subtree 0 at 50, but exact anchor at 50 says 70000.
-        let est = PoolEstimate::new(10, &[(0, 50)], &[(50, 70000)]);
+        let est = PoolEstimate::new(10, &[(0, 50), (0, 70)]);
         assert_eq!(est.cumulative(50), 70000, "exact overwrites subtree");
     }
 
@@ -325,7 +325,7 @@ mod tests {
     fn pool_estimate_extends_past_last_anchor() {
         // Two anchors: (10, 0) activation, (20, 1000).
         // Slope = 1000 / 10 = 100 leaves/block.
-        let est = PoolEstimate::new(11, &[], &[(20, 1000)]);
+        let est = PoolEstimate::new(11, &[(0, 20)]);
         assert_eq!(est.cumulative(20), 1000);
         // At 30, extend by 10 blocks: 1000 + 10*100 = 2000.
         assert_eq!(est.cumulative(30), 2000);
@@ -333,7 +333,7 @@ mod tests {
 
     #[test]
     fn pool_estimate_range_additive() {
-        let est = PoolEstimate::new(10, &[(0, 50), (1, 100)], &[]);
+        let est = PoolEstimate::new(10, &[(0, 50), (1, 100)]);
         let full = est.range(50, 100);
         let left = est.range(50, 75);
         let right = est.range(76, 100);
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn pool_estimate_monotonic() {
-        let est = PoolEstimate::new(10, &[(0, 50), (1, 100), (2, 150)], &[]);
+        let est = PoolEstimate::new(10, &[(0, 50), (1, 100), (2, 150)]);
         let mut prev = 0;
         for h in 0..200 {
             let cur = est.cumulative(h);
@@ -358,7 +358,7 @@ mod tests {
     #[test]
     fn pool_estimate_inactive_pool_contributes_zero() {
         // Pool never activated (activation_height = 0 or very high).
-        let est = PoolEstimate::new(1_000_000, &[], &[]);
+        let est = PoolEstimate::new(1_000_000, &[]);
         assert_eq!(est.cumulative(100), 0);
         assert_eq!(est.range(0, 100), 0);
     }
@@ -423,18 +423,18 @@ mod tests {
     fn pool_estimate_incremental_roots() {
         // Start index > 0: subtree roots [(2, 100), (3, 150)] mean indices 2 and 3.
         // Index 2 → (2+1)*65536 = 196608, index 3 → (3+1)*65536 = 262144.
-        let est = PoolEstimate::new(10, &[(2, 100), (3, 150)], &[]);
+        let est = PoolEstimate::new(10, &[(2, 100), (3, 150)]);
         assert_eq!(est.cumulative(100), 196608);
         assert_eq!(est.cumulative(150), 262144);
     }
 
     #[test]
     fn pool_estimate_usable() {
-        let empty = PoolEstimate::new(100, &[], &[]);
+        let empty = PoolEstimate::new(100, &[]);
         assert!(!empty.is_usable(), "no data beyond activation");
-        let with_root = PoolEstimate::new(100, &[(0, 200)], &[]);
+        let with_root = PoolEstimate::new(100, &[(0, 200)]);
         assert!(with_root.is_usable(), "has subtree root");
-        let with_exact = PoolEstimate::new(100, &[], &[(200, 5000)]);
+        let with_exact = PoolEstimate::new(100, &[(0, 200)]);
         assert!(with_exact.is_usable(), "has exact anchor");
     }
 
