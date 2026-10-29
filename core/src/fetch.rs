@@ -175,9 +175,8 @@ pub const BOOST_MIN_GAIN: f64 = 1.2;
 pub const BOOST_RETRY_WINDOWS: u32 = 12;
 /// The retry wait doubles with each withdrawal in a row, at most this many times.
 const BOOST_RETRY_MAX_DOUBLINGS: u32 = 4;
-/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, far below
-/// a regional gateway's per-client limits (96 in flight, 12 heavy; a block range
-/// counts as a normal request).
+/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, well within
+/// the deployment's per-connection capacity (a block range counts as a normal request).
 pub const BOOST_EXTRA_OHTTP_STREAMS: usize = 2;
 
 /// [v0.7 P2] Detector thresholds. Defaults are the shipped policy; the

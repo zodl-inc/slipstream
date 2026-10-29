@@ -116,6 +116,12 @@ darkside = ["zcash_client_sqlite"]
 # backend.
 gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
 
+# X-Client-Trace-Id header for QA and debug builds. OFF by default. Release
+# builds MUST NOT enable this feature (ZIP conformance: release builds must not
+# send the trace header and must not contain a run-time code path that can
+# enable it). The mobile SDKs enable this feature only in debug builds.
+client-trace = []
+
 # Integration-test binaries that require the sqlite backend are declared with
 # `required-features`, so `cargo test --no-default-features` SKIPS them instead
 # of failing to build — a non-sqlite backend must keep a runnable test suite

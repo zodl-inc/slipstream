@@ -71,19 +71,24 @@ use tokio::io::DuplexStream;
 use tokio::sync::Mutex;
 use tower_service::Service;
 pub use zcash_protocol::consensus::NetworkType;
+#[cfg(test)]
+use zodl_ohttp_client::CONTENT_TYPE_CHUNKED_RES;
 use zodl_ohttp_client::{
-    BhttpRequest, BhttpResponse, CONTENT_TYPE_CHUNKED_RES, ChunkedResponseDecoder, ClientProfile,
-    ClientTrace, DOH_RESOLVERS, GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES,
-    GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfig, Network, NetworkRule, RelayBackoff,
-    ResponseEvent, SizeGuard, check_size, doh_query_url, encapsulate_chunked_request,
-    envelope_from_doh_json, key_config_dns_name, signed_config_url, verify_signed_config,
+    BhttpRequest, BhttpResponse, ChunkedResponseDecoder, ClientProfile, DOH_RESOLVERS,
+    GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfig, Network,
+    NetworkRule, RelayBackoff, ResponseEvent, SizeGuard, check_size, doh_query_url,
+    encapsulate_chunked_request, envelope_from_doh_json, key_config_dns_name, signed_config_url,
+    verify_signed_config,
 };
+
+#[cfg(feature = "client-trace")]
+use zodl_ohttp_client::ClientTrace;
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
 const DUPLEX_BUF: usize = 4 << 20;
 /// Whole OHTTP round trip (encapsulate → relay → gateway → lightwalletd → back). The engine's own
 /// `UNARY_TIMEOUT` (30 s) bounds the wait for response headers, so this only matters for large
-/// buffered streams; the gateway itself gives lightwalletd 80 s.
+/// streams; the gateway itself gives lightwalletd 80 s.
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Idle timeout between chunks in a streaming OHTTP response. A healthy stream delivers chunks
@@ -139,10 +144,8 @@ fn shared_keys() -> std::sync::MutexGuard<'static, HashMap<(String, String), Cac
         .unwrap_or_else(|p| p.into_inner())
 }
 
-/// Hostname prefix that marks an endpoint as an OHTTP gateway (mirrors the Kotlin SDK).
-pub const GATEWAY_HOST_PREFIX: &str = "ohttp-gateway";
-
 /// Process-wide default client trace prefix for OHTTP connections (set once from JNI).
+#[cfg(feature = "client-trace")]
 static DEFAULT_CLIENT_TRACE_PREFIX: OnceLock<Option<String>> = OnceLock::new();
 
 /// Process-wide cache of OHTTP clients for Direct-dialer connections only. Each cached client
@@ -183,6 +186,9 @@ impl ClientCacheKey {
             return None;
         };
 
+        // Without `client-trace` the prefix is dropped by the client, so it must not split the cache.
+        #[cfg(not(feature = "client-trace"))]
+        let trace_prefix = trace_prefix.and(None);
         Some(Self {
             gateway_host: gateway_host.to_string(),
             relay_url: relay_url.to_string(),
@@ -195,19 +201,31 @@ impl ClientCacheKey {
 /// Set the default client trace prefix for all OHTTP connections without an explicit prefix.
 /// Called from JNI/FFI when the engine or TorRuntime is created.
 ///
-/// Debug-only gating (P7) is the caller's job: the Android SDK passes a prefix only when its
-/// own `BuildConfig.DEBUG` is true, the Swift SDK only under `#if DEBUG`. It cannot be a
-/// `cfg(debug_assertions)` gate here because the mobile SDKs always build this crate with the
-/// release profile, which silently dropped the prefix in debug app builds too.
+/// Only available when the `client-trace` feature is enabled. Release builds MUST NOT enable
+/// this feature (ZIP conformance). The Android SDK enables `client-trace` only when its own
+/// `BuildConfig.DEBUG` is true; the Swift SDK only under `#if DEBUG`. Without the feature this
+/// function is a no-op that ignores its argument, keeping the API surface unchanged.
+#[cfg(feature = "client-trace")]
 pub fn set_default_client_trace_prefix(prefix: Option<String>) {
     let _ = DEFAULT_CLIENT_TRACE_PREFIX.set(prefix);
 }
 
-/// Get the default client trace prefix.
+#[cfg(not(feature = "client-trace"))]
+pub fn set_default_client_trace_prefix(_prefix: Option<String>) {
+    // No-op when client-trace is disabled
+}
+
+/// Get the default client trace prefix (returns None when client-trace is disabled).
+#[cfg(feature = "client-trace")]
 fn get_default_client_trace_prefix() -> Option<String> {
     DEFAULT_CLIENT_TRACE_PREFIX
         .get()
         .and_then(|opt| opt.clone())
+}
+
+#[cfg(not(feature = "client-trace"))]
+fn get_default_client_trace_prefix() -> Option<String> {
+    None
 }
 
 /// Get or create a cached OHTTP client for the given parameters. **Privacy:** only
@@ -1153,7 +1171,8 @@ where
             continue;
         }
 
-        if !status.is_success() {
+        // ZIP conformance: only 200 is success, other 2xx treated like 5xx (UNAVAILABLE)
+        if status != StatusCode::OK {
             let msg = format!("relay/gateway HTTP {status}: {}", answer.detail());
             return Err(match status {
                 // A back-off signal, not an unreachable gateway: the caller records the pause
@@ -1167,13 +1186,9 @@ where
             });
         }
 
-        // Check content-type
-        let media_type = answer.content_type().unwrap_or("");
-        let essence = media_type.split(';').next().unwrap_or_default().trim();
-        if !essence.eq_ignore_ascii_case(CONTENT_TYPE_CHUNKED_RES) {
-            return Err(RoundTripError::Transport(format!(
-                "relay answered {media_type:?}, not {CONTENT_TYPE_CHUNKED_RES}"
-            )));
+        // On 200, decapsulate whatever the Content-Type (AEAD authenticates)
+        if let Some(media_type) = answer.content_type() {
+            tracing::debug!("ohttp: response media type: {media_type}");
         }
 
         return Ok((opener.decoder(), answer));
@@ -1316,6 +1331,8 @@ struct OhttpClient {
     /// reconnects.
     dial_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
+    /// Only present when the `client-trace` feature is enabled.
+    #[cfg(feature = "client-trace")]
     client_trace: Option<ClientTrace>,
     /// The shared core's options for this client (`SLIPSTREAM` for gRPC, `SLIPSTREAM_HTTP` for
     /// [`http_round_trip`]).
@@ -1335,6 +1352,9 @@ impl OhttpClient {
         client_trace_prefix: Option<String>,
         profile: ClientProfile,
     ) -> Result<Self, String> {
+        // Without `client-trace` the prefix is dropped: release builds never send the header.
+        #[cfg(not(feature = "client-trace"))]
+        drop(client_trace_prefix);
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -1358,6 +1378,7 @@ impl OhttpClient {
             dialer,
             h2_pool: Mutex::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
+            #[cfg(feature = "client-trace")]
             client_trace: client_trace_prefix.map(|p| ClientTrace::new(&p, &profile.trace)),
             profile,
         })
@@ -1574,7 +1595,10 @@ impl OhttpClient {
         on_send: &F,
     ) -> Result<RelayAnswer, HttpsError> {
         self.relay_pause_before_post()?;
+        #[cfg(feature = "client-trace")]
         let trace = self.client_trace.as_ref().map(|t| t.next());
+        #[cfg(not(feature = "client-trace"))]
+        let trace: Option<String> = None;
         let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once(&self.relay, Method::POST, &headers, body, guard, on_send)
             .await
@@ -1588,7 +1612,10 @@ impl OhttpClient {
         on_send: &F,
     ) -> Result<RelayStream, HttpsError> {
         self.relay_pause_before_post()?;
+        #[cfg(feature = "client-trace")]
         let trace = self.client_trace.as_ref().map(|t| t.next());
+        #[cfg(not(feature = "client-trace"))]
+        let trace: Option<String> = None;
         let headers = self.profile.headers.relay_post(trace.as_deref());
         self.https_once_stream(&self.relay, Method::POST, &headers, body, on_send)
             .await
@@ -2209,6 +2236,23 @@ struct HttpTarget {
     path: String,
 }
 
+/// An extension call as Binary HTTP (RFC 9292), header names lowercased (ZIP #10: "Header names
+/// MUST be lowercase").
+fn http_bhttp_request(
+    method: &str,
+    target: HttpTarget,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> BhttpRequest {
+    let mut request = BhttpRequest::new(method, target.host, target.path)
+        .scheme(target.scheme)
+        .body(body);
+    for (name, value) in headers {
+        request = request.header(name.to_ascii_lowercase(), value.as_str());
+    }
+    request
+}
+
 fn parse_http_target(url: &str) -> Result<HttpTarget, String> {
     let uri = url
         .parse::<http::Uri>()
@@ -2474,13 +2518,7 @@ where
     .await
     .map_err(HttpRoundTripError::Failed)?;
 
-    // HTTP request as Binary HTTP (RFC 9292): the URL's scheme, header names as given
-    let mut request = BhttpRequest::new(method, target.host, target.path)
-        .scheme(target.scheme)
-        .body(body);
-    for (name, value) in headers {
-        request = request.header(name.as_str(), value.as_str());
-    }
+    let request = http_bhttp_request(method, target, headers, body);
 
     // Send through OHTTP relay (encapsulate, POST, decapsulate), the whole exchange bounded
     let response = tokio::time::timeout(
@@ -2876,13 +2914,14 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn http_profile_keeps_header_names_as_given_and_grpc_profile_lowercases() {
-        let request = BhttpRequest::new("GET", "h.example", "/").header("X-Custom", "1");
-        let as_given =
-            encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM_HTTP.encode).unwrap();
-        assert!(contains(&as_given, b"X-Custom"));
-        let lowered = encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).unwrap();
-        assert!(contains(&lowered, b"x-custom") && !contains(&lowered, b"X-Custom"));
+    fn extension_calls_send_lowercase_header_names() {
+        let target = parse_http_target("https://h.example/path").expect("target");
+        let headers = [("X-Custom".to_string(), "1".to_string())];
+        let request = http_bhttp_request("GET", target, &headers, b"");
+        let http = encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM_HTTP.encode).unwrap();
+        assert!(contains(&http, b"x-custom") && !contains(&http, b"X-Custom"));
+        let grpc = encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).unwrap();
+        assert!(contains(&grpc, b"x-custom") && !contains(&grpc, b"X-Custom"));
     }
 
     /// C-08: a relay POST is never sent twice with the same ciphertext. The gateway answers a
@@ -3006,6 +3045,57 @@ pub(crate) mod tests {
             );
             assert_eq!(posts.get(), 1, "status {status}");
         }
+    }
+
+    /// ZIP conformance: only 200 is success, other 2xx (201-299) treated like 5xx (UNAVAILABLE).
+    #[tokio::test]
+    async fn outer_2xx_other_than_200_are_errors() {
+        for status in [201u16, 202, 204, 206, 226] {
+            let posts = Cell::new(0u32);
+            let result = run_exchange(
+                &ClientProfile::SLIPSTREAM,
+                test_key(),
+                &test_request(),
+                |_body| {
+                    posts.set(posts.get() + 1);
+                    async move { Ok::<RelayAnswer, HttpsError>(outer_answer(status)) }
+                },
+                || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
+            )
+            .await;
+            let Err(RoundTripError::Transport(message)) = result else {
+                panic!("expected Transport error for {status}, got {result:?}");
+            };
+            assert!(
+                message.starts_with(&format!("relay/gateway HTTP {status}")),
+                "got: {message}"
+            );
+            assert_eq!(posts.get(), 1, "status {status}");
+        }
+    }
+
+    /// ZIP conformance: on 200, decapsulate whatever the Content-Type (AEAD authenticates).
+    /// The code no longer checks Content-Type; AEAD decapsulation will fail if the body is wrong.
+    #[tokio::test]
+    async fn outer_200_with_any_content_type_is_attempted() {
+        // Content-Type is now ignored; a wrong body will fail at AEAD decapsulation
+        let result = run_exchange(
+            &ClientProfile::SLIPSTREAM,
+            test_key(),
+            &test_request(),
+            |_body| async {
+                Ok::<RelayAnswer, HttpsError>(RelayAnswer {
+                    status: StatusCode::OK,
+                    content_type: Some("application/octet-stream".to_string()),
+                    retry_after: None,
+                    body: vec![7; 64],
+                })
+            },
+            || async { Err(RoundTripError::Transport("unexpected refetch".into())) },
+        )
+        .await;
+        // Reaches the decoder (Content-Type not checked), which refuses the invalid body
+        assert!(matches!(result, Err(RoundTripError::Decode(_))));
     }
 
     /// A success status whose body is not a sealed response for this request is an error, not a
@@ -3323,7 +3413,8 @@ pub(crate) mod tests {
     }
 
     /// The streamed answer goes through the same exchange loop as the buffered one: an outer
-    /// non-success status is final (and names the status), a wrong content-type is rejected.
+    /// non-success status, and any 2xx other than 200, is final (and names the status); a 200 is
+    /// handed on whatever its content-type.
     #[tokio::test]
     async fn streamed_outer_answers_use_the_shared_exchange_checks() {
         fn stream_answer(status: u16, content_type: &str) -> RelayStream {
@@ -3353,16 +3444,27 @@ pub(crate) mod tests {
         let err = run_exchange_chunked(
             test_key(),
             &test_request(),
+            |_sealed| async { Ok(stream_answer(201, CONTENT_TYPE_CHUNKED_RES)) },
+            || async { unreachable!("no refetch on 201") },
+        )
+        .await
+        .err()
+        .expect("a 2xx other than 200 is final");
+        assert!(
+            matches!(&err, RoundTripError::Transport(m) if m.contains("201")),
+            "{err:?}"
+        );
+
+        // A 200 is decapsulated whatever its content-type: the AEAD authenticates the body.
+        let (_decoder, answer) = run_exchange_chunked(
+            test_key(),
+            &test_request(),
             |_sealed| async { Ok(stream_answer(200, "text/html")) },
             || async { unreachable!("no refetch on 200") },
         )
         .await
-        .err()
-        .expect("wrong content-type is rejected");
-        assert!(
-            matches!(&err, RoundTripError::Transport(m) if m.contains("text/html")),
-            "{err:?}"
-        );
+        .expect("a 200 with another content-type is handed back unread");
+        assert_eq!(answer.status, StatusCode::OK);
 
         let (_decoder, answer) = run_exchange_chunked(
             test_key(),
@@ -3881,9 +3983,17 @@ pub(crate) mod tests {
         .await
         .expect("create client with trace prefix");
 
+        // With `client-trace` the prefix is sent, so it keys its own client; without it the prefix
+        // is dropped and both callers share one pooled client.
+        #[cfg(feature = "client-trace")]
         assert!(
             !Arc::ptr_eq(&client_no_trace, &client_with_trace),
             "different trace prefixes must yield distinct cached clients"
+        );
+        #[cfg(not(feature = "client-trace"))]
+        assert!(
+            Arc::ptr_eq(&client_no_trace, &client_with_trace),
+            "without client-trace a trace prefix must not split the cache"
         );
 
         // Same params → same client (cache hit)
