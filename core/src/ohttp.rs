@@ -3983,9 +3983,17 @@ pub(crate) mod tests {
         .await
         .expect("create client with trace prefix");
 
+        // With `client-trace` the prefix is sent, so it keys its own client; without it the prefix
+        // is dropped and both callers share one pooled client.
+        #[cfg(feature = "client-trace")]
         assert!(
             !Arc::ptr_eq(&client_no_trace, &client_with_trace),
             "different trace prefixes must yield distinct cached clients"
+        );
+        #[cfg(not(feature = "client-trace"))]
+        assert!(
+            Arc::ptr_eq(&client_no_trace, &client_with_trace),
+            "without client-trace a trace prefix must not split the cache"
         );
 
         // Same params → same client (cache hit)
