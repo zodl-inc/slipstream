@@ -584,20 +584,38 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
         // re-baseline (`rebaseline_floor_if_scope_expanded`) folds already-credited work
         // into the new `pass_start_permille` — without subtracting the baseline here, that
         // same work would ALSO inflate this pass-local ratio and double-count it.
-        let pass_total = p.pass_total();
-        let fetched_capped = p
-            .fetched()
-            .saturating_sub(p.pass_base_fetched())
-            .min(pass_total);
-        let scanned_capped = p
-            .scanned()
-            .saturating_sub(p.pass_base_scanned())
-            .min(pass_total);
-        let pass_permille = fetched_capped
-            .saturating_add(scanned_capped)
-            .saturating_mul(1000)
-            .checked_div(pass_total.saturating_mul(2))
-            .unwrap_or(0);
+        // Use work-based progress when available (pass_total_work > 0), otherwise blocks.
+        let pass_permille = if p.pass_total_work() > 0 {
+            let pass_total_work = p.pass_total_work();
+            let fetched_work_capped = p
+                .fetched_work()
+                .saturating_sub(p.pass_base_fetched_work())
+                .min(pass_total_work);
+            let scanned_work_capped = p
+                .scanned_work()
+                .saturating_sub(p.pass_base_scanned_work())
+                .min(pass_total_work);
+            fetched_work_capped
+                .saturating_add(scanned_work_capped)
+                .saturating_mul(1000)
+                .checked_div(pass_total_work.saturating_mul(2))
+                .unwrap_or(0)
+        } else {
+            let pass_total = p.pass_total();
+            let fetched_capped = p
+                .fetched()
+                .saturating_sub(p.pass_base_fetched())
+                .min(pass_total);
+            let scanned_capped = p
+                .scanned()
+                .saturating_sub(p.pass_base_scanned())
+                .min(pass_total);
+            fetched_capped
+                .saturating_add(scanned_capped)
+                .saturating_mul(1000)
+                .checked_div(pass_total.saturating_mul(2))
+                .unwrap_or(0)
+        };
         // The pass's own progress is stretched between where the wallet's GLOBAL position
         // stood when the pass began (`pass_start_permille`, latched by the scheduler's first
         // suggest round of this pass) and 1000 — so a resync inherits the position the

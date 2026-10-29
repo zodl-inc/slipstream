@@ -39,6 +39,7 @@ pub mod probe;
 pub mod throttle;
 pub mod treestate;
 pub mod verify;
+pub mod work;
 
 // Issue #4: the zcash_client_sqlite wallet-storage backend and — today — the
 // engine loop that is hard-wired to it. A future non-sqlite backend would slot

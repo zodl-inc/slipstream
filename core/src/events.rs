@@ -87,6 +87,10 @@ pub struct Progress {
     pub fetched_blocks: AtomicU64,
     /// Number of compact blocks scanned so far.
     pub scanned_blocks: AtomicU64,
+    /// Work units fetched so far (outputs/actions + block weight).
+    fetched_work: AtomicU64,
+    /// Work units scanned so far (outputs/actions + block weight).
+    scanned_work: AtomicU64,
     /// Number of transactions enhanced (decrypt_and_store) so far.
     pub enhanced_txs: AtomicU64,
     /// End height of the range currently being processed (inclusive).
@@ -100,6 +104,8 @@ pub struct Progress {
     /// very first suggestion — no snap-back when Historic ranges are revealed.
     /// Updated via `set_pass_total(n)`.
     pub pass_total_blocks: AtomicU64,
+    /// Total work units in the current pass (when work estimator is available).
+    pass_total_work: AtomicU64,
     /// Spendable hint latch: 0 = funds not yet spendable; 1 = a ChainTip-priority range
     /// completed scanning (≈ SBS "funds-spendable" semantics). Latches to 1 and never
     /// resets to 0 within a pass. Read with `spendable()`.
@@ -159,6 +165,14 @@ pub struct Progress {
     pass_base_fetched: AtomicU64,
     /// [h16-1] See [`Self::pass_base_fetched`] — the `scanned_blocks` counterpart.
     pass_base_scanned: AtomicU64,
+    /// Work-unit baseline for fetched (see [`Self::pass_base_fetched`] — work counterpart).
+    pass_base_fetched_work: AtomicU64,
+    /// Work-unit baseline for scanned (see [`Self::pass_base_scanned`] — work counterpart).
+    pass_base_scanned_work: AtomicU64,
+    /// Which unit the pass started with: 0 = blocks (legacy/no estimator), 1 = work.
+    /// Latched by the first suggest round that records `pass_total_work > 0`; prevents
+    /// unit-flip scope-expansion check from re-baseining that round.
+    seed_unit: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -227,10 +241,13 @@ impl Default for Progress {
             chain_tip: AtomicU64::new(0),
             fetched_blocks: AtomicU64::new(0),
             scanned_blocks: AtomicU64::new(0),
+            fetched_work: AtomicU64::new(0),
+            scanned_work: AtomicU64::new(0),
             enhanced_txs: AtomicU64::new(0),
             current_range_end: AtomicU64::new(0),
             reorgs_recovered: AtomicU64::new(0),
             pass_total_blocks: AtomicU64::new(0),
+            pass_total_work: AtomicU64::new(0),
             spendable_hint: AtomicU64::new(0),
             ranges_completed: AtomicU64::new(0),
             recovering: AtomicU64::new(0),
@@ -239,6 +256,9 @@ impl Default for Progress {
             pass_start_permille: AtomicU64::new(u64::MAX),
             pass_base_fetched: AtomicU64::new(0),
             pass_base_scanned: AtomicU64::new(0),
+            pass_base_fetched_work: AtomicU64::new(0),
+            pass_base_scanned_work: AtomicU64::new(0),
+            seed_unit: AtomicU64::new(0),
             tip_refreshes: AtomicU64::new(0),
             tx_set_version: AtomicU64::new(0),
             wallet_writers: AtomicUsize::new(0),
@@ -268,6 +288,20 @@ impl Progress {
     #[inline]
     pub fn add_scanned(&self, n: u64) {
         self.scanned_blocks.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Bump `fetched_work` by `n` (work units fetched).
+    #[inline]
+    pub fn add_fetched_work(&self, n: u64) {
+        self.fetched_work.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Bump `scanned_work` by `n` (work units scanned).
+    #[inline]
+    pub fn add_scanned_work(&self, n: u64) {
+        self.scanned_work.fetch_add(n, Ordering::Relaxed);
         self.touch();
     }
 
@@ -343,6 +377,17 @@ impl Progress {
     #[inline]
     pub fn set_pass_total(&self, n: u64) {
         self.pass_total_blocks.store(n, Ordering::Relaxed);
+    }
+
+    /// Set `pass_total_work` to `n` (STORE, not add). Called by the scheduler when
+    /// a work estimator is available.
+    #[inline]
+    pub fn set_pass_total_work(&self, n: u64) {
+        self.pass_total_work.store(n, Ordering::Relaxed);
+        // Latch seed_unit to 1 (work) on the first non-zero work total.
+        if n > 0 {
+            self.seed_unit.compare_exchange(0, 1, Ordering::Relaxed, Ordering::Relaxed).ok();
+        }
     }
 
     /// Deprecated: use `set_pass_total` instead.  Retained for any call sites that
@@ -727,6 +772,13 @@ impl Progress {
         self.pass_base_scanned.store(scanned, Ordering::Relaxed);
     }
 
+    /// Snapshot the pass-local work baseline (work-unit variant of [`Self::set_pass_baseline`]).
+    #[inline]
+    pub fn set_pass_baseline_work(&self, fetched_work: u64, scanned_work: u64) {
+        self.pass_base_fetched_work.store(fetched_work, Ordering::Relaxed);
+        self.pass_base_scanned_work.store(scanned_work, Ordering::Relaxed);
+    }
+
     /// Read the pass-local fetched baseline (see [`Self::set_pass_baseline`]).
     #[inline]
     pub fn pass_base_fetched(&self) -> u64 {
@@ -737,6 +789,42 @@ impl Progress {
     #[inline]
     pub fn pass_base_scanned(&self) -> u64 {
         self.pass_base_scanned.load(Ordering::Relaxed)
+    }
+
+    /// Read `fetched_work`.
+    #[inline]
+    pub fn fetched_work(&self) -> u64 {
+        self.fetched_work.load(Ordering::Relaxed)
+    }
+
+    /// Read `scanned_work`.
+    #[inline]
+    pub fn scanned_work(&self) -> u64 {
+        self.scanned_work.load(Ordering::Relaxed)
+    }
+
+    /// Read `pass_total_work`.
+    #[inline]
+    pub fn pass_total_work(&self) -> u64 {
+        self.pass_total_work.load(Ordering::Relaxed)
+    }
+
+    /// Read the work baseline for fetched.
+    #[inline]
+    pub fn pass_base_fetched_work(&self) -> u64 {
+        self.pass_base_fetched_work.load(Ordering::Relaxed)
+    }
+
+    /// Read the work baseline for scanned.
+    #[inline]
+    pub fn pass_base_scanned_work(&self) -> u64 {
+        self.pass_base_scanned_work.load(Ordering::Relaxed)
+    }
+
+    /// Read seed_unit: 0 = blocks, 1 = work.
+    #[inline]
+    pub fn seed_unit(&self) -> u64 {
+        self.seed_unit.load(Ordering::Relaxed)
     }
 
     /// Reset the per-pass RATIO counters at the start of a sync pass.
@@ -764,12 +852,18 @@ impl Progress {
     pub fn begin_pass(&self) {
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
+        self.fetched_work.store(0, Ordering::Relaxed);
+        self.scanned_work.store(0, Ordering::Relaxed);
         self.pass_total_blocks.store(0, Ordering::Relaxed);
+        self.pass_total_work.store(0, Ordering::Relaxed);
         self.current_range_end.store(0, Ordering::Relaxed);
         self.spendable_hint.store(0, Ordering::Relaxed);
         self.pass_start_permille.store(u64::MAX, Ordering::Relaxed);
         self.pass_base_fetched.store(0, Ordering::Relaxed);
         self.pass_base_scanned.store(0, Ordering::Relaxed);
+        self.pass_base_fetched_work.store(0, Ordering::Relaxed);
+        self.pass_base_scanned_work.store(0, Ordering::Relaxed);
+        self.seed_unit.store(0, Ordering::Relaxed);
         // v2: a new pass starts the stall clock fresh. `recovering` and the permille
         // floor are deliberately NOT reset — recovering is recomputed on the first
         // suggest round, and the floor is session-monotonic by contract (§4.4).

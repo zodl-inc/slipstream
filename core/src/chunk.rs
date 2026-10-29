@@ -40,6 +40,8 @@ pub struct Chunk {
     /// Trial-decryption work denominator: sapling outputs + orchard actions
     /// across all transactions in this chunk.
     pub outputs: u64,
+    /// Work units: block weight + sum of all pool leaves (outputs + actions).
+    pub work: u64,
 }
 
 impl Chunk {
@@ -51,11 +53,14 @@ impl Chunk {
             .flat_map(|block| &block.vtx)
             .map(|tx| (tx.outputs.len() + tx.actions.len()) as u64)
             .sum();
+        // Work units: block weight + all pool leaves.
+        let work: u64 = blocks.iter().map(crate::work::block_work).sum();
         Self {
             index,
             blocks,
             estimated_bytes,
             outputs,
+            work,
         }
     }
 
@@ -73,6 +78,7 @@ impl Chunk {
             (Some(end), Some(start)) if start == end + 1 => {
                 self.estimated_bytes += next.estimated_bytes;
                 self.outputs += next.outputs;
+                self.work += next.work;
                 self.blocks.extend(next.blocks);
                 Ok(())
             }

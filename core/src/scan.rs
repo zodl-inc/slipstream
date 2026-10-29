@@ -1177,6 +1177,12 @@ async fn scan_chunks_inner(
         // Bump the shared progress counter (poll-based; Relaxed ordering).
         if let Some(ref p) = progress {
             p.add_scanned(chunk_scanned_blocks);
+            // Compute work for the scanned blocks (may be less than chunk.work if sub-batched).
+            let scanned_work: u64 = chunk.blocks[..(chunk_scanned_blocks as usize)]
+                .iter()
+                .map(crate::work::block_work)
+                .sum();
+            p.add_scanned_work(scanned_work);
         }
 
         // T5.1 per-chunk info log (kept at chunk granularity — would spam on fast devices
