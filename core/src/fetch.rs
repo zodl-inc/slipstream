@@ -1976,12 +1976,12 @@ impl Booster {
             self.gain_checked = true;
             return false;
         }
-        if !extras_delivered || self.live_extras() == 0 {
-            if self.boost_windows < BOOST_GAIN_LAST_WINDOW {
-                return false;
-            }
-            // Still waiting and the extras delivered nothing by now (no circuit, no
-            // connection): the boost only adds load, so it is withdrawn below.
+        // Extras that delivered nothing by BOOST_GAIN_LAST_WINDOW (no circuit, no
+        // connection) are judged anyway: the boost then only adds load.
+        if (!extras_delivered || self.live_extras() == 0)
+            && self.boost_windows < BOOST_GAIN_LAST_WINDOW
+        {
+            return false;
         }
         self.gain_checked = true;
         let Some(base) = self.pre_boost_rate else {
