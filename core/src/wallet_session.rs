@@ -470,8 +470,7 @@ impl WalletSession {
     }
 
     /// Stores `roots`, each pool's first root at its index in `start` — the `start` they were
-    /// requested from (`grpc::get_subtree_roots_from`). Also persists their completing
-    /// heights to `ext_slipstream_subtree_ends` for work estimation.
+    /// requested from (`grpc::get_subtree_roots_from`).
     pub fn put_subtree_roots_at(
         &mut self,
         start: SubtreeRootStart,
@@ -486,22 +485,6 @@ impl WalletSession {
         self.db
             .put_ironwood_subtree_roots(start.ironwood, &roots.ironwood)
             .map_err(|e| wallet_err("put_ironwood_subtree_roots", e))?;
-        // Persist completing heights for work estimation.
-        self.put_subtree_ends_internal(
-            "sapling",
-            start.sapling,
-            &roots.sapling,
-        )?;
-        self.put_subtree_ends_internal(
-            "orchard",
-            start.orchard,
-            &roots.orchard,
-        )?;
-        self.put_subtree_ends_internal(
-            "ironwood",
-            start.ironwood,
-            &roots.ironwood,
-        )?;
         Ok(())
     }
 
@@ -573,55 +556,6 @@ impl WalletSession {
             u64::try_from(total).unwrap_or(0),
             u64::try_from(unreconciled).unwrap_or(0),
         ))
-    }
-
-    /// Internal helper: persist completing heights for one pool's subtree roots
-    /// to `ext_slipstream_subtree_ends`.
-    fn put_subtree_ends_internal<Node>(
-        &self,
-        pool: &str,
-        start_index: u64,
-        roots: &[zcash_client_backend::data_api::chain::CommitmentTreeRoot<Node>],
-    ) -> Result<(), SlipstreamError> {
-        let conn = Connection::open(&self.db_path)
-            .map_err(|e| wallet_err("subtree_ends conn", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| wallet_err("subtree_ends busy_timeout", e))?;
-        for (i, root) in roots.iter().enumerate() {
-            let idx = start_index + i as u64;
-            let end_height = u64::from(u32::from(root.subtree_end_height()));
-            conn.execute(
-                "INSERT OR REPLACE INTO ext_slipstream_subtree_ends (pool, idx, end_height)
-                 VALUES (?1, ?2, ?3)",
-                [pool, &idx.to_string(), &end_height.to_string()],
-            )
-            .map_err(|e| wallet_err("subtree_ends insert", e))?;
-        }
-        Ok(())
-    }
-
-    /// Read all persisted subtree-root completing heights for `pool`.
-    /// Returns `(idx, end_height)` pairs in index order.
-    pub fn subtree_ends(&self, pool: &str) -> Result<Vec<(u64, u64)>, SlipstreamError> {
-        let conn = Connection::open(&self.db_path)
-            .map_err(|e| wallet_err("subtree_ends read conn", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .map_err(|e| wallet_err("subtree_ends read busy_timeout", e))?;
-        let mut stmt = conn
-            .prepare("SELECT idx, end_height FROM ext_slipstream_subtree_ends WHERE pool = ?1 ORDER BY idx")
-            .map_err(|e| wallet_err("subtree_ends prepare", e))?;
-        let rows = stmt
-            .query_map([pool], |row| {
-                let idx: i64 = row.get(0)?;
-                let end_height: i64 = row.get(1)?;
-                Ok((idx as u64, end_height as u64))
-            })
-            .map_err(|e| wallet_err("subtree_ends query", e))?;
-        let mut result = Vec::new();
-        for row in rows {
-            result.push(row.map_err(|e| wallet_err("subtree_ends row", e))?);
-        }
-        Ok(result)
     }
 
     /// Exclusive access for the scan driver (scan_cached_blocks needs &mut).

@@ -92,26 +92,11 @@ pub(crate) fn global_floor_permille(
 /// already-known range-length sum, no network I/O. Reads `p.chain_tip()` live, like the inline
 /// block it replaces. Returns whether this round re-baselined the session floor (test hook;
 /// `run_to_completion` ignores it).
-///
-/// When `work_estimator` is provided, also computes and sets work-unit totals for the pass.
 pub(crate) fn update_pass_progress(
     p: &Progress,
     scanned_so_far_in_pass: &mut u64,
     sum_remaining: u64,
     wallet_birthday: Option<u64>,
-) -> bool {
-    update_pass_progress_with_work(p, scanned_so_far_in_pass, sum_remaining, wallet_birthday, None, &[])
-}
-
-/// Work-aware variant of `update_pass_progress`. When `work_estimator` is provided,
-/// computes work-unit totals from `remaining_ranges` and sets `pass_total_work`.
-fn update_pass_progress_with_work(
-    p: &Progress,
-    scanned_so_far_in_pass: &mut u64,
-    sum_remaining: u64,
-    wallet_birthday: Option<u64>,
-    work_estimator: Option<&crate::work::WorkEstimator>,
-    remaining_ranges: &[zcash_client_backend::data_api::scanning::ScanRange],
 ) -> bool {
     // [h16-1] Snapshot the pass-local blend baseline BEFORE the pass total is set: from
     // this moment, `derive_snapshot` reads `fetched()`/`scanned()` relative to this
@@ -123,18 +108,6 @@ fn update_pass_progress_with_work(
         p.scanned().saturating_sub(*scanned_so_far_in_pass),
     );
     p.set_pass_total(*scanned_so_far_in_pass + sum_remaining);
-    // Work-unit tracking: compute and set pass_total_work if estimator is available.
-    if let Some(est) = work_estimator {
-        let remaining_work = sum_remaining_work(est, remaining_ranges);
-        // Work baseline: current work minus what remains.
-        let completed_work_fetched = p.fetched_work().saturating_sub(remaining_work);
-        let completed_work_scanned = p.scanned_work().saturating_sub(remaining_work);
-        p.set_pass_baseline_work(
-            p.fetched_work().saturating_sub(completed_work_fetched),
-            p.scanned_work().saturating_sub(completed_work_scanned),
-        );
-        p.set_pass_total_work(completed_work_fetched + remaining_work);
-    }
     // [API v2 §4.4 / Phase E] Seed the session-monotonic floor with the GLOBAL position.
     // fetch_max semantics: the seed can only RAISE the floor, and re-seeding every suggest
     // round tracks global progress as ranges complete. Two behaviours fall out for free:
@@ -180,12 +153,6 @@ fn update_pass_progress_with_work(
         *scanned_so_far_in_pass = 0;
         p.set_pass_baseline(p.fetched(), p.scanned());
         p.set_pass_total(sum_remaining);
-        // Work re-baseline: skip the scope-expansion check if the unit just flipped.
-        if let Some(est) = work_estimator {
-            let remaining_work = sum_remaining_work(est, remaining_ranges);
-            p.set_pass_baseline_work(p.fetched_work(), p.scanned_work());
-            p.set_pass_total_work(remaining_work);
-        }
         // [h10] The pass start follows the re-baseline: the scope grew UNDER
         // this running pass, so the pass's own progress must stretch from the
         // re-baselined position too, or it would still stretch from the stale
@@ -234,48 +201,6 @@ pub(crate) fn scan_continuity_repair_credit(
     rewind_height
         .saturating_sub(start)
         .min(end_exclusive.saturating_sub(start))
-}
-
-/// Build a `WorkEstimator` from the wallet's network, subtree ends, and chain metadata.
-/// Returns `None` if no usable data is available (no subtree roots persisted).
-#[allow(dead_code)]
-fn build_work_estimator(
-    session: &WalletSession,
-) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
-    use zcash_protocol::consensus::Parameters;
-    let network = &session.network;
-    let mut pool_data = Vec::new();
-    for pool in crate::work::POOLS {
-        let activation_height = network
-            .activation_height(pool.activation)
-            .map(|h| u64::from(u32::from(h)))
-            .unwrap_or(u64::MAX);
-        let subtree_ends = session.subtree_ends(pool.label)?;
-        // No exact anchors for now — metadata/chain_metadata would go here.
-        let exact_anchors = vec![];
-        pool_data.push((activation_height, subtree_ends, exact_anchors));
-    }
-    let estimator = crate::work::WorkEstimator::new(pool_data);
-    if estimator.is_usable() {
-        Ok(Some(estimator))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Compute remaining work units for `ranges` using `estimator`.
-fn sum_remaining_work(
-    estimator: &crate::work::WorkEstimator,
-    ranges: &[zcash_client_backend::data_api::scanning::ScanRange],
-) -> u64 {
-    ranges
-        .iter()
-        .map(|r| {
-            let start = u64::from(u32::from(r.block_range().start));
-            let end = u64::from(u32::from(r.block_range().end));
-            estimator.range(start, end.saturating_sub(1))
-        })
-        .sum()
 }
 
 /// [API v2.1 E-3] Seed the snapshot atomics from PERSISTED wallet state, so the snapshot is

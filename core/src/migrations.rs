@@ -110,11 +110,6 @@ impl RusqliteMigration for ExtSchemaInit {
 pub const MIGRATION_ID_EXT_RECONCILE_IRONWOOD: Uuid =
     Uuid::from_u128(0x9b1c2f04_7d3a_4c58_bf16_2a0e5c8d41e7);
 
-/// Identifier of the migration that creates the subtree-root completing-heights
-/// table for work-unit progress estimation.
-pub const MIGRATION_ID_EXT_SUBTREE_ENDS: Uuid =
-    Uuid::from_u128(0x3f7a9c2e_1b84_4d59_a025_8e6f4b3d9c71);
-
 /// Rebuilds both read-side reconciliation views so that a dangling **Ironwood**
 /// spend (`nullifier_map.spend_pool = 4`) is detected like its Sapling and
 /// Orchard siblings ([`crate::reconcile::RECONCILE_VIEW_SQL`], issue #9).
@@ -176,48 +171,6 @@ impl RusqliteMigration for ExtReconcileIronwood {
     }
 }
 
-/// Creates the `ext_slipstream_subtree_ends` table to persist subtree-root
-/// completing heights for work-unit progress estimation. Each row records one
-/// subtree root's index and the height at which it completed.
-struct ExtSubtreeEnds;
-
-impl schemerz::Migration<Uuid> for ExtSubtreeEnds {
-    fn id(&self) -> Uuid {
-        MIGRATION_ID_EXT_SUBTREE_ENDS
-    }
-
-    fn dependencies(&self) -> HashSet<Uuid> {
-        // Depends on the initial ext schema migration.
-        [MIGRATION_ID_EXT_SCHEMA_INIT].into_iter().collect()
-    }
-
-    fn description(&self) -> &'static str {
-        "Creates ext_slipstream_subtree_ends table for work-unit progress estimation."
-    }
-}
-
-impl RusqliteMigration for ExtSubtreeEnds {
-    type Error = WalletMigrationError;
-
-    fn up(&self, transaction: &Transaction) -> Result<(), WalletMigrationError> {
-        transaction.execute_batch(
-            "CREATE TABLE ext_slipstream_subtree_ends (
-                pool TEXT NOT NULL,
-                idx INTEGER NOT NULL,
-                end_height INTEGER NOT NULL,
-                PRIMARY KEY (pool, idx)
-            ) WITHOUT ROWID;",
-        )?;
-        Ok(())
-    }
-
-    fn down(&self, _transaction: &Transaction) -> Result<(), WalletMigrationError> {
-        Err(WalletMigrationError::CannotRevert(
-            MIGRATION_ID_EXT_SUBTREE_ENDS,
-        ))
-    }
-}
-
 /// The slipstream external migration graph, for registration via
 /// [`WalletMigrator::with_external_migrations`] by any opener of a slipstream
 /// wallet database (the engine's own `WalletSession::open`, or a host that
@@ -225,11 +178,7 @@ impl RusqliteMigration for ExtSubtreeEnds {
 ///
 /// [`WalletMigrator::with_external_migrations`]: zcash_client_sqlite::wallet::init::WalletMigrator::with_external_migrations
 pub fn external_migrations() -> Vec<Box<dyn RusqliteMigration<Error = WalletMigrationError>>> {
-    vec![
-        Box::new(ExtSchemaInit),
-        Box::new(ExtReconcileIronwood),
-        Box::new(ExtSubtreeEnds),
-    ]
+    vec![Box::new(ExtSchemaInit), Box::new(ExtReconcileIronwood)]
 }
 
 #[cfg(test)]
