@@ -1796,9 +1796,8 @@ struct TrackedWorker {
     /// `slot.bytes` at the start of the window.
     window_bytes: u64,
     last_kick: Option<Instant>,
-    /// Plan chunk the worker held at the last window, and the restarts of it
-    /// after which it stayed slow.
-    kick_plan_index: Option<u64>,
+    /// Restarts after which the worker's head stream stayed slow (any plan chunk:
+    /// head chunks are short-lived while chunks are cut).
     slow_kicks: u32,
 }
 
@@ -1868,7 +1867,6 @@ impl Booster {
                     slot: Arc::clone(slot),
                     window_bytes: 0,
                     last_kick: None,
-                    kick_plan_index: None,
                     slow_kicks: 0,
                 })
                 .collect(),
@@ -1927,7 +1925,10 @@ impl Booster {
             BoostStep::Start => {
                 self.pre_boost_rate = self.last_rate;
                 self.boost_windows = 0;
-                self.gain_checked = false;
+                // Extras of an earlier boost still finishing their chunk would deliver
+                // bytes before this boost's own extras connect and make its baseline
+                // look higher: such a boost is not judged.
+                self.gain_checked = self.live_extras() > 0;
                 self.start(workers, fraction);
             }
             BoostStep::Stop => self.stop(fraction),
@@ -2011,11 +2012,16 @@ impl Booster {
                 .unwrap_or(0);
             // Parked or finished peers deliver nothing, so the recent best stands in for them.
             let reference = others_best.max(recent_best);
-            let slow = head_is_slow(delta, reference);
+            // Under the absolute floor everyone is slow: the link is full, and only a head
+            // far behind the others is restarted.
+            let slow = if reference < KICK_MIN_WINDOW_BYTES {
+                (delta as f64) < KICK_RATE_FRACTION * reference as f64
+            } else {
+                head_is_slow(delta, reference)
+            };
             let plan_index = w.slot.plan_index.load(Ordering::Relaxed);
-            if w.kick_plan_index != Some(plan_index) || !slow {
-                // A new chunk, or the last restart helped.
-                w.kick_plan_index = Some(plan_index);
+            if !slow {
+                // The last restart helped (or none was needed).
                 w.slow_kicks = 0;
             }
             let cooling = w
@@ -2093,7 +2099,6 @@ impl Booster {
                 slot,
                 window_bytes: 0,
                 last_kick: None,
-                kick_plan_index: None,
                 slow_kicks: 0,
             });
         }
@@ -2173,10 +2178,9 @@ impl BoostState {
                 0
             };
             if self.cold >= BOOST_COLD_WINDOWS {
-                *self = Self {
-                    withdrawals: self.withdrawals,
-                    ..Self::default()
-                };
+                // The scanner stopped waiting: the boost did its job, so the next
+                // withdrawal waits the shortest time again.
+                *self = Self::default();
                 return BoostStep::Stop;
             }
         }
@@ -2592,7 +2596,7 @@ mod boost_tests {
     }
 
     #[test]
-    fn an_ended_boost_keeps_its_withdrawal_count() {
+    fn a_boost_that_ends_because_the_scanner_caught_up_clears_the_doubling() {
         let mut st = BoostState::default();
         st.observe(1.0);
         st.observe(1.0);
@@ -2606,7 +2610,7 @@ mod boost_tests {
             st.observe(0.0);
         }
         assert_eq!(st.observe(0.0), BoostStep::Stop);
-        assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS << 1);
+        assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS);
     }
 
     #[test]
