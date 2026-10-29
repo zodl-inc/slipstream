@@ -166,8 +166,8 @@ const KICK_MIN_WINDOW_BYTES: u64 = 64 * 1024;
 const KICK_COOLDOWN: Duration = Duration::from_secs(30);
 /// Longest time between two restarts of a plan chunk that stays slow after them.
 pub const KICK_MAX_COOLDOWN: Duration = Duration::from_secs(120);
-/// Last boost window in which its gain is judged; a boost whose extra workers delivered
-/// nothing by then is left to end the usual way.
+/// Last boost window in which its gain is judged: by then a boost whose extra workers
+/// delivered nothing is judged on the rate alone.
 pub const BOOST_GAIN_LAST_WINDOW: u32 = 4;
 /// Factor by which a boost must raise the fetch's byte rate, or it is withdrawn.
 pub const BOOST_MIN_GAIN: f64 = 1.2;
@@ -1962,17 +1962,26 @@ impl Booster {
     /// returns whether it did. Judged once, in the first window from the second on in
     /// which the scanner still waits (else the boost did its job and ends the usual way)
     /// and the extra workers delivered bytes (over Tor a new circuit can take a window or
-    /// two); a boost whose extras deliver nothing by [`BOOST_GAIN_LAST_WINDOW`] only
-    /// restarts slow head streams and is not judged.
+    /// two). A boost whose extras still deliver nothing at [`BOOST_GAIN_LAST_WINDOW`] while
+    /// the scanner waits is judged then, on the same rate test, and so withdrawn unless the
+    /// head restarts alone raised the rate.
     fn check_boost_gain(&mut self, rate: f64, fraction: f64, per_stream: &[u64]) -> bool {
         self.boost_windows += 1;
         if self.gain_checked || self.boost_windows < 2 {
             return false;
         }
         let extras_delivered = per_stream.iter().skip(self.base_streams).any(|&b| b > 0);
-        if fraction < BOOST_ON_FRACTION || !extras_delivered || self.live_extras() == 0 {
-            self.gain_checked = self.boost_windows >= BOOST_GAIN_LAST_WINDOW;
+        if fraction < BOOST_ON_FRACTION {
+            // The scanner no longer waits: the boost did its job and ends the usual way.
+            self.gain_checked = true;
             return false;
+        }
+        if !extras_delivered || self.live_extras() == 0 {
+            if self.boost_windows < BOOST_GAIN_LAST_WINDOW {
+                return false;
+            }
+            // Still waiting and the extras delivered nothing by now (no circuit, no
+            // connection): the boost only adds load, so it is withdrawn below.
         }
         self.gain_checked = true;
         let Some(base) = self.pre_boost_rate else {
