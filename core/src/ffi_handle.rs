@@ -42,7 +42,7 @@ use std::{
 };
 use tokio::{runtime::Runtime, task::AbortHandle};
 
-use crate::{config::Endpoint, events::{Progress, PASS_UNIT_BLOCKS}};
+use crate::{config::Endpoint, events::{Progress}};
 
 /// C-compatible snapshot struct. All fields are C-safe integers.
 /// Maps to `FfiSlipstreamSnapshot` in `zcashlc.h` (cbindgen generates this).

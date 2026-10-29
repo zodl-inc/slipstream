@@ -99,19 +99,8 @@ impl PoolEstimate {
     /// is `(activation - 1, 0)` — no leaves before the pool's activation. Each
     /// subtree root `j` with completing height `e_j` adds `(e_j, (j+1) * 65536)`.
     ///
-    /// [Issue #5 nit] The `exact_anchors` parameter is test-only. Production code should call
-    /// `new_production` instead. This version is kept for test backwards compatibility.
-    #[cfg(test)]
-    pub fn new(
-        activation_height: u64,
-        subtree_ends: &[(u64, u64)],
-        exact_anchors: &[(u64, u64)],
-    ) -> Self {
-        Self::new_with_exact(activation_height, subtree_ends, exact_anchors)
-    }
-
-    /// Production version: builds from subtree-root completing heights only, without exact anchors.
-    #[cfg(not(test))]
+    /// Builds from subtree-root completing heights. The `exact_anchors` parameter was removed
+    /// (nit #5): tests now use subtree data only.
     pub fn new(
         activation_height: u64,
         subtree_ends: &[(u64, u64)],
@@ -227,22 +216,8 @@ pub struct WorkEstimator {
 }
 
 impl WorkEstimator {
-    /// Build from per-pool data: activation heights, subtree-root completing heights,
-    /// and exact anchors (test only). The order of `pool_data` must match `POOLS`.
-    #[cfg(test)]
-    pub fn new(pool_data: PoolData) -> Self {
-        let pools = pool_data
-            .into_iter()
-            .map(|(activation_height, subtree_ends, exact_anchors)| {
-                PoolEstimate::new(activation_height, &subtree_ends, &exact_anchors)
-            })
-            .collect();
-        Self { pools }
-    }
-
     /// Build from per-pool data: activation heights and subtree-root completing heights.
-    /// The order of `pool_data` must match `POOLS`. Production version without exact_anchors.
-    #[cfg(not(test))]
+    /// The order of `pool_data` must match `POOLS`.
     pub fn new(pool_data: PoolData) -> Self {
         let pools = pool_data
             .into_iter()
@@ -392,7 +367,7 @@ mod tests {
     fn work_estimator_sums_pools() {
         // Two pools: first has 100 leaves at h=10, second has 50.
         let est = WorkEstimator::new(vec![
-            (5, vec![], vec![(10, 100)]),
+            (5, vec![]),
             (5, vec![], vec![(10, 50)]),
         ]);
         // At h=10: block_work = BLOCK_WEIGHT * 11 = 44, pool_work = 100+50 = 150.
@@ -403,7 +378,7 @@ mod tests {
     #[test]
     fn work_estimator_range_is_additive() {
         let est = WorkEstimator::new(vec![
-            (5, vec![(0, 50), (1, 100)], vec![]),
+            (5, vec![(0, 50), (1, 100)]),
             (5, vec![], vec![(100, 200)]),
         ]);
         let full = est.range(50, 100);
@@ -415,7 +390,7 @@ mod tests {
     #[test]
     fn work_estimator_is_monotonic() {
         let est = WorkEstimator::new(vec![
-            (10, vec![(0, 50), (1, 100)], vec![]),
+            (10, vec![(0, 50), (1, 100)]),
             (10, vec![(0, 60)], vec![]),
         ]);
         let mut prev = 0;
