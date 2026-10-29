@@ -584,15 +584,33 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
         // re-baseline (`rebaseline_floor_if_scope_expanded`) folds already-credited work
         // into the new `pass_start_permille` — without subtracting the baseline here, that
         // same work would ALSO inflate this pass-local ratio and double-count it.
-        let pass_total = p.pass_total();
-        let fetched_capped = p
-            .fetched()
-            .saturating_sub(p.pass_base_fetched())
-            .min(pass_total);
-        let scanned_capped = p
-            .scanned()
-            .saturating_sub(p.pass_base_scanned())
-            .min(pass_total);
+        //
+        // Output-weighted progress: a pass whose unit is work (fixed by its first suggest round,
+        // `Progress::fix_pass_unit`) blends work units instead of blocks — the same baselines,
+        // clamps and half weights, so a spam-dense range moves the reading in proportion to its
+        // trial-decryption cost. A zero work total falls back to the block terms.
+        let pass_total_blocks = p.pass_total();
+        let pass_total_work = p.pass_total_work();
+        let (pass_total, fetched, base_fetched, scanned, base_scanned) =
+            if p.pass_unit_is_work() && pass_total_work > 0 {
+                (
+                    pass_total_work,
+                    p.fetched_work(),
+                    p.pass_base_fetched_work(),
+                    p.scanned_work(),
+                    p.pass_base_scanned_work(),
+                )
+            } else {
+                (
+                    pass_total_blocks,
+                    p.fetched(),
+                    p.pass_base_fetched(),
+                    p.scanned(),
+                    p.pass_base_scanned(),
+                )
+            };
+        let fetched_capped = fetched.saturating_sub(base_fetched).min(pass_total);
+        let scanned_capped = scanned.saturating_sub(base_scanned).min(pass_total);
         let pass_permille = fetched_capped
             .saturating_add(scanned_capped)
             .saturating_mul(1000)
@@ -642,7 +660,7 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             enhanced_txs: p.enhanced(),
             current_range_end: p.range_end(),
             state: state_u8,
-            pass_total_blocks: p.pass_total(),
+            pass_total_blocks,
             spendable_hint: p.spendable() as u8,
             ranges_completed: p.ranges_completed(),
             is_recovering: is_recovering_u8,

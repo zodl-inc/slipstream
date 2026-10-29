@@ -87,6 +87,10 @@ pub struct Progress {
     pub fetched_blocks: AtomicU64,
     /// Number of compact blocks scanned so far.
     pub scanned_blocks: AtomicU64,
+    /// Work units fetched so far (when WorkEstimator is available).
+    pub fetched_work: AtomicU64,
+    /// Work units scanned so far (when WorkEstimator is available).
+    pub scanned_work: AtomicU64,
     /// Number of transactions enhanced (decrypt_and_store) so far.
     pub enhanced_txs: AtomicU64,
     /// End height of the range currently being processed (inclusive).
@@ -100,6 +104,10 @@ pub struct Progress {
     /// very first suggestion — no snap-back when Historic ranges are revealed.
     /// Updated via `set_pass_total(n)`.
     pub pass_total_blocks: AtomicU64,
+    /// Total work units in the current pass (when WorkEstimator is available).
+    /// Parallel to pass_total_blocks but in work units. B2: set to
+    /// `work_so_far_in_pass + remaining_work` each suggest round.
+    pub pass_total_work: AtomicU64,
     /// Spendable hint latch: 0 = funds not yet spendable; 1 = a ChainTip-priority range
     /// completed scanning (≈ SBS "funds-spendable" semantics). Latches to 1 and never
     /// resets to 0 within a pass. Read with `spendable()`.
@@ -159,6 +167,16 @@ pub struct Progress {
     pass_base_fetched: AtomicU64,
     /// [h16-1] See [`Self::pass_base_fetched`] — the `scanned_blocks` counterpart.
     pass_base_scanned: AtomicU64,
+    /// Work-unit baseline: parallel to `pass_base_fetched`, used when WorkEstimator is available.
+    pass_base_fetched_work: AtomicU64,
+    /// Work-unit baseline: parallel to `pass_base_scanned`, used when WorkEstimator is available.
+    pass_base_scanned_work: AtomicU64,
+    /// The unit this pass's progress is measured in: [`PASS_UNIT_UNSET`], [`PASS_UNIT_BLOCKS`]
+    /// or [`PASS_UNIT_WORK`]. Fixed by the pass's FIRST suggest round
+    /// ([`Self::fix_pass_unit`]) and never changed until [`Self::begin_pass`] resets it, so a
+    /// pass never switches unit mid-way (the floor and the pass start would otherwise mix
+    /// block and work permille).
+    pass_unit: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -227,10 +245,13 @@ impl Default for Progress {
             chain_tip: AtomicU64::new(0),
             fetched_blocks: AtomicU64::new(0),
             scanned_blocks: AtomicU64::new(0),
+            fetched_work: AtomicU64::new(0),
+            scanned_work: AtomicU64::new(0),
             enhanced_txs: AtomicU64::new(0),
             current_range_end: AtomicU64::new(0),
             reorgs_recovered: AtomicU64::new(0),
             pass_total_blocks: AtomicU64::new(0),
+            pass_total_work: AtomicU64::new(0),
             spendable_hint: AtomicU64::new(0),
             ranges_completed: AtomicU64::new(0),
             recovering: AtomicU64::new(0),
@@ -239,6 +260,9 @@ impl Default for Progress {
             pass_start_permille: AtomicU64::new(u64::MAX),
             pass_base_fetched: AtomicU64::new(0),
             pass_base_scanned: AtomicU64::new(0),
+            pass_base_fetched_work: AtomicU64::new(0),
+            pass_base_scanned_work: AtomicU64::new(0),
+            pass_unit: AtomicU64::new(PASS_UNIT_UNSET),
             tip_refreshes: AtomicU64::new(0),
             tx_set_version: AtomicU64::new(0),
             wallet_writers: AtomicUsize::new(0),
@@ -255,6 +279,13 @@ impl Default for Progress {
 /// scope grew (import/rewind), not that progress regressed. See
 /// [`Progress::rebaseline_floor_if_scope_expanded`].
 pub const FLOOR_REBASELINE_EPSILON_PERMILLE: u64 = 50;
+
+/// [`Progress`] pass unit: no suggest round of this pass has run yet.
+pub const PASS_UNIT_UNSET: u64 = 0;
+/// [`Progress`] pass unit: progress counts blocks.
+pub const PASS_UNIT_BLOCKS: u64 = 1;
+/// [`Progress`] pass unit: progress counts work units (blocks + shielded outputs/actions).
+pub const PASS_UNIT_WORK: u64 = 2;
 
 impl Progress {
     /// Bump `fetched_blocks` by `n` (Relaxed — poll-only, no ordering guarantee).
@@ -343,6 +374,12 @@ impl Progress {
     #[inline]
     pub fn set_pass_total(&self, n: u64) {
         self.pass_total_blocks.store(n, Ordering::Relaxed);
+    }
+
+    /// Set `pass_total_work` to `n` (STORE, not add). Work-unit variant of `set_pass_total`.
+    #[inline]
+    pub fn set_pass_total_work(&self, n: u64) {
+        self.pass_total_work.store(n, Ordering::Relaxed);
     }
 
     /// Deprecated: use `set_pass_total` instead.  Retained for any call sites that
@@ -739,6 +776,59 @@ impl Progress {
         self.pass_base_scanned.load(Ordering::Relaxed)
     }
 
+    /// [B2] Snapshot the pass-local work-unit baseline: work-unit variant of `set_pass_baseline`.
+    #[inline]
+    pub fn set_pass_baseline_work(&self, fetched: u64, scanned: u64) {
+        self.pass_base_fetched_work
+            .store(fetched, Ordering::Relaxed);
+        self.pass_base_scanned_work
+            .store(scanned, Ordering::Relaxed);
+    }
+
+    /// Read `pass_total_work` (Relaxed load).
+    #[inline]
+    pub fn pass_total_work(&self) -> u64 {
+        self.pass_total_work.load(Ordering::Relaxed)
+    }
+
+    /// Fix this pass's unit if no suggest round has fixed it yet (`want_work` decides), and
+    /// return the unit in force: `true` = work. Later rounds of the same pass get the unit the
+    /// first round chose, whatever they ask for.
+    pub fn fix_pass_unit(&self, want_work: bool) -> bool {
+        let want = if want_work {
+            PASS_UNIT_WORK
+        } else {
+            PASS_UNIT_BLOCKS
+        };
+        match self.pass_unit.compare_exchange(
+            PASS_UNIT_UNSET,
+            want,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => want_work,
+            Err(current) => current == PASS_UNIT_WORK,
+        }
+    }
+
+    /// Whether this pass measures progress in work units (see [`Self::fix_pass_unit`]).
+    #[inline]
+    pub fn pass_unit_is_work(&self) -> bool {
+        self.pass_unit.load(Ordering::Relaxed) == PASS_UNIT_WORK
+    }
+
+    /// Read the pass-local fetched work baseline.
+    #[inline]
+    pub fn pass_base_fetched_work(&self) -> u64 {
+        self.pass_base_fetched_work.load(Ordering::Relaxed)
+    }
+
+    /// Read the pass-local scanned work baseline.
+    #[inline]
+    pub fn pass_base_scanned_work(&self) -> u64 {
+        self.pass_base_scanned_work.load(Ordering::Relaxed)
+    }
+
     /// Reset the per-pass RATIO counters at the start of a sync pass.
     ///
     /// The FFI handle outlives individual sync passes (Swift `prepare()` opens it once;
@@ -764,12 +854,18 @@ impl Progress {
     pub fn begin_pass(&self) {
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
+        self.scanned_work.store(0, Ordering::Relaxed);
+        self.fetched_work.store(0, Ordering::Relaxed);
         self.pass_total_blocks.store(0, Ordering::Relaxed);
+        self.pass_total_work.store(0, Ordering::Relaxed);
         self.current_range_end.store(0, Ordering::Relaxed);
         self.spendable_hint.store(0, Ordering::Relaxed);
         self.pass_start_permille.store(u64::MAX, Ordering::Relaxed);
         self.pass_base_fetched.store(0, Ordering::Relaxed);
         self.pass_base_scanned.store(0, Ordering::Relaxed);
+        self.pass_base_fetched_work.store(0, Ordering::Relaxed);
+        self.pass_base_scanned_work.store(0, Ordering::Relaxed);
+        self.pass_unit.store(PASS_UNIT_UNSET, Ordering::Relaxed);
         // v2: a new pass starts the stall clock fresh. `recovering` and the permille
         // floor are deliberately NOT reset — recovering is recomputed on the first
         // suggest round, and the floor is session-monotonic by contract (§4.4).
@@ -792,6 +888,32 @@ impl Progress {
     #[inline]
     pub fn scanned(&self) -> u64 {
         self.scanned_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Read `fetched_work` (Relaxed load).
+    #[inline]
+    pub fn fetched_work(&self) -> u64 {
+        self.fetched_work.load(Ordering::Relaxed)
+    }
+
+    /// Read `scanned_work` (Relaxed load).
+    #[inline]
+    pub fn scanned_work(&self) -> u64 {
+        self.scanned_work.load(Ordering::Relaxed)
+    }
+
+    /// Bump `fetched_work` by `n` (Relaxed — poll-only, no ordering guarantee).
+    #[inline]
+    pub fn add_fetched_work(&self, n: u64) {
+        self.fetched_work.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Bump `scanned_work` by `n`.
+    #[inline]
+    pub fn add_scanned_work(&self, n: u64) {
+        self.scanned_work.fetch_add(n, Ordering::Relaxed);
+        self.touch();
     }
 
     /// Read `enhanced_txs` (Relaxed load).
@@ -1214,6 +1336,41 @@ mod tests {
 
     /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
     /// and — like the other per-pass ratio state — resets to 0 on `begin_pass()`.
+    #[test]
+    fn begin_pass_resets_work_fields() {
+        let p = Progress::default();
+        assert!(!p.pass_unit_is_work(), "a fresh handle has no unit yet");
+        p.add_fetched_work(11);
+        p.add_scanned_work(22);
+        p.set_pass_total_work(33);
+        p.set_pass_baseline_work(4, 5);
+        assert!(p.fix_pass_unit(true));
+        p.begin_pass();
+        assert_eq!(p.fetched_work(), 0);
+        assert_eq!(p.scanned_work(), 0);
+        assert_eq!(p.pass_total_work(), 0);
+        assert_eq!(p.pass_base_fetched_work(), 0);
+        assert_eq!(p.pass_base_scanned_work(), 0);
+        assert!(!p.pass_unit_is_work(), "the unit is unset again");
+        assert!(!p.fix_pass_unit(false), "the next pass picks its own unit");
+    }
+
+    #[test]
+    fn fix_pass_unit_keeps_the_first_choice() {
+        let p = Progress::default();
+        assert!(p.fix_pass_unit(true));
+        assert!(
+            p.fix_pass_unit(false),
+            "a later round cannot switch to blocks"
+        );
+        p.begin_pass();
+        assert!(!p.fix_pass_unit(false));
+        assert!(
+            !p.fix_pass_unit(true),
+            "a later round cannot switch to work"
+        );
+    }
+
     #[test]
     fn pass_baseline_defaults_to_zero_and_resets_on_begin_pass() {
         let p = Progress::default();

@@ -40,22 +40,33 @@ pub struct Chunk {
     /// Trial-decryption work denominator: sapling outputs + orchard actions
     /// across all transactions in this chunk.
     pub outputs: u64,
+    /// Work units for progress accounting: BLOCK_WEIGHT per block + shielded
+    /// outputs/actions weighted by pool. Used when a WorkEstimator is available
+    /// to track progress proportional to trial-decryption cost instead of block count.
+    pub work: u64,
 }
 
 impl Chunk {
     pub fn from_blocks(index: u64, blocks: Vec<CompactBlock>) -> Self {
         let estimated_bytes = blocks.iter().map(Message::encoded_len).sum();
-        // Count total sapling outputs and orchard actions across all transactions.
-        let outputs: u64 = blocks
-            .iter()
-            .flat_map(|block| &block.vtx)
-            .map(|tx| (tx.outputs.len() + tx.actions.len()) as u64)
-            .sum();
+        // Walk vtx once: count outputs for the old metric + work for progress.
+        let mut outputs: u64 = 0;
+        let mut work: u64 = 0;
+        for block in &blocks {
+            let mut leaves: u64 = 0;
+            for tx in &block.vtx {
+                outputs += (tx.outputs.len() + tx.actions.len()) as u64;
+                leaves += (tx.outputs.len() + tx.actions.len() + tx.ironwood_actions.len()) as u64;
+            }
+            // Same value as `work::block_work(block)`, from the single vtx walk above.
+            work += crate::work::BLOCK_WEIGHT + leaves;
+        }
         Self {
             index,
             blocks,
             estimated_bytes,
             outputs,
+            work,
         }
     }
 
@@ -73,6 +84,7 @@ impl Chunk {
             (Some(end), Some(start)) if start == end + 1 => {
                 self.estimated_bytes += next.estimated_bytes;
                 self.outputs += next.outputs;
+                self.work += next.work;
                 self.blocks.extend(next.blocks);
                 Ok(())
             }
@@ -325,6 +337,90 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// A block carrying one tx with `outputs` Sapling outputs, `actions` Orchard actions and
+    /// `ironwood` Ironwood actions.
+    fn dense_block(height: u64, outputs: u32, actions: u32, ironwood: u32) -> CompactBlock {
+        let mut tx = tx_with_outputs_and_actions(outputs, actions);
+        tx.ironwood_actions = (0..ironwood)
+            .map(|_| CompactOrchardAction::default())
+            .collect();
+        CompactBlock {
+            height,
+            hash: vec![height as u8; 32],
+            vtx: vec![tx],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chunk_work_sums_block_weights() {
+        let blocks = vec![
+            block(10),
+            dense_block(11, 2, 3, 1),
+            dense_block(12, 50, 0, 0),
+        ];
+        let expected: u64 = blocks.iter().map(crate::work::block_work).sum();
+        let c = Chunk::from_blocks(0, blocks);
+        assert_eq!(
+            c.work, expected,
+            "the single vtx walk matches work::block_work"
+        );
+        let w = crate::work::BLOCK_WEIGHT;
+        assert_eq!(c.work, w + (w + 2 + 3 + 1) + (w + 50));
+        assert_eq!(
+            c.outputs,
+            2 + 3 + 50,
+            "outputs metric unchanged (no ironwood)"
+        );
+    }
+
+    #[test]
+    fn chunk_append_sums_work() {
+        let mut a = Chunk::from_blocks(0, vec![block(10), dense_block(11, 4, 0, 0)]);
+        let b = Chunk::from_blocks(1, vec![dense_block(12, 0, 9, 2), block(13)]);
+        let (wa, wb) = (a.work, b.work);
+        a.append(b).expect("contiguous");
+        assert_eq!(a.work, wa + wb);
+        let not_next = Chunk::from_blocks(2, vec![dense_block(20, 1, 1, 1)]);
+        let back = a.append(not_next).expect_err("gap");
+        assert_eq!(a.work, wa + wb, "a refused append leaves the work alone");
+        assert_eq!(back.work, crate::work::BLOCK_WEIGHT + 3);
+    }
+
+    /// The scan credits each sub-batch from its height range; over any split of a (merged)
+    /// chunk the credits add up to exactly the chunk's work.
+    #[test]
+    fn sub_batched_chunk_scan_credit_equals_its_work() {
+        let mut c = Chunk::from_blocks(0, vec![block(10), dense_block(11, 30, 0, 0), block(12)]);
+        c.append(Chunk::from_blocks(
+            1,
+            vec![
+                dense_block(13, 0, 40, 0),
+                dense_block(14, 1, 1, 5),
+                block(15),
+            ],
+        ))
+        .expect("contiguous");
+        for splits in [
+            vec![(10, 15)],
+            vec![(10, 11), (12, 12), (13, 15)],
+            vec![(10, 10), (11, 14), (15, 15)],
+        ] {
+            let credited: u64 = splits
+                .iter()
+                .map(|&(lo, hi)| crate::work::work_in_heights(&c.blocks, lo, hi))
+                .sum();
+            assert_eq!(credited, c.work, "split {splits:?}");
+        }
+        // A sub-batch is credited from its own heights, not from the chunk's first N blocks:
+        // the 2-block batch 13..=14 carries the dense blocks, the prefix 10..=11 does not.
+        let w = crate::work::BLOCK_WEIGHT;
+        assert_eq!(
+            crate::work::work_in_heights(&c.blocks, 13, 14),
+            2 * w + 40 + 7
+        );
     }
 
     #[test]

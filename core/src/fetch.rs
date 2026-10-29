@@ -1595,6 +1595,7 @@ async fn release_ordered(
             // Bump the shared progress counter (poll-based; Relaxed — no ordering guarantee).
             if let Some(p) = progress {
                 p.add_fetched(chunk_block_count);
+                p.add_fetched_work(chunk.work);
             }
             queue.send(chunk).await?;
             if let Some(height) = released_through {
