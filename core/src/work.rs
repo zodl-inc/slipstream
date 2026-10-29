@@ -188,9 +188,12 @@ impl PoolEstimate {
     pub fn is_usable(&self) -> bool {
         // An estimate is usable if it has at least two anchors (activation + one data point),
         // or one anchor with non-zero size.
-        self.anchors.len() > 1 || self.anchors.first().map_or(false, |a| a.size > 0)
+        self.anchors.len() > 1 || self.anchors.first().is_some_and(|a| a.size > 0)
     }
 }
+
+/// Per-pool data for building a WorkEstimator: (activation_height, subtree_ends, exact_anchors).
+pub type PoolData = Vec<(u64, Vec<(u64, u64)>, Vec<(u64, u64)>)>;
 
 /// Multi-pool work estimator: sums each pool's estimate.
 #[derive(Clone, Debug)]
@@ -201,7 +204,7 @@ pub struct WorkEstimator {
 impl WorkEstimator {
     /// Build from per-pool data: activation heights, subtree-root completing heights,
     /// and exact anchors. The order of `pool_data` must match `POOLS`.
-    pub fn new(pool_data: Vec<(u64, Vec<(u64, u64)>, Vec<(u64, u64)>)>) -> Self {
+    pub fn new(pool_data: PoolData) -> Self {
         let pools = pool_data
             .into_iter()
             .map(|(activation_height, subtree_ends, exact_anchors)| {
