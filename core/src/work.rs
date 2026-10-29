@@ -465,12 +465,12 @@ mod tests {
 
     #[test]
     fn work_estimator_usable() {
-        let no_data = WorkEstimator::new(vec![(100, vec![], vec![]); 3]);
+        let no_data = WorkEstimator::new(vec![(100, vec![]); 3]);
         assert!(!no_data.is_usable(), "no pool has data");
         let one_pool = WorkEstimator::new(vec![
-            (100, vec![(0, 200)], vec![]),
-            (100, vec![], vec![]),
-            (100, vec![], vec![]),
+            (100, vec![(0, 200)]),
+            (100, vec![]),
+            (100, vec![]),
         ]);
         assert!(one_pool.is_usable(), "first pool has data");
     }
