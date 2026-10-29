@@ -186,6 +186,9 @@ impl ClientCacheKey {
             return None;
         };
 
+        // Without `client-trace` the prefix is dropped by the client, so it must not split the cache.
+        #[cfg(not(feature = "client-trace"))]
+        let trace_prefix = trace_prefix.and(None);
         Some(Self {
             gateway_host: gateway_host.to_string(),
             relay_url: relay_url.to_string(),
