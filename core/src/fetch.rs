@@ -1918,17 +1918,20 @@ impl Booster {
                 // Withdrawn: this window starts the retry wait, nothing else to decide.
                 return;
             }
-        } else if rate > 0.0 {
+        } else if rate > 0.0 && self.live_extras() == 0 {
+            // Only a window without extras of an earlier boost measures the base workers.
             self.last_rate = Some(rate);
         }
         match self.state.observe(fraction) {
+            BoostStep::Start if self.live_extras() > 0 => {
+                // Extras of an earlier boost are still finishing their chunk: their bytes
+                // would count as this boost's, so it starts once they are gone.
+                self.state.defer_start();
+            }
             BoostStep::Start => {
                 self.pre_boost_rate = self.last_rate;
                 self.boost_windows = 0;
-                // Extras of an earlier boost still finishing their chunk would deliver
-                // bytes before this boost's own extras connect and make its baseline
-                // look higher: such a boost is not judged.
-                self.gain_checked = self.live_extras() > 0;
+                self.gain_checked = false;
                 self.start(workers, fraction);
             }
             BoostStep::Stop => self.stop(fraction),
@@ -2012,9 +2015,11 @@ impl Booster {
                 .unwrap_or(0);
             // Parked or finished peers deliver nothing, so the recent best stands in for them.
             let reference = others_best.max(recent_best);
-            // Under the absolute floor everyone is slow: the link is full, and only a head
-            // far behind the others is restarted.
-            let slow = if reference < KICK_MIN_WINDOW_BYTES {
+            // On a slow link everyone is slow: the link is full, and only a head far behind
+            // the others is restarted.
+            // Under eight times the absolute floor the floor would flag a head that keeps
+            // pace with its peers, so only the relative test applies there.
+            let slow = if reference < 8 * KICK_MIN_WINDOW_BYTES {
                 (delta as f64) < KICK_RATE_FRACTION * reference as f64
             } else {
                 head_is_slow(delta, reference)
@@ -2200,6 +2205,12 @@ impl BoostState {
     }
 
     /// A boost raised the byte rate: the next withdrawal waits the shortest time again.
+    /// Undoes a `Start` that cannot happen yet; the next fetch-bound window starts it.
+    fn defer_start(&mut self) {
+        self.on = false;
+        self.hot = BOOST_HOT_WINDOWS.saturating_sub(1);
+    }
+
     fn boost_paid_off(&mut self) {
         self.withdrawals = 0;
     }
@@ -2623,6 +2634,16 @@ mod boost_tests {
             b = decayed_best(b, 0);
         }
         assert!(b < 10, "decays towards zero: {b}");
+    }
+
+    #[test]
+    fn a_deferred_start_starts_on_the_next_fetch_bound_window() {
+        let mut st = BoostState::default();
+        assert_eq!(st.observe(1.0), BoostStep::Stay);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+        st.defer_start();
+        assert!(!st.on);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
     }
 
     #[test]
