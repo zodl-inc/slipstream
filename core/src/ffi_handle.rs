@@ -678,6 +678,7 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
+    use crate::events::PASS_UNIT_BLOCKS;
 
     use super::*;
     use crate::events::WalletWriterGate;

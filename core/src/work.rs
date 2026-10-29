@@ -368,7 +368,7 @@ mod tests {
         // Two pools: first has 100 leaves at h=10, second has 50.
         let est = WorkEstimator::new(vec![
             (5, vec![]),
-            (5, vec![], vec![(10, 50)]),
+            (5, vec![(0, 10)]),
         ]);
         // At h=10: block_work = BLOCK_WEIGHT * 11 = 44, pool_work = 100+50 = 150.
         let expected = BLOCK_WEIGHT * 11 + 150;
@@ -379,7 +379,7 @@ mod tests {
     fn work_estimator_range_is_additive() {
         let est = WorkEstimator::new(vec![
             (5, vec![(0, 50), (1, 100)]),
-            (5, vec![], vec![(100, 200)]),
+            (5, vec![(0, 100)]),
         ]);
         let full = est.range(50, 100);
         let left = est.range(50, 75);
@@ -391,7 +391,7 @@ mod tests {
     fn work_estimator_is_monotonic() {
         let est = WorkEstimator::new(vec![
             (10, vec![(0, 50), (1, 100)]),
-            (10, vec![(0, 60)], vec![]),
+            (10, vec![(0, 60)]),
         ]);
         let mut prev = 0;
         for h in 0..200 {
