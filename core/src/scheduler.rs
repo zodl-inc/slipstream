@@ -32,7 +32,7 @@ use crate::{
     connector::TorConn,
     enhance::{EnhanceStats, enhancement_connection, run_enhancement_lazily_isolated},
     error::SlipstreamError,
-    events::Progress,
+    events::{Progress, PASS_UNIT_BLOCKS, PASS_UNIT_WORK},
     fetch::{FetchPlan, FetchStats, run_fetch},
     scan::{ScanStats, local_treestate_active, needs_server_boundary_state, scan_chunks},
     wallet_session::WalletSession,
@@ -212,7 +212,14 @@ pub(crate) fn update_pass_progress(
     // high/old ones and computes a raw value ABOVE the floor at that instant — that mixed,
     // double-counted read is the bug fixed here (confirmed against this exact seed/credit
     // combination in scheduler::tests::rebaseline_old_order_used_to_latch_a_double_counted_697).
-    if p.scope_expanded(seed) {
+    //
+    // [E-5] Compute the seed's unit and estimator identity for scope-expansion false-positive
+    // prevention: scope_expanded only reports true when seed and floor are in the same unit
+    // and the seed's estimator is at least as complete.
+    let unit = if use_work { PASS_UNIT_WORK } else { PASS_UNIT_BLOCKS };
+    let estimator_identity = work_estimator.map(|e| e.total_anchor_count()).unwrap_or(0);
+
+    if p.scope_expanded(seed, unit, estimator_identity) {
         // [h16-1] The new start already includes everything credited so far: fold the
         // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
         // counters, so the next blend reads 0 pass-local progress against the fresh
@@ -237,7 +244,7 @@ pub(crate) fn update_pass_progress(
         // invariant above, nothing a concurrent poll can fetch_max it with in this window
         // exceeds the floor this call is about to compare `seed` against — so this re-check
         // is guaranteed to still see the expansion.
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed, unit, estimator_identity);
         debug_assert!(
             rebaselined,
             "scope_expanded just reported an expansion and nothing between here and there \
@@ -254,7 +261,7 @@ pub(crate) fn update_pass_progress(
         // of the same pass keep it — the pass's reported progress is measured
         // from where the GLOBAL position stood when the pass began.
         p.set_pass_start_permille_if_unset(seed);
-        let _ = p.permille_floor(seed);
+        let _ = p.permille_floor(seed, unit, estimator_identity);
         false
     }
 }
@@ -347,12 +354,16 @@ pub fn seed_progress_from_wallet(
     // Same unit choice as the pass's first suggest round: in work when the estimator can
     // express the position, so the pass's first work seed is not read as a scope expansion
     // against a higher block-based floor seeded here.
-    let work_seed = session.build_work_estimator().and_then(|est| {
-        global_floor_permille_work(tip, Some(birthday), remaining_work(&est, &ranges), &est)
+    let work_estimator = session.build_work_estimator();
+    let work_seed = work_estimator.as_ref().and_then(|est| {
+        global_floor_permille_work(tip, Some(birthday), remaining_work(est, &ranges), est)
     });
     let seed = work_seed.or_else(|| global_floor_permille(tip, Some(birthday), sum_remaining));
     if let Some(seed) = seed {
-        let _ = progress.permille_floor(seed);
+        // [E-5] Compute unit and estimator identity for the floor update.
+        let unit = if work_seed.is_some() { PASS_UNIT_WORK } else { PASS_UNIT_BLOCKS };
+        let estimator_identity = work_estimator.as_ref().map(|e| e.total_anchor_count()).unwrap_or(0);
+        let _ = progress.permille_floor(seed, unit, estimator_identity);
     }
     tracing::info!(
         tip,
@@ -607,6 +618,11 @@ pub async fn run_to_completion(
             p.set_range_end(end);
         }
 
+        // [B3 fix] Snapshot scanned_work at range start to clamp continuity credit: only credit
+        // the work actually done in THIS attempt, not work from earlier attempts at overlapping
+        // ranges that the counter already holds.
+        let range_start_scanned_work = progress.as_ref().map(|p| p.scanned_work()).unwrap_or(0);
+
         let (mut tx, rx) = chunk_queue(config.memory_budget_bytes);
         // v0.5 pacer fix: boundary treestate fetches start when the chunk is
         // EMITTED (fetch side), so the RTT hides under queue wait + scan
@@ -766,14 +782,22 @@ pub async fn run_to_completion(
             // small repair range while fetched/scanned still hold the whole aborted range.
             scanned_so_far_in_pass +=
                 scan_continuity_repair_credit(start, end_exclusive, u64::from(rewind_height));
-            // B3: Credit surviving work when using work-based progress.
+            // B3: Credit surviving work when using work-based progress. [B3 fix] Clamp to the
+            // work actually done in this attempt (scanned_work_now - range_start snapshot), so we
+            // never credit work from earlier attempts that the counter already holds.
             if let Some(ref est) = work_estimator {
-                scanned_work_so_far_in_pass += scan_continuity_work_credit(
+                let raw_credit = scan_continuity_work_credit(
                     est,
                     start,
                     end_exclusive,
                     u64::from(rewind_height),
                 );
+                let actual_work_done = progress
+                    .as_ref()
+                    .map(|p| p.scanned_work().saturating_sub(range_start_scanned_work))
+                    .unwrap_or(0);
+                let clamped_credit = raw_credit.min(actual_work_done);
+                scanned_work_so_far_in_pass += clamped_credit;
             }
 
             report.reorgs_recovered += 1;
@@ -1202,7 +1226,7 @@ mod tests {
             "zero pass-local count under the NEW seed ⇒ raw = 450 ≤ 900, floor still unmoved"
         );
 
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS, 0);
         assert!(rebaselined, "the re-check must still see the expansion");
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1259,7 +1283,7 @@ mod tests {
         p.set_pass_total(scanned_so_far_in_pass + 1_100_000);
 
         // OLD step 1: lower the floor FIRST.
-        assert!(p.rebaseline_floor_if_scope_expanded(SEED));
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_BLOCKS, 0));
 
         // OLD step 2: move the start SECOND, still ahead of the baseline/total refresh.
         p.set_pass_start_permille(SEED);
@@ -1723,7 +1747,7 @@ mod tests {
             900
         );
 
-        assert!(p.rebaseline_floor_if_scope_expanded(SEED));
+        assert!(p.rebaseline_floor_if_scope_expanded(SEED, PASS_UNIT_WORK, est.total_anchor_count()));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             450
@@ -2174,3 +2198,47 @@ mod tests {
         );
     }
 }
+
+    #[test]
+    fn scope_expansion_false_positive_stale_estimator() {
+        // E-5(a): stale open-time extrapolation (before new roots fetched) should not drop floor.
+        use crate::events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress};
+        use crate::work::WorkEstimator;
+
+        let p = Progress::default();
+        
+        // Initial work-based floor at 800‰ with estimator identity 5.
+        let _ = p.permille_floor(800, PASS_UNIT_WORK, 5);
+        assert_eq!(p.floor_estimator_identity(), 5);
+        
+        // Stale open-time seed at 750‰ from incomplete estimator (identity 3 < 5).
+        // Should NOT rebaseline because estimator is less complete.
+        assert!(!p.rebaseline_floor_if_scope_expanded(750, PASS_UNIT_WORK, 3));
+        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 800);
+        
+        // Later, fresh seed at 850‰ from complete estimator (identity 6 > 5).
+        // Should advance floor normally.
+        let _ = p.permille_floor(850, PASS_UNIT_WORK, 6);
+        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 850);
+    }
+
+    #[test]
+    fn scope_expansion_false_positive_unit_mismatch() {
+        // E-5(b): transient estimator failure (block seed vs work floor) should not drop floor.
+        use crate::events::{PASS_UNIT_BLOCKS, PASS_UNIT_WORK, Progress};
+
+        let p = Progress::default();
+        
+        // Work-based floor at 900‰.
+        let _ = p.permille_floor(900, PASS_UNIT_WORK, 10);
+        
+        // Transient failure produces block seed at 700‰.
+        // Should NOT rebaseline because units don't match.
+        assert!(!p.rebaseline_floor_if_scope_expanded(700, PASS_UNIT_BLOCKS, 0));
+        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 900);
+        
+        // Later, work seed at 950‰.
+        // Should advance floor normally (same unit).
+        let _ = p.permille_floor(950, PASS_UNIT_WORK, 10);
+        assert_eq!(p.progress_permille_floor.load(std::sync::atomic::Ordering::Relaxed), 950);
+    }

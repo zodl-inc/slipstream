@@ -49,17 +49,15 @@ pub struct Chunk {
 impl Chunk {
     pub fn from_blocks(index: u64, blocks: Vec<CompactBlock>) -> Self {
         let estimated_bytes = blocks.iter().map(Message::encoded_len).sum();
-        // Walk vtx once: count outputs for the old metric + work for progress.
+        // Count outputs for the old metric and compute work using work::block_work.
         let mut outputs: u64 = 0;
         let mut work: u64 = 0;
         for block in &blocks {
-            let mut leaves: u64 = 0;
             for tx in &block.vtx {
                 outputs += (tx.outputs.len() + tx.actions.len()) as u64;
-                leaves += (tx.outputs.len() + tx.actions.len() + tx.ironwood_actions.len()) as u64;
             }
-            // Same value as `work::block_work(block)`, from the single vtx walk above.
-            work += crate::work::BLOCK_WEIGHT + leaves;
+            // [Issue #5 nit fix] Call work::block_work instead of re-implementing.
+            work += crate::work::block_work(block);
         }
         Self {
             index,

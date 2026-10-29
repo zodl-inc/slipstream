@@ -98,6 +98,10 @@ pub struct WalletSession {
     // Used by seed_block_metadata (cfg(any(test, feature = "darkside")) only).
     #[cfg_attr(not(any(test, feature = "darkside")), allow(dead_code))]
     db_path: PathBuf,
+    /// Cached work estimator (E-5 fix): reuse the last good estimator on transient failure
+    /// instead of flipping to blocks, which would cause a false scope-expansion if the floor
+    /// is in work units.
+    cached_estimator: std::cell::RefCell<Option<crate::work::WorkEstimator>>,
 }
 
 fn wallet_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
@@ -227,6 +231,7 @@ impl WalletSession {
             network,
             db,
             db_path: db_path.to_path_buf(),
+            cached_estimator: std::cell::RefCell::new(None),
         })
     }
 
@@ -622,22 +627,44 @@ impl WalletSession {
     ///
     /// Progress is presentation state: any error is logged and yields `None`, and the caller
     /// then reports progress in blocks. This never fails a pass.
+    ///
+    /// E-5 fix: caches the last good estimator and reuses it on transient failure instead of
+    /// flipping to blocks, which would cause a false scope-expansion if the floor is in work units.
     pub fn build_work_estimator(&self) -> Option<crate::work::WorkEstimator> {
         match self.read_work_estimator() {
-            Ok(est) => est,
-            Err(e) => {
-                tracing::warn!(%e, "work estimator unavailable; progress falls back to blocks");
+            Ok(Some(est)) => {
+                // Update cache with new successful read.
+                *self.cached_estimator.borrow_mut() = Some(est.clone());
+                Some(est)
+            }
+            Ok(None) => {
+                // Empty shards → blocks. Don't cache this state.
                 None
+            }
+            Err(e) => {
+                tracing::warn!(%e, "work estimator read failed");
+                // Try to reuse cached estimator instead of flipping to blocks.
+                if let Some(cached) = &*self.cached_estimator.borrow() {
+                    tracing::warn!("reusing cached work estimator instead of falling back to blocks");
+                    Some(cached.clone())
+                } else {
+                    tracing::warn!("no cached estimator; progress falls back to blocks");
+                    None
+                }
             }
         }
     }
 
     fn read_work_estimator(&self) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
-        let conn = Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| wallet_err("work estimator open", e))?;
+        // [Issue #4 fix] Wrap blocking sqlite open in block_in_place so it doesn't block the
+        // tokio runtime's other tasks.
+        let conn = tokio::task::block_in_place(|| {
+            Connection::open_with_flags(
+                &self.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|e| wallet_err("work estimator open", e))
+        })?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| wallet_err("work estimator busy_timeout", e))?;
         crate::work::estimator_from_shards(&self.network, |label| read_subtree_ends(&conn, label))

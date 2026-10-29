@@ -98,9 +98,29 @@ impl PoolEstimate {
     /// Build from subtree-root completing heights + exact sizes. The first anchor
     /// is `(activation - 1, 0)` — no leaves before the pool's activation. Each
     /// subtree root `j` with completing height `e_j` adds `(e_j, (j+1) * 65536)`.
-    /// Exact anchors from metadata/chain_metadata overwrite any subtree-derived
-    /// anchor at the same height.
+    ///
+    /// [Issue #5 nit] The `exact_anchors` parameter is test-only. Production code should call
+    /// `new_production` instead. This version is kept for test backwards compatibility.
+    #[cfg(test)]
     pub fn new(
+        activation_height: u64,
+        subtree_ends: &[(u64, u64)],
+        exact_anchors: &[(u64, u64)],
+    ) -> Self {
+        Self::new_with_exact(activation_height, subtree_ends, exact_anchors)
+    }
+
+    /// Production version: builds from subtree-root completing heights only, without exact anchors.
+    #[cfg(not(test))]
+    pub fn new(
+        activation_height: u64,
+        subtree_ends: &[(u64, u64)],
+    ) -> Self {
+        Self::new_with_exact(activation_height, subtree_ends, &[])
+    }
+
+    /// Internal implementation used by both test and production versions.
+    fn new_with_exact(
         activation_height: u64,
         subtree_ends: &[(u64, u64)],
         exact_anchors: &[(u64, u64)],
@@ -190,10 +210,21 @@ impl PoolEstimate {
         // or one anchor with non-zero size.
         self.anchors.len() > 1 || self.anchors.first().is_some_and(|a| a.size > 0)
     }
+
+    /// Number of anchors in this pool estimate.
+    pub fn anchor_count(&self) -> u64 {
+        self.anchors.len() as u64
+    }
 }
 
-/// Per-pool data for building a WorkEstimator: (activation_height, subtree_ends, exact_anchors).
+/// Per-pool data for building a WorkEstimator.
+/// Test version: (activation_height, subtree_ends, exact_anchors).
+/// Production version: (activation_height, subtree_ends).
+#[cfg(test)]
 pub type PoolData = Vec<(u64, Vec<(u64, u64)>, Vec<(u64, u64)>)>;
+
+#[cfg(not(test))]
+pub type PoolData = Vec<(u64, Vec<(u64, u64)>)>;
 
 /// Multi-pool work estimator: sums each pool's estimate.
 #[derive(Clone, Debug)]
@@ -203,12 +234,26 @@ pub struct WorkEstimator {
 
 impl WorkEstimator {
     /// Build from per-pool data: activation heights, subtree-root completing heights,
-    /// and exact anchors. The order of `pool_data` must match `POOLS`.
+    /// and exact anchors (test only). The order of `pool_data` must match `POOLS`.
+    #[cfg(test)]
     pub fn new(pool_data: PoolData) -> Self {
         let pools = pool_data
             .into_iter()
             .map(|(activation_height, subtree_ends, exact_anchors)| {
                 PoolEstimate::new(activation_height, &subtree_ends, &exact_anchors)
+            })
+            .collect();
+        Self { pools }
+    }
+
+    /// Build from per-pool data: activation heights and subtree-root completing heights.
+    /// The order of `pool_data` must match `POOLS`. Production version without exact_anchors.
+    #[cfg(not(test))]
+    pub fn new(pool_data: PoolData) -> Self {
+        let pools = pool_data
+            .into_iter()
+            .map(|(activation_height, subtree_ends)| {
+                PoolEstimate::new(activation_height, &subtree_ends)
             })
             .collect();
         Self { pools }
@@ -239,6 +284,12 @@ impl WorkEstimator {
     pub fn pool_count(&self) -> usize {
         self.pools.len()
     }
+
+    /// Total number of anchors across all pools. Used as the estimator identity for
+    /// scope-expansion false-positive prevention (E-5 fix).
+    pub fn total_anchor_count(&self) -> u64 {
+        self.pools.iter().map(|p| p.anchor_count()).sum()
+    }
 }
 
 /// Builds the estimator for `network` from each ACTIVE pool's completed-subtree rows.
@@ -262,7 +313,9 @@ where
             continue;
         };
         let ends = read_shards(pool.label)?;
-        pool_data.push((u64::from(u32::from(activation)), ends, Vec::new()));
+        // [Issue #5 nit] Production code doesn't use exact_anchors; the test-only version of
+        // PoolEstimate::new that takes 3 parameters is only available in #[cfg(test)].
+        pool_data.push((u64::from(u32::from(activation)), ends));
     }
     let est = WorkEstimator::new(pool_data);
     Ok(est.is_usable().then_some(est))
