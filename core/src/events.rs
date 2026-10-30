@@ -70,6 +70,15 @@ pub struct DownloadFailure {
     pub last_unix: u64,
 }
 
+/// Last valid scheduler observation of a work pass's scan scope.
+#[cfg(feature = "zcash_client_sqlite")]
+#[derive(Clone, Copy, Debug)]
+struct WorkPassScope {
+    birthday: u64,
+    total_blocks: u64,
+    reorgs: u64,
+}
+
 /// Shared engine progress for poll-based consumers (decision D8).
 ///
 /// All counters are monotonic during one sync pass; `Relaxed` ordering is
@@ -81,6 +90,9 @@ pub struct DownloadFailure {
 /// receive live updates. `None` disables all progress tracking with zero overhead.
 #[derive(Debug)]
 pub struct Progress {
+    /// Scheduler-only scope evidence; snapshot readers never lock this state.
+    #[cfg(feature = "zcash_client_sqlite")]
+    work_pass_scope: std::sync::Mutex<Option<WorkPassScope>>,
     /// Current chain tip height as reported by the server.
     pub chain_tip: AtomicU64,
     /// Number of compact blocks fetched so far.
@@ -247,6 +259,8 @@ impl Default for Progress {
     /// [`Progress::pass_start_permille`]).
     fn default() -> Self {
         Self {
+            #[cfg(feature = "zcash_client_sqlite")]
+            work_pass_scope: std::sync::Mutex::new(None),
             chain_tip: AtomicU64::new(0),
             fetched_blocks: AtomicU64::new(0),
             scanned_blocks: AtomicU64::new(0),
@@ -281,8 +295,8 @@ impl Default for Progress {
 }
 
 /// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
-/// suggest-round seed this many permille (or more) BELOW the current floor means the scan
-/// scope grew (import/rewind), not that progress regressed. See
+/// suggest-round seed must be more than this many permille BELOW the current floor to
+/// qualify for a reset. Work passes also require independent scope evidence. See
 /// [`Progress::rebaseline_floor_if_scope_expanded`].
 pub const FLOOR_REBASELINE_EPSILON_PERMILLE: u64 = 50;
 
@@ -700,7 +714,29 @@ impl Progress {
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
-    /// Pure read of the scope-expansion condition: true when `seed` lands materially
+    /// Observe a valid work suggestion, detecting exact scope growth or a successful rewind.
+    /// The first observation preserves initial seeding and correction semantics.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn observe_work_scope(&self, birthday: u64, total_blocks: u64) -> bool {
+        let current = WorkPassScope {
+            birthday,
+            total_blocks,
+            reorgs: self.reorgs(),
+        };
+        let mut previous = self
+            .work_pass_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let expanded = previous.is_none_or(|old| {
+            current.birthday < old.birthday
+                || current.total_blocks > old.total_blocks
+                || current.reorgs > old.reorgs
+        });
+        *previous = Some(current);
+        expanded
+    }
+
+    /// Pure read of numeric reset eligibility: true when `seed` lands materially
     /// BELOW the current session floor. Stores nothing; lets a caller decide which branch
     /// to take and publish fields in a safe order before the floor moves.
     ///
@@ -726,10 +762,9 @@ impl Progress {
     }
 
     /// When a suggest round's GLOBAL seed lands materially BELOW the current session floor,
-    /// the scan scope expanded — an imported account with an older birthday, or a rewind
-    /// re-growing the queue. Reset the floor to the new truthful seed. Normal operation
-    /// never triggers this: within one scope the seed is monotone and tip drift is <1‰.
-    /// The epsilon is far above that noise and far below a real expansion.
+    /// reset the floor to that seed if its unit is compatible. A numeric gap alone is not
+    /// evidence of scope growth: exact work can outpace its subtree estimate. The scheduler
+    /// additionally requires observed scope growth for initialized WORK-to-WORK resets.
     /// Returns whether a re-baseline happened.
     pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64, seed_unit: u64) -> bool {
         if self.scope_expanded(seed, seed_unit) {
@@ -887,6 +922,13 @@ impl Progress {
     /// [`Self::request_stop_for_wallet_change`]). It outlives the pass it interrupts, and only
     /// [`Self::begin_session`] re-arms it.
     pub fn begin_pass(&self) {
+        #[cfg(feature = "zcash_client_sqlite")]
+        {
+            *self
+                .work_pass_scope
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
         self.scanned_work.store(0, Ordering::Relaxed);
@@ -1369,6 +1411,30 @@ mod tests {
             2,
             "tx_set_version is monotonic per handle"
         );
+    }
+
+    #[cfg(feature = "zcash_client_sqlite")]
+    #[test]
+    fn work_scope_observation_tracks_exact_growth() {
+        let p = Progress::default();
+        assert!(p.observe_work_scope(1_001, 1_000));
+        assert!(!p.observe_work_scope(1_001, 1_000));
+        assert!(!p.observe_work_scope(1_001, 900));
+        assert!(p.observe_work_scope(1_001, 1_000));
+        assert!(p.observe_work_scope(1, 1_000));
+        p.add_reorg();
+        assert!(p.observe_work_scope(1, 1_000));
+        assert!(!p.observe_work_scope(1, 1_000));
+    }
+
+    #[cfg(feature = "zcash_client_sqlite")]
+    #[test]
+    fn begin_pass_resets_work_scope_observation() {
+        let p = Progress::default();
+        assert!(p.observe_work_scope(1, 1_000));
+        assert!(!p.observe_work_scope(1, 1_000));
+        p.begin_pass();
+        assert!(p.observe_work_scope(1, 1_000));
     }
 
     /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
