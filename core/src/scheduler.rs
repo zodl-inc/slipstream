@@ -1810,11 +1810,11 @@ mod tests {
 
         p.begin_pass();
         let (mut b, mut w) = (0, 0);
-        let pending = [6_001..10_001];
+        let pending = 6_001..10_001;
         assert!(!update_pass_progress(
             &p,
             &mut b,
-            &pending,
+            std::slice::from_ref(&pending),
             Some(1),
             &mut w,
             0,
@@ -1827,12 +1827,26 @@ mod tests {
 
         p.begin_pass();
         let (mut b, mut w) = (0, 0);
-        let rebaselined = dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending);
+        let rebaselined = dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending),
+        );
         let recovered = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         assert_eq!(recovered, 636, "rebaselined={rebaselined}");
         assert!(!rebaselined);
         assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
-        assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             636
@@ -1891,13 +1905,13 @@ mod tests {
     #[test]
     fn work_progress_block_snapshot_retains_work_provenance() {
         let (p, est) = block_snapshot_advance_fixture();
-        let pending = [7_001..10_001];
+        let pending = 7_001..10_001;
         for _ in 0..2 {
             p.begin_pass();
             assert!(!update_pass_progress(
                 &p,
                 &mut 0,
-                &pending,
+                std::slice::from_ref(&pending),
                 Some(1),
                 &mut 0,
                 0,
@@ -1909,7 +1923,14 @@ mod tests {
             );
             assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
             p.begin_pass();
-            assert!(!dense_suggest(&p, &mut 0, &mut 0, &est, Some(1), &pending));
+            assert!(!dense_suggest(
+                &p,
+                &mut 0,
+                &mut 0,
+                &est,
+                Some(1),
+                std::slice::from_ref(&pending)
+            ));
             assert_eq!(
                 derive_snapshot(&p, SyncState::Syncing).progress_permille,
                 700
@@ -1923,14 +1944,28 @@ mod tests {
         let (p, est) = block_snapshot_advance_fixture();
         p.note_work_rewind(5_001..10_001);
         p.begin_pass();
-        let pending = [5_001..10_001];
+        let pending = 5_001..10_001;
         let (mut b, mut w) = (0, 0);
-        assert!(dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             500
         );
-        assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             500
@@ -1952,14 +1987,28 @@ mod tests {
         let (p, est) = block_snapshot_advance_fixture();
         p.set_chain_tip(20_000);
         p.begin_pass();
-        let pending = [7_001..20_001];
+        let pending = 7_001..20_001;
         let (mut b, mut w) = (0, 0);
-        assert!(dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             350
         );
-        assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             350
@@ -1971,11 +2020,11 @@ mod tests {
         let est = WorkEstimator::new(vec![(6_001, vec![(0, 10_000)])]);
         let p = Progress::default();
         p.set_chain_tip(11_000);
-        let pending = [6_001..10_001];
+        let pending = 6_001..10_001;
         assert!(!update_pass_progress(
             &p,
             &mut 0,
-            &pending,
+            std::slice::from_ref(&pending),
             Some(1),
             &mut 0,
             0,
@@ -1987,13 +2036,27 @@ mod tests {
         );
         assert_eq!(p.floor_unit(), PASS_UNIT_BLOCKS);
         p.begin_pass();
-        assert!(dense_suggest(&p, &mut 0, &mut 0, &est, Some(1), &pending));
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             352
         );
         assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
-        assert!(!dense_suggest(&p, &mut 0, &mut 0, &est, Some(1), &pending));
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&pending)
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             352
