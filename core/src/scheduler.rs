@@ -200,10 +200,10 @@ pub(crate) fn update_pass_progress(
     // `forceCounterProgressUntilDone`; the blessed permille now reads the
     // genuine climb by itself).
     //
-    // [h17-1] Decide with the PURE read (`Progress::scope_expanded`) first, and when it says
-    // the scope expanded, publish the whole re-baselined pass — baseline, total, then start
-    // — and only THEN lower the floor, last. `derive_snapshot` can run on another thread at
-    // any instant while this function is mid-flight, and it folds whatever it reads into the
+    // [h17-1] Decide with the PURE read (`Progress::scope_expanded`) first. When the numeric
+    // gap qualifies and scope evidence permits it, publish the re-baselined pass — baseline,
+    // total, then start — and only THEN lower the floor, last. `derive_snapshot` can run on
+    // another thread at any instant while this function is mid-flight, folding its reads into the
     // floor with `fetch_max`, so every intermediate combination of fields it can observe here
     // must compute a raw value AT MOST the floor the OLD scope already published, or that
     // stale-but-too-high reading gets latched permanently (fetch_max never lowers):
@@ -228,7 +228,17 @@ pub(crate) fn update_pass_progress(
         PASS_UNIT_BLOCKS
     };
 
-    if p.scope_expanded(seed, unit) {
+    // Estimates can lag actual credited work even when the scan scope is unchanged.
+    // Observe every valid work suggestion, including the first zero/unset-floor seed.
+    let work_scope_expanded = if use_work {
+        wallet_birthday.is_some_and(|birthday| {
+            p.observe_work_scope(birthday, *scanned_so_far_in_pass + sum_remaining)
+        })
+    } else {
+        false
+    };
+    let scope_allows_reset = !use_work || p.floor_unit() != PASS_UNIT_WORK || work_scope_expanded;
+    if scope_allows_reset && p.scope_expanded(seed, unit) {
         // [h16-1] The new start already includes everything credited so far: fold the
         // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
         // counters, so the next blend reads 0 pass-local progress against the fresh
@@ -241,6 +251,10 @@ pub(crate) fn update_pass_progress(
         if use_work {
             p.set_pass_baseline_work(p.fetched_work(), p.scanned_work());
             p.set_pass_total_work(sum_remaining_work);
+            if let Some(birthday) = wallet_birthday {
+                // Credited blocks were folded into the seed; track the remaining-only scope.
+                p.observe_work_scope(birthday, sum_remaining);
+            }
         }
         // [h10] The pass start follows the re-baseline: the scope grew UNDER
         // this running pass, so the pass's own progress must stretch from the
@@ -1519,6 +1533,365 @@ mod tests {
     /// Uniform density: 6 leaves per block, so every block is 10 work units.
     fn uniform(tip: u64) -> WorkEstimator {
         WorkEstimator::new_for_test(vec![(1, vec![], vec![(tip, 6 * tip)])])
+    }
+
+    // A numeric seed gap caused only by actual leaf density must not reset progress.
+    fn assert_dense_tip_stays_monotonic(est: WorkEstimator, birthday: u64) {
+        let tip = birthday + 10_999;
+        let p = Progress::default();
+        p.set_chain_tip(tip);
+        let (mut blocks_done, mut work_done) = (0, 0);
+        let historic_work = est.range(birthday, birthday + 9_999);
+        let initial_work = est.range(birthday, tip);
+        assert!(!update_pass_progress(
+            &p,
+            &mut blocks_done,
+            11_000,
+            Some(birthday),
+            &mut work_done,
+            initial_work,
+            Some(&est),
+        ));
+        let actual_tip_work = 60_000 + 1_000 * BLOCK_WEIGHT;
+        p.add_fetched(1_000);
+        p.add_scanned(1_000);
+        p.add_fetched_work(actual_tip_work);
+        p.add_scanned_work(actual_tip_work);
+        blocks_done += 1_000;
+        work_done += actual_tip_work;
+        let before = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        let estimated_seed =
+            global_floor_permille_work(tip, Some(birthday), historic_work, &est).unwrap();
+        assert_eq!(before, 551);
+        assert_eq!(estimated_seed, 90);
+        assert!(u64::from(before) > estimated_seed + 50);
+        assert_ne!(
+            before, 90,
+            "the display follows actual work, not the block ratio"
+        );
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut blocks_done,
+            10_000,
+            Some(birthday),
+            &mut work_done,
+            historic_work,
+            Some(&est),
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!(
+            "dense tip: before={before}, estimated_seed={estimated_seed}, after={after}, rebaselined={rebaselined}"
+        );
+        assert!(!rebaselined);
+        assert_eq!(after, before);
+        assert_eq!(blocks_done, 1_000);
+        assert_eq!(work_done, actual_tip_work);
+        let rebaselined_again = update_pass_progress(
+            &p,
+            &mut blocks_done,
+            10_000,
+            Some(birthday),
+            &mut work_done,
+            historic_work,
+            Some(&est),
+        );
+        let after_again = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!(!rebaselined_again);
+        assert_eq!(after_again, before);
+        p.add_fetched(10_000);
+        p.add_scanned(10_000);
+        p.add_fetched_work(historic_work);
+        p.add_scanned_work(historic_work);
+        let complete = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert_eq!(complete, 1000);
+    }
+
+    #[test]
+    fn work_progress_dense_tip_does_not_rebaseline_unchanged_scope() {
+        assert_dense_tip_stays_monotonic(WorkEstimator::new(vec![(1, vec![(0, 10_000)])]), 1);
+    }
+
+    #[test]
+    fn work_progress_dense_tip_with_mainnet_subtree_indices_stays_monotonic() {
+        assert_dense_tip_stays_monotonic(
+            WorkEstimator::new(vec![(419_200, vec![(100, 2_000_000), (101, 2_010_000)])]),
+            2_000_001,
+        );
+    }
+
+    // Queue growth must remain visible even when the wallet birthday is unchanged.
+    #[test]
+    fn work_scope_queue_growth_without_earlier_birthday_rebaselines() {
+        let est = uniform(10_000);
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        let (mut b, mut w) = (0, 0);
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            10_000,
+            Some(1),
+            &mut w,
+            100_000,
+            Some(&est)
+        ));
+        p.add_fetched(9_000);
+        p.add_scanned(9_000);
+        p.add_fetched_work(90_000);
+        p.add_scanned_work(90_000);
+        b = 9_000;
+        w = 90_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+        assert!(update_pass_progress(
+            &p,
+            &mut b,
+            2_000,
+            Some(1),
+            &mut w,
+            20_000,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            800
+        );
+        assert_eq!((b, w), (0, 0));
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            2_000,
+            Some(1),
+            &mut w,
+            20_000,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            800
+        );
+        p.add_fetched_work(10_000);
+        p.add_scanned_work(10_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+    }
+
+    // A successful rewind is independent evidence even with the same whole-pass block total.
+    #[test]
+    fn work_scope_rewind_without_total_growth_rebaselines_once() {
+        let est = uniform(10_000);
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        let (mut b, mut w) = (0, 0);
+        update_pass_progress(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
+        p.add_fetched(10_000);
+        p.add_scanned(9_000);
+        p.add_fetched_work(100_000);
+        p.add_scanned_work(90_000);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            950
+        );
+        b = 8_990;
+        w = 89_900;
+        p.add_reorg();
+        assert!(update_pass_progress(
+            &p,
+            &mut b,
+            1_010,
+            Some(1),
+            &mut w,
+            10_100,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            899
+        );
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            1_010,
+            Some(1),
+            &mut w,
+            10_100,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            899
+        );
+        p.add_fetched_work(10_100);
+        p.add_scanned_work(10_100);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    // An invalid suggest must neither erase the observation nor consume real later growth.
+    #[test]
+    fn work_scope_missing_birthday_preserves_observation() {
+        let est = uniform(10_000);
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        let (mut b, mut w) = (0, 0);
+        update_pass_progress(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
+        p.add_fetched(1_000);
+        p.add_scanned(1_000);
+        p.add_fetched_work(90_000);
+        p.add_scanned_work(90_000);
+        b = 1_000;
+        w = 90_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            9_000,
+            None,
+            &mut w,
+            90_000,
+            Some(&est)
+        ));
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            9_000,
+            Some(1),
+            &mut w,
+            90_000,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            10_000,
+            None,
+            &mut w,
+            100_000,
+            Some(&est)
+        ));
+        assert!(update_pass_progress(
+            &p,
+            &mut b,
+            10_000,
+            Some(1),
+            &mut w,
+            100_000,
+            Some(&est)
+        ));
+        assert_eq!(derive_snapshot(&p, SyncState::Syncing).progress_permille, 0);
+    }
+
+    // Resetting credited work changes the comparison baseline for the next genuine growth.
+    #[test]
+    fn work_scope_rebaseline_records_remaining_only_total() {
+        let est = uniform(10_000);
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        let (mut b, mut w) = (0, 0);
+        update_pass_progress(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
+        p.add_fetched(9_000);
+        p.add_scanned(9_000);
+        p.add_fetched_work(90_000);
+        p.add_scanned_work(90_000);
+        b = 9_000;
+        w = 90_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+        assert!(update_pass_progress(
+            &p,
+            &mut b,
+            2_000,
+            Some(1),
+            &mut w,
+            20_000,
+            Some(&est)
+        ));
+        assert_eq!(p.pass_total(), 2_000);
+        p.add_fetched(100);
+        p.add_scanned(100);
+        p.add_fetched_work(1_000);
+        p.add_scanned_work(1_000);
+        b = 100;
+        w = 1_000;
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            810
+        );
+        // 2,600 blocks is larger than the rebased 2,000, but below the old 11,000.
+        assert!(update_pass_progress(
+            &p,
+            &mut b,
+            2_500,
+            Some(1),
+            &mut w,
+            25_000,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            750
+        );
+        assert_eq!((b, w), (0, 0));
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            2_500,
+            Some(1),
+            &mut w,
+            25_000,
+            Some(&est)
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            750
+        );
+    }
+
+    // Both a prior WORK floor and a prior BLOCKS floor retain first-suggest correction.
+    #[test]
+    fn work_scope_new_pass_preserves_initial_correction() {
+        let est = uniform(10_000);
+        for old_unit in [PASS_UNIT_WORK, PASS_UNIT_BLOCKS] {
+            let p = Progress::default();
+            p.set_chain_tip(10_000);
+            update_pass_progress(&p, &mut 0, 10_000, Some(1), &mut 0, 100_000, Some(&est));
+            p.permille_floor(900, old_unit);
+            p.begin_pass();
+            assert!(update_pass_progress(
+                &p,
+                &mut 0,
+                10_000,
+                Some(1),
+                &mut 0,
+                100_000,
+                Some(&est)
+            ));
+            assert_eq!(derive_snapshot(&p, SyncState::Syncing).progress_permille, 0);
+            assert!(!update_pass_progress(
+                &p,
+                &mut 0,
+                10_000,
+                Some(1),
+                &mut 0,
+                100_000,
+                Some(&est)
+            ));
+        }
     }
 
     #[test]
