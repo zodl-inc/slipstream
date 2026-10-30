@@ -126,19 +126,22 @@ pub(crate) fn remaining_work(
 /// [h16-1] One suggest round's progress bookkeeping: set the pass total and seed/re-baseline
 /// the session floor + pass start from the GLOBAL seed. Extracted from the `run_to_completion`
 /// loop body (behaviour unchanged by the extraction itself) so it can be driven directly in
-/// tests without a live fetch/scan pass — everything here is pure atomic bookkeeping over an
-/// already-known range-length sum, no network I/O. Reads `p.chain_tip()` live, like the inline
+/// tests without a live fetch/scan pass — everything here is scheduler bookkeeping over
+/// already-known pending ranges, no network I/O. Reads `p.chain_tip()` live, like the inline
 /// block it replaces. Returns whether this round re-baselined the session floor (test hook;
 /// `run_to_completion` ignores it).
 pub(crate) fn update_pass_progress(
     p: &Progress,
     scanned_so_far_in_pass: &mut u64,
-    sum_remaining: u64,
+    pending: &[std::ops::Range<u64>],
     wallet_birthday: Option<u64>,
     scanned_work_so_far_in_pass: &mut u64,
     sum_remaining_work: u64,
     work_estimator: Option<&crate::work::WorkEstimator>,
 ) -> bool {
+    let sum_remaining = pending.iter().fold(0u64, |sum, r| {
+        sum.saturating_add(r.end.saturating_sub(r.start))
+    });
     // [h16-1] Snapshot the pass-local blend baseline BEFORE the pass total is set: from
     // this moment, `derive_snapshot` reads `fetched()`/`scanned()` relative to this
     // baseline instead of raw, so blocks already credited to `scanned_so_far_in_pass`
@@ -228,17 +231,23 @@ pub(crate) fn update_pass_progress(
         PASS_UNIT_BLOCKS
     };
 
-    // Estimates can lag actual credited work even when the scan scope is unchanged.
-    // Observe every valid work suggestion, including the first zero/unset-floor seed.
-    let work_scope_expanded = if use_work {
-        wallet_birthday.is_some_and(|birthday| {
-            p.observe_work_scope(birthday, *scanned_so_far_in_pass + sum_remaining)
-        })
+    // Estimator/exact-credit gaps alone never justify lowering a retained WORK floor.
+    let lower_bound = if use_work {
+        wallet_birthday
+            .zip(work_estimator)
+            .map(|(birthday, est)| p.work_scope_lower_bound(birthday, pending, est))
     } else {
-        false
+        None
     };
-    let scope_allows_reset = !use_work || p.floor_unit() != PASS_UNIT_WORK || work_scope_expanded;
-    if scope_allows_reset && p.scope_expanded(seed, unit) {
+    let correction_seed = if use_work && p.floor_unit() == PASS_UNIT_WORK {
+        seed.max(lower_bound.unwrap_or_else(|| {
+            p.progress_permille_floor
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }))
+    } else {
+        seed
+    };
+    if p.scope_expanded(correction_seed, unit) {
         // [h16-1] The new start already includes everything credited so far: fold the
         // pass-local accumulator back to 0 and re-snapshot the baseline to the CURRENT
         // counters, so the next blend reads 0 pass-local progress against the fresh
@@ -251,30 +260,26 @@ pub(crate) fn update_pass_progress(
         if use_work {
             p.set_pass_baseline_work(p.fetched_work(), p.scanned_work());
             p.set_pass_total_work(sum_remaining_work);
-            if let Some(birthday) = wallet_birthday {
-                // Credited blocks were folded into the seed; track the remaining-only scope.
-                p.observe_work_scope(birthday, sum_remaining);
-            }
         }
         // [h10] The pass start follows the re-baseline: the scope grew UNDER
         // this running pass, so the pass's own progress must stretch from the
         // re-baselined position too, or it would still stretch from the stale
         // pre-expansion start and under-report the re-scan's climb.
-        p.set_pass_start_permille(seed);
+        p.set_pass_start_permille(correction_seed);
         // [h17-1] Lower the floor LAST, now that the rest of the re-baselined pass is fully
         // published (see above). `scope_expanded` and this call share exactly one condition
         // (it calls that method) and the floor only ever RISES in between — and, per the
         // invariant above, nothing a concurrent poll can fetch_max it with in this window
         // exceeds the floor this call is about to compare `seed` against — so this re-check
         // is guaranteed to still see the expansion.
-        let rebaselined = p.rebaseline_floor_if_scope_expanded(seed, unit);
+        let rebaselined = p.rebaseline_floor_if_scope_expanded(correction_seed, unit);
         debug_assert!(
             rebaselined,
             "scope_expanded just reported an expansion and nothing between here and there \
              can raise the floor above what it already held, so the re-check cannot flip"
         );
         info!(
-            seed,
+            seed = correction_seed,
             birthday = wallet_birthday,
             "scan scope expanded — session progress floor re-baselined (re-scan reads as a genuine climb)"
         );
@@ -287,6 +292,25 @@ pub(crate) fn update_pass_progress(
         let _ = p.permille_floor(seed, unit);
         false
     }
+}
+
+/// Carry only scan/rewind height evidence into the lifetime correction bound.
+fn record_continuity_scope(
+    p: &Progress,
+    start: u64,
+    end_exclusive: u64,
+    at: u64,
+    range_start_scanned: u64,
+) {
+    // A continuity error can occur inside a chunk that never published scan credit.
+    // Its height alone is not proof that the entire preceding range was earned.
+    let scanned_end = start
+        .saturating_add(p.scanned().saturating_sub(range_start_scanned))
+        .min(at)
+        .min(end_exclusive)
+        .max(start);
+    p.note_work_completed(start..scanned_end);
+    p.note_work_rewind(at.saturating_sub(10)..p.chain_tip().saturating_add(1));
 }
 
 /// [h16-2] How much of an aborted range's work survives a `ScanContinuity` truncate: the
@@ -592,14 +616,6 @@ pub async fn run_to_completion(
         // complete from the very first suggestion. Re-suggest after each range recomputes
         // correctly: scanned_so_far + sum(remaining) stays constant unless new ranges appear.
         if let Some(ref p) = progress {
-            let sum_remaining: u64 = ranges
-                .iter()
-                .map(|r| {
-                    let s = u64::from(r.block_range().start);
-                    let e = u64::from(r.block_range().end);
-                    e.saturating_sub(s)
-                })
-                .sum();
             // B1: Compute sum_remaining_work when a WorkEstimator is available.
             let sum_remaining_work = work_estimator
                 .as_ref()
@@ -615,7 +631,10 @@ pub async fn run_to_completion(
             update_pass_progress(
                 p,
                 &mut scanned_so_far_in_pass,
-                sum_remaining,
+                &ranges
+                    .iter()
+                    .map(|r| u64::from(r.block_range().start)..u64::from(r.block_range().end))
+                    .collect::<Vec<_>>(),
                 wallet_birthday,
                 &mut scanned_work_so_far_in_pass,
                 sum_remaining_work,
@@ -651,6 +670,7 @@ pub async fn run_to_completion(
         // the work actually done in THIS attempt, not work from earlier attempts at overlapping
         // ranges that the counter already holds.
         let range_start_scanned_work = progress.as_ref().map(|p| p.scanned_work()).unwrap_or(0);
+        let range_start_scanned = progress.as_ref().map(|p| p.scanned()).unwrap_or(0);
 
         let (mut tx, rx) = chunk_queue(config.memory_budget_bytes);
         // v0.5 pacer fix: boundary treestate fetches start when the chunk is
@@ -831,6 +851,13 @@ pub async fn run_to_completion(
 
             report.reorgs_recovered += 1;
             if let Some(ref p) = progress {
+                record_continuity_scope(
+                    p,
+                    start,
+                    end_exclusive,
+                    u64::from(at),
+                    range_start_scanned,
+                );
                 p.add_reorg();
             }
 
@@ -935,6 +962,9 @@ pub async fn run_to_completion(
         report.enhance.address += scan_stats.interleaved_enhance.address;
 
         // F1: accumulate scanned blocks for next iteration's whole-pass denominator.
+        if let Some(ref p) = progress {
+            p.note_work_completed(start..end_exclusive);
+        }
         scanned_so_far_in_pass += scan_stats.blocks;
         // B1: accumulate scanned work when using work-based progress.
         scanned_work_so_far_in_pass += scan_stats.work;
@@ -1113,7 +1143,7 @@ mod tests {
 
         // Round 1: the pass's first suggest round, no expansion yet — a 1,000,000-block
         // span with everything still remaining, so the seed (and the latched start) is 0.
-        let rebaselined = update_pass_progress(
+        let rebaselined = progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             1_000_000,
@@ -1142,7 +1172,7 @@ mod tests {
         // 2,000,000-block span with 1,100,000 remaining (the reviewer's own example).
         // seed = (2,000,000 − 1,100,000) × 1000 / 2,000,000 = 450, far enough below the
         // 900 floor to read as scope expansion, not noise.
-        let rebaselined = update_pass_progress(
+        let rebaselined = progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             1_100_000,
@@ -1168,7 +1198,7 @@ mod tests {
         // is still 450, which must NOT read as a further expansion against the now-correct
         // 450 floor (pre-fix, the round-2 poll above re-inflates the floor and this round
         // wrongly re-baselines again).
-        let rebaselined_again = update_pass_progress(
+        let rebaselined_again = progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             1_100_000,
@@ -1216,7 +1246,7 @@ mod tests {
         const B1: u64 = TIP - 1_000_000 + 1;
         p.set_chain_tip(TIP);
         let mut scanned_so_far_in_pass = 0u64;
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             1_000_000,
@@ -1283,7 +1313,7 @@ mod tests {
         const B1: u64 = TIP - 1_000_000 + 1;
         p.set_chain_tip(TIP);
         let mut scanned_so_far_in_pass = 0u64;
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             1_000_000,
@@ -1369,7 +1399,7 @@ mod tests {
             Some(663_150),
             "single-account wallet reads that account's birthday"
         );
-        let rebaselined = update_pass_progress(
+        let rebaselined = progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             3_000,
@@ -1419,7 +1449,7 @@ mod tests {
             Some(600_000),
             "a fresh read after the mid-pass import returns the NEW minimum birthday"
         );
-        let rebaselined = update_pass_progress(
+        let rebaselined = progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             60_000,
@@ -1456,7 +1486,7 @@ mod tests {
 
         // Round 1: the range about to break is [0, 10_000) — "a 10k-block range".
         let (start, end_exclusive) = (0u64, 10_000u64);
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             end_exclusive - start,
@@ -1487,7 +1517,7 @@ mod tests {
         // Next suggest round: the repair range is [8_990, 10_000) -> 1_010 remaining
         // ("T ≈ 1,010" in the reviewer's own notation for the UNCREDITED pre-fix total —
         // post-fix, T is the credited 8_990 plus this 1_010 repair range).
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut scanned_so_far_in_pass,
             1_010,
@@ -1530,6 +1560,29 @@ mod tests {
         WorkEstimator::new_for_test(vec![(1, vec![], vec![(1_000, 0), (2_000, 32_000)])])
     }
 
+    fn progress_for_suffix(
+        p: &Progress,
+        b: &mut u64,
+        remaining: u64,
+        birthday: Option<u64>,
+        w: &mut u64,
+        remaining_work: u64,
+        estimator: Option<&WorkEstimator>,
+    ) -> bool {
+        // These older arithmetic fixtures describe one contiguous suffix. Tests of
+        // irregular scheduling geometry call update_pass_progress directly.
+        let end = p.chain_tip().saturating_add(1).max(remaining);
+        update_pass_progress(
+            p,
+            b,
+            &[end.saturating_sub(remaining)..end],
+            birthday,
+            w,
+            remaining_work,
+            estimator,
+        )
+    }
+
     /// Uniform density: 6 leaves per block, so every block is 10 work units.
     fn uniform(tip: u64) -> WorkEstimator {
         WorkEstimator::new_for_test(vec![(1, vec![], vec![(tip, 6 * tip)])])
@@ -1546,17 +1599,18 @@ mod tests {
         assert!(!update_pass_progress(
             &p,
             &mut blocks_done,
-            11_000,
+            &[birthday..birthday + 11_000],
             Some(birthday),
             &mut work_done,
             initial_work,
-            Some(&est),
+            Some(&est)
         ));
         let actual_tip_work = 60_000 + 1_000 * BLOCK_WEIGHT;
         p.add_fetched(1_000);
         p.add_scanned(1_000);
         p.add_fetched_work(actual_tip_work);
         p.add_scanned_work(actual_tip_work);
+        p.note_work_completed(birthday + 10_000..birthday + 11_000);
         blocks_done += 1_000;
         work_done += actual_tip_work;
         let before = derive_snapshot(&p, SyncState::Syncing).progress_permille;
@@ -1572,7 +1626,7 @@ mod tests {
         let rebaselined = update_pass_progress(
             &p,
             &mut blocks_done,
-            10_000,
+            &[birthday..birthday + 10_000],
             Some(birthday),
             &mut work_done,
             historic_work,
@@ -1589,7 +1643,7 @@ mod tests {
         let rebaselined_again = update_pass_progress(
             &p,
             &mut blocks_done,
-            10_000,
+            &[birthday..birthday + 10_000],
             Some(birthday),
             &mut work_done,
             historic_work,
@@ -1619,6 +1673,426 @@ mod tests {
         );
     }
 
+    fn dense_tip_fixture(est: &WorkEstimator, birthday: u64) -> (Progress, u64, u64) {
+        let p = Progress::default();
+        let tip = birthday + 10_999;
+        p.set_chain_tip(tip);
+        let (mut b, mut w) = (0, 0);
+        update_pass_progress(
+            &p,
+            &mut b,
+            &[birthday..birthday + 11_000],
+            Some(birthday),
+            &mut w,
+            est.range(birthday, tip),
+            Some(est),
+        );
+        let actual = 60_000 + 1_000 * BLOCK_WEIGHT;
+        p.add_fetched(1_000);
+        p.add_scanned(1_000);
+        p.add_fetched_work(actual);
+        p.add_scanned_work(actual);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+        p.note_work_completed(birthday + 10_000..birthday + 11_000);
+        (p, 1_000, actual)
+    }
+
+    fn assert_dense_tip_restart(est: WorkEstimator, birthday: u64) {
+        let (p, mut b, mut w) = dense_tip_fixture(&est, birthday);
+        update_pass_progress(
+            &p,
+            &mut b,
+            &[birthday..birthday + 10_000],
+            Some(birthday),
+            &mut w,
+            est.range(birthday, birthday + 9_999),
+            Some(&est),
+        );
+        let before = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        p.begin_pass();
+        b = 0;
+        w = 0;
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut b,
+            &[birthday..birthday + 10_000],
+            Some(birthday),
+            &mut w,
+            est.range(birthday, birthday + 9_999),
+            Some(&est),
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!("restart before={before} after={after} rebaselined={rebaselined}");
+        assert_eq!(before, 551);
+        assert!(!rebaselined);
+        assert_eq!(after, 551);
+    }
+
+    #[test]
+    fn work_progress_dense_tip_restart_keeps_floor() {
+        assert_dense_tip_restart(WorkEstimator::new(vec![(1, vec![(0, 10_000)])]), 1);
+    }
+
+    #[test]
+    fn work_progress_dense_tip_mainnet_restart_keeps_floor() {
+        assert_dense_tip_restart(
+            WorkEstimator::new(vec![(419_200, vec![(100, 2_000_000), (101, 2_010_000)])]),
+            2_000_001,
+        );
+    }
+
+    #[test]
+    fn work_progress_dense_tip_short_rewind_is_bounded() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        let before = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        // The dense ChainTip attempt breaks at the tip and rewinds ten blocks.
+        let (start, end, at) = (10_001, 11_001, 11_000u64);
+        let rewind = at.saturating_sub(10);
+        b = b - 1_000 + scan_continuity_repair_credit(start, end, rewind);
+        w = w - (60_000 + 1_000 * BLOCK_WEIGHT)
+            + scan_continuity_work_credit(&est, start, end, rewind).min(p.scanned_work());
+        record_continuity_scope(&p, start, end, at, 0);
+        p.add_reorg();
+        let remaining = est.range(1, 10_000) + est.range(rewind, 11_000);
+        let rebaselined = update_pass_progress(
+            &p,
+            &mut b,
+            &[1..10_001, rewind..11_001],
+            Some(1),
+            &mut w,
+            remaining,
+            Some(&est),
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!("rewind before={before} after={after} rebaselined={rebaselined}");
+        let reopened_share = (u128::from(est.range(rewind, 11_000)) * 1000)
+            .div_ceil(u128::from(est.range(1, 11_000))) as u16;
+        assert_eq!(before, 551);
+        assert!(after >= 551 - reopened_share);
+        assert_eq!(after, 551);
+    }
+
+    fn dense_suggest(
+        p: &Progress,
+        b: &mut u64,
+        w: &mut u64,
+        est: &WorkEstimator,
+        birthday: Option<u64>,
+        pending: &[std::ops::Range<u64>],
+    ) -> bool {
+        let work = pending.iter().map(|r| est.range(r.start, r.end - 1)).sum();
+        update_pass_progress(p, b, pending, birthday, w, work, Some(est))
+    }
+
+    #[test]
+    fn work_progress_repeated_restarts_keep_floor() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, _, _) = dense_tip_fixture(&est, 1);
+        for _ in 0..3 {
+            p.begin_pass();
+            let (mut b, mut w) = (0, 0);
+            assert!(!dense_suggest(
+                &p,
+                &mut b,
+                &mut w,
+                &est,
+                Some(1),
+                &[1..10_001]
+            ));
+            assert_eq!(
+                derive_snapshot(&p, SyncState::Syncing).progress_permille,
+                551
+            );
+        }
+        p.add_fetched_work(est.range(1, 10_000));
+        p.add_scanned_work(est.range(1, 10_000));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    #[test]
+    fn work_progress_restart_before_resuggestion_keeps_floor() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, _, _) = dense_tip_fixture(&est, 1);
+        // No post-completion suggestion has recorded a reduced queue yet.
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..10_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+        // Nor may an interrupted, partially scanned range turn into queue growth.
+        p.add_fetched_work(10_000);
+        p.add_scanned_work(5_000);
+        let before = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..10_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            before
+        );
+    }
+
+    #[test]
+    fn work_progress_estimator_refresh_without_growth_keeps_floor() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, _, _) = dense_tip_fixture(&est, 1);
+        p.begin_pass();
+        let refreshed = WorkEstimator::new(vec![(1, vec![(0, 5_000), (1, 10_000)])]);
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &refreshed,
+            Some(1),
+            &[1..10_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+        // A later real extension must price BOTH spans with refreshed density.
+        p.set_chain_tip(22_000);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &refreshed,
+            Some(1),
+            &[1..10_001, 11_001..22_001]
+        ));
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert_eq!(after, 275, "the common-model global work doubled");
+    }
+
+    #[test]
+    fn work_progress_small_scope_growth_is_bounded() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1_001);
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1_001),
+            &[1_001..11_001, 11_001..11_011]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(991),
+            &[991..11_001, 11_001..11_011]
+        ));
+        let share = (u128::from(est.range(991, 1_000)) * 1000)
+            .div_ceil(u128::from(est.range(991, 12_000))) as u16;
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!(after >= 551 - share);
+        assert_eq!(after, 551);
+    }
+
+    #[test]
+    fn work_progress_continuity_without_scanned_credit_cannot_spend_floor() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        let range_start_scanned = p.scanned();
+        // A Historic attempt fails inside an uncredited chunk. The error height
+        // cannot turn its unscanned prefix into completed-and-reopened work.
+        record_continuity_scope(&p, 1, 10_001, 9_001, range_start_scanned);
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!((460..=461).contains(&after), "after={after}");
+    }
+
+    #[test]
+    fn work_progress_large_rewind_rebaselines_once() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        // Most of this rewind was already pending Historic work. Only the dense
+        // completed tip is newly reopened, even though the repair spans 6,000 blocks.
+        record_continuity_scope(&p, 1, 10_001, 5_011, p.scanned());
+        p.add_reorg();
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        let share = (u128::from(est.range(10_001, 11_000)) * 1000)
+            .div_ceil(u128::from(est.range(1, 11_000))) as u16;
+        assert!(
+            after >= 551 - share,
+            "after={after}, reopened share={share}"
+        );
+        assert!(after < 501);
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+        p.add_fetched_work(est.range(1, 11_000));
+        p.add_scanned_work(est.range(1, 11_000));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+    }
+
+    #[test]
+    fn work_progress_overlapping_rewind_observations_are_not_double_charged() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        p.note_work_rewind(10_201..11_001);
+        p.note_work_rewind(10_501..11_001);
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 10_201..11_001]
+        ));
+        let first = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        p.note_work_rewind(10_001..10_701);
+        dense_suggest(&p, &mut b, &mut w, &est, Some(1), &[1..11_001]);
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        let share = (u128::from(est.range(10_001, 11_000)) * 1000)
+            .div_ceil(u128::from(est.range(1, 11_000))) as u16;
+        assert!(after >= 551 - share);
+        assert!(after <= first);
+        p.note_work_rewind(10_001..11_001);
+        p.add_reorg();
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+    }
+
+    #[test]
+    fn work_progress_scope_growth_across_pass_boundary_is_visible() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, _, _) = dense_tip_fixture(&est, 1);
+        p.begin_pass();
+        // Requiring the completed tip again is a real same-birthday rescan.
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!((460..=461).contains(&after));
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+    }
+
+    #[test]
+    fn work_progress_missing_metadata_preserves_scope() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        p.note_work_rewind(10_001..11_001);
+        assert!(!dense_suggest(&p, &mut b, &mut w, &est, None, &[1..11_001]));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+        p.begin_pass();
+        assert!(!update_pass_progress(
+            &p,
+            &mut 0,
+            &[1..11_001],
+            Some(1),
+            &mut 0,
+            0,
+            None
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+        p.begin_pass();
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..11_001]
+        ));
+        assert!((460..=461).contains(&derive_snapshot(&p, SyncState::Syncing).progress_permille));
+    }
+
     // Queue growth must remain visible even when the wallet birthday is unchanged.
     #[test]
     fn work_scope_queue_growth_without_earlier_birthday_rebaselines() {
@@ -1626,7 +2100,7 @@ mod tests {
         let p = Progress::default();
         p.set_chain_tip(10_000);
         let (mut b, mut w) = (0, 0);
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             10_000,
@@ -1641,11 +2115,12 @@ mod tests {
         p.add_scanned_work(90_000);
         b = 9_000;
         w = 90_000;
+        p.note_work_completed(1..9_001);
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             900
         );
-        assert!(update_pass_progress(
+        assert!(progress_for_suffix(
             &p,
             &mut b,
             2_000,
@@ -1659,7 +2134,7 @@ mod tests {
             800
         );
         assert_eq!((b, w), (0, 0));
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             2_000,
@@ -1680,14 +2155,14 @@ mod tests {
         );
     }
 
-    // A successful rewind is independent evidence even with the same whole-pass block total.
+    // Ten reopened blocks cannot spend the unrelated fifty-permille fetch-ahead gap.
     #[test]
-    fn work_scope_rewind_without_total_growth_rebaselines_once() {
+    fn work_scope_short_rewind_preserves_fetch_ahead_floor() {
         let est = uniform(10_000);
         let p = Progress::default();
         p.set_chain_tip(10_000);
         let (mut b, mut w) = (0, 0);
-        update_pass_progress(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
+        progress_for_suffix(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
         p.add_fetched(10_000);
         p.add_scanned(9_000);
         p.add_fetched_work(100_000);
@@ -1698,8 +2173,10 @@ mod tests {
         );
         b = 8_990;
         w = 89_900;
+        p.note_work_completed(1..9_001);
+        p.note_work_rewind(8_991..10_001);
         p.add_reorg();
-        assert!(update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             1_010,
@@ -1710,9 +2187,9 @@ mod tests {
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
-            899
+            950
         );
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             1_010,
@@ -1723,7 +2200,7 @@ mod tests {
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
-            899
+            950
         );
         p.add_fetched_work(10_100);
         p.add_scanned_work(10_100);
@@ -1740,7 +2217,7 @@ mod tests {
         let p = Progress::default();
         p.set_chain_tip(10_000);
         let (mut b, mut w) = (0, 0);
-        update_pass_progress(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
+        progress_for_suffix(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
         p.add_fetched(1_000);
         p.add_scanned(1_000);
         p.add_fetched_work(90_000);
@@ -1751,7 +2228,7 @@ mod tests {
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             900
         );
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             9_000,
@@ -1760,7 +2237,7 @@ mod tests {
             90_000,
             Some(&est)
         ));
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             9_000,
@@ -1773,7 +2250,7 @@ mod tests {
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             900
         );
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             10_000,
@@ -1782,7 +2259,7 @@ mod tests {
             100_000,
             Some(&est)
         ));
-        assert!(update_pass_progress(
+        assert!(progress_for_suffix(
             &p,
             &mut b,
             10_000,
@@ -1791,7 +2268,12 @@ mod tests {
             100_000,
             Some(&est)
         ));
-        assert_eq!(derive_snapshot(&p, SyncState::Syncing).progress_permille, 0);
+        // Reopening 1,000 of 10,000 uniform blocks permits at most 100 permille,
+        // preserving the unrelated exact-work/estimate gap.
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            800
+        );
     }
 
     // Resetting credited work changes the comparison baseline for the next genuine growth.
@@ -1801,18 +2283,19 @@ mod tests {
         let p = Progress::default();
         p.set_chain_tip(10_000);
         let (mut b, mut w) = (0, 0);
-        update_pass_progress(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
+        progress_for_suffix(&p, &mut b, 10_000, Some(1), &mut w, 100_000, Some(&est));
         p.add_fetched(9_000);
         p.add_scanned(9_000);
         p.add_fetched_work(90_000);
         p.add_scanned_work(90_000);
         b = 9_000;
         w = 90_000;
+        p.note_work_completed(1..9_001);
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             900
         );
-        assert!(update_pass_progress(
+        assert!(progress_for_suffix(
             &p,
             &mut b,
             2_000,
@@ -1828,12 +2311,13 @@ mod tests {
         p.add_scanned_work(1_000);
         b = 100;
         w = 1_000;
+        p.note_work_completed(8_001..8_101);
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             810
         );
         // 2,600 blocks is larger than the rebased 2,000, but below the old 11,000.
-        assert!(update_pass_progress(
+        assert!(progress_for_suffix(
             &p,
             &mut b,
             2_500,
@@ -1847,7 +2331,7 @@ mod tests {
             750
         );
         assert_eq!((b, w), (0, 0));
-        assert!(!update_pass_progress(
+        assert!(!progress_for_suffix(
             &p,
             &mut b,
             2_500,
@@ -1862,36 +2346,55 @@ mod tests {
         );
     }
 
-    // Both a prior WORK floor and a prior BLOCKS floor retain first-suggest correction.
+    // A prior BLOCKS floor still permits initial correction into WORK units.
+    // WORK-to-WORK retry preservation is covered by the dense restart regressions.
     #[test]
     fn work_scope_new_pass_preserves_initial_correction() {
         let est = uniform(10_000);
-        for old_unit in [PASS_UNIT_WORK, PASS_UNIT_BLOCKS] {
-            let p = Progress::default();
-            p.set_chain_tip(10_000);
-            update_pass_progress(&p, &mut 0, 10_000, Some(1), &mut 0, 100_000, Some(&est));
-            p.permille_floor(900, old_unit);
-            p.begin_pass();
-            assert!(update_pass_progress(
-                &p,
-                &mut 0,
-                10_000,
-                Some(1),
-                &mut 0,
-                100_000,
-                Some(&est)
-            ));
-            assert_eq!(derive_snapshot(&p, SyncState::Syncing).progress_permille, 0);
-            assert!(!update_pass_progress(
-                &p,
-                &mut 0,
-                10_000,
-                Some(1),
-                &mut 0,
-                100_000,
-                Some(&est)
-            ));
-        }
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        progress_for_suffix(&p, &mut 0, 10_000, Some(1), &mut 0, 100_000, Some(&est));
+        p.permille_floor(900, PASS_UNIT_BLOCKS);
+        p.begin_pass();
+        assert!(progress_for_suffix(
+            &p,
+            &mut 0,
+            10_000,
+            Some(1),
+            &mut 0,
+            100_000,
+            Some(&est)
+        ));
+        assert_eq!(derive_snapshot(&p, SyncState::Syncing).progress_permille, 0);
+        assert!(!progress_for_suffix(
+            &p,
+            &mut 0,
+            10_000,
+            Some(1),
+            &mut 0,
+            100_000,
+            Some(&est)
+        ));
+    }
+
+    #[test]
+    fn work_scope_first_observation_does_not_invent_growth() {
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        p.permille_floor(900, PASS_UNIT_WORK);
+        assert!(!progress_for_suffix(
+            &p,
+            &mut 0,
+            10_000,
+            Some(1),
+            &mut 0,
+            100_000,
+            Some(&uniform(10_000))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
     }
 
     #[test]
@@ -1914,7 +2417,7 @@ mod tests {
         let (mut blocks_done, mut work_done) = (0u64, 0u64);
 
         // Round 1: A = [1, 1001), B = [1001, 2001).
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut blocks_done,
             2_000,
@@ -1940,7 +2443,7 @@ mod tests {
         );
 
         // Round 2: only B remains.
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut blocks_done,
             1_000,
@@ -1980,7 +2483,7 @@ mod tests {
         let est = sparse_then_dense();
         let p = Progress::default();
         p.set_chain_tip(2_000);
-        update_pass_progress(&p, &mut 0, 2_000, Some(1), &mut 0, 40_000, Some(&est));
+        progress_for_suffix(&p, &mut 0, 2_000, Some(1), &mut 0, 40_000, Some(&est));
 
         let credit = |blocks: u64, work: u64| {
             p.add_fetched(blocks);
@@ -2016,7 +2519,7 @@ mod tests {
         p.set_chain_tip(TIP);
         let (mut blocks_done, mut work_done) = (0u64, 0u64);
 
-        let rebaselined = update_pass_progress(
+        let rebaselined = progress_for_suffix(
             &p,
             &mut blocks_done,
             1_000_000,
@@ -2039,7 +2542,7 @@ mod tests {
         );
 
         // Import with an older birthday: 20 M work in scope, 11 M remaining ⇒ seed 450.
-        let rebaselined = update_pass_progress(
+        let rebaselined = progress_for_suffix(
             &p,
             &mut blocks_done,
             1_100_000,
@@ -2064,7 +2567,7 @@ mod tests {
             450
         );
 
-        let rebaselined_again = update_pass_progress(
+        let rebaselined_again = progress_for_suffix(
             &p,
             &mut blocks_done,
             1_100_000,
@@ -2103,7 +2606,7 @@ mod tests {
         let est = uniform(TIP);
         let p = Progress::default();
         p.set_chain_tip(TIP);
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut 0,
             1_000_000,
@@ -2153,7 +2656,7 @@ mod tests {
         p.set_chain_tip(10_000);
         let (mut blocks_done, mut work_done) = (0u64, 0u64);
         let (start, end_exclusive) = (1u64, 10_001u64);
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut blocks_done,
             10_000,
@@ -2178,7 +2681,7 @@ mod tests {
         assert_eq!(work_done, 89_900);
 
         // Repair range [8 991, 10 001): 1 010 blocks, 10 100 work.
-        update_pass_progress(
+        progress_for_suffix(
             &p,
             &mut blocks_done,
             1_010,
@@ -2218,13 +2721,13 @@ mod tests {
         let p = Progress::default();
         p.set_chain_tip(2_000);
         let (mut b, mut w) = (0u64, 0u64);
-        update_pass_progress(&p, &mut b, 2_000, Some(1), &mut w, 40_000, Some(&est));
+        progress_for_suffix(&p, &mut b, 2_000, Some(1), &mut w, 40_000, Some(&est));
         assert!(p.pass_unit_is_work());
         p.add_fetched_work(4_000);
         p.add_scanned_work(4_000);
         b += 1_000;
         w += 4_000;
-        update_pass_progress(&p, &mut b, 1_000, None, &mut w, 36_000, Some(&est));
+        progress_for_suffix(&p, &mut b, 1_000, None, &mut w, 36_000, Some(&est));
         assert!(p.pass_unit_is_work(), "still work");
         assert_eq!(p.pass_total_work(), 40_000);
         assert_eq!(
@@ -2241,7 +2744,7 @@ mod tests {
         let p = Progress::default();
         p.set_chain_tip(2_000);
         let (mut b, mut w) = (0u64, 0u64);
-        update_pass_progress(&p, &mut b, 2_000, Some(1), &mut w, 0, None);
+        progress_for_suffix(&p, &mut b, 2_000, Some(1), &mut w, 0, None);
         assert!(!p.pass_unit_is_work());
         p.add_fetched(1_000);
         p.add_scanned(1_000);
@@ -2249,7 +2752,7 @@ mod tests {
         p.add_scanned_work(4_000);
         b += 1_000;
         w += 4_000;
-        update_pass_progress(&p, &mut b, 1_000, Some(1), &mut w, 36_000, Some(&est));
+        progress_for_suffix(&p, &mut b, 1_000, Some(1), &mut w, 36_000, Some(&est));
         assert!(!p.pass_unit_is_work(), "still blocks");
         assert_eq!(
             p.pass_total_work(),
@@ -2264,7 +2767,7 @@ mod tests {
         );
         // The next pass picks its own unit.
         p.begin_pass();
-        update_pass_progress(&p, &mut 0, 1_000, Some(1), &mut 0, 36_000, Some(&est));
+        progress_for_suffix(&p, &mut 0, 1_000, Some(1), &mut 0, 36_000, Some(&est));
         assert!(p.pass_unit_is_work());
     }
 
