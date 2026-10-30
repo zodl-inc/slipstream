@@ -466,15 +466,23 @@ impl SlipstreamHandle {
     /// wait took and what it found: `settle_ms`, `drain_ms`, `settled`, `drained` and
     /// `for_wallet_change`.
     ///
-    /// This is the plain stop (backgrounding, shutdown): a scan call in progress runs to its end,
-    /// by default the end of its chunk, before the abort reaches it. Right before changing the
-    /// wallet, stop with [`Self::stop_for_wallet_change`] instead.
+    /// This is the plain stop (backgrounding, shutdown). It asks the session to stop at its next
+    /// block ([`Progress::request_stop_for_wallet_change`]) before the abort, as
+    /// [`Self::stop_for_wallet_change`] does and for the same reason: the scan runs inside
+    /// `block_in_place`, where the abort cannot reach it until the scan call returns, and a
+    /// scan fed by chunks that are already fetched never yields between calls, so the abort
+    /// may not land for minutes. On a slow link (2026-10-30, Android, app backgrounded
+    /// mid-restore) the aborted pass kept scanning 14 chunks for 2.5 min, the stop reported
+    /// `settled=false` and the next start waited on the pass lock. The interrupted scan call
+    /// writes nothing and the next session scans those blocks again. Right before changing the
+    /// wallet, stop with [`Self::stop_for_wallet_change`], which logs `for_wallet_change`.
     ///
     /// Hosts call this instead of keeping their own copy of the waits; the C and JNI wrappers add
     /// only their own extras around it (on iOS, the `last_stop_at` stamp for tip freshness). It
     /// blocks the calling thread, so call it from a host thread, never from a task on this
     /// handle's runtime (see [`settle_passes`]).
     pub fn stop(&mut self, budget: Duration) -> StopReport {
+        self.progress.request_stop_for_wallet_change();
         self.stop_and_report(budget, false)
     }
 
@@ -1485,28 +1493,36 @@ mod tests {
         );
     }
 
-    /// Only the stop a host makes right before it changes the wallet asks the running session to
-    /// end at its next block. A plain stop (backgrounding, shutdown) must leave that request
-    /// alone, so every other stop behaves exactly as it did before the wallet-change stop.
+    /// Both stops ask the running session to end at its next block: the abort alone cannot
+    /// reach a scan running inside `block_in_place`, so a plain stop (backgrounding, shutdown)
+    /// on a slow link could otherwise wait minutes for the pass. The request is aimed at that
+    /// session only: the next one re-arms it.
     #[test]
-    fn only_a_stop_for_a_wallet_change_asks_the_scan_to_stop() {
-        let progress = Arc::new(Progress::default());
-        let mut handle = handle_in(SyncState::Syncing, progress.clone());
+    fn every_stop_asks_the_scan_to_stop_at_its_next_block() {
         let budget = Duration::from_millis(50);
+        for for_wallet_change in [false, true] {
+            let progress = Arc::new(Progress::default());
+            let mut handle = handle_in(SyncState::Syncing, progress.clone());
+            progress.begin_session();
+            assert!(!progress.stop_requested());
 
-        let report = handle.stop(budget);
-        assert!(report.quiescent(), "nothing was running: {report:?}");
-        assert!(
-            !progress.stop_requested(),
-            "a plain stop must not ask the scan to stop early"
-        );
+            let report = if for_wallet_change {
+                handle.stop_for_wallet_change(budget)
+            } else {
+                handle.stop(budget)
+            };
+            assert!(report.quiescent(), "nothing was running: {report:?}");
+            assert!(
+                progress.stop_requested(),
+                "for_wallet_change={for_wallet_change}: the stop must reach the scan's per-block check"
+            );
 
-        let report = handle.stop_for_wallet_change(budget);
-        assert!(report.quiescent(), "nothing was running: {report:?}");
-        assert!(
-            progress.stop_requested(),
-            "a stop for a wallet change must ask the running session to stop at its next block"
-        );
+            progress.begin_session();
+            assert!(
+                !progress.stop_requested(),
+                "the next session is not stopped by it"
+            );
+        }
     }
 
     /// Both stops leave the handle Idle, and they do so also when they could not prove the wallet

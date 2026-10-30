@@ -991,7 +991,9 @@ impl Progress {
 
     /// Ask the running sync session to stop at its next block because the host is about to
     /// change the wallet: adding or removing an account, a rewind, a wipe. The host calls this
-    /// right before the change, so that its stop can prove the wallet file idle in time.
+    /// right before the change, so that its stop can prove the wallet file idle in time. The
+    /// handle's plain stop (`SlipstreamHandle::stop`: backgrounding, shutdown) calls it too, so
+    /// that stop does not wait for a whole chunk's scan either.
     ///
     /// Call it BEFORE aborting the session's task. An abort lands only at the task's next
     /// `.await`, and the scan runs synchronously inside `block_in_place`, so one scan call can

@@ -129,7 +129,9 @@ pub struct FetchPlan {
 /// the link is already full (more streams only split it, and the head chunk gets
 /// a smaller share), so the boost is withdrawn like an ended one and not retried
 /// for [`BOOST_RETRY_WINDOWS`] windows, doubling with each further withdrawal; a
-/// boost that pays off clears the doubling.
+/// boost that pays off clears the doubling. A boost that started before any
+/// unboosted window received bytes has no rate to beat and is withdrawn the same
+/// way; its retry wait measures the base workers for the next one.
 ///
 /// The ahead budget is unchanged (the head chunk never waits on it), so memory
 /// stays bounded as without the boost. After [`BOOST_COLD_WINDOWS`] consecutive
@@ -1985,10 +1987,7 @@ impl Booster {
             return false;
         }
         self.gain_checked = true;
-        let Some(base) = self.pre_boost_rate else {
-            return false;
-        };
-        if rate >= base * BOOST_MIN_GAIN {
+        if boost_raised_rate(self.pre_boost_rate, rate) {
             self.state.boost_paid_off();
             return false;
         }
@@ -1997,12 +1996,18 @@ impl Booster {
         self.dispatcher.set_cutting(false);
         self.dispatcher
             .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
-        info!(
-            before_kbps = (base / 1024.0) as u64,
-            boosted_kbps = (rate / 1024.0) as u64,
-            retry_windows,
-            "fetch boost withdrawn: more streams did not speed up the download"
-        );
+        match self.pre_boost_rate {
+            Some(base) => info!(
+                before_kbps = (base / 1024.0) as u64,
+                boosted_kbps = (rate / 1024.0) as u64,
+                retry_windows,
+                "fetch boost withdrawn: more streams did not speed up the download"
+            ),
+            None => info!(
+                boosted_kbps = (rate / 1024.0) as u64,
+                retry_windows, "fetch boost withdrawn: no unboosted rate to compare it with"
+            ),
+        }
         true
     }
 
@@ -2148,6 +2153,15 @@ enum BoostStep {
     Start,
     Stop,
     Stay,
+}
+
+/// Whether a boost that is being judged raised the byte rate enough to stay. A boost
+/// that started before any unboosted window received bytes (a Tor circuit still being
+/// built, the first chunks slow) has no rate to beat: it is withdrawn, and the windows
+/// of its retry wait measure the base workers, so the next boost is judged on a rate.
+/// Keeping it instead left the extra streams on a slow link for the whole sync.
+fn boost_raised_rate(pre_boost_rate: Option<f64>, rate: f64) -> bool {
+    pre_boost_rate.is_some_and(|base| rate >= base * BOOST_MIN_GAIN)
 }
 
 /// The booster's on/off hysteresis over closed windows (see [`FetchBoost`]).
@@ -2614,6 +2628,20 @@ mod boost_tests {
         assert_eq!(st.observe(1.0), BoostStep::Start);
         st.boost_paid_off();
         assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS);
+    }
+
+    #[test]
+    fn a_boost_without_an_unboosted_rate_is_withdrawn() {
+        assert!(!boost_raised_rate(None, 0.0));
+        assert!(
+            !boost_raised_rate(None, 1e9),
+            "no rate to compare: withdrawn"
+        );
+        assert!(boost_raised_rate(Some(1000.0), 1000.0 * BOOST_MIN_GAIN));
+        assert!(!boost_raised_rate(
+            Some(1000.0),
+            1000.0 * BOOST_MIN_GAIN - 1.0
+        ));
     }
 
     #[test]
