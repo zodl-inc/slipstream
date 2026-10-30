@@ -11,6 +11,11 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- `transport_health` provides retained, typed OHTTP request observations and
+  coalesced subscriptions. Success and failure evidence keep their original
+  monotonic times, late subscribers receive bounded historical replay, and
+  closing a subscription fences callbacks and late request completions from
+  its replacement. Notification consumers cannot block transport reporting.
 - `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
   endpoint whose host has a relay (`ohttp::relay_for`) is never dialled
   directly: every RPC is sealed to the gateway's signed key configuration and
