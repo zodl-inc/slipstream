@@ -374,8 +374,9 @@ pub(crate) fn scan_continuity_work_credit(
 /// Callers treat errors as "no seed" (presentation state, never correctness state).
 ///
 /// The seed uses the subtree roots stored at open, before the pass fetches new ones, so it can
-/// sit up to the scope-expansion epsilon above the first in-pass seed; the reading then holds
-/// until real progress passes it. Larger gaps re-baseline at the first suggest round.
+/// differ from a refreshed in-pass estimate. Estimator-only gaps retain the displayed floor
+/// until real progress passes it. Recorded birthday/tip/pending scope evidence permits only
+/// proportional corrections for actual added or reopened work, subject to the epsilon.
 pub fn seed_progress_from_wallet(
     progress: &Progress,
     session: &WalletSession,
@@ -423,6 +424,17 @@ pub fn seed_progress_from_wallet(
             PASS_UNIT_BLOCKS
         };
         let _ = progress.permille_floor(seed, unit);
+        if work_seed.is_some()
+            && let Some(est) = work_estimator.as_ref()
+        {
+            // The persisted seed is known history, including an empty pending queue.
+            // Account imports before the first pass must compare against this scope.
+            let pending: Vec<_> = ranges
+                .iter()
+                .map(|r| u64::from(r.block_range().start)..u64::from(r.block_range().end))
+                .collect();
+            let _ = progress.work_scope_lower_bound(birthday, &pending, est);
+        }
     }
     tracing::info!(
         tip,
@@ -1581,7 +1593,7 @@ mod tests {
         update_pass_progress(
             p,
             b,
-            &[end.saturating_sub(remaining)..end],
+            std::slice::from_ref(&(end.saturating_sub(remaining)..end)),
             birthday,
             w,
             remaining_work,
@@ -1605,7 +1617,7 @@ mod tests {
         assert!(!update_pass_progress(
             &p,
             &mut blocks_done,
-            &[birthday..birthday + 11_000],
+            std::slice::from_ref(&(birthday..birthday + 11_000)),
             Some(birthday),
             &mut work_done,
             initial_work,
@@ -1632,7 +1644,7 @@ mod tests {
         let rebaselined = update_pass_progress(
             &p,
             &mut blocks_done,
-            &[birthday..birthday + 10_000],
+            std::slice::from_ref(&(birthday..birthday + 10_000)),
             Some(birthday),
             &mut work_done,
             historic_work,
@@ -1649,7 +1661,7 @@ mod tests {
         let rebaselined_again = update_pass_progress(
             &p,
             &mut blocks_done,
-            &[birthday..birthday + 10_000],
+            std::slice::from_ref(&(birthday..birthday + 10_000)),
             Some(birthday),
             &mut work_done,
             historic_work,
@@ -1687,7 +1699,7 @@ mod tests {
         update_pass_progress(
             &p,
             &mut b,
-            &[birthday..birthday + 11_000],
+            std::slice::from_ref(&(birthday..birthday + 11_000)),
             Some(birthday),
             &mut w,
             est.range(birthday, tip),
@@ -1711,7 +1723,7 @@ mod tests {
         update_pass_progress(
             &p,
             &mut b,
-            &[birthday..birthday + 10_000],
+            std::slice::from_ref(&(birthday..birthday + 10_000)),
             Some(birthday),
             &mut w,
             est.range(birthday, birthday + 9_999),
@@ -1724,7 +1736,7 @@ mod tests {
         let rebaselined = update_pass_progress(
             &p,
             &mut b,
-            &[birthday..birthday + 10_000],
+            std::slice::from_ref(&(birthday..birthday + 10_000)),
             Some(birthday),
             &mut w,
             est.range(birthday, birthday + 9_999),
@@ -1807,7 +1819,7 @@ mod tests {
                 &mut w,
                 &est,
                 Some(1),
-                &[1..10_001]
+                std::slice::from_ref(&(1..10_001))
             ));
             assert_eq!(
                 derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1834,7 +1846,7 @@ mod tests {
             &mut 0,
             &est,
             Some(1),
-            &[1..10_001]
+            std::slice::from_ref(&(1..10_001))
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1851,7 +1863,7 @@ mod tests {
             &mut 0,
             &est,
             Some(1),
-            &[1..10_001]
+            std::slice::from_ref(&(1..10_001))
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1871,7 +1883,7 @@ mod tests {
             &mut 0,
             &refreshed,
             Some(1),
-            &[1..10_001]
+            std::slice::from_ref(&(1..10_001))
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -1936,7 +1948,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         assert!((460..=461).contains(&after), "after={after}");
@@ -1956,7 +1968,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         let share = (u128::from(est.range(10_001, 11_000)) * 1000)
@@ -1972,7 +1984,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -2002,7 +2014,14 @@ mod tests {
         ));
         let first = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         p.note_work_rewind(10_001..10_701);
-        dense_suggest(&p, &mut b, &mut w, &est, Some(1), &[1..11_001]);
+        dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(1..11_001)),
+        );
         let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         let share = (u128::from(est.range(10_001, 11_000)) * 1000)
             .div_ceil(u128::from(est.range(1, 11_000))) as u16;
@@ -2016,7 +2035,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         p.begin_pass();
         assert!(!dense_suggest(
@@ -2025,7 +2044,7 @@ mod tests {
             &mut 0,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -2045,7 +2064,7 @@ mod tests {
             &mut 0,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         assert!((460..=461).contains(&after));
@@ -2055,7 +2074,7 @@ mod tests {
             &mut 0,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
@@ -2068,7 +2087,14 @@ mod tests {
         let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
         let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
         p.note_work_rewind(10_001..11_001);
-        assert!(!dense_suggest(&p, &mut b, &mut w, &est, None, &[1..11_001]));
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            None,
+            std::slice::from_ref(&(1..11_001))
+        ));
         let completed = est.range(10_001, 10_500);
         p.add_fetched(500);
         p.add_scanned(500);
@@ -2205,7 +2231,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[1..10_501]
+            std::slice::from_ref(&(1..10_501))
         ));
         p.note_work_completed(10_001..10_501);
         // An independent small new queue cannot combine with an already-completed
@@ -2250,7 +2276,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[11_001..12_001]
+            std::slice::from_ref(&(11_001..12_001))
         ));
         let earned = derive_snapshot(&p, SyncState::Syncing).progress_permille;
         p.set_chain_tip(13_000);
@@ -2260,7 +2286,7 @@ mod tests {
             &mut w,
             &est,
             Some(1),
-            &[11_001..13_001]
+            std::slice::from_ref(&(11_001..13_001))
         ));
         let bound = u128::from(earned) * u128::from(est.range(1, 12_000))
             / u128::from(est.range(1, 13_000));
@@ -2276,7 +2302,14 @@ mod tests {
         let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
         let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
         p.note_work_rewind(10_001..11_001);
-        assert!(!dense_suggest(&p, &mut b, &mut w, &est, None, &[1..11_001]));
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            None,
+            std::slice::from_ref(&(1..11_001))
+        ));
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             551
@@ -2285,7 +2318,7 @@ mod tests {
         assert!(!update_pass_progress(
             &p,
             &mut 0,
-            &[1..11_001],
+            std::slice::from_ref(&(1..11_001)),
             Some(1),
             &mut 0,
             0,
@@ -2302,7 +2335,7 @@ mod tests {
             &mut 0,
             &est,
             Some(1),
-            &[1..11_001]
+            std::slice::from_ref(&(1..11_001))
         ));
         assert!((460..=461).contains(&derive_snapshot(&p, SyncState::Syncing).progress_permille));
     }
@@ -3074,6 +3107,165 @@ mod tests {
         );
     }
 
+    #[test]
+    fn work_progress_no_proposal_ack_preserves_fractional_credit() {
+        let a = WorkEstimator::new_for_test(vec![(1, vec![], vec![(1_300, 7_800)])]);
+        let b = WorkEstimator::new_for_test(vec![(
+            1,
+            vec![],
+            vec![(900, 4_400), (1_100, 6_600), (1_200, 7_200), (1_300, 7_800)],
+        )]);
+        let c = WorkEstimator::new_for_test(vec![(
+            1,
+            vec![],
+            vec![(900, 5_390), (1_200, 7_200), (1_300, 7_800)],
+        )]);
+        let p = Progress::default();
+        p.set_chain_tip(1_000);
+        dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &a,
+            Some(1),
+            std::slice::from_ref(&(901..1_001)),
+        );
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+        p.set_chain_tip(1_100);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &a,
+            Some(1),
+            std::slice::from_ref(&(901..1_101))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            818
+        );
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &a,
+            Some(1),
+            std::slice::from_ref(&(901..1_101))
+        ));
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &b,
+            Some(1),
+            std::slice::from_ref(&(901..1_101))
+        ));
+        p.set_chain_tip(1_200);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &b,
+            Some(1),
+            std::slice::from_ref(&(901..1_201))
+        ));
+        let middle = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &c,
+            Some(1),
+            std::slice::from_ref(&(901..1_201))
+        ));
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &b,
+            Some(1),
+            std::slice::from_ref(&(901..1_201))
+        ));
+        p.set_chain_tip(1_300);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &b,
+            Some(1),
+            std::slice::from_ref(&(901..1_301))
+        ));
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!("fractional acknowledgment: middle={middle}, after={after}, exact=692.307692");
+        assert_eq!(after, 692);
+    }
+
+    #[test]
+    fn work_progress_higher_raw_seed_settles_fractional_credit() {
+        let a = WorkEstimator::new_for_test(vec![(1, vec![], vec![(1_300, 7_800)])]);
+        let d = WorkEstimator::new_for_test(vec![(
+            1,
+            vec![],
+            vec![(900, 5_410), (1_100, 6_600), (1_200, 7_200), (1_300, 7_800)],
+        )]);
+        let p = Progress::default();
+        p.set_chain_tip(1_000);
+        dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &a,
+            Some(1),
+            std::slice::from_ref(&(901..1_001)),
+        );
+        p.set_chain_tip(1_100);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &a,
+            Some(1),
+            std::slice::from_ref(&(901..1_101))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            818
+        );
+        // A truthful higher seed supports 819, independently of the old fraction.
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &d,
+            Some(1),
+            std::slice::from_ref(&(901..1_101))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            819
+        );
+        p.set_chain_tip(1_184);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &d,
+            Some(1),
+            std::slice::from_ref(&(901..1_185))
+        ));
+        // 819*11000/11840 = 760.895..., while stale fractional credit would yield761.
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            760
+        );
+    }
+
     // ── [API v2.1 E-3] truthful-from-open seed ─────────────────────────────────
 
     /// Open a wallet with one imported account (TEST_UFVK, birthday treestate at 663149)
@@ -3093,6 +3285,143 @@ mod tests {
             .expect("import account");
         s.update_chain_tip(tip).expect("update tip");
         s
+    }
+
+    fn wallet_with_work_seed(dir: &tempfile::TempDir) -> WalletSession {
+        let s = wallet_with_account(dir, 700_000);
+        let conn = rusqlite::Connection::open(dir.path().join("data.db")).expect("side conn");
+        // Persisted complete queue and completed subtree rows, using upstream's
+        // existing schema exactly as the wallet estimator fixtures do.
+        conn.execute("DELETE FROM scan_queue", [])
+            .expect("complete queue");
+        // Upstream derives persisted chain height from queue coverage, including
+        // Scanned bookkeeping rows that are excluded from suggestions.
+        conn.execute("INSERT INTO scan_queue (block_range_start, block_range_end, priority) VALUES (663150, 700001, 10)", [])
+            .expect("persist scanned coverage");
+        conn.execute(
+            "INSERT INTO sapling_tree_shards (shard_index, subtree_end_height) VALUES (0, 500000), (1, 600000)",
+            [],
+        ).expect("completed subtrees");
+        s
+    }
+
+    #[test]
+    fn work_progress_seeded_work_scope_accounts_for_first_import() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut s = wallet_with_work_seed(&dir);
+        let p = Progress::default();
+        seed_progress_from_wallet(&p, &s).expect("persisted work seed");
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        assert_eq!(derive_snapshot(&p, SyncState::Idle).progress_permille, 1000);
+        let birthday = zcash_client_backend::data_api::AccountBirthday::from_treestate(
+            zcash_client_backend::proto::service::TreeState {
+                network: "main".into(),
+                height: 599_999,
+                hash: "0".repeat(64),
+                time: 1,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("older birthday");
+        s.db_mut()
+            .create_account(
+                "older account after persisted seed",
+                &secrecy::SecretVec::new([7u8; 32].to_vec()),
+                &birthday,
+                None,
+            )
+            .expect("import older account");
+        let est = s.build_work_estimator().expect("work estimator");
+        let pending: Vec<_> = s
+            .suggest_scan_ranges()
+            .expect("expanded queue")
+            .iter()
+            .map(|r| u64::from(r.block_range().start)..u64::from(r.block_range().end))
+            .collect();
+        let birthday = s.min_birthday().expect("expanded birthday");
+        assert_eq!(birthday, Some(600_000));
+        p.begin_pass();
+        let rebaselined = dense_suggest(&p, &mut 0, &mut 0, &est, birthday, &pending);
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        let reopened: u64 = pending
+            .iter()
+            .map(|r| {
+                let start = r.start.max(663_150);
+                let end = r.end.min(700_001);
+                if start < end {
+                    est.range(start, end - 1)
+                } else {
+                    0
+                }
+            })
+            .sum();
+        let bound = ((1000u128 * u128::from(est.range(663_150, 700_000)))
+            .saturating_sub(u128::from(reopened) * 1000)
+            / u128::from(est.range(600_000, 700_000))) as u16;
+        eprintln!("persisted WORK import: after={after}, bound={bound}, rebaselined={rebaselined}");
+        assert!(rebaselined);
+        assert_eq!(after, bound);
+        assert!(after < 950);
+        assert!(!dense_suggest(&p, &mut 0, &mut 0, &est, birthday, &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+    }
+
+    #[test]
+    fn work_progress_seeded_work_scope_refresh_without_growth_keeps_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = wallet_with_work_seed(&dir);
+        let conn = rusqlite::Connection::open(dir.path().join("data.db")).expect("side conn");
+        conn.execute(
+            "UPDATE scan_queue SET block_range_end=680001 WHERE priority=10",
+            [],
+        )
+        .expect("persist partially scanned coverage");
+        conn.execute("INSERT INTO scan_queue (block_range_start, block_range_end, priority) VALUES (680001, 700001, 20)", [])
+            .expect("persisted Historic work");
+        let p = Progress::default();
+        seed_progress_from_wallet(&p, &s).expect("persisted work seed");
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        let before = derive_snapshot(&p, SyncState::Idle).progress_permille;
+        conn.execute(
+            "UPDATE sapling_tree_shards SET subtree_end_height=680000 WHERE shard_index=1",
+            [],
+        )
+        .expect("refresh anchor");
+        conn.execute(
+            "INSERT INTO sapling_tree_shards (shard_index, subtree_end_height) VALUES (2, 699999)",
+            [],
+        )
+        .expect("refresh density");
+        let est = s.build_work_estimator().expect("refreshed estimator");
+        let pending: Vec<_> = s
+            .suggest_scan_ranges()
+            .expect("same queue")
+            .iter()
+            .map(|r| u64::from(r.block_range().start)..u64::from(r.block_range().end))
+            .collect();
+        let work: u64 = pending.iter().map(|r| est.range(r.start, r.end - 1)).sum();
+        let raw = global_floor_permille_work(700_000, Some(663_150), work, &est).unwrap();
+        assert!(
+            raw + 50 < u64::from(before),
+            "density change must be material"
+        );
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(663_150),
+            &pending
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            before
+        );
     }
 
     /// A wallet with NO accounts seeds nothing — the zero snapshot is already truthful.

@@ -1428,18 +1428,33 @@ mod tests {
         let est = crate::work::WorkEstimator::new(vec![]);
         p.set_chain_tip(1_000);
         p.permille_floor(900, PASS_UNIT_WORK);
-        assert_eq!(p.work_scope_lower_bound(1, &[1..1_001], &est), 900);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(1..1_001)), &est),
+            900
+        );
         p.note_work_completed(1..901);
-        assert_eq!(p.work_scope_lower_bound(1, &[901..1_001], &est), 900);
-        assert_eq!(p.work_scope_lower_bound(1, &[801..1_001], &est), 800);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(901..1_001)), &est),
+            900
+        );
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
         // Reading an unapplied proposal must not consume it.
-        assert_eq!(p.work_scope_lower_bound(1, &[801..1_001], &est), 800);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
         assert!(p.rebaseline_floor_if_scope_expanded(800, PASS_UNIT_WORK));
         p.acknowledge_work_scope(800);
         p.permille_floor(850, PASS_UNIT_WORK);
         // Acknowledgment starts the next proposal from the applied floor, so
         // progress earned before the next observation remains present.
-        assert_eq!(p.work_scope_lower_bound(1, &[701..1_001], &est), 750);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(701..1_001)), &est),
+            750
+        );
     }
 
     #[cfg(feature = "zcash_client_sqlite")]
@@ -1449,12 +1464,15 @@ mod tests {
         let est = crate::work::WorkEstimator::new(vec![]);
         p.set_chain_tip(1_000);
         p.permille_floor(900, PASS_UNIT_WORK);
-        p.work_scope_lower_bound(1, &[1..1_001], &est);
+        p.work_scope_lower_bound(1, std::slice::from_ref(&(1..1_001)), &est);
         p.note_work_completed(1..901);
         p.add_scanned_work(100);
         p.begin_pass();
         assert_eq!(p.scanned_work(), 0);
-        assert_eq!(p.work_scope_lower_bound(1, &[801..1_001], &est), 800);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
     }
 
     /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,

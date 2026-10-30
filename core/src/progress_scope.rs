@@ -48,6 +48,7 @@ pub(crate) struct WorkScope {
     // Consumed proposals may publish an integer floor just below their precise
     // earned share. Carry that fraction into the next proposal, not a new loss.
     rounding_credit: u128,
+    rounding_credit_floor: u64,
 }
 
 fn union(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
@@ -109,12 +110,17 @@ impl WorkScope {
     /// The scheduler calls this only after applying a proposal, or when its raw
     /// seed independently supports the displayed floor. Deduplication stays live.
     pub(crate) fn acknowledge(&mut self, floor: u64) {
-        self.rounding_credit = self.correction.take().map_or(0, |correction| {
-            correction
+        if let Some(correction) = self.correction.take() {
+            self.rounding_credit = correction
                 .earned_share
                 .saturating_sub(u128::from(floor.min(1000)) * SHARE_SCALE)
-                .min(SHARE_SCALE - 1)
-        });
+                .min(SHARE_SCALE - 1);
+        } else if floor > self.rounding_credit_floor {
+            // An unchanged seed acknowledgment consumes no proposal or precision.
+            // A genuinely higher raw floor independently settles the old fraction.
+            self.rounding_credit = 0;
+        }
+        self.rounding_credit_floor = floor;
     }
 
     pub(crate) fn rewound(&mut self, range: Range<u64>) {
