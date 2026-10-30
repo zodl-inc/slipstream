@@ -71,6 +71,7 @@ pub struct DownloadFailure {
 }
 
 /// Last valid scheduler observation of a work pass's scan scope.
+#[cfg(feature = "zcash_client_sqlite")]
 #[derive(Clone, Copy, Debug)]
 struct WorkPassScope {
     birthday: u64,
@@ -90,6 +91,7 @@ struct WorkPassScope {
 #[derive(Debug)]
 pub struct Progress {
     /// Scheduler-only scope evidence; snapshot readers never lock this state.
+    #[cfg(feature = "zcash_client_sqlite")]
     work_pass_scope: std::sync::Mutex<Option<WorkPassScope>>,
     /// Current chain tip height as reported by the server.
     pub chain_tip: AtomicU64,
@@ -257,6 +259,7 @@ impl Default for Progress {
     /// [`Progress::pass_start_permille`]).
     fn default() -> Self {
         Self {
+            #[cfg(feature = "zcash_client_sqlite")]
             work_pass_scope: std::sync::Mutex::new(None),
             chain_tip: AtomicU64::new(0),
             fetched_blocks: AtomicU64::new(0),
@@ -713,6 +716,7 @@ impl Progress {
 
     /// Observe a valid work suggestion, detecting exact scope growth or a successful rewind.
     /// The first observation preserves initial seeding and correction semantics.
+    #[cfg(feature = "zcash_client_sqlite")]
     pub(crate) fn observe_work_scope(&self, birthday: u64, total_blocks: u64) -> bool {
         let current = WorkPassScope {
             birthday,
@@ -918,10 +922,13 @@ impl Progress {
     /// [`Self::request_stop_for_wallet_change`]). It outlives the pass it interrupts, and only
     /// [`Self::begin_session`] re-arms it.
     pub fn begin_pass(&self) {
-        *self
-            .work_pass_scope
-            .lock()
-            .unwrap_or_else(|p| p.into_inner()) = None;
+        #[cfg(feature = "zcash_client_sqlite")]
+        {
+            *self
+                .work_pass_scope
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = None;
+        }
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
         self.scanned_work.store(0, Ordering::Relaxed);
@@ -1406,6 +1413,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash_client_sqlite")]
     #[test]
     fn work_scope_observation_tracks_exact_growth() {
         let p = Progress::default();
@@ -1419,6 +1427,7 @@ mod tests {
         assert!(!p.observe_work_scope(1, 1_000));
     }
 
+    #[cfg(feature = "zcash_client_sqlite")]
     #[test]
     fn begin_pass_resets_work_scope_observation() {
         let p = Progress::default();
