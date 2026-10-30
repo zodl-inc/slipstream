@@ -278,6 +278,9 @@ pub(crate) fn update_pass_progress(
             "scope_expanded just reported an expansion and nothing between here and there \
              can raise the floor above what it already held, so the re-check cannot flip"
         );
+        if use_work && rebaselined {
+            p.acknowledge_work_scope(correction_seed);
+        }
         info!(
             seed = correction_seed,
             birthday = wallet_birthday,
@@ -289,7 +292,10 @@ pub(crate) fn update_pass_progress(
         // of the same pass keep it — the pass's reported progress is measured
         // from where the GLOBAL position stood when the pass began.
         p.set_pass_start_permille_if_unset(seed);
-        let _ = p.permille_floor(seed, unit);
+        let floor = p.permille_floor(seed, unit);
+        if use_work && seed >= floor {
+            p.acknowledge_work_scope(floor);
+        }
         false
     }
 }
@@ -2054,6 +2060,214 @@ mod tests {
         assert_eq!(
             derive_snapshot(&p, SyncState::Syncing).progress_permille,
             after
+        );
+    }
+
+    #[test]
+    fn work_progress_completed_rewind_during_metadata_gap_is_not_charged() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        p.note_work_rewind(10_001..11_001);
+        assert!(!dense_suggest(&p, &mut b, &mut w, &est, None, &[1..11_001]));
+        let completed = est.range(10_001, 10_500);
+        p.add_fetched(500);
+        p.add_scanned(500);
+        p.add_fetched_work(completed);
+        p.add_scanned_work(completed);
+        b += 500;
+        w += completed;
+        p.note_work_completed(10_001..10_501);
+        let rebaselined = dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 10_501..11_001],
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!("metadata gap completed rewind: after={after}, rebaselined={rebaselined}");
+        assert!(!rebaselined);
+        assert_eq!(after, 551);
+    }
+
+    #[test]
+    fn work_progress_cumulative_small_growth_survives_tolerance_and_restart() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        let mut drops = 0;
+        for step in 1..=11 {
+            let tip = 11_000 + step * 1_000;
+            p.set_chain_tip(tip);
+            let pending = [1..10_001, 11_001..tip + 1];
+            if dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending) {
+                drops += 1;
+            }
+            let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+            assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+            assert_eq!(
+                derive_snapshot(&p, SyncState::Syncing).progress_permille,
+                after
+            );
+            if step == 1 {
+                assert_eq!(after, 551, "the first correction is within tolerance");
+                p.begin_pass();
+                b = 0;
+                w = 0;
+                assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+                assert_eq!(
+                    derive_snapshot(&p, SyncState::Syncing).progress_permille,
+                    551
+                );
+            }
+        }
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!("cumulative doubled span: after={after}, drops={drops}");
+        assert!(drops > 0);
+        assert!(
+            (275..=325).contains(&after),
+            "a doubled span has bound 275 plus tolerance"
+        );
+        p.begin_pass();
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            &[1..10_001, 11_001..22_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+    }
+
+    #[test]
+    fn work_progress_cumulative_growth_preserves_intervening_earned_share() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        p.set_chain_tip(12_000);
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 11_001..12_001]
+        ));
+        p.add_fetched_work(50_000);
+        p.add_scanned_work(50_000);
+        let earned = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!(
+            earned > 551,
+            "real partial-range work raises the displayed floor"
+        );
+        p.set_chain_tip(13_000);
+        let rebaselined = dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 11_001..13_001],
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        let bound = (551u128 * u128::from(est.range(1, 11_000))
+            + u128::from(earned - 551) * u128::from(est.range(1, 12_000)))
+            / u128::from(est.range(1, 13_000));
+        eprintln!("intervening work earned={earned}, after={after}, bound={bound}");
+        assert!(rebaselined);
+        assert!((bound as u16..=bound as u16 + 1).contains(&after));
+        assert!(after > 466, "the partial-range earned share is retained");
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 11_001..13_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+    }
+
+    #[test]
+    fn work_progress_completed_unapplied_rewind_cancels_its_entitlement() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        p.note_work_rewind(10_001..10_501);
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_501]
+        ));
+        p.note_work_completed(10_001..10_501);
+        // An independent small new queue cannot combine with an already-completed
+        // held rewind to manufacture a material correction.
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 10_501..11_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+    }
+
+    #[test]
+    fn work_progress_raw_seed_settles_unapplied_correction() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
+        p.set_chain_tip(12_000);
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 11_001..12_001]
+        ));
+        let completed = est.range(1, 10_000);
+        p.add_fetched_work(completed);
+        p.add_scanned_work(completed);
+        b += 10_000;
+        w += completed;
+        p.note_work_completed(1..10_001);
+        // The truthful global seed now exceeds the retained displayed floor.
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[11_001..12_001]
+        ));
+        let earned = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        p.set_chain_tip(13_000);
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[11_001..13_001]
+        ));
+        let bound = u128::from(earned) * u128::from(est.range(1, 12_000))
+            / u128::from(est.range(1, 13_000));
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!(
+            (bound as u16..=bound as u16 + 1).contains(&after),
+            "the settled earlier expansion must not be replayed: after={after}, bound={bound}"
         );
     }
 

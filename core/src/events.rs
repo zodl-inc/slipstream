@@ -724,6 +724,15 @@ impl Progress {
             )
     }
 
+    /// Consume a proposal after it is applied or independently supported by the seed.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn acknowledge_work_scope(&self, floor: u64) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .acknowledge(floor);
+    }
+
     /// Record successful scan completion independently of pass-local credit counters.
     #[cfg(feature = "zcash_client_sqlite")]
     pub(crate) fn note_work_completed(&self, range: std::ops::Range<u64>) {
@@ -1423,7 +1432,14 @@ mod tests {
         p.note_work_completed(1..901);
         assert_eq!(p.work_scope_lower_bound(1, &[901..1_001], &est), 900);
         assert_eq!(p.work_scope_lower_bound(1, &[801..1_001], &est), 800);
-        assert_eq!(p.work_scope_lower_bound(1, &[801..1_001], &est), 900);
+        // Reading an unapplied proposal must not consume it.
+        assert_eq!(p.work_scope_lower_bound(1, &[801..1_001], &est), 800);
+        assert!(p.rebaseline_floor_if_scope_expanded(800, PASS_UNIT_WORK));
+        p.acknowledge_work_scope(800);
+        p.permille_floor(850, PASS_UNIT_WORK);
+        // Acknowledgment starts the next proposal from the applied floor, so
+        // progress earned before the next observation remains present.
+        assert_eq!(p.work_scope_lower_bound(1, &[701..1_001], &est), 750);
     }
 
     #[cfg(feature = "zcash_client_sqlite")]

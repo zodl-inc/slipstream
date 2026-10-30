@@ -25,11 +25,29 @@ struct Observation {
     pending: Vec<Range<u64>>,
 }
 
+// Upward-rounded fractional permille avoids spending a fresh integer rounding
+// loss on every held observation. The final integer candidate loses less than one.
+const SHARE_SCALE: u128 = 1 << 32;
+
+#[derive(Debug)]
+struct Correction {
+    earned_share: u128,
+    observed_floor: u64,
+    reopened: Vec<Range<u64>>,
+    refunded: Vec<Range<u64>>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct WorkScope {
     previous: Option<Observation>,
     rewinds: Vec<Range<u64>>,
     charged: Vec<Range<u64>>,
+    // Geometry may advance while the epsilon holds the display. This entitlement
+    // survives those observations until the scheduler applies or settles it.
+    correction: Option<Correction>,
+    // Consumed proposals may publish an integer floor just below their precise
+    // earned share. Carry that fraction into the next proposal, not a new loss.
+    rounding_credit: u128,
 }
 
 fn union(mut ranges: Vec<Range<u64>>) -> Vec<Range<u64>> {
@@ -77,6 +95,26 @@ impl WorkScope {
             old.pending = subtract(&old.pending, std::slice::from_ref(&range));
         }
         self.charged = subtract(&self.charged, std::slice::from_ref(&range));
+        self.rewinds = subtract(&self.rewinds, std::slice::from_ref(&range));
+        if let Some(correction) = &mut self.correction {
+            let remaining = subtract(&correction.reopened, std::slice::from_ref(&range));
+            correction
+                .refunded
+                .extend(subtract(&correction.reopened, &remaining));
+            correction.refunded = union(std::mem::take(&mut correction.refunded));
+            correction.reopened = remaining;
+        }
+    }
+
+    /// The scheduler calls this only after applying a proposal, or when its raw
+    /// seed independently supports the displayed floor. Deduplication stays live.
+    pub(crate) fn acknowledge(&mut self, floor: u64) {
+        self.rounding_credit = self.correction.take().map_or(0, |correction| {
+            correction
+                .earned_share
+                .saturating_sub(u128::from(floor.min(1000)) * SHARE_SCALE)
+                .min(SHARE_SCALE - 1)
+        });
     }
 
     pub(crate) fn rewound(&mut self, range: Range<u64>) {
@@ -130,14 +168,45 @@ impl WorkScope {
             .iter()
             .map(|r| u128::from(estimator.range(r.start, r.end - 1)))
             .sum();
-        // One division loses at most one permille. Queue additions outside the old
-        // span are already paid for by scaling, so only its interior is subtracted.
-        let lower = (u128::from(floor.min(1000)) * old_work).saturating_sub(reopened_work * 1000)
-            / new_work;
+        let has_growth = new_work > old_work || reopened_work > 0;
+        let lower = if has_growth || self.correction.is_some() {
+            let share_ceiling = (u128::from(floor.min(1000)) * SHARE_SCALE + self.rounding_credit)
+                .min(1000 * SHARE_SCALE);
+            let correction = self.correction.get_or_insert_with(|| Correction {
+                earned_share: share_ceiling,
+                observed_floor: floor,
+                reopened: Vec::new(),
+                refunded: Vec::new(),
+            });
+            // A newly displayed earned share belongs to the previous observation's
+            // span. Add it before scaling for this observation's new scope.
+            let gained = u128::from(floor.saturating_sub(correction.observed_floor)) * SHARE_SCALE;
+            let refunded_work: u128 = correction
+                .refunded
+                .iter()
+                .map(|r| u128::from(estimator.range(r.start, r.end - 1)))
+                .sum();
+            let earned = correction.earned_share.saturating_add(gained);
+            let numerator = earned
+                .saturating_mul(old_work)
+                .saturating_add(refunded_work * 1000 * SHARE_SCALE)
+                .saturating_sub(reopened_work * 1000 * SHARE_SCALE);
+            // All products fit u128: a share is <=1000*2^32, work is u64.
+            // Round UP here so repeated held proposals cannot accumulate extra
+            // downward rounding. Only the final integer conversion rounds down.
+            correction.earned_share = numerator.div_ceil(new_work).min(share_ceiling);
+            correction.observed_floor = floor;
+            correction.reopened.extend(reopened.iter().cloned());
+            correction.reopened = union(std::mem::take(&mut correction.reopened));
+            correction.refunded.clear();
+            (correction.earned_share / SHARE_SCALE) as u64
+        } else {
+            floor
+        };
         self.charged.extend(reopened);
         self.charged = union(std::mem::take(&mut self.charged));
         self.rewinds.clear();
         self.previous = Some(Observation { span, pending });
-        lower as u64
+        lower
     }
 }
