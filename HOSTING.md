@@ -409,9 +409,9 @@ Feed the result into account creation (your `zcash_client_sqlite` calls, or
   (position is durable — restarts are cheap and resume).
 - Right before you change the wallet (add or remove an account, rewind, wipe, or reopen a
   handle on the same wallet), stop with `stop_for_wallet_change`, refuse the change unless
-  both of its waits finished, and start again afterwards. A plain `stop` lets a scan call in
-  progress finish first (by default, its whole chunk), which can take longer than the 10 s
-  budget when accounts are added in quick succession.
+  both of its waits finished, and start again afterwards. A plain `stop` also ends the scan
+  at its next block, but only `stop_for_wallet_change` marks the stop as one for a wallet
+  change in the engine's log (`for_wallet_change`).
 - Apply the two documented rules verbatim: visibility (§7.1) and the tx re-query rule
   (§5.4); use `busy_timeout` on your DB connections (§7.3).
 - Treat `state == 2` as "offer retry" (call `start` again). Transient network trouble
