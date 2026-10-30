@@ -1785,6 +1785,222 @@ mod tests {
     }
 
     #[test]
+    fn work_progress_blocks_fallback_keeps_work_floor() {
+        let est = WorkEstimator::new(vec![(6_001, vec![(0, 10_000)])]);
+        let p = Progress::default();
+        p.set_chain_tip(11_000);
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(1..11_001)),
+        ));
+        p.add_fetched(7_000);
+        p.add_scanned(7_000);
+        p.add_fetched_work(69_400);
+        p.add_scanned_work(69_400);
+        p.note_work_completed(1..6_001);
+        p.note_work_completed(10_001..11_001);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            551
+        );
+
+        p.begin_pass();
+        let (mut b, mut w) = (0, 0);
+        let pending = [6_001..10_001];
+        assert!(!update_pass_progress(
+            &p,
+            &mut b,
+            &pending,
+            Some(1),
+            &mut w,
+            0,
+            None,
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            636
+        );
+
+        p.begin_pass();
+        let (mut b, mut w) = (0, 0);
+        let rebaselined = dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending);
+        let recovered = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert_eq!(recovered, 636, "rebaselined={rebaselined}");
+        assert!(!rebaselined);
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            636
+        );
+    }
+
+    fn block_snapshot_advance_fixture() -> (Progress, WorkEstimator) {
+        let est = uniform(10_000);
+        let p = Progress::default();
+        p.set_chain_tip(10_000);
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(1..10_001)),
+        ));
+        p.add_fetched(6_000);
+        p.add_scanned(6_000);
+        p.add_fetched_work(60_000);
+        p.add_scanned_work(60_000);
+        p.note_work_completed(1..6_001);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            600
+        );
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+
+        p.begin_pass();
+        assert!(!update_pass_progress(
+            &p,
+            &mut 0,
+            std::slice::from_ref(&(6_001..10_001)),
+            Some(1),
+            &mut 0,
+            0,
+            None,
+        ));
+        assert_eq!(p.pass_start_permille(), Some(600));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            600
+        );
+        p.add_fetched(1_000);
+        p.add_scanned(1_000);
+        p.note_work_completed(6_001..7_001);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            700
+        );
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        (p, est)
+    }
+
+    #[test]
+    fn work_progress_block_snapshot_retains_work_provenance() {
+        let (p, est) = block_snapshot_advance_fixture();
+        let pending = [7_001..10_001];
+        for _ in 0..2 {
+            p.begin_pass();
+            assert!(!update_pass_progress(
+                &p,
+                &mut 0,
+                &pending,
+                Some(1),
+                &mut 0,
+                0,
+                None,
+            ));
+            assert_eq!(
+                derive_snapshot(&p, SyncState::Syncing).progress_permille,
+                700
+            );
+            assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+            p.begin_pass();
+            assert!(!dense_suggest(&p, &mut 0, &mut 0, &est, Some(1), &pending));
+            assert_eq!(
+                derive_snapshot(&p, SyncState::Syncing).progress_permille,
+                700
+            );
+            assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        }
+    }
+
+    #[test]
+    fn work_progress_fallback_recovery_preserves_real_rewind() {
+        let (p, est) = block_snapshot_advance_fixture();
+        p.note_work_rewind(5_001..10_001);
+        p.begin_pass();
+        let pending = [5_001..10_001];
+        let (mut b, mut w) = (0, 0);
+        assert!(dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            500
+        );
+        assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            500
+        );
+        p.add_fetched(5_000);
+        p.add_scanned(5_000);
+        p.add_fetched_work(50_000);
+        p.add_scanned_work(50_000);
+        p.note_work_completed(5_001..10_001);
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            1000
+        );
+        assert_eq!(derive_snapshot(&p, SyncState::Done).progress_permille, 1000);
+    }
+
+    #[test]
+    fn work_progress_fallback_recovery_preserves_real_expansion() {
+        let (p, est) = block_snapshot_advance_fixture();
+        p.set_chain_tip(20_000);
+        p.begin_pass();
+        let pending = [7_001..20_001];
+        let (mut b, mut w) = (0, 0);
+        assert!(dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            350
+        );
+        assert!(!dense_suggest(&p, &mut b, &mut w, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            350
+        );
+    }
+
+    #[test]
+    fn work_progress_initial_blocks_to_work_still_rebaselines() {
+        let est = WorkEstimator::new(vec![(6_001, vec![(0, 10_000)])]);
+        let p = Progress::default();
+        p.set_chain_tip(11_000);
+        let pending = [6_001..10_001];
+        assert!(!update_pass_progress(
+            &p,
+            &mut 0,
+            &pending,
+            Some(1),
+            &mut 0,
+            0,
+            None,
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            636
+        );
+        assert_eq!(p.floor_unit(), PASS_UNIT_BLOCKS);
+        p.begin_pass();
+        assert!(dense_suggest(&p, &mut 0, &mut 0, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            352
+        );
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        assert!(!dense_suggest(&p, &mut 0, &mut 0, &est, Some(1), &pending));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            352
+        );
+    }
+
+    #[test]
     fn work_progress_repeated_restarts_keep_floor() {
         let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
         let (p, _, _) = dense_tip_fixture(&est, 1);
