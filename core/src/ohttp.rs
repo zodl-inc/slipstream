@@ -411,9 +411,29 @@ impl Dialer {
 #[derive(Clone)]
 pub struct OhttpConnector {
     client: Arc<OhttpClient>,
+    health: Option<Arc<RequestHealth>>,
 }
 
 impl OhttpConnector {
+    pub(crate) fn health_route(&self) -> HealthRoute {
+        HealthRoute {
+            gateway_host: self.client.gateway_host.clone(),
+            relay_url: self.client.relay_url.clone(),
+            via_tor: self.client.dialer.is_tor(),
+        }
+    }
+
+    pub(crate) fn request_health(&self) -> Arc<RequestHealth> {
+        Arc::new(RequestHealth::new(&self.client))
+    }
+
+    pub(crate) fn bound_to(&self, health: Arc<RequestHealth>) -> Self {
+        Self {
+            client: self.client.clone(),
+            health: Some(health),
+        }
+    }
+
     /// Direct dialer: the relay sees the device IP.
     pub fn new(gateway_host: &str, relay_url: &str) -> Result<Self, String> {
         Self::with_dialer(
@@ -428,6 +448,7 @@ impl OhttpConnector {
     /// streams: see [`crate::grpc::connect_dedicated`].
     pub fn dedicated(gateway_host: &str, relay_url: &str) -> Result<Self, String> {
         Ok(Self {
+            health: None,
             client: Arc::new(OhttpClient::new(
                 gateway_host,
                 relay_url,
@@ -448,6 +469,7 @@ impl OhttpConnector {
         // Direct: the process-wide client, so channels reuse one h2 connection to the relay.
         // Tor: a fresh client, as before (circuit isolation).
         Ok(Self {
+            health: None,
             client: cached_or_new_client(
                 gateway_host,
                 relay_url,
@@ -474,7 +496,11 @@ impl OhttpConnector {
     }
 
     async fn warm_up_inner(&self) -> Result<(), RoundTripError> {
-        let health = RequestHealth::for_scope(&self.client, HealthScope::Route);
+        let health = crate::grpc::current_owner_health()
+            .filter(|health| health.route == self.health_route())
+            .unwrap_or_else(|| {
+                Arc::new(RequestHealth::for_scope(&self.client, HealthScope::Route))
+            });
         let result = self.warm_up_observed(&health).await;
         match &result {
             Ok(()) => health.finish(HealthOutcome::Inconclusive, HealthStage::Complete),
@@ -518,12 +544,14 @@ impl Service<Uri> for OhttpConnector {
 
     fn call(&mut self, _dst: Uri) -> Self::Future {
         let client = Arc::clone(&self.client);
+        let health = self.health.clone();
         Box::pin(async move {
             let (client_io, server_io) = tokio::io::duplex(DUPLEX_BUF);
             tokio::spawn(async move {
                 let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let client = Arc::clone(&client);
-                    async move { Ok::<_, Infallible>(client.handle(req).await) }
+                    let health = health.clone();
+                    async move { Ok::<_, Infallible>(client.handle(req, health).await) }
                 });
                 let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
                     .serve_connection(TokioIo::new(server_io), svc);
@@ -964,8 +992,10 @@ where
 
 /// One logical call across immediate resealing/key/freshness recovery. Classification is
 /// carried from the boundary that knows it, never reconstructed from an error string.
-struct RequestHealth {
-    ticket: HealthRequest,
+pub(crate) struct RequestHealth {
+    pub(crate) ticket: HealthRequest,
+    route: HealthRoute,
+    started: tokio::time::Instant,
     state: std::sync::Mutex<(HealthStage, Option<HealthOutcome>, bool)>,
 }
 
@@ -980,15 +1010,21 @@ impl RequestHealth {
     }
 
     fn for_scope(client: &OhttpClient, scope: HealthScope) -> Self {
+        Self::for_route(
+            HealthRoute {
+                gateway_host: client.gateway_host.clone(),
+                relay_url: client.relay_url.clone(),
+                via_tor: client.dialer.is_tor(),
+            },
+            scope,
+        )
+    }
+
+    pub(crate) fn for_route(route: HealthRoute, scope: HealthScope) -> Self {
         Self {
-            ticket: transport_health::begin_request(
-                &HealthRoute {
-                    gateway_host: client.gateway_host.clone(),
-                    relay_url: client.relay_url.clone(),
-                    via_tor: client.dialer.is_tor(),
-                },
-                scope,
-            ),
+            started: tokio::time::Instant::now(),
+            ticket: transport_health::begin_request(&route, scope),
+            route,
             state: std::sync::Mutex::new((HealthStage::Connection, None, false)),
         }
     }
@@ -1017,6 +1053,22 @@ impl RequestHealth {
             }
         };
         self.finish(outcome, stage);
+    }
+
+    pub(crate) fn timeout_at(&self, budget: Duration) -> tokio::time::Instant {
+        self.started + budget
+    }
+
+    pub(crate) fn deadline(&self, stage: HealthStage) {
+        let (observed_stage, known, _) = *self.state.lock().unwrap();
+        self.finish(
+            known.unwrap_or(HealthOutcome::TransportUnavailable),
+            if known.is_some() {
+                observed_stage
+            } else {
+                stage
+            },
+        );
     }
 
     fn finish(&self, outcome: HealthOutcome, stage: HealthStage) {
@@ -1117,6 +1169,14 @@ fn inner_health(
         }),
         _ => None,
     }
+}
+
+/// DNS fallback errors do not replace the original relay error that key recovery returns.
+#[derive(Clone, Copy)]
+enum HttpsHealthRole {
+    RelayPost,
+    KeyConfiguration,
+    KeyFallback,
 }
 
 /// Why a whole OHTTP round trip failed; the gRPC bridge maps each differently.
@@ -1779,6 +1839,7 @@ impl OhttpClient {
         guard: SizeGuard,
         on_send: &F,
         health: Option<&RequestHealth>,
+        role: HttpsHealthRole,
     ) -> Result<RelayAnswer, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
@@ -1820,6 +1881,24 @@ impl OhttpClient {
         };
         let (parts, body) = resp.into_parts();
         self.note_retry_after(parts.status, &parts.headers);
+        let rejected_head = match role {
+            HttpsHealthRole::RelayPost => parts.status != StatusCode::OK,
+            HttpsHealthRole::KeyConfiguration => {
+                !self.profile.outer.success.accepts(parts.status.as_u16())
+            }
+            HttpsHealthRole::KeyFallback => false,
+        };
+        if rejected_head
+            && parts.status != StatusCode::TOO_MANY_REQUESTS
+            && let Some(health) = health
+        {
+            // Keep the head provisional across key/freshness recovery, but do not
+            // erase a known rejection if its error page outlives an owner deadline.
+            if health.state.lock().unwrap().0 != HealthStage::KeyConfiguration {
+                health.boundary(HealthStage::ResponseHead);
+            }
+            health.classify(classify_outer(parts.status));
+        }
         if parts.status == StatusCode::TOO_MANY_REQUESTS
             && let Some(health) = health
         {
@@ -1891,6 +1970,7 @@ impl OhttpClient {
             guard,
             on_send,
             health,
+            HttpsHealthRole::RelayPost,
         )
         .await
     }
@@ -2052,6 +2132,7 @@ impl OhttpClient {
                         self.profile.limits.key_config_guard(),
                         &|| {},
                         health,
+                        HttpsHealthRole::KeyConfiguration,
                     )
                     .await
                 {
@@ -2177,6 +2258,7 @@ impl OhttpClient {
                 self.profile.limits.key_config_guard(),
                 &|| {},
                 health,
+                HttpsHealthRole::KeyFallback,
             )
             .await
             .map_err(|e| e.into_message())?;
@@ -2543,7 +2625,11 @@ impl OhttpClient {
     /// In-process h2 handler: one gRPC request in, one gRPC response (with trailers) out.
     /// Uses streaming decoding: the first gRPC message frame is returned before the full response
     /// has been received from the gateway.
-    async fn handle(&self, req: Request<Incoming>) -> Response<BoxBody<Bytes, Infallible>> {
+    async fn handle(
+        &self,
+        req: Request<Incoming>,
+        health: Option<Arc<RequestHealth>>,
+    ) -> Response<BoxBody<Bytes, Infallible>> {
         use futures_util::stream::StreamExt as _;
 
         let (parts, body) = req.into_parts();
@@ -2566,7 +2652,7 @@ impl OhttpClient {
         );
 
         let started = std::time::Instant::now();
-        let health = Arc::new(RequestHealth::new(self));
+        let health = health.unwrap_or_else(|| Arc::new(RequestHealth::new(self)));
         // Timeout only for getting the Head (status + headers)
         let (http_status, mut headers, events) = match tokio::time::timeout(
             ROUND_TRIP_TIMEOUT,
@@ -2607,10 +2693,7 @@ impl OhttpClient {
                 );
             }
             Err(_) => {
-                health.finish(
-                    HealthOutcome::TransportUnavailable,
-                    HealthStage::ResponseHead,
-                );
+                health.deadline(HealthStage::ResponseHead);
                 tracing::warn!(path = %path, "ohttp: round trip timed out waiting for Head");
                 return grpc_error(GRPC_UNAVAILABLE, "ohttp: round trip timed out");
             }
@@ -2986,10 +3069,7 @@ where
     )
     .await
     .map_err(|_| {
-        health.finish(
-            HealthOutcome::TransportUnavailable,
-            HealthStage::ResponseHead,
-        );
+        health.deadline(HealthStage::ResponseHead);
         HttpRoundTripError::Failed(format!(
             "ohttp: round trip timed out after {}s",
             ROUND_TRIP_TIMEOUT.as_secs()
@@ -3445,7 +3525,10 @@ pub(crate) mod tests {
     async fn health_tonic_client(client: Arc<OhttpClient>) -> crate::grpc::LwdClient {
         let channel =
             tonic::transport::Endpoint::from_static("http://ohttp-gateway-testnet.example:443")
-                .connect_with_connector(OhttpConnector { client })
+                .connect_with_connector(OhttpConnector {
+                    client,
+                    health: None,
+                })
                 .await
                 .unwrap();
         crate::grpc::LwdClient::new(channel)
@@ -3755,7 +3838,15 @@ pub(crate) mod tests {
             answer
         })
         .await;
-        assert!(OhttpConnector { client }.warm_up_typed().await.is_err());
+        assert!(
+            OhttpConnector {
+                client,
+                health: None
+            }
+            .warm_up_typed()
+            .await
+            .is_err()
+        );
         assert!(
             subscription
                 .snapshot()
@@ -3825,7 +3916,13 @@ pub(crate) mod tests {
             unreachable!("cached key and pooled connection need no HTTP request")
         })
         .await;
-        OhttpConnector { client }.warm_up_typed().await.unwrap();
+        OhttpConnector {
+            client,
+            health: None,
+        }
+        .warm_up_typed()
+        .await
+        .unwrap();
         let snapshot = subscription.snapshot();
         assert!(
             snapshot
@@ -4104,6 +4201,500 @@ pub(crate) mod tests {
                     .len(),
                 1
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_final_buffered_rejections_survive_trickling_error_body_deadline() {
+        for (status, expected) in [
+            (403, HealthOutcome::PolicyRejected),
+            (426, HealthOutcome::ConfigurationFailure),
+            (413, HealthOutcome::ResponseRejected),
+            (201, HealthOutcome::ResponseRejected),
+        ] {
+            let relay = format!("https://health-review-rejection-{status}.invalid/relay");
+            let gateway = "health-review-rejection.invalid";
+            let client = get_or_create_client(
+                gateway,
+                &relay,
+                Dialer::Direct,
+                get_default_client_trace_prefix(),
+                ClientProfile::SLIPSTREAM_HTTP,
+            )
+            .await
+            .unwrap();
+            cache_a_key(&client).await;
+            let subscription = health_subscription(&client);
+            serve_in_process_relay(&client, move |_| async move {
+                let body = futures_util::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Some((
+                        Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"x"))),
+                        (),
+                    ))
+                });
+                let mut response = Response::new(BodyExt::boxed(StreamBody::new(body)));
+                *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                response
+            })
+            .await;
+            let result = http_round_trip_via(
+                &relay,
+                gateway,
+                Dialer::Direct,
+                "POST",
+                parse_http_target("https://origin.invalid/data").unwrap(),
+                &[],
+                b"body",
+                None,
+                || {},
+            )
+            .await;
+            assert!(
+                matches!(result, Err(HttpRoundTripError::Failed(message)) if message.contains("timed out after 100s"))
+            );
+            let snapshot = subscription.snapshot();
+            assert!(
+                snapshot.observations.iter().any(|o| o.outcome == expected),
+                "{status}: {snapshot:?}"
+            );
+            assert!(
+                !snapshot
+                    .observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::TransportUnavailable),
+                "{status}: {snapshot:?}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_tracked_unary_owner_preserves_native_key_rejection() {
+        for (status, expected) in [
+            (429, None),
+            (403, Some(HealthOutcome::PolicyRejected)),
+            (426, Some(HealthOutcome::ConfigurationFailure)),
+            (413, Some(HealthOutcome::ResponseRejected)),
+            (0, Some(HealthOutcome::TransportUnavailable)),
+        ] {
+            let client = Arc::new(
+                OhttpClient::new(
+                    "health-owner-rejection.invalid",
+                    &format!("https://health-owner-key-{status}.invalid/relay"),
+                    Dialer::Direct,
+                    None,
+                    ClientProfile::SLIPSTREAM,
+                )
+                .unwrap(),
+            );
+            let subscription = health_subscription(&client);
+            serve_in_process_relay(&client, move |request| async move {
+                assert_eq!(request.method(), Method::GET);
+                if status == 0 {
+                    return std::future::pending().await;
+                }
+                let body = futures_util::stream::unfold((), |_| async {
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Some((
+                        Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"x"))),
+                        (),
+                    ))
+                });
+                let mut response = Response::new(BodyExt::boxed(StreamBody::new(body)));
+                *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+                response
+            })
+            .await;
+            let raw = health_tonic_client(client.clone()).await;
+            let tracked = crate::grpc::TrackedConnection::ohttp(
+                raw,
+                OhttpConnector {
+                    client,
+                    health: None,
+                },
+                "http://health-owner-rejection.invalid:443".into(),
+            );
+            let result = tracked
+                .call(async |client| crate::grpc::get_latest_block_height(client).await)
+                .await;
+            assert!(
+                matches!(result, Err(crate::error::SlipstreamError::Transport(message)) if message.contains("timed out after 30s"))
+            );
+            let snapshot = subscription.snapshot();
+            assert!(
+                snapshot.observations.iter().any(|o| expected.map_or(
+                    matches!(o.outcome, HealthOutcome::RateLimited { .. }),
+                    |expected| o.outcome == expected
+                )),
+                "{status}: {snapshot:?}"
+            );
+            assert_eq!(
+                snapshot
+                    .observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::TransportUnavailable),
+                status == 0,
+                "{status}: {snapshot:?}"
+            );
+            assert!(
+                snapshot.observations.iter().all(|o| o.stage
+                    == if status == 0 {
+                        HealthStage::ResponseHead
+                    } else {
+                        HealthStage::KeyConfiguration
+                    }),
+                "{status}: {snapshot:?}"
+            );
+            assert_eq!(
+                snapshot
+                    .observations
+                    .iter()
+                    .map(|o| o.request_id)
+                    .collect::<std::collections::HashSet<_>>()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    pub(crate) async fn connector_with_trickling_key_pause() -> (
+        OhttpConnector,
+        crate::transport_health::HealthSubscription,
+        HealthRoute,
+        Arc<AtomicUsize>,
+    ) {
+        let tor = arti_client::TorClient::builder()
+            .create_unbootstrapped()
+            .unwrap();
+        let client = Arc::new(
+            OhttpClient::new(
+                "health-tor-owner.invalid",
+                "https://health-tor-owner-relay.invalid/relay",
+                Dialer::Tor(tor),
+                None,
+                ClientProfile::SLIPSTREAM,
+            )
+            .unwrap(),
+        );
+        let subscription = health_subscription(&client);
+        let connector = OhttpConnector {
+            client: client.clone(),
+            health: None,
+        };
+        let route = connector.health_route();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        serve_in_process_relay(&client, {
+            let dispatches = dispatches.clone();
+            move |request| {
+                assert_eq!(request.method(), Method::GET);
+                dispatches.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let body = futures_util::stream::unfold((), |_| async {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                        Some((
+                            Ok::<_, Infallible>(Frame::data(Bytes::from_static(b"x"))),
+                            (),
+                        ))
+                    });
+                    let mut response = Response::new(BodyExt::boxed(StreamBody::new(body)));
+                    *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+                    response
+                }
+            }
+        })
+        .await;
+        (connector, subscription, route, dispatches)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_recoverable_outer_rejection_resets_before_key_fetch_blackhole() {
+        for status in [400, 422] {
+            let relay = format!("https://health-reset-{status}.invalid/relay");
+            let gateway = "health-reset.invalid";
+            let client = get_or_create_client(
+                gateway,
+                &relay,
+                Dialer::Direct,
+                get_default_client_trace_prefix(),
+                ClientProfile::SLIPSTREAM_HTTP,
+            )
+            .await
+            .unwrap();
+            cache_a_key(&client).await;
+            let subscription = health_subscription(&client);
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            serve_in_process_relay(&client, {
+                let dispatches = dispatches.clone();
+                move |request| {
+                    dispatches.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        if request.method() == Method::GET {
+                            return std::future::pending().await;
+                        }
+                        let mut response = Response::new(Full::new(Bytes::new()).boxed());
+                        *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                        response
+                    }
+                }
+            })
+            .await;
+            assert!(
+                http_round_trip_via(
+                    &relay,
+                    gateway,
+                    Dialer::Direct,
+                    "POST",
+                    parse_http_target("https://origin.invalid/data").unwrap(),
+                    &[],
+                    &[],
+                    None,
+                    || {}
+                )
+                .await
+                .is_err()
+            );
+            assert_eq!(
+                dispatches.load(Ordering::SeqCst),
+                2,
+                "one POST then its permitted key recovery GET"
+            );
+            let snapshot = subscription.snapshot();
+            assert!(
+                snapshot
+                    .observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::TransportUnavailable)
+            );
+            assert!(
+                !snapshot
+                    .observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::ConfigurationFailure)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn health_recoverable_outer_rejection_emits_no_intermediate_failure_when_recovered() {
+        for status in [400, 422] {
+            let client = health_fixture_client(&format!("health-recovered-{status}"), false).await;
+            let subscription = health_subscription(&client);
+            let health = RequestHealth::new(&client);
+            let calls = Arc::new(AtomicUsize::new(0));
+            serve_in_process_relay(&client, {
+                let calls = calls.clone();
+                move |request| {
+                    let first = calls.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        if first {
+                            let mut response = Response::new(Full::new(Bytes::new()).boxed());
+                            *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                            return response;
+                        }
+                        let request = request.into_body().collect().await.unwrap().to_bytes();
+                        let (mut bytes, end) =
+                            fixture_response(&request, 200, "0", "application/json");
+                        bytes.extend_from_slice(&end);
+                        Response::new(Full::new(Bytes::from(bytes)).boxed())
+                    }
+                }
+            })
+            .await;
+            let key = client.key_config.lock().await.as_ref().unwrap().config;
+            let (mut decoder, answer) = run_exchange_chunked_observed(
+                key,
+                &test_request(),
+                |body| {
+                    client.post_sealed_observed(body, SizeGuard::new(None), &|| {}, Some(&health))
+                },
+                || async { Ok(key) },
+                Some(&health),
+            )
+            .await
+            .unwrap();
+            let mut events = decoder.push(&answer.body).unwrap();
+            events.extend(decoder.finish().unwrap());
+            assert_eq!(
+                zodl_ohttp_client::collect_response(events).unwrap().status,
+                200
+            );
+            assert!(
+                subscription.snapshot().observations.is_empty(),
+                "successful immediate recovery publishes no intermediate logical failure"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_concurrent_tracked_owners_keep_rejection_and_blackhole_independent() {
+        let client = Arc::new(health_fixture_client("health-concurrent-owners", true).await);
+        let subscription = health_subscription(&client);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        serve_in_process_relay(&client, {
+            let dispatches = dispatches.clone();
+            move |_| {
+                let call = dispatches.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if call > 0 {
+                        return std::future::pending().await;
+                    }
+                    let mut response = Response::new(Full::new(Bytes::new()).boxed());
+                    *response.status_mut() = StatusCode::FORBIDDEN;
+                    response
+                }
+            }
+        })
+        .await;
+        let key = format!("{}:{}", client.relay.host, client.relay.port);
+        let opened = client.h2_pool.lock().await.get(&key).unwrap().1;
+        let raw = health_tonic_client(client.clone()).await;
+        let tracked = crate::grpc::TrackedConnection::ohttp(
+            raw,
+            OhttpConnector {
+                client: client.clone(),
+                health: None,
+            },
+            "http://health-concurrent-owners.invalid:443".into(),
+        );
+        assert!(Arc::ptr_eq(
+            &client,
+            &tracked.factory.as_ref().unwrap().connector.client
+        ));
+        let (first, second) = tokio::join!(
+            tracked.call(async |client| crate::grpc::get_latest_block_height(client).await),
+            tracked.call(async |client| crate::grpc::get_latest_block_height(client).await)
+        );
+        assert!(first.is_err() && second.is_err());
+        let snapshot = subscription.snapshot();
+        let rejection = snapshot
+            .observations
+            .iter()
+            .find(|o| o.outcome == HealthOutcome::PolicyRejected)
+            .unwrap();
+        let timeout = snapshot
+            .observations
+            .iter()
+            .find(|o| o.outcome == HealthOutcome::TransportUnavailable)
+            .unwrap();
+        assert_ne!(rejection.request_id, timeout.request_id);
+        assert_eq!(dispatches.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            client.h2_pool.lock().await.get(&key).unwrap().1,
+            opened,
+            "the actual relay h2 connection is reused"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_tracked_cancellation_isolated_and_actual_tor_transport_reused() {
+        for via_tor in [false, true] {
+            let mut client =
+                health_fixture_client(&format!("health-tracked-cancel-{via_tor}"), true).await;
+            if via_tor {
+                client.dialer = Dialer::Tor(
+                    arti_client::TorClient::builder()
+                        .create_unbootstrapped()
+                        .unwrap(),
+                );
+            }
+            let client = Arc::new(client);
+            let subscription = health_subscription(&client);
+            let dispatches = Arc::new(AtomicUsize::new(0));
+            let started = Arc::new(tokio::sync::Notify::new());
+            serve_in_process_relay(&client, {
+                let dispatches = dispatches.clone();
+                let started = started.clone();
+                move |request| {
+                    let first = dispatches.fetch_add(1, Ordering::SeqCst) == 0;
+                    let started = started.clone();
+                    async move {
+                        if first {
+                            started.notify_one();
+                            return std::future::pending().await;
+                        }
+                        let request = request.into_body().collect().await.unwrap().to_bytes();
+                        let (mut bytes, end) =
+                            fixture_response(&request, 200, "0", "application/grpc");
+                        bytes.extend_from_slice(&end);
+                        Response::new(Full::new(Bytes::from(bytes)).boxed())
+                    }
+                }
+            })
+            .await;
+            let key = format!("{}:{}", client.relay.host, client.relay.port);
+            let opened = client.h2_pool.lock().await.get(&key).unwrap().1;
+            let raw = health_tonic_client(client.clone()).await;
+            let tracked = crate::grpc::TrackedConnection::ohttp(
+                raw,
+                OhttpConnector {
+                    client: client.clone(),
+                    health: None,
+                },
+                "http://health-tracked-cancel.invalid:443".into(),
+            );
+            let original = &tracked.factory.as_ref().unwrap().connector.client;
+            assert!(Arc::ptr_eq(&client, original));
+            if let (Dialer::Tor(first), Dialer::Tor(second)) = (&client.dialer, &original.dialer) {
+                assert!(Arc::ptr_eq(first, second));
+            }
+            let cancelled = tracked.clone();
+            let task = tokio::spawn(async move {
+                cancelled
+                    .call(async |client| crate::grpc::get_latest_block_height(client).await)
+                    .await
+            });
+            started.notified().await;
+            let wall_start = std::time::Instant::now();
+            assert_eq!(
+                tracked
+                    .call(async |client| crate::grpc::get_latest_block_height(client).await)
+                    .await
+                    .unwrap(),
+                0
+            );
+            eprintln!(
+                "tracked local-pipe plus hermetic RPC round-trip via_tor={via_tor}: {} us",
+                wall_start.elapsed().as_micros()
+            );
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::advance(Duration::from_secs(101)).await;
+            for _ in 0..10 {
+                tokio::task::yield_now().await;
+            }
+            let snapshot = subscription.snapshot();
+            assert!(
+                snapshot
+                    .observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::Cancelled),
+                "{snapshot:?}"
+            );
+            assert!(snapshot.observations.iter().any(
+                |o| o.scope == HealthScope::Lightwalletd && o.outcome == HealthOutcome::Usable
+            ));
+            assert!(
+                !snapshot
+                    .observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::TransportUnavailable)
+            );
+            assert_eq!(
+                dispatches.load(Ordering::SeqCst),
+                2,
+                "no observation-only dispatch/replay"
+            );
+            assert_eq!(client.h2_pool.lock().await.get(&key).unwrap().1, opened);
         }
     }
 
@@ -5713,6 +6304,7 @@ pub(crate) mod tests {
         .await;
         client.note_retry_after(StatusCode::TOO_MANY_REQUESTS, &HeaderMap::new());
         OhttpConnector {
+            health: None,
             client: Arc::new(client),
         }
     }
@@ -5747,6 +6339,7 @@ pub(crate) mod tests {
         .await;
         (
             OhttpConnector {
+                health: None,
                 client: Arc::new(client),
             },
             gets,

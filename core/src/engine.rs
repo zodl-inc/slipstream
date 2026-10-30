@@ -25,7 +25,7 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     config::{Endpoint, EngineConfig},
-    connector::{ConnPurpose, TorConn, connect_via},
+    connector::{ConnPurpose, TorConn, connect_via_tracked as connect_via},
     enhance::{EnhanceStats, run_enhancement_isolated},
     error::SlipstreamError,
     events::Progress,
@@ -166,11 +166,11 @@ pub async fn probe_tip(
     tor: Option<&TorConn>,
 ) -> Result<u64, SlipstreamError> {
     // Public tip data (ZIP circuit isolation policy): the session's shared connection.
-    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::SyncShared).await?;
+    let client = connect_via(&config.endpoint, tor, ConnPurpose::SyncShared).await?;
     let tip = grpc::with_ohttp_endpoint(
         &config.endpoint,
         tor.is_some(),
-        grpc::get_latest_block_height(&mut client),
+        client.call(async |client| grpc::get_latest_block_height(client).await),
     )
     .await;
     if tip.is_err()
@@ -262,7 +262,7 @@ pub async fn sync_once(
     let wire_probe_ms = probe_elapsed.as_secs_f64() * 1e3;
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
-    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
+    let client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
 
     // Per-account bootstrap (for hosts without their own account manager — the CLI and
     // tests; production hosts import directly into the wallet DB). Each key is imported
@@ -276,7 +276,9 @@ pub async fn sync_once(
         let birthday_ts = grpc::with_ohttp_endpoint(
             &config.endpoint,
             tor.is_some(),
-            grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1),
+            client.call(async |client| {
+                grpc::get_tree_state(client, u64::from(u32::from(*birthday)) - 1).await
+            }),
         )
         .await?;
         if let Some(ref p) = progress {
@@ -301,7 +303,9 @@ pub async fn sync_once(
     let roots = grpc::with_ohttp_endpoint(
         &config.endpoint,
         tor.is_some(),
-        grpc::get_subtree_roots_from(&mut client, roots_start, progress.as_deref()),
+        client.call(async |client| {
+            grpc::get_subtree_roots_from(client, roots_start, progress.as_deref()).await
+        }),
     )
     .await?;
     if let Some(ref p) = progress {
@@ -321,7 +325,7 @@ pub async fn sync_once(
     let tip = grpc::with_ohttp_endpoint(
         &config.endpoint,
         tor.is_some(),
-        grpc::get_latest_block_height(&mut client),
+        client.call(async |client| grpc::get_latest_block_height(client).await),
     )
     .await?;
     if let Some(ref p) = progress {
@@ -345,11 +349,13 @@ pub async fn sync_once(
     // GetAddressUtxos names the wallet's addresses: with Tor on it gets a circuit of its own.
     let transparent = match tor {
         Some(t) => {
-            let mut utxo_client = t.connect_isolated(&config.endpoint).await?;
+            let utxo_client = t.connect_isolated_tracked(&config.endpoint).await?;
             grpc::with_ohttp_endpoint(
                 &config.endpoint,
                 true,
-                refresh_utxos(&mut session, &mut utxo_client, progress.as_deref()),
+                utxo_client.call(async |client| {
+                    refresh_utxos(&mut session, client, progress.as_deref()).await
+                }),
             )
             .await?
         }
@@ -357,7 +363,9 @@ pub async fn sync_once(
             grpc::with_ohttp_endpoint(
                 &config.endpoint,
                 false,
-                refresh_utxos(&mut session, &mut client, progress.as_deref()),
+                client.call(async |client| {
+                    refresh_utxos(&mut session, client, progress.as_deref()).await
+                }),
             )
             .await?
         }
@@ -465,14 +473,17 @@ pub async fn sync_once(
     let final_enhance = grpc::with_ohttp_endpoint(
         &config.endpoint,
         tor.is_some(),
-        run_enhancement_isolated(
-            &mut session,
-            &mut client,
-            config.network,
-            progress.clone(),
-            &mut skipped_keys,
-            tor.map(|t| (t, &config.endpoint)),
-        ),
+        client.call(async |client| {
+            run_enhancement_isolated(
+                &mut session,
+                client,
+                config.network,
+                progress.clone(),
+                &mut skipped_keys,
+                tor.map(|t| (t, &config.endpoint)),
+            )
+            .await
+        }),
     )
     .await?;
     let final_enhance_elapsed = enhance_started.elapsed();

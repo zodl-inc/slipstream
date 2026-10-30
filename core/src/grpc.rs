@@ -146,9 +146,13 @@ pub(crate) async fn retry_get_tree_state(
         } else {
             crate::connector::ConnPurpose::MetadataUnique
         };
-        let mut client = crate::connector::connect_via(endpoint, tor, purpose).await?;
-        match with_ohttp_endpoint(endpoint, tor.is_some(), get_tree_state(&mut client, height))
-            .await
+        let client = crate::connector::connect_via_tracked(endpoint, tor, purpose).await?;
+        match with_ohttp_endpoint(
+            endpoint,
+            tor.is_some(),
+            client.call(async |client| get_tree_state(client, height).await),
+        )
+        .await
         {
             Ok(ts) => {
                 // Liveness: a server response is forward progress (tree states ride
@@ -187,7 +191,9 @@ pub(crate) async fn retry_get_tree_state(
 
 tokio::task_local! {
     static OHTTP_HEALTH_ROUTE: Option<crate::transport_health::HealthRoute>;
-    static OHTTP_STREAM_REQUEST: Option<Arc<crate::transport_health::HealthRequest>>;
+    static OHTTP_OWNER_HEALTH: Option<Arc<crate::ohttp::RequestHealth>>;
+    static OHTTP_FACTORY: Option<OhttpFactory>;
+    static OHTTP_STREAM_REQUEST: Option<Arc<crate::ohttp::RequestHealth>>;
 }
 
 /// Explicitly scope the exact network future. Tokio does not inherit this into spawned tasks.
@@ -195,8 +201,16 @@ pub(crate) async fn with_ohttp_health_route<T>(
     route: Option<crate::transport_health::HealthRoute>,
     future: impl std::future::Future<Output = T>,
 ) -> T {
+    let factory =
+        current_factory().filter(|factory| Some(factory.connector.health_route()) == route);
     OHTTP_HEALTH_ROUTE
-        .scope(route, OHTTP_STREAM_REQUEST.scope(None, future))
+        .scope(
+            route,
+            OHTTP_FACTORY.scope(
+                factory,
+                OHTTP_OWNER_HEALTH.scope(None, OHTTP_STREAM_REQUEST.scope(None, future)),
+            ),
+        )
         .await
 }
 
@@ -219,28 +233,157 @@ pub(crate) async fn with_ohttp_endpoint<T>(
 }
 
 pub(crate) async fn with_ohttp_stream_request<T>(
-    request: Option<Arc<crate::transport_health::HealthRequest>>,
+    request: Option<Arc<crate::ohttp::RequestHealth>>,
     future: impl std::future::Future<Output = T>,
 ) -> T {
     OHTTP_STREAM_REQUEST.scope(request, future).await
 }
 
-pub(crate) fn unary_health_request() -> Option<Arc<crate::transport_health::HealthRequest>> {
-    current_ohttp_health_route().map(|route| {
-        Arc::new(crate::transport_health::begin_request(
-            &route,
-            crate::transport_health::HealthScope::Lightwalletd,
-        ))
+pub(crate) fn current_owner_health() -> Option<Arc<crate::ohttp::RequestHealth>> {
+    OHTTP_OWNER_HEALTH.try_with(Clone::clone).ok().flatten()
+}
+
+pub(crate) async fn with_owner_health<T>(
+    health: Option<Arc<crate::ohttp::RequestHealth>>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    OHTTP_OWNER_HEALTH.scope(health, future).await
+}
+
+pub(crate) fn unary_health_request() -> Option<Arc<crate::ohttp::RequestHealth>> {
+    current_owner_health().or_else(|| {
+        current_ohttp_health_route().map(|route| {
+            Arc::new(crate::ohttp::RequestHealth::for_route(
+                route,
+                crate::transport_health::HealthScope::Lightwalletd,
+            ))
+        })
     })
 }
 
-pub(crate) fn record_unary_deadline(request: &Option<Arc<crate::transport_health::HealthRequest>>) {
+pub(crate) fn request_deadline(
+    health: &Option<Arc<crate::ohttp::RequestHealth>>,
+    budget: Duration,
+) -> tokio::time::Instant {
+    health.as_ref().map_or_else(
+        || tokio::time::Instant::now() + budget,
+        |health| health.timeout_at(budget),
+    )
+}
+
+pub(crate) fn record_unary_deadline(request: &Option<Arc<crate::ohttp::RequestHealth>>) {
     if let Some(request) = request {
-        request.record(
-            crate::transport_health::HealthOutcome::TransportUnavailable,
-            crate::transport_health::HealthStage::ResponseHead,
-        );
+        request.deadline(crate::transport_health::HealthStage::ResponseHead);
     }
+}
+
+#[derive(Clone)]
+pub(crate) struct OhttpFactory {
+    pub(crate) connector: crate::ohttp::OhttpConnector,
+    uri: String,
+}
+
+pub(crate) fn current_factory() -> Option<OhttpFactory> {
+    OHTTP_FACTORY.try_with(Clone::clone).ok().flatten()
+}
+
+/// Internal companion to the unchanged public tonic client. Its factory keeps the exact
+/// original relay connection, key cache and Tor isolation; only request-local pipes are new.
+#[derive(Clone)]
+pub(crate) struct TrackedConnection {
+    client: LwdClient,
+    pub(crate) factory: Option<OhttpFactory>,
+}
+
+impl std::ops::Deref for TrackedConnection {
+    type Target = LwdClient;
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
+impl std::ops::DerefMut for TrackedConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.client
+    }
+}
+impl TrackedConnection {
+    pub(crate) fn plain(client: LwdClient) -> Self {
+        Self {
+            client,
+            factory: None,
+        }
+    }
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn in_context(client: LwdClient) -> Self {
+        Self {
+            client,
+            factory: current_factory(),
+        }
+    }
+    pub(crate) fn ohttp(
+        client: LwdClient,
+        connector: crate::ohttp::OhttpConnector,
+        uri: String,
+    ) -> Self {
+        Self {
+            client,
+            factory: Some(OhttpFactory { connector, uri }),
+        }
+    }
+    pub(crate) fn into_client(self) -> LwdClient {
+        self.client
+    }
+    pub(crate) async fn call<T>(
+        &self,
+        call: impl AsyncFnOnce(&mut LwdClient) -> Result<T, SlipstreamError>,
+    ) -> Result<T, SlipstreamError> {
+        let mut client = self.client.clone();
+        let route = self
+            .factory
+            .as_ref()
+            .map(|factory| factory.connector.health_route());
+        OHTTP_FACTORY
+            .scope(
+                self.factory.clone(),
+                with_ohttp_health_route(route, Box::pin(call(&mut client))),
+            )
+            .await
+    }
+}
+
+pub(crate) struct RpcClient {
+    pub(crate) client: LwdClient,
+    pub(crate) health: Option<Arc<crate::ohttp::RequestHealth>>,
+}
+
+pub(crate) async fn request_client(client: &LwdClient) -> Result<RpcClient, SlipstreamError> {
+    if let Some(factory) = current_factory() {
+        let health = factory.connector.request_health();
+        let channel = TonicEndpoint::from_shared(factory.uri)
+            .map_err(|error| transport_err("local OHTTP endpoint", error))?
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .connect_with_connector(factory.connector.bound_to(health.clone()))
+            .await
+            .map_err(|error| transport_err("local OHTTP pipe", error))?;
+        Ok(RpcClient {
+            client: LwdClient::new(channel),
+            health: Some(health),
+        })
+    } else {
+        Ok(RpcClient {
+            client: client.clone(),
+            health: unary_health_request(),
+        })
+    }
+}
+
+async fn with_rpc_client<T>(
+    client: &mut LwdClient,
+    call: impl AsyncFnOnce(&mut LwdClient) -> Result<T, SlipstreamError>,
+) -> Result<T, SlipstreamError> {
+    // Bound the generic tonic/setup future's stack footprint inside sync_once.
+    let mut request = Box::pin(request_client(client)).await?;
+    with_owner_health(request.health, Box::pin(call(&mut request.client))).await
 }
 
 /// Awaits a unary gRPC call under [`UNARY_TIMEOUT`]; maps the gRPC status
@@ -254,7 +397,7 @@ async fn with_unary_timeout<T>(
         .ok()
         .flatten()
         .or_else(unary_health_request);
-    match tokio::time::timeout(UNARY_TIMEOUT, fut).await {
+    match tokio::time::timeout_at(request_deadline(&health, UNARY_TIMEOUT), fut).await {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
         Ok(Err(status)) => Err(status_err(context, status)),
         Err(_) => {
@@ -281,10 +424,7 @@ where
             OHTTP_STREAM_REQUEST
                 .try_with(|request| {
                     if let Some(request) = request {
-                        request.record(
-                            crate::transport_health::HealthOutcome::TransportUnavailable,
-                            crate::transport_health::HealthStage::ResponseBody,
-                        );
+                        request.deadline(crate::transport_health::HealthStage::ResponseBody);
                     }
                 })
                 .ok();
@@ -339,6 +479,15 @@ pub async fn connect_dedicated(endpoint: &Endpoint) -> Result<LwdClient, Slipstr
 }
 
 async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, SlipstreamError> {
+    connect_tracked(endpoint, shared)
+        .await
+        .map(TrackedConnection::into_client)
+}
+
+pub(crate) async fn connect_tracked(
+    endpoint: &Endpoint,
+    shared: bool,
+) -> Result<TrackedConnection, SlipstreamError> {
     // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
     // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
     if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
@@ -353,10 +502,10 @@ async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, Sl
         // in-process h2 server; TLS happens inside the connector, towards the relay. (tonic
         // refuses an `https://` URI without a tls_config.)
         let pipe_uri = format!("http://{}:{}", endpoint.host, endpoint.port);
-        let channel = TonicEndpoint::from_shared(pipe_uri)
+        let channel = TonicEndpoint::from_shared(pipe_uri.clone())
             .map_err(|e| transport_err("endpoint uri", e))?
             .connect_timeout(std::time::Duration::from_secs(10))
-            .connect_with_connector(connector)
+            .connect_with_connector(connector.clone())
             .await
             .map_err(|e| {
                 let source = std::error::Error::source(&e)
@@ -368,7 +517,11 @@ async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, Sl
                 )
             })?;
         net_stats::record(net_stats::NetEvent::DirectChannel);
-        return Ok(CompactTxStreamerClient::new(channel));
+        return Ok(TrackedConnection::ohttp(
+            CompactTxStreamerClient::new(channel),
+            connector,
+            pipe_uri,
+        ));
     }
     let mut ep = TonicEndpoint::from_shared(endpoint.uri())
         .map_err(|e| transport_err("endpoint uri", e))?
@@ -383,11 +536,16 @@ async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, Sl
         .await
         .map_err(|e| transport_err(&format!("connect {}", endpoint.host), e))?;
     net_stats::record(net_stats::NetEvent::DirectChannel);
-    Ok(CompactTxStreamerClient::new(channel))
+    Ok(TrackedConnection::plain(CompactTxStreamerClient::new(
+        channel,
+    )))
 }
 
 pub async fn get_lightd_info(client: &mut LwdClient) -> Result<LightdInfo, SlipstreamError> {
-    with_unary_timeout("get_lightd_info", client.get_lightd_info(Empty {})).await
+    with_rpc_client(client, async |client| {
+        with_unary_timeout("get_lightd_info", client.get_lightd_info(Empty {})).await
+    })
+    .await
 }
 
 /// Broadcast a raw transaction (\[B7\] send tooling). Returns the server's
@@ -396,35 +554,44 @@ pub async fn send_transaction(
     client: &mut LwdClient,
     tx_bytes: Vec<u8>,
 ) -> Result<(i32, String), SlipstreamError> {
-    let req = zcash_client_backend::proto::service::RawTransaction {
-        data: tx_bytes,
-        height: 0,
-    };
-    let resp = with_unary_timeout("send_transaction", client.send_transaction(req)).await?;
-    Ok((resp.error_code as i32, resp.error_message))
+    with_rpc_client(client, async |client| {
+        let req = zcash_client_backend::proto::service::RawTransaction {
+            data: tx_bytes,
+            height: 0,
+        };
+        let resp = with_unary_timeout("send_transaction", client.send_transaction(req)).await?;
+        Ok((resp.error_code as i32, resp.error_message))
+    })
+    .await
 }
 
 pub async fn get_latest_block_height(client: &mut LwdClient) -> Result<u64, SlipstreamError> {
-    net_stats::record(net_stats::NetEvent::GetLatestBlock);
-    Ok(
-        with_unary_timeout("get_latest_block", client.get_latest_block(ChainSpec {}))
-            .await?
-            .height,
-    )
+    with_rpc_client(client, async |client| {
+        net_stats::record(net_stats::NetEvent::GetLatestBlock);
+        Ok(
+            with_unary_timeout("get_latest_block", client.get_latest_block(ChainSpec {}))
+                .await?
+                .height,
+        )
+    })
+    .await
 }
 
 pub async fn get_tree_state(
     client: &mut LwdClient,
     height: u64,
 ) -> Result<TreeState, SlipstreamError> {
-    net_stats::record(net_stats::NetEvent::GetTreeState);
-    with_unary_timeout(
-        "get_tree_state",
-        client.get_tree_state(BlockId {
-            height,
-            hash: vec![],
-        }),
-    )
+    with_rpc_client(client, async |client| {
+        net_stats::record(net_stats::NetEvent::GetTreeState);
+        with_unary_timeout(
+            "get_tree_state",
+            client.get_tree_state(BlockId {
+                height,
+                hash: vec![],
+            }),
+        )
+        .await
+    })
     .await
 }
 
@@ -457,34 +624,37 @@ async fn collect_subtree_roots<H: HashSer>(
     label: &str,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<CommitmentTreeRoot<H>>, SlipstreamError> {
-    let mut req = GetSubtreeRootsArg {
-        start_index: u32::try_from(start_index).map_err(|_| {
-            SlipstreamError::Wallet(format!("{label} subtree index {start_index} exceeds u32"))
-        })?,
-        ..Default::default()
-    };
-    req.set_shielded_protocol(protocol);
-    let context = format!("get_subtree_roots({label} from {start_index})");
-    net_stats::record(net_stats::NetEvent::GetSubtreeRoots);
-    let health = unary_health_request();
-    with_ohttp_stream_request(health, async {
-        let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
-        collect_stream(
-            &mut stream,
-            &context,
-            "subtree root stream",
-            progress,
-            |r| {
-                let node = H::read(&r.root_hash[..])
-                    .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
-                Ok(CommitmentTreeRoot::from_parts(
-                    zcash_protocol::consensus::BlockHeight::from_u32(
-                        r.completing_block_height as u32,
-                    ),
-                    node,
-                ))
-            },
-        )
+    with_rpc_client(client, async |client| {
+        let mut req = GetSubtreeRootsArg {
+            start_index: u32::try_from(start_index).map_err(|_| {
+                SlipstreamError::Wallet(format!("{label} subtree index {start_index} exceeds u32"))
+            })?,
+            ..Default::default()
+        };
+        req.set_shielded_protocol(protocol);
+        let context = format!("get_subtree_roots({label} from {start_index})");
+        net_stats::record(net_stats::NetEvent::GetSubtreeRoots);
+        let health = unary_health_request();
+        with_ohttp_stream_request(health, async {
+            let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
+            collect_stream(
+                &mut stream,
+                &context,
+                "subtree root stream",
+                progress,
+                |r| {
+                    let node = H::read(&r.root_hash[..])
+                        .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
+                    Ok(CommitmentTreeRoot::from_parts(
+                        zcash_protocol::consensus::BlockHeight::from_u32(
+                            r.completing_block_height as u32,
+                        ),
+                        node,
+                    ))
+                },
+            )
+            .await
+        })
         .await
     })
     .await
@@ -553,44 +723,47 @@ pub async fn get_transaction(
     client: &mut LwdClient,
     txid: [u8; 32],
 ) -> Result<Option<RawTransaction>, SlipstreamError> {
-    net_stats::record(net_stats::NetEvent::GetTransaction);
-    // B2: unary deadline; the not-found mapping below needs the raw status, so this
-    // call cannot reuse with_unary_timeout's uniform error mapping.
-    let health = unary_health_request();
-    let outcome = tokio::time::timeout(
-        UNARY_TIMEOUT,
-        client.get_transaction(TxFilter {
-            hash: txid.to_vec(),
-            ..Default::default()
-        }),
-    )
-    .await
-    .map_err(|_| {
-        record_unary_deadline(&health);
-        SlipstreamError::Transport(format!(
-            "get_transaction: timed out after {}s",
-            UNARY_TIMEOUT.as_secs()
-        ))
-    })?;
-    match outcome {
-        Ok(resp) => Ok(Some(resp.into_inner())),
-        Err(status) => {
-            // lightwalletd returns NotFound or Unknown/Internal with "not found" message
-            // for unrecognized txids. Treat these as Ok(None) — caller maps to
-            // TxidNotRecognized. All other status codes propagate as transport errors.
-            let code = status.code();
-            let msg_lower = status.message().to_lowercase();
-            if code == tonic::Code::NotFound
-                || ((code == tonic::Code::Unknown || code == tonic::Code::Internal)
-                    && (msg_lower.contains("not found")
-                        || msg_lower.contains("no such transaction")))
-            {
-                Ok(None)
-            } else {
-                Err(status_err("get_transaction", status))
+    with_rpc_client(client, async |client| {
+        net_stats::record(net_stats::NetEvent::GetTransaction);
+        // B2: unary deadline; the not-found mapping below needs the raw status, so this
+        // call cannot reuse with_unary_timeout's uniform error mapping.
+        let health = unary_health_request();
+        let outcome = tokio::time::timeout_at(
+            request_deadline(&health, UNARY_TIMEOUT),
+            client.get_transaction(TxFilter {
+                hash: txid.to_vec(),
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|_| {
+            record_unary_deadline(&health);
+            SlipstreamError::Transport(format!(
+                "get_transaction: timed out after {}s",
+                UNARY_TIMEOUT.as_secs()
+            ))
+        })?;
+        match outcome {
+            Ok(resp) => Ok(Some(resp.into_inner())),
+            Err(status) => {
+                // lightwalletd returns NotFound or Unknown/Internal with "not found" message
+                // for unrecognized txids. Treat these as Ok(None) — caller maps to
+                // TxidNotRecognized. All other status codes propagate as transport errors.
+                let code = status.code();
+                let msg_lower = status.message().to_lowercase();
+                if code == tonic::Code::NotFound
+                    || ((code == tonic::Code::Unknown || code == tonic::Code::Internal)
+                        && (msg_lower.contains("not found")
+                            || msg_lower.contains("no such transaction")))
+                {
+                    Ok(None)
+                } else {
+                    Err(status_err("get_transaction", status))
+                }
             }
         }
-    }
+    })
+    .await
 }
 
 /// Stream raw transactions involving a transparent address in a height range; every
@@ -600,18 +773,21 @@ pub async fn get_taddress_txids(
     filter: TransparentAddressBlockFilter,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<RawTransaction>, SlipstreamError> {
-    net_stats::record(net_stats::NetEvent::GetTaddressTxids);
-    let health = unary_health_request();
-    with_ohttp_stream_request(health, async {
-        let mut stream =
-            with_unary_timeout("get_taddress_txids", client.get_taddress_txids(filter)).await?;
-        collect_stream(
-            &mut stream,
-            "get_taddress_txids",
-            "taddress txid stream",
-            progress,
-            Ok,
-        )
+    with_rpc_client(client, async |client| {
+        net_stats::record(net_stats::NetEvent::GetTaddressTxids);
+        let health = unary_health_request();
+        with_ohttp_stream_request(health, async {
+            let mut stream =
+                with_unary_timeout("get_taddress_txids", client.get_taddress_txids(filter)).await?;
+            collect_stream(
+                &mut stream,
+                "get_taddress_txids",
+                "taddress txid stream",
+                progress,
+                Ok,
+            )
+            .await
+        })
         .await
     })
     .await
@@ -634,12 +810,15 @@ pub async fn get_taddress_txids(
 pub async fn open_mempool_stream(
     client: &mut LwdClient,
 ) -> Result<tonic::Streaming<RawTransaction>, SlipstreamError> {
-    net_stats::record(net_stats::NetEvent::GetMempoolStream);
-    client
-        .get_mempool_stream(Empty {})
-        .await
-        .map(tonic::Response::into_inner)
-        .map_err(|status| status_err("get_mempool_stream", status))
+    with_rpc_client(client, async |client| {
+        net_stats::record(net_stats::NetEvent::GetMempoolStream);
+        client
+            .get_mempool_stream(Empty {})
+            .await
+            .map(tonic::Response::into_inner)
+            .map_err(|status| status_err("get_mempool_stream", status))
+    })
+    .await
 }
 
 /// Collect UTXOs for the given transparent addresses from `start_height`; every UTXO received
@@ -650,25 +829,28 @@ pub async fn get_address_utxos(
     start_height: u64,
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<GetAddressUtxosReply>, SlipstreamError> {
-    net_stats::record(net_stats::NetEvent::GetAddressUtxos);
-    let health = unary_health_request();
-    with_ohttp_stream_request(health, async {
-        let mut stream = with_unary_timeout(
-            "get_address_utxos",
-            client.get_address_utxos_stream(GetAddressUtxosArg {
-                addresses,
-                start_height,
-                max_entries: 0,
-            }),
-        )
-        .await?;
-        collect_stream(
-            &mut stream,
-            "get_address_utxos",
-            "utxo stream",
-            progress,
-            Ok,
-        )
+    with_rpc_client(client, async |client| {
+        net_stats::record(net_stats::NetEvent::GetAddressUtxos);
+        let health = unary_health_request();
+        with_ohttp_stream_request(health, async {
+            let mut stream = with_unary_timeout(
+                "get_address_utxos",
+                client.get_address_utxos_stream(GetAddressUtxosArg {
+                    addresses,
+                    start_height,
+                    max_entries: 0,
+                }),
+            )
+            .await?;
+            collect_stream(
+                &mut stream,
+                "get_address_utxos",
+                "utxo stream",
+                progress,
+                Ok,
+            )
+            .await
+        })
         .await
     })
     .await
@@ -813,6 +995,32 @@ pub mod net_stats {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test(start_paused = true)]
+    async fn health_local_setup_consumes_the_existing_unary_deadline_budget() {
+        let route = crate::transport_health::HealthRoute {
+            gateway_host: "health-local-budget.invalid".into(),
+            relay_url: "https://health-local-budget-relay.invalid/relay".into(),
+            via_tor: false,
+        };
+        let request = Arc::new(crate::ohttp::RequestHealth::for_route(
+            route,
+            crate::transport_health::HealthScope::Lightwalletd,
+        ));
+        let started = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let result = with_owner_health(
+            Some(request),
+            with_unary_timeout::<()>("after-local-setup", std::future::pending()),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            tokio::time::Instant::now() - started,
+            Duration::from_secs(30),
+            "local setup must not extend the logical RPC deadline"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn health_nested_public_route_shadows_private_scope() {

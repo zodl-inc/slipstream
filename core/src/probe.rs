@@ -150,12 +150,18 @@ async fn probe_one(endpoint: Endpoint, deadline: Instant) -> ProbeResult {
         sample_mbps: None,
     };
 
-    let Ok(Ok(mut client)) = timeout(remaining(deadline), grpc::connect(&endpoint)).await else {
+    let Ok(Ok(mut client)) =
+        timeout(remaining(deadline), grpc::connect_tracked(&endpoint, true)).await
+    else {
         return result;
     };
     let Ok(Ok(tip)) = timeout(
         remaining(deadline),
-        grpc::with_ohttp_endpoint(&endpoint, false, grpc::get_latest_block_height(&mut client)),
+        grpc::with_ohttp_endpoint(
+            &endpoint,
+            false,
+            client.call(async |client| grpc::get_latest_block_height(client).await),
+        ),
     )
     .await
     else {

@@ -48,7 +48,7 @@ use zcash_client_backend::proto::{
 use crate::{
     chunk::{Chunk, ChunkQueueSender, QueueMeter},
     config::{Endpoint, EngineConfig},
-    connector::{ConnPurpose, TorConn, connect_via},
+    connector::{ConnPurpose, TorConn, connect_via_tracked as connect_via},
     error::SlipstreamError,
     grpc::{self, LwdClient},
     verify::Continuity,
@@ -1137,18 +1137,22 @@ async fn open_and_pump(
         // (Longer for OHTTP gateways, whose buffered response = the whole chunk —
         // grpc::range_open_timeout.)
         grpc::net_stats::record(grpc::net_stats::NetEvent::GetBlockRange);
-        let health = grpc::unary_health_request();
-        let opened = tokio::time::timeout(open_timeout, client.get_block_range(req))
-            .await
-            .map_err(|_| {
-                grpc::record_unary_deadline(&health);
-                SlipstreamError::Transport(format!(
-                    "get_block_range {}..{}: timed out after {}s",
-                    cursor.resume_from,
-                    window_end,
-                    open_timeout.as_secs()
-                ))
-            })?;
+        let mut rpc = grpc::request_client(client).await?;
+        let health = rpc.health.clone();
+        let opened = tokio::time::timeout_at(
+            grpc::request_deadline(&health, open_timeout),
+            rpc.client.get_block_range(req),
+        )
+        .await
+        .map_err(|_| {
+            grpc::record_unary_deadline(&health);
+            SlipstreamError::Transport(format!(
+                "get_block_range {}..{}: timed out after {}s",
+                cursor.resume_from,
+                window_end,
+                open_timeout.as_secs()
+            ))
+        })?;
         let start = cursor.resume_from;
         let span = window_end - start + 1;
         let split = |refusal: &dyn std::fmt::Display, max_span: &mut u64| {
@@ -1337,19 +1341,22 @@ async fn worker(
             match grpc::with_ohttp_endpoint(
                 &endpoint,
                 tor.is_some(),
-                open_and_pump(
-                    &mut client,
-                    &mut cursor,
-                    &plan,
-                    &gate,
-                    &out,
-                    open_timeout,
-                    progress.as_deref(),
-                    &mut max_span,
-                    split_on_invalid,
-                    Some(&slot),
-                    Some(&dispatcher),
-                ),
+                client.call(async |client| {
+                    open_and_pump(
+                        client,
+                        &mut cursor,
+                        &plan,
+                        &gate,
+                        &out,
+                        open_timeout,
+                        progress.as_deref(),
+                        &mut max_span,
+                        split_on_invalid,
+                        Some(&slot),
+                        Some(&dispatcher),
+                    )
+                    .await
+                }),
             )
             .await
             {
@@ -3434,11 +3441,11 @@ mod tests {
             via_tor: true,
         };
         let subscription = transport_health::subscribe(route.clone(), 42, Arc::new(|_| {}));
-        let request = Arc::new(transport_health::begin_request(
-            &route,
+        let request = Arc::new(crate::ohttp::RequestHealth::for_route(
+            route,
             HealthScope::Lightwalletd,
         ));
-        let id = request.request_id();
+        let id = request.ticket.request_id();
         let (tx, _rx) = mpsc::channel::<SubChunk>(64);
         let gate = open_gate();
         let mut cursor = test_cursor(0, 100, 129);

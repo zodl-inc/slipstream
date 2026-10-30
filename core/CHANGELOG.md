@@ -10,6 +10,11 @@ workspace.
 
 ## [Unreleased]
 
+### Fixed
+- Known OHTTP policy, configuration, size and rate-limit outcomes survive an
+  error body that outlasts a caller deadline. Native handlers and their exact
+  deadline owners share one request's evidence; concurrent calls remain independent.
+
 ### Added
 - Native OHTTP traffic now publishes typed health evidence before sync retry
   backoff, including key-configuration fallback, authenticated backend responses,
