@@ -300,22 +300,10 @@ pub(crate) fn update_pass_progress(
     }
 }
 
-/// Carry only scan/rewind height evidence into the lifetime correction bound.
-fn record_continuity_scope(
-    p: &Progress,
-    start: u64,
-    end_exclusive: u64,
-    at: u64,
-    range_start_scanned: u64,
-) {
-    // A continuity error can occur inside a chunk that never published scan credit.
-    // Its height alone is not proof that the entire preceding range was earned.
-    let scanned_end = start
-        .saturating_add(p.scanned().saturating_sub(range_start_scanned))
-        .min(at)
-        .min(end_exclusive)
-        .max(start);
-    p.note_work_completed(start..scanned_end);
+/// Carry a successful rewind boundary into the lifetime correction bound.
+fn record_continuity_scope(p: &Progress, at: u64) {
+    // Completion evidence comes only from successful persistence. Scan counters
+    // can include unsubmitted work, so a rewind never promotes them to completion.
     p.note_work_rewind(at.saturating_sub(10)..p.chain_tip().saturating_add(1));
 }
 
@@ -688,7 +676,6 @@ pub async fn run_to_completion(
         // the work actually done in THIS attempt, not work from earlier attempts at overlapping
         // ranges that the counter already holds.
         let range_start_scanned_work = progress.as_ref().map(|p| p.scanned_work()).unwrap_or(0);
-        let range_start_scanned = progress.as_ref().map(|p| p.scanned()).unwrap_or(0);
 
         let (mut tx, rx) = chunk_queue(config.memory_budget_bytes);
         // v0.5 pacer fix: boundary treestate fetches start when the chunk is
@@ -869,13 +856,7 @@ pub async fn run_to_completion(
 
             report.reorgs_recovered += 1;
             if let Some(ref p) = progress {
-                record_continuity_scope(
-                    p,
-                    start,
-                    end_exclusive,
-                    u64::from(at),
-                    range_start_scanned,
-                );
+                record_continuity_scope(p, u64::from(at));
                 p.add_reorg();
             }
 
@@ -980,9 +961,6 @@ pub async fn run_to_completion(
         report.enhance.address += scan_stats.interleaved_enhance.address;
 
         // F1: accumulate scanned blocks for next iteration's whole-pass denominator.
-        if let Some(ref p) = progress {
-            p.note_work_completed(start..end_exclusive);
-        }
         scanned_so_far_in_pass += scan_stats.blocks;
         // B1: accumulate scanned work when using work-based progress.
         scanned_work_so_far_in_pass += scan_stats.work;
@@ -1773,7 +1751,7 @@ mod tests {
         b = b - 1_000 + scan_continuity_repair_credit(start, end, rewind);
         w = w - (60_000 + 1_000 * BLOCK_WEIGHT)
             + scan_continuity_work_credit(&est, start, end, rewind).min(p.scanned_work());
-        record_continuity_scope(&p, start, end, at, 0);
+        record_continuity_scope(&p, at);
         p.add_reorg();
         let remaining = est.range(1, 10_000) + est.range(rewind, 11_000);
         let rebaselined = update_pass_progress(
@@ -1938,10 +1916,9 @@ mod tests {
     fn work_progress_continuity_without_scanned_credit_cannot_spend_floor() {
         let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
         let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
-        let range_start_scanned = p.scanned();
         // A Historic attempt fails inside an uncredited chunk. The error height
         // cannot turn its unscanned prefix into completed-and-reopened work.
-        record_continuity_scope(&p, 1, 10_001, 9_001, range_start_scanned);
+        record_continuity_scope(&p, 9_001);
         assert!(dense_suggest(
             &p,
             &mut b,
@@ -1960,7 +1937,7 @@ mod tests {
         let (p, mut b, mut w) = dense_tip_fixture(&est, 1);
         // Most of this rewind was already pending Historic work. Only the dense
         // completed tip is newly reopened, even though the repair spans 6,000 blocks.
-        record_continuity_scope(&p, 1, 10_001, 5_011, p.scanned());
+        record_continuity_scope(&p, 5_011);
         p.add_reorg();
         assert!(dense_suggest(
             &p,
@@ -3104,6 +3081,468 @@ mod tests {
             global_floor_permille_work(2_000, Some(1), 99_999, &est),
             Some(0),
             "clamps"
+        );
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum PartialCommitMode {
+        Deferred,
+        Sparse,
+        Vanilla,
+        Unsubmitted,
+        Failed,
+        FailedVanilla,
+    }
+
+    // Scan through the real production persistence targets. Deferred success
+    // abandons the async lane owner while SQLite still blocks its transaction.
+    async fn commit_interrupted_prefix(
+        p: &std::sync::Arc<Progress>,
+        range: std::ops::Range<u64>,
+        mode: PartialCommitMode,
+    ) {
+        use zcash_client_backend::proto::compact_formats::{ChainMetadata, CompactBlock};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("wallet.db");
+        let network = crate::network::SlipstreamNetwork::Custom {
+            constants: zcash_protocol::consensus::NetworkType::Main,
+            heights: crate::network::CustomActivations::all_from_genesis(),
+        };
+        let mut wallet = WalletSession::open(network, &path).expect("wallet");
+        let hash = |h: u64| {
+            let mut bytes = vec![0; 32];
+            bytes[..8].copy_from_slice(&h.to_le_bytes());
+            bytes
+        };
+        let blocks = range
+            .clone()
+            .map(|height| CompactBlock {
+                height,
+                hash: hash(height),
+                prev_hash: if height == range.start {
+                    vec![0; 32]
+                } else {
+                    hash(height - 1)
+                },
+                chain_metadata: Some(ChainMetadata::default()),
+                ..Default::default()
+            })
+            .collect();
+        let chunk = crate::chunk::Chunk::from_blocks(0, blocks);
+        let source = crate::block_source::MemBlockSource::new(&chunk);
+        let state = zcash_client_backend::proto::service::TreeState {
+            network: "main".into(),
+            height: range.start - 1,
+            hash: "0".repeat(64),
+            ..Default::default()
+        }
+        .to_chain_state()
+        .expect("state");
+        let lock = rusqlite::Connection::open(&path).expect("write lock");
+        if matches!(
+            mode,
+            PartialCommitMode::Sparse
+                | PartialCommitMode::Vanilla
+                | PartialCommitMode::FailedVanilla
+        ) {
+            if matches!(mode, PartialCommitMode::FailedVanilla) {
+                lock.execute_batch(&format!(
+                    "CREATE TRIGGER reject_inline_commit BEFORE INSERT ON blocks WHEN NEW.height = {} BEGIN SELECT RAISE(ABORT, 'reject inline commit'); END",
+                    range.start + (range.end-range.start)/2,
+                )).expect("reject inline transaction");
+            }
+            let mut sparse = crate::persist::SparseTreeState::default();
+            let result = tokio::task::block_in_place(|| {
+                let target = if matches!(mode, PartialCommitMode::Sparse) {
+                    crate::scan::ScanTarget::Sparse(&mut sparse)
+                } else {
+                    crate::scan::ScanTarget::Inline
+                };
+                crate::scan::scan_batch(
+                    &mut wallet,
+                    &source,
+                    BlockHeight::from(range.start as u32),
+                    &state,
+                    (range.end - range.start) as usize,
+                    target,
+                    Some(p),
+                )
+            });
+            if matches!(mode, PartialCommitMode::FailedVanilla) {
+                assert!(
+                    result
+                        .expect_err("inline transaction must fail")
+                        .to_string()
+                        .contains("reject inline commit")
+                );
+                let count: u64 = lock
+                    .query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))
+                    .expect("no rolled-back inline blocks");
+                assert_eq!(count, 0);
+                return;
+            }
+            result.expect("serialized prefix commit");
+        } else {
+            let mut facade = crate::persist::WriteBehindFacade::seed(wallet.db_mut(), range.start)
+                .expect("facade");
+            tokio::task::block_in_place(|| {
+                crate::scan::scan_batch(
+                    &mut wallet,
+                    &source,
+                    BlockHeight::from(range.start as u32),
+                    &state,
+                    (range.end - range.start) as usize,
+                    crate::scan::ScanTarget::Deferred(&mut facade),
+                    Some(p),
+                )
+            })
+            .expect("scan into deferred stash");
+            let pending = facade.take_stash().expect("pending commit");
+            if matches!(mode, PartialCommitMode::Unsubmitted) {
+                drop(pending);
+                let count: u64 = lock
+                    .query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))
+                    .expect("no committed blocks");
+                assert_eq!(count, 0);
+                return;
+            }
+            let mut lane =
+                crate::persist::PersistLane::open(&path, network, 1, false, 0, false, None)
+                    .expect("persist lane");
+            lane.attach_writer_gate(std::sync::Arc::clone(p));
+            if matches!(mode, PartialCommitMode::Failed) {
+                lock.execute_batch(&format!(
+                    "CREATE TRIGGER reject_partial_commit BEFORE INSERT ON blocks WHEN NEW.height = {} BEGIN SELECT RAISE(ABORT, 'reject partial commit'); END",
+                    range.start + (range.end-range.start)/2,
+                )).expect("reject transaction after a partial insert");
+                lane.submit(pending).await.expect("submit failing unit");
+                let error = lane.drain().await.expect_err("commit must fail");
+                assert!(
+                    error.to_string().contains("reject partial commit"),
+                    "{error}"
+                );
+                assert_eq!(p.wallet_writers(), 0);
+                let count: u64 = lock
+                    .query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))
+                    .expect("no failed commit rows");
+                assert_eq!(count, 0);
+                return;
+            }
+            lock.execute_batch("BEGIN IMMEDIATE").expect("hold commit");
+            lane.submit(pending).await.expect("submit prefix");
+            assert_eq!(p.wallet_writers(), 1);
+            drop(lane);
+            lock.execute_batch("COMMIT").expect("release commit");
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while p.wallet_writers() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("orphan commit releases gate");
+        }
+        let count: u64 = lock
+            .query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))
+            .expect("confirmed block rows");
+        assert_eq!(count, range.end - range.start);
+    }
+
+    async fn dense_partial_commit_restart(control: bool, mode: PartialCommitMode) -> u16 {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (progress, mut b, mut w) = dense_tip_fixture(&est, 1);
+        let p = std::sync::Arc::new(progress);
+        p.note_work_rewind(10_501..11_001);
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 10_501..11_001]
+        ));
+        commit_interrupted_prefix(&p, 10_501..10_751, mode).await;
+        if control {
+            p.note_work_completed(10_501..10_751);
+        }
+        p.begin_pass();
+        b = 0;
+        w = 0;
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_001, 10_751..11_001]
+        ));
+        p.note_work_rewind(10_001..10_301);
+        dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_301, 10_751..11_001],
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!(!dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            &[1..10_301, 10_751..11_001]
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+        eprintln!("dense committed prefix: control={control}, after={after}");
+        after
+    }
+
+    async fn uniform_partial_commit_restart(control: bool, mode: PartialCommitMode) -> u16 {
+        let est = uniform(10_000);
+        let p = std::sync::Arc::new(Progress::default());
+        p.set_chain_tip(10_000);
+        dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(9_001..10_001)),
+        );
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            900
+        );
+        p.note_work_rewind(7_001..9_001);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(7_001..10_001))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            700
+        );
+        commit_interrupted_prefix(&p, 7_001..8_001, mode).await;
+        if control {
+            p.note_work_completed(7_001..8_001);
+        }
+        p.begin_pass();
+        dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(8_001..10_001)),
+        );
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            800
+        );
+        p.note_work_rewind(7_001..8_001);
+        dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(7_001..10_001)),
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        assert!(!dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(7_001..10_001))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            after
+        );
+        eprintln!("uniform committed prefix: control={control}, after={after}");
+        after
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_dense_restart_refunds_only_outstanding_work() {
+        assert!(dense_partial_commit_restart(false, PartialCommitMode::Deferred).await >= 500);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_uniform_restart_reopens_completed_prefix() {
+        assert_eq!(
+            uniform_partial_commit_restart(false, PartialCommitMode::Deferred).await,
+            700
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_inline_sparse_restart() {
+        assert_eq!(
+            uniform_partial_commit_restart(false, PartialCommitMode::Sparse).await,
+            700
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_inline_vanilla_restart() {
+        assert_eq!(
+            uniform_partial_commit_restart(false, PartialCommitMode::Vanilla).await,
+            700
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_unsubmitted_continuity_cannot_clear_charges() {
+        let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+        let (progress, mut b, mut w) = dense_tip_fixture(&est, 1);
+        let p = std::sync::Arc::new(progress);
+        p.note_work_rewind(10_001..11_001);
+        assert!(dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(1..11_001))
+        ));
+        let before = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        commit_interrupted_prefix(&p, 10_001..10_601, PartialCommitMode::Unsubmitted).await;
+        // Production chunk counters can include the facade's unsubmitted stash.
+        p.add_scanned(600);
+        p.add_scanned_work(600 * BLOCK_WEIGHT);
+        record_continuity_scope(&p, 10_601);
+        let rebaselined = dense_suggest(
+            &p,
+            &mut b,
+            &mut w,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(1..11_001)),
+        );
+        let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+        eprintln!(
+            "unsubmitted continuity: before={before}, after={after}, rebaselined={rebaselined}"
+        );
+        assert!(!rebaselined);
+        assert_eq!(after, before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_failed_transaction_does_not_refund() {
+        for mode in [PartialCommitMode::Failed, PartialCommitMode::FailedVanilla] {
+            let est = WorkEstimator::new(vec![(1, vec![(0, 10_000)])]);
+            let (progress, mut b, mut w) = dense_tip_fixture(&est, 1);
+            let p = std::sync::Arc::new(progress);
+            p.note_work_rewind(10_501..11_001);
+            assert!(!dense_suggest(
+                &p,
+                &mut b,
+                &mut w,
+                &est,
+                Some(1),
+                &[1..10_001, 10_501..11_001]
+            ));
+            commit_interrupted_prefix(&p, 10_501..10_751, mode).await;
+            p.begin_pass();
+            b = 0;
+            w = 0;
+            assert!(!dense_suggest(
+                &p,
+                &mut b,
+                &mut w,
+                &est,
+                Some(1),
+                &[1..10_001, 10_501..11_001]
+            ));
+            p.note_work_rewind(10_001..10_301);
+            assert!(dense_suggest(
+                &p,
+                &mut b,
+                &mut w,
+                &est,
+                Some(1),
+                &[1..10_301, 10_501..11_001]
+            ));
+            let after = derive_snapshot(&p, SyncState::Syncing).progress_permille;
+            assert_eq!(after, 478, "all 800 reopened blocks still need scanning");
+            assert!(!dense_suggest(
+                &p,
+                &mut b,
+                &mut w,
+                &est,
+                Some(1),
+                &[1..10_301, 10_501..11_001]
+            ));
+            assert_eq!(
+                derive_snapshot(&p, SyncState::Syncing).progress_permille,
+                after
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_reopened_before_resuggestion_is_visible() {
+        let est = uniform(10_000);
+        let p = std::sync::Arc::new(Progress::default());
+        p.set_chain_tip(10_000);
+        dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(9_001..10_001)),
+        );
+        p.note_work_rewind(7_001..9_001);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(7_001..10_001))
+        ));
+        commit_interrupted_prefix(&p, 7_001..8_001, PartialCommitMode::Deferred).await;
+        // Model the previously displayed earned share after this confirmed scan.
+        // No ordinary suggestion has observed its shorter pending queue yet.
+        p.permille_floor(800, PASS_UNIT_WORK);
+        p.begin_pass();
+        p.note_work_rewind(7_001..8_001);
+        assert!(dense_suggest(
+            &p,
+            &mut 0,
+            &mut 0,
+            &est,
+            Some(1),
+            std::slice::from_ref(&(7_001..10_001))
+        ));
+        assert_eq!(
+            derive_snapshot(&p, SyncState::Syncing).progress_permille,
+            700
+        );
+    }
+
+    // Diagnostic controls, not the production completion-notification path.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn work_progress_partial_commit_explicit_completion_controls() {
+        assert_eq!(
+            dense_partial_commit_restart(true, PartialCommitMode::Deferred).await,
+            500
+        );
+        assert_eq!(
+            uniform_partial_commit_restart(true, PartialCommitMode::Deferred).await,
+            700
         );
     }
 

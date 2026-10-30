@@ -596,6 +596,8 @@ type IronwoodSparseTree = OrchardSparseTree;
 /// invalidate it explicitly).
 #[derive(Default)]
 pub struct SparseTreeState {
+    // Commit evidence outlives the async scan owner on the deferred path.
+    committed_progress: Option<crate::events::ProgressArc>,
     sapling: Option<SaplingSparseTree>,
     orchard: Option<OrchardSparseTree>,
     /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
@@ -636,6 +638,10 @@ pub struct SparseTreeState {
 }
 
 impl SparseTreeState {
+    pub(crate) fn attach_progress(&mut self, progress: Option<crate::events::ProgressArc>) {
+        self.committed_progress = progress;
+    }
+
     /// \[B6\] Set the anchor-retention policy (see the field docs). Public for
     /// integration tests and direct hosts; production plumbs it from
     /// `EngineConfig::anchor_retention`.
@@ -1367,6 +1373,7 @@ pub fn sparse_put_blocks(
         census_orchard,
         graft,
         graft_verdict_totals,
+        committed_progress,
         ..
     } = sparse
     else {
@@ -2096,6 +2103,11 @@ pub fn sparse_put_blocks(
         Ok(())
     })?;
     let txn_ms = t_txn.elapsed().as_millis();
+    if let Some(progress) = committed_progress {
+        // The scan-queue update is durable now. Publish before fallible graft
+        // cleanup, and while a deferred job still owns its wallet writer gate.
+        progress.note_work_completed(u64::from(first_height)..u64::from(last_height) + 1);
+    }
 
     // v0.4 Plan A: buffer rows of the row sets built/grafted this call are dead now
     // the txn committed: exactly their positions, never the rest of their shard.
@@ -4575,9 +4587,13 @@ impl PersistLane {
     }
 
     /// [B4-16 drain] Attach the handle's shared progress so every deferred commit holds
-    /// the writer gate for its whole life. The production scan path attaches; oracle and
-    /// test drivers (no stop()/start() drain to serve) may skip.
+    /// the writer gate for its whole life and publishes confirmed completion from its
+    /// owned tree state. Attach before submitting the first unit. Oracle and test
+    /// drivers with no progress handle may skip.
     pub fn attach_writer_gate(&mut self, progress: crate::events::ProgressArc) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.attach_progress(Some(progress.clone()));
+        }
         self.progress = Some(progress);
     }
 
