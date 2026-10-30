@@ -68,6 +68,8 @@ pub mod oracle;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod persist;
 #[cfg(feature = "zcash_client_sqlite")]
+mod progress_scope;
+#[cfg(feature = "zcash_client_sqlite")]
 pub mod reconcile;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod report;

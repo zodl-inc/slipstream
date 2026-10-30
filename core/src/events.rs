@@ -70,15 +70,6 @@ pub struct DownloadFailure {
     pub last_unix: u64,
 }
 
-/// Last valid scheduler observation of a work pass's scan scope.
-#[cfg(feature = "zcash_client_sqlite")]
-#[derive(Clone, Copy, Debug)]
-struct WorkPassScope {
-    birthday: u64,
-    total_blocks: u64,
-    reorgs: u64,
-}
-
 /// Shared engine progress for poll-based consumers (decision D8).
 ///
 /// All counters are monotonic during one sync pass; `Relaxed` ordering is
@@ -92,7 +83,7 @@ struct WorkPassScope {
 pub struct Progress {
     /// Scheduler-only scope evidence; snapshot readers never lock this state.
     #[cfg(feature = "zcash_client_sqlite")]
-    work_pass_scope: std::sync::Mutex<Option<WorkPassScope>>,
+    work_scope: std::sync::Mutex<crate::progress_scope::WorkScope>,
     /// Current chain tip height as reported by the server.
     pub chain_tip: AtomicU64,
     /// Number of compact blocks fetched so far.
@@ -260,7 +251,7 @@ impl Default for Progress {
     fn default() -> Self {
         Self {
             #[cfg(feature = "zcash_client_sqlite")]
-            work_pass_scope: std::sync::Mutex::new(None),
+            work_scope: std::sync::Mutex::new(crate::progress_scope::WorkScope::default()),
             chain_tip: AtomicU64::new(0),
             fetched_blocks: AtomicU64::new(0),
             scanned_blocks: AtomicU64::new(0),
@@ -714,26 +705,50 @@ impl Progress {
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
-    /// Observe a valid work suggestion, detecting exact scope growth or a successful rewind.
-    /// The first observation preserves initial seeding and correction semantics.
+    /// Bound a WORK correction using handle-lifetime height evidence.
     #[cfg(feature = "zcash_client_sqlite")]
-    pub(crate) fn observe_work_scope(&self, birthday: u64, total_blocks: u64) -> bool {
-        let current = WorkPassScope {
-            birthday,
-            total_blocks,
-            reorgs: self.reorgs(),
-        };
-        let mut previous = self
-            .work_pass_scope
+    pub(crate) fn work_scope_lower_bound(
+        &self,
+        birthday: u64,
+        pending: &[std::ops::Range<u64>],
+        estimator: &crate::work::WorkEstimator,
+    ) -> u64 {
+        self.work_scope
             .lock()
-            .unwrap_or_else(|p| p.into_inner());
-        let expanded = previous.is_none_or(|old| {
-            current.birthday < old.birthday
-                || current.total_blocks > old.total_blocks
-                || current.reorgs > old.reorgs
-        });
-        *previous = Some(current);
-        expanded
+            .unwrap_or_else(|p| p.into_inner())
+            .observe(
+                birthday..self.chain_tip().saturating_add(1),
+                pending,
+                estimator,
+                self.progress_permille_floor.load(Ordering::Relaxed),
+            )
+    }
+
+    /// Consume a proposal after it is applied or independently supported by the seed.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn acknowledge_work_scope(&self, floor: u64) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .acknowledge(floor);
+    }
+
+    /// Record successful scan completion independently of pass-local credit counters.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn note_work_completed(&self, range: std::ops::Range<u64>) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .completed(range);
+    }
+
+    /// Record the successful continuity repair's extent, not just its generation count.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn note_work_rewind(&self, range: std::ops::Range<u64>) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rewound(range);
     }
 
     /// Pure read of numeric reset eligibility: true when `seed` lands materially
@@ -922,13 +937,6 @@ impl Progress {
     /// [`Self::request_stop_for_wallet_change`]). It outlives the pass it interrupts, and only
     /// [`Self::begin_session`] re-arms it.
     pub fn begin_pass(&self) {
-        #[cfg(feature = "zcash_client_sqlite")]
-        {
-            *self
-                .work_pass_scope
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = None;
-        }
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
         self.scanned_work.store(0, Ordering::Relaxed);
@@ -1415,26 +1423,56 @@ mod tests {
 
     #[cfg(feature = "zcash_client_sqlite")]
     #[test]
-    fn work_scope_observation_tracks_exact_growth() {
+    fn work_scope_observation_tracks_bounded_growth() {
         let p = Progress::default();
-        assert!(p.observe_work_scope(1_001, 1_000));
-        assert!(!p.observe_work_scope(1_001, 1_000));
-        assert!(!p.observe_work_scope(1_001, 900));
-        assert!(p.observe_work_scope(1_001, 1_000));
-        assert!(p.observe_work_scope(1, 1_000));
-        p.add_reorg();
-        assert!(p.observe_work_scope(1, 1_000));
-        assert!(!p.observe_work_scope(1, 1_000));
+        let est = crate::work::WorkEstimator::new(vec![]);
+        p.set_chain_tip(1_000);
+        p.permille_floor(900, PASS_UNIT_WORK);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(1..1_001)), &est),
+            900
+        );
+        p.note_work_completed(1..901);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(901..1_001)), &est),
+            900
+        );
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
+        // Reading an unapplied proposal must not consume it.
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
+        assert!(p.rebaseline_floor_if_scope_expanded(800, PASS_UNIT_WORK));
+        p.acknowledge_work_scope(800);
+        p.permille_floor(850, PASS_UNIT_WORK);
+        // Acknowledgment starts the next proposal from the applied floor, so
+        // progress earned before the next observation remains present.
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(701..1_001)), &est),
+            750
+        );
     }
 
     #[cfg(feature = "zcash_client_sqlite")]
     #[test]
-    fn begin_pass_resets_work_scope_observation() {
+    fn begin_pass_preserves_work_scope_observation() {
         let p = Progress::default();
-        assert!(p.observe_work_scope(1, 1_000));
-        assert!(!p.observe_work_scope(1, 1_000));
+        let est = crate::work::WorkEstimator::new(vec![]);
+        p.set_chain_tip(1_000);
+        p.permille_floor(900, PASS_UNIT_WORK);
+        p.work_scope_lower_bound(1, std::slice::from_ref(&(1..1_001)), &est);
+        p.note_work_completed(1..901);
+        p.add_scanned_work(100);
         p.begin_pass();
-        assert!(p.observe_work_scope(1, 1_000));
+        assert_eq!(p.scanned_work(), 0);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
     }
 
     /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
