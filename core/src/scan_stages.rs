@@ -208,15 +208,75 @@ impl ThreadCpuSample {
     }
 }
 
-/// Sample all rayon worker threads' CPU time via broadcast.
-/// Returns per-thread samples in worker order.
+/// Sample all rayon worker threads' CPU time. Returns per-thread samples in worker order.
+///
+/// A `pool` is sampled with a broadcast. The global pool (`None`, the one the scan's trial
+/// decryption runs on) is sampled without one on Linux/Android: a broadcast waits until every
+/// worker has finished the decryption batch it is running, and the scan lane would sit in
+/// that wait twice per chunk. Its workers' CPU clocks are looked up once (one broadcast, the
+/// first time) and read from the calling thread afterwards. Elsewhere, or when a clock cannot
+/// be looked up or read, the samples are zero (see [`ThreadCpuSample::now`]): the `chunk
+/// stages` line then reads no CPU time, but the scan lane never waits on the workers.
+///
+/// The first call for the global pool must come from outside any rayon pool (the scan calls it
+/// from its tokio lane): the clock lookup's broadcast runs on whichever pool it is made from,
+/// and that pool's clocks are kept for the rest of the process.
 pub fn sample_rayon_workers(pool: Option<&rayon::ThreadPool>) -> Vec<ThreadCpuSample> {
     let broadcast_fn = |_ctx: rayon::BroadcastContext<'_>| ThreadCpuSample::now();
 
     match pool {
         Some(pool) => pool.broadcast(broadcast_fn),
-        None => rayon::broadcast(broadcast_fn),
+        None => sample_global_workers()
+            .unwrap_or_else(|| vec![ThreadCpuSample::default(); rayon::current_num_threads()]),
     }
+}
+
+/// The global pool's samples without a broadcast (see [`sample_rayon_workers`]); `None` when a
+/// worker's CPU clock could not be looked up.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn sample_global_workers() -> Option<Vec<ThreadCpuSample>> {
+    use std::mem::MaybeUninit;
+    use std::sync::OnceLock;
+    static CLOCKS: OnceLock<Option<Vec<libc::clockid_t>>> = OnceLock::new();
+    let clocks = CLOCKS.get_or_init(|| {
+        rayon::broadcast(|_ctx| {
+            let mut clock = MaybeUninit::<libc::clockid_t>::uninit();
+            // SAFETY: `pthread_self` is the calling worker; `clock` is written on success.
+            let ret =
+                unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), clock.as_mut_ptr()) };
+            // SAFETY: initialized by the successful call above.
+            (ret == 0).then(|| unsafe { clock.assume_init() })
+        })
+        .into_iter()
+        .collect()
+    });
+    let clocks = clocks.as_ref()?;
+    clocks
+        .iter()
+        .map(|&clock| {
+            let mut ts = MaybeUninit::<libc::timespec>::uninit();
+            // SAFETY: `ts` is written on success; the clock is a live worker's (the global pool's
+            // threads run for the whole process).
+            let ret = unsafe { libc::clock_gettime(clock, ts.as_mut_ptr()) };
+            (ret == 0).then(|| {
+                // SAFETY: initialized by the successful call above.
+                let ts = unsafe { ts.assume_init() };
+                ThreadCpuSample {
+                    cpu_ns: ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64,
+                }
+            })
+        })
+        .collect()
+}
+
+/// The global pool's samples without a broadcast (see [`sample_rayon_workers`]): zero on this
+/// platform, one per worker.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn sample_global_workers() -> Option<Vec<ThreadCpuSample>> {
+    Some(vec![
+        ThreadCpuSample::default();
+        rayon::current_num_threads()
+    ])
 }
 
 /// Rayon worker CPU statistics from sampled deltas.
@@ -337,5 +397,30 @@ mod tests {
         let stats = RayonCpuStats::from_samples(&[], &[]);
         assert_eq!(stats.total_cpu_ms, 0);
         assert_eq!(stats.num_threads, 0);
+    }
+
+    /// The global pool is sampled once per worker without a broadcast, and on Linux the
+    /// samples are the workers' own CPU clocks: work run on every worker shows up in them.
+    #[test]
+    fn global_pool_samples_track_worker_cpu() {
+        let before = sample_rayon_workers(None);
+        assert_eq!(before.len(), rayon::current_num_threads());
+        rayon::broadcast(|_ctx| {
+            let started = std::time::Instant::now();
+            let mut x = 0u64;
+            while started.elapsed() < std::time::Duration::from_millis(30) {
+                x = std::hint::black_box(x.wrapping_add(1));
+            }
+        });
+        let after = sample_rayon_workers(None);
+        assert_eq!(after.len(), before.len());
+        let stats = RayonCpuStats::from_samples(&before, &after);
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        assert!(
+            stats.total_cpu_ms >= 10,
+            "the workers spun 30 ms each: {stats:?}"
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        assert_eq!(stats.total_cpu_ms, 0);
     }
 }

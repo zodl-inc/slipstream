@@ -81,12 +81,19 @@ pub struct DownloadFailure {
 /// receive live updates. `None` disables all progress tracking with zero overhead.
 #[derive(Debug)]
 pub struct Progress {
+    /// Scheduler-only scope evidence; snapshot readers never lock this state.
+    #[cfg(feature = "zcash_client_sqlite")]
+    work_scope: std::sync::Mutex<crate::progress_scope::WorkScope>,
     /// Current chain tip height as reported by the server.
     pub chain_tip: AtomicU64,
     /// Number of compact blocks fetched so far.
     pub fetched_blocks: AtomicU64,
     /// Number of compact blocks scanned so far.
     pub scanned_blocks: AtomicU64,
+    /// Work units fetched so far (when WorkEstimator is available).
+    pub fetched_work: AtomicU64,
+    /// Work units scanned so far (when WorkEstimator is available).
+    pub scanned_work: AtomicU64,
     /// Number of transactions enhanced (decrypt_and_store) so far.
     pub enhanced_txs: AtomicU64,
     /// End height of the range currently being processed (inclusive).
@@ -100,6 +107,10 @@ pub struct Progress {
     /// very first suggestion — no snap-back when Historic ranges are revealed.
     /// Updated via `set_pass_total(n)`.
     pub pass_total_blocks: AtomicU64,
+    /// Total work units in the current pass (when WorkEstimator is available).
+    /// Parallel to pass_total_blocks but in work units. B2: set to
+    /// `work_so_far_in_pass + remaining_work` each suggest round.
+    pub pass_total_work: AtomicU64,
     /// Spendable hint latch: 0 = funds not yet spendable; 1 = a ChainTip-priority range
     /// completed scanning (≈ SBS "funds-spendable" semantics). Latches to 1 and never
     /// resets to 0 within a pass. Read with `spendable()`.
@@ -159,6 +170,21 @@ pub struct Progress {
     pass_base_fetched: AtomicU64,
     /// [h16-1] See [`Self::pass_base_fetched`] — the `scanned_blocks` counterpart.
     pass_base_scanned: AtomicU64,
+    /// Work-unit baseline: parallel to `pass_base_fetched`, used when WorkEstimator is available.
+    pass_base_fetched_work: AtomicU64,
+    /// Work-unit baseline: parallel to `pass_base_scanned`, used when WorkEstimator is available.
+    pass_base_scanned_work: AtomicU64,
+    /// The unit this pass's progress is measured in: [`PASS_UNIT_UNSET`], [`PASS_UNIT_BLOCKS`]
+    /// or [`PASS_UNIT_WORK`]. Fixed by the pass's FIRST suggest round
+    /// ([`Self::fix_pass_unit`]) and never changed until [`Self::begin_pass`] resets it, so a
+    /// pass never switches unit mid-way (the floor and the pass start would otherwise mix
+    /// block and work permille).
+    pass_unit: AtomicU64,
+    /// The unit (blocks or work) of the current `progress_permille_floor`. Can be UNSET before
+    /// the first floor update. Scope expansion compares units one-directionally: a BLOCKS seed
+    /// is rejected against a WORK floor (transient failure), but a WORK seed can re-baseline
+    /// a BLOCKS floor. UNSET acts as a wildcard (accepts any seed).
+    floor_unit: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
     /// persisted tip VALUE without proving freshness) — the FFI's `tip_fresh` fact latches
@@ -224,13 +250,18 @@ impl Default for Progress {
     /// [`Progress::pass_start_permille`]).
     fn default() -> Self {
         Self {
+            #[cfg(feature = "zcash_client_sqlite")]
+            work_scope: std::sync::Mutex::new(crate::progress_scope::WorkScope::default()),
             chain_tip: AtomicU64::new(0),
             fetched_blocks: AtomicU64::new(0),
             scanned_blocks: AtomicU64::new(0),
+            fetched_work: AtomicU64::new(0),
+            scanned_work: AtomicU64::new(0),
             enhanced_txs: AtomicU64::new(0),
             current_range_end: AtomicU64::new(0),
             reorgs_recovered: AtomicU64::new(0),
             pass_total_blocks: AtomicU64::new(0),
+            pass_total_work: AtomicU64::new(0),
             spendable_hint: AtomicU64::new(0),
             ranges_completed: AtomicU64::new(0),
             recovering: AtomicU64::new(0),
@@ -239,6 +270,10 @@ impl Default for Progress {
             pass_start_permille: AtomicU64::new(u64::MAX),
             pass_base_fetched: AtomicU64::new(0),
             pass_base_scanned: AtomicU64::new(0),
+            pass_base_fetched_work: AtomicU64::new(0),
+            pass_base_scanned_work: AtomicU64::new(0),
+            pass_unit: AtomicU64::new(PASS_UNIT_UNSET),
+            floor_unit: AtomicU64::new(PASS_UNIT_UNSET),
             tip_refreshes: AtomicU64::new(0),
             tx_set_version: AtomicU64::new(0),
             wallet_writers: AtomicUsize::new(0),
@@ -251,10 +286,17 @@ impl Default for Progress {
 }
 
 /// [API v2.1 E-5] Scope-expansion detection margin for the session progress floor: a
-/// suggest-round seed this many permille (or more) BELOW the current floor means the scan
-/// scope grew (import/rewind), not that progress regressed. See
+/// suggest-round seed must be more than this many permille BELOW the current floor to
+/// qualify for a reset. Work passes also require independent scope evidence. See
 /// [`Progress::rebaseline_floor_if_scope_expanded`].
 pub const FLOOR_REBASELINE_EPSILON_PERMILLE: u64 = 50;
+
+/// [`Progress`] pass unit: no suggest round of this pass has run yet.
+pub const PASS_UNIT_UNSET: u64 = 0;
+/// [`Progress`] pass unit: progress counts blocks.
+pub const PASS_UNIT_BLOCKS: u64 = 1;
+/// [`Progress`] pass unit: progress counts work units (blocks + shielded outputs/actions).
+pub const PASS_UNIT_WORK: u64 = 2;
 
 impl Progress {
     /// Bump `fetched_blocks` by `n` (Relaxed — poll-only, no ordering guarantee).
@@ -343,6 +385,12 @@ impl Progress {
     #[inline]
     pub fn set_pass_total(&self, n: u64) {
         self.pass_total_blocks.store(n, Ordering::Relaxed);
+    }
+
+    /// Set `pass_total_work` to `n` (STORE, not add). Work-unit variant of `set_pass_total`.
+    #[inline]
+    pub fn set_pass_total_work(&self, n: u64) {
+        self.pass_total_work.store(n, Ordering::Relaxed);
     }
 
     /// Deprecated: use `set_pass_total` instead.  Retained for any call sites that
@@ -633,43 +681,111 @@ impl Progress {
         self.last_progress_unix.load(Ordering::Relaxed)
     }
 
+    /// Get the floor's unit: PASS_UNIT_UNSET, PASS_UNIT_BLOCKS, or PASS_UNIT_WORK.
+    pub fn floor_unit(&self) -> u64 {
+        self.floor_unit.load(Ordering::Relaxed)
+    }
+
     /// Fold `raw` (0..=1000) into the session-monotonic floor and return the floor.
     /// fetch_max keeps reported progress from ever regressing while the handle lives.
+    /// Updates floor_unit when the floor advances.
     #[inline]
-    pub fn permille_floor(&self, raw: u64) -> u64 {
+    pub fn permille_floor(&self, raw: u64, unit: u64) -> u64 {
         let clamped = raw.min(1000);
-        self.progress_permille_floor
+        let old = self
+            .progress_permille_floor
             .fetch_max(clamped, Ordering::Relaxed);
+        if clamped > old {
+            // Floor advanced: update its unit.
+            // Relaxed ordering is sufficient: no cross-field invariants are promised to
+            // concurrent readers. Each field is independent, and the consumer needs only
+            // an eventually-consistent view for UI display.
+            self.floor_unit.store(unit, Ordering::Relaxed);
+        }
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
 
-    /// [h17-1] Pure read of the scope-expansion condition: true when `seed` lands materially
-    /// BELOW the current session floor (see [`Self::rebaseline_floor_if_scope_expanded`]'s doc
-    /// for what that means and why). Stores nothing — [`Self::rebaseline_floor_if_scope_expanded`]
-    /// checks exactly this same condition (it calls this method) before it stores. Lets a
-    /// caller decide which branch to take, and publish every field a re-baseline touches in a
-    /// safe order, before the floor itself moves — see `update_pass_progress`
-    /// (`core/src/scheduler.rs`), which calls this first and calls
-    /// [`Self::rebaseline_floor_if_scope_expanded`] last for exactly that reason.
-    #[inline]
-    pub fn scope_expanded(&self, seed: u64) -> bool {
-        let current = self.progress_permille_floor.load(Ordering::Relaxed);
-        seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
+    /// Bound a WORK correction using handle-lifetime height evidence.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn work_scope_lower_bound(
+        &self,
+        birthday: u64,
+        pending: &[std::ops::Range<u64>],
+        estimator: &crate::work::WorkEstimator,
+    ) -> u64 {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .observe(
+                birthday..self.chain_tip().saturating_add(1),
+                pending,
+                estimator,
+                self.progress_permille_floor.load(Ordering::Relaxed),
+            )
     }
 
-    /// [API v2.1 E-5] When a suggest round's GLOBAL seed lands materially BELOW the current
-    /// session floor, the scan SCOPE EXPANDED under the floor's feet — an imported account
-    /// with an older birthday, or a rewind re-growing the queue — and the old floor (folded
-    /// to ~1000 by the previous scope's Done) would MASK the whole re-scan at ~100%. Reset
-    /// the floor to the new truthful seed so the blessed permille reads a genuine climb.
-    /// Normal operation can never trigger it: within one scope the seed is monotone (the
-    /// queue only shrinks between suggest rounds) and tip drift moves it by <1‰ — the
-    /// epsilon is 50× above that noise and far below any real expansion (an import drops
-    /// the seed by hundreds of permille). Returns whether a re-baseline happened.
-    pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64) -> bool {
-        if self.scope_expanded(seed) {
+    /// Consume a proposal after it is applied or independently supported by the seed.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn acknowledge_work_scope(&self, floor: u64) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .acknowledge(floor);
+    }
+
+    /// Record successful scan completion independently of pass-local credit counters.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn note_work_completed(&self, range: std::ops::Range<u64>) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .completed(range);
+    }
+
+    /// Record the successful continuity repair's extent, not just its generation count.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) fn note_work_rewind(&self, range: std::ops::Range<u64>) {
+        self.work_scope
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rewound(range);
+    }
+
+    /// Pure read of numeric reset eligibility: true when `seed` lands materially
+    /// BELOW the current session floor. Stores nothing; lets a caller decide which branch
+    /// to take and publish fields in a safe order before the floor moves.
+    ///
+    /// Unit guard is one-directional: rejects a BLOCKS seed against a WORK floor (transient
+    /// estimator failure), but allows a WORK seed to re-baseline a BLOCKS floor. UNSET floor
+    /// acts as a wildcard (any seed unit accepted).
+    ///
+    /// Accepted cost of the asymmetry: a BLOCKS floor left by a pass that ran in blocks and
+    /// stopped mid-way can be re-baselined by the next pass's WORK seed when the two units
+    /// disagree by more than the epsilon, without a change of scope. The drop is display-only
+    /// and the next readings climb from the truthful position.
+    #[inline]
+    pub fn scope_expanded(&self, seed: u64, seed_unit: u64) -> bool {
+        let current = self.progress_permille_floor.load(Ordering::Relaxed);
+        let floor_unit = self.floor_unit.load(Ordering::Relaxed);
+
+        // One-directional unit guard: only block BLOCKS seed vs WORK floor.
+        let unit_compatible = floor_unit == PASS_UNIT_UNSET
+            || seed_unit == floor_unit
+            || (seed_unit == PASS_UNIT_WORK && floor_unit == PASS_UNIT_BLOCKS);
+
+        unit_compatible && seed.saturating_add(FLOOR_REBASELINE_EPSILON_PERMILLE) < current
+    }
+
+    /// When a suggest round's GLOBAL seed lands materially BELOW the current session floor,
+    /// reset the floor to that seed if its unit is compatible. A numeric gap alone is not
+    /// evidence of scope growth: exact work can outpace its subtree estimate. The scheduler
+    /// additionally requires observed scope growth for initialized WORK-to-WORK resets.
+    /// Returns whether a re-baseline happened.
+    pub fn rebaseline_floor_if_scope_expanded(&self, seed: u64, seed_unit: u64) -> bool {
+        if self.scope_expanded(seed, seed_unit) {
             self.progress_permille_floor
                 .store(seed.min(1000), Ordering::Relaxed);
+            self.floor_unit.store(seed_unit, Ordering::Relaxed);
             return true;
         }
         false
@@ -739,6 +855,65 @@ impl Progress {
         self.pass_base_scanned.load(Ordering::Relaxed)
     }
 
+    /// B2: Snapshot the pass-local work-unit baseline: work-unit variant of `set_pass_baseline`.
+    #[inline]
+    pub fn set_pass_baseline_work(&self, fetched: u64, scanned: u64) {
+        self.pass_base_fetched_work
+            .store(fetched, Ordering::Relaxed);
+        self.pass_base_scanned_work
+            .store(scanned, Ordering::Relaxed);
+    }
+
+    /// Read `pass_total_work` (Relaxed load).
+    #[inline]
+    pub fn pass_total_work(&self) -> u64 {
+        self.pass_total_work.load(Ordering::Relaxed)
+    }
+
+    /// Fix this pass's unit if no suggest round has fixed it yet (`want_work` decides), and
+    /// return the unit in force: `true` = work. Later rounds of the same pass get the unit the
+    /// first round chose, whatever they ask for.
+    /// Read the current pass unit: [`PASS_UNIT_UNSET`], [`PASS_UNIT_BLOCKS`], or [`PASS_UNIT_WORK`].
+    #[inline]
+    pub fn pass_unit(&self) -> u64 {
+        self.pass_unit.load(Ordering::Relaxed)
+    }
+
+    pub fn fix_pass_unit(&self, want_work: bool) -> bool {
+        let want = if want_work {
+            PASS_UNIT_WORK
+        } else {
+            PASS_UNIT_BLOCKS
+        };
+        match self.pass_unit.compare_exchange(
+            PASS_UNIT_UNSET,
+            want,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => want_work,
+            Err(current) => current == PASS_UNIT_WORK,
+        }
+    }
+
+    /// Whether this pass measures progress in work units (see [`Self::fix_pass_unit`]).
+    #[inline]
+    pub fn pass_unit_is_work(&self) -> bool {
+        self.pass_unit.load(Ordering::Relaxed) == PASS_UNIT_WORK
+    }
+
+    /// Read the pass-local fetched work baseline.
+    #[inline]
+    pub fn pass_base_fetched_work(&self) -> u64 {
+        self.pass_base_fetched_work.load(Ordering::Relaxed)
+    }
+
+    /// Read the pass-local scanned work baseline.
+    #[inline]
+    pub fn pass_base_scanned_work(&self) -> u64 {
+        self.pass_base_scanned_work.load(Ordering::Relaxed)
+    }
+
     /// Reset the per-pass RATIO counters at the start of a sync pass.
     ///
     /// The FFI handle outlives individual sync passes (Swift `prepare()` opens it once;
@@ -764,12 +939,18 @@ impl Progress {
     pub fn begin_pass(&self) {
         self.scanned_blocks.store(0, Ordering::Relaxed);
         self.fetched_blocks.store(0, Ordering::Relaxed);
+        self.scanned_work.store(0, Ordering::Relaxed);
+        self.fetched_work.store(0, Ordering::Relaxed);
         self.pass_total_blocks.store(0, Ordering::Relaxed);
+        self.pass_total_work.store(0, Ordering::Relaxed);
         self.current_range_end.store(0, Ordering::Relaxed);
         self.spendable_hint.store(0, Ordering::Relaxed);
         self.pass_start_permille.store(u64::MAX, Ordering::Relaxed);
         self.pass_base_fetched.store(0, Ordering::Relaxed);
         self.pass_base_scanned.store(0, Ordering::Relaxed);
+        self.pass_base_fetched_work.store(0, Ordering::Relaxed);
+        self.pass_base_scanned_work.store(0, Ordering::Relaxed);
+        self.pass_unit.store(PASS_UNIT_UNSET, Ordering::Relaxed);
         // v2: a new pass starts the stall clock fresh. `recovering` and the permille
         // floor are deliberately NOT reset — recovering is recomputed on the first
         // suggest round, and the floor is session-monotonic by contract (§4.4).
@@ -792,6 +973,32 @@ impl Progress {
     #[inline]
     pub fn scanned(&self) -> u64 {
         self.scanned_blocks.load(Ordering::Relaxed)
+    }
+
+    /// Read `fetched_work` (Relaxed load).
+    #[inline]
+    pub fn fetched_work(&self) -> u64 {
+        self.fetched_work.load(Ordering::Relaxed)
+    }
+
+    /// Read `scanned_work` (Relaxed load).
+    #[inline]
+    pub fn scanned_work(&self) -> u64 {
+        self.scanned_work.load(Ordering::Relaxed)
+    }
+
+    /// Bump `fetched_work` by `n` (Relaxed — poll-only, no ordering guarantee).
+    #[inline]
+    pub fn add_fetched_work(&self, n: u64) {
+        self.fetched_work.fetch_add(n, Ordering::Relaxed);
+        self.touch();
+    }
+
+    /// Bump `scanned_work` by `n`.
+    #[inline]
+    pub fn add_scanned_work(&self, n: u64) {
+        self.scanned_work.fetch_add(n, Ordering::Relaxed);
+        self.touch();
     }
 
     /// Read `enhanced_txs` (Relaxed load).
@@ -834,7 +1041,9 @@ impl Progress {
 
     /// Ask the running sync session to stop at its next block because the host is about to
     /// change the wallet: adding or removing an account, a rewind, a wipe. The host calls this
-    /// right before the change, so that its stop can prove the wallet file idle in time.
+    /// right before the change, so that its stop can prove the wallet file idle in time. The
+    /// handle's plain stop (`SlipstreamHandle::stop`: backgrounding, shutdown) calls it too, so
+    /// that stop does not wait for a whole chunk's scan either.
     ///
     /// Call it BEFORE aborting the session's task. An abort lands only at the task's next
     /// `.await`, and the scan runs synchronously inside `block_in_place`, so one scan call can
@@ -1212,8 +1421,97 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "zcash_client_sqlite")]
+    #[test]
+    fn work_scope_observation_tracks_bounded_growth() {
+        let p = Progress::default();
+        let est = crate::work::WorkEstimator::new(vec![]);
+        p.set_chain_tip(1_000);
+        p.permille_floor(900, PASS_UNIT_WORK);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(1..1_001)), &est),
+            900
+        );
+        p.note_work_completed(1..901);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(901..1_001)), &est),
+            900
+        );
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
+        // Reading an unapplied proposal must not consume it.
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
+        assert!(p.rebaseline_floor_if_scope_expanded(800, PASS_UNIT_WORK));
+        p.acknowledge_work_scope(800);
+        p.permille_floor(850, PASS_UNIT_WORK);
+        // Acknowledgment starts the next proposal from the applied floor, so
+        // progress earned before the next observation remains present.
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(701..1_001)), &est),
+            750
+        );
+    }
+
+    #[cfg(feature = "zcash_client_sqlite")]
+    #[test]
+    fn begin_pass_preserves_work_scope_observation() {
+        let p = Progress::default();
+        let est = crate::work::WorkEstimator::new(vec![]);
+        p.set_chain_tip(1_000);
+        p.permille_floor(900, PASS_UNIT_WORK);
+        p.work_scope_lower_bound(1, std::slice::from_ref(&(1..1_001)), &est);
+        p.note_work_completed(1..901);
+        p.add_scanned_work(100);
+        p.begin_pass();
+        assert_eq!(p.scanned_work(), 0);
+        assert_eq!(
+            p.work_scope_lower_bound(1, std::slice::from_ref(&(801..1_001)), &est),
+            800
+        );
+    }
+
     /// [h16-1] The pass-local blend baseline defaults to 0, round-trips through its setter,
     /// and — like the other per-pass ratio state — resets to 0 on `begin_pass()`.
+    #[test]
+    fn begin_pass_resets_work_fields() {
+        let p = Progress::default();
+        assert!(!p.pass_unit_is_work(), "a fresh handle has no unit yet");
+        p.add_fetched_work(11);
+        p.add_scanned_work(22);
+        p.set_pass_total_work(33);
+        p.set_pass_baseline_work(4, 5);
+        assert!(p.fix_pass_unit(true));
+        p.begin_pass();
+        assert_eq!(p.fetched_work(), 0);
+        assert_eq!(p.scanned_work(), 0);
+        assert_eq!(p.pass_total_work(), 0);
+        assert_eq!(p.pass_base_fetched_work(), 0);
+        assert_eq!(p.pass_base_scanned_work(), 0);
+        assert!(!p.pass_unit_is_work(), "the unit is unset again");
+        assert!(!p.fix_pass_unit(false), "the next pass picks its own unit");
+    }
+
+    #[test]
+    fn fix_pass_unit_keeps_the_first_choice() {
+        let p = Progress::default();
+        assert!(p.fix_pass_unit(true));
+        assert!(
+            p.fix_pass_unit(false),
+            "a later round cannot switch to blocks"
+        );
+        p.begin_pass();
+        assert!(!p.fix_pass_unit(false));
+        assert!(
+            !p.fix_pass_unit(true),
+            "a later round cannot switch to work"
+        );
+    }
+
     #[test]
     fn pass_baseline_defaults_to_zero_and_resets_on_begin_pass() {
         let p = Progress::default();
@@ -1247,29 +1545,36 @@ mod tests {
     #[test]
     fn floor_rebaseline_on_scope_expansion_only() {
         let p = Progress::default();
-        assert_eq!(p.permille_floor(990), 990);
+        assert_eq!(p.permille_floor(990, PASS_UNIT_BLOCKS), 990);
         // Within-scope drift up to the epsilon never re-baselines (tip drift is <1‰).
         assert!(
-            !p.rebaseline_floor_if_scope_expanded(989),
+            !p.rebaseline_floor_if_scope_expanded(989, PASS_UNIT_BLOCKS),
             "1‰ dip is noise"
         );
         assert!(
-            !p.rebaseline_floor_if_scope_expanded(990 - FLOOR_REBASELINE_EPSILON_PERMILLE),
+            !p.rebaseline_floor_if_scope_expanded(
+                990 - FLOOR_REBASELINE_EPSILON_PERMILLE,
+                PASS_UNIT_BLOCKS
+            ),
             "exactly-epsilon dip is still within scope"
         );
-        assert_eq!(p.permille_floor(0), 990, "floor held through noise");
+        assert_eq!(
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
+            990,
+            "floor held through noise"
+        );
         // Import with an older birthday: the seed plummets → re-baseline to the truth.
         assert!(
-            p.rebaseline_floor_if_scope_expanded(120),
+            p.rebaseline_floor_if_scope_expanded(120, PASS_UNIT_BLOCKS),
             "material drop = scope expansion"
         );
         assert_eq!(
-            p.permille_floor(0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             120,
             "floor re-baselined to the expanded-scope seed"
         );
         // …and climbs monotonically again within the new scope.
-        assert_eq!(p.permille_floor(300), 300);
+        assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS), 300);
     }
 
     /// [h17-1] `scope_expanded` answers exactly like its mutating sibling
@@ -1279,15 +1584,15 @@ mod tests {
     #[test]
     fn scope_expanded_reads_true_and_false_without_mutating_the_floor() {
         let p = Progress::default();
-        assert_eq!(p.permille_floor(900), 900);
+        assert_eq!(p.permille_floor(900, PASS_UNIT_BLOCKS), 900);
 
         // Within-scope noise reads false, and a pure read must not move the floor.
         assert!(
-            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE),
+            !p.scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE, PASS_UNIT_BLOCKS),
             "exactly-epsilon dip is still within scope"
         );
         assert_eq!(
-            p.permille_floor(0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             900,
             "a pure read must not lower the floor"
         );
@@ -1295,25 +1600,28 @@ mod tests {
         // A material drop reads true — and is STILL just a read: the floor holds until a
         // caller separately chooses to act on it.
         assert!(
-            p.scope_expanded(450),
+            p.scope_expanded(450, PASS_UNIT_BLOCKS),
             "450 is >50‰ below the 900 floor ⇒ scope expansion"
         );
         assert_eq!(
-            p.permille_floor(0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             900,
             "scope_expanded alone must never lower (or raise) the floor"
         );
 
         // Agrees with the mutating sibling on both the false and the true case.
-        assert!(!p.rebaseline_floor_if_scope_expanded(900 - FLOOR_REBASELINE_EPSILON_PERMILLE));
+        assert!(!p.rebaseline_floor_if_scope_expanded(
+            900 - FLOOR_REBASELINE_EPSILON_PERMILLE,
+            PASS_UNIT_BLOCKS
+        ));
         assert_eq!(
-            p.permille_floor(0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             900,
             "still not expanded ⇒ still untouched"
         );
-        assert!(p.rebaseline_floor_if_scope_expanded(450));
+        assert!(p.rebaseline_floor_if_scope_expanded(450, PASS_UNIT_BLOCKS));
         assert_eq!(
-            p.permille_floor(0),
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
             450,
             "the mutating sibling now re-baselines"
         );
@@ -1333,15 +1641,15 @@ mod tests {
         );
 
         // First suggest round of the pass: ordinary progress, no scope expansion.
-        assert!(!p.rebaseline_floor_if_scope_expanded(300));
+        assert!(!p.rebaseline_floor_if_scope_expanded(300, PASS_UNIT_BLOCKS));
         p.set_pass_start_permille_if_unset(300);
-        let _ = p.permille_floor(300);
+        let _ = p.permille_floor(300, PASS_UNIT_BLOCKS);
         assert_eq!(p.pass_start_permille(), Some(300));
 
         // A later round of the SAME pass, still no expansion — the start must hold.
-        assert!(!p.rebaseline_floor_if_scope_expanded(340));
+        assert!(!p.rebaseline_floor_if_scope_expanded(340, PASS_UNIT_BLOCKS));
         p.set_pass_start_permille_if_unset(340);
-        let _ = p.permille_floor(340);
+        let _ = p.permille_floor(340, PASS_UNIT_BLOCKS);
         assert_eq!(
             p.pass_start_permille(),
             Some(300),
@@ -1350,7 +1658,7 @@ mod tests {
 
         // A round where the scope EXPANDS under the pass (an import with an older
         // birthday, or a rewind): the pass start must follow the re-baseline.
-        assert!(p.rebaseline_floor_if_scope_expanded(50));
+        assert!(p.rebaseline_floor_if_scope_expanded(50, PASS_UNIT_BLOCKS));
         p.set_pass_start_permille(50);
         assert_eq!(
             p.pass_start_permille(),

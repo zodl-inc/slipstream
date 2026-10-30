@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::chain::{
-    ChainState, error::Error as ChainError, scan_cached_blocks,
+    ChainState, ScanSummary, error::Error as ChainError, scan_cached_blocks,
 };
 use zcash_client_backend::proto::service::TreeState;
 use zcash_primitives::block::BlockHash;
@@ -354,12 +354,77 @@ fn map_scan_error<WE: std::fmt::Display>(
     SlipstreamError::Wallet(format!("scan_cached_blocks: {e}"))
 }
 
+/// The scan call's persistence target. Deferred scans only fill their facade;
+/// the persist lane publishes completion from its successful transaction.
+pub(crate) enum ScanTarget<'a> {
+    Inline,
+    Sparse(&'a mut crate::persist::SparseTreeState),
+    Deferred(&'a mut crate::persist::WriteBehindFacade),
+}
+
+/// One synchronous scan/persistence boundary, shared by the production drivers.
+pub(crate) fn scan_batch(
+    session: &mut WalletSession,
+    source: &MemBlockSource<'_>,
+    from_height: BlockHeight,
+    from_state: &ChainState,
+    limit: usize,
+    target: ScanTarget<'_>,
+    progress: Option<&crate::events::ProgressArc>,
+) -> Result<ScanSummary, SlipstreamError> {
+    let network = session.network;
+    match target {
+        ScanTarget::Deferred(facade) => {
+            scan_cached_blocks(&network, source, facade, from_height, from_state, limit)
+                .map_err(map_scan_error)
+        }
+        ScanTarget::Sparse(sparse) => {
+            sparse.attach_progress(progress.cloned());
+            let mut facade = crate::persist::SparseFacade {
+                inner: session.db_mut(),
+                sparse,
+            };
+            scan_cached_blocks(
+                &network,
+                source,
+                &mut facade,
+                from_height,
+                from_state,
+                limit,
+            )
+            .map_err(map_scan_error)
+        }
+        ScanTarget::Inline => {
+            // Upstream put_blocks is the final fallible operation of this call.
+            // No await separates its successful commit and this notification.
+            let summary = scan_cached_blocks(
+                &network,
+                source,
+                session.db_mut(),
+                from_height,
+                from_state,
+                limit,
+            )
+            .map_err(map_scan_error)?;
+            if let Some(progress) = progress {
+                let range = summary.scanned_range();
+                progress.note_work_completed(u64::from(range.start)..u64::from(range.end));
+            }
+            Ok(summary)
+        }
+    }
+}
+
 // ── Stats ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default, Clone)]
 pub struct ScanStats {
     pub blocks: u64,
     pub chunks: u64,
+    /// Work units scanned (BLOCK_WEIGHT per block + pool outputs/actions).
+    /// Credited per sub-batch from the height range's blocks (B8). When a
+    /// WorkEstimator is available, progress is measured in work instead of blocks.
+    pub work: u64,
     pub sapling_received: u64,
     pub orchard_received: u64,
     /// Stats from interleaved (per-K-chunk) enhancement runs (T6.1).
@@ -860,6 +925,8 @@ async fn scan_chunks_inner(
         let mut chunk_elapsed_ms: u64 = 0;
         // T6.9: time this chunk's submits spent blocked on previous commits.
         let mut chunk_persist_wait_ms: u64 = 0;
+        // B8: work units credited per sub-batch from the blocks in sub_start..=sub_end.
+        let mut chunk_work: u64 = 0;
 
         loop {
             // How many blocks remain in this chunk from sub_start?
@@ -995,40 +1062,22 @@ async fn scan_chunks_inner(
             // StoppedForWalletChange; the call has written nothing by then.
             let source = MemBlockSource::new(&chunk).with_stop(progress.as_deref());
             let scan_result = tokio::task::block_in_place(|| {
-                if let Some(wb) = wb.as_mut() {
-                    // T6.9 write-behind: virtualized reads + stash (no DB work
-                    // on this task; the commit is deferred to the persist lane).
-                    scan_cached_blocks(
-                        &network,
-                        &source,
-                        &mut wb.facade,
-                        BlockHeight::from(from_height),
-                        &from_state,
-                        current_batch_len,
-                    )
+                let target = if let Some(wb) = wb.as_mut() {
+                    ScanTarget::Deferred(&mut wb.facade)
                 } else if config.sparse_persistence {
-                    let mut facade = crate::persist::SparseFacade {
-                        inner: session.db_mut(),
-                        sparse: &mut sparse_state,
-                    };
-                    scan_cached_blocks(
-                        &network,
-                        &source,
-                        &mut facade,
-                        BlockHeight::from(from_height),
-                        &from_state,
-                        current_batch_len,
-                    )
+                    ScanTarget::Sparse(&mut sparse_state)
                 } else {
-                    scan_cached_blocks(
-                        &network,
-                        &source,
-                        session.db_mut(),
-                        BlockHeight::from(from_height),
-                        &from_state,
-                        current_batch_len,
-                    )
-                }
+                    ScanTarget::Inline
+                };
+                scan_batch(
+                    session,
+                    &source,
+                    BlockHeight::from(from_height),
+                    &from_state,
+                    current_batch_len,
+                    target,
+                    progress.as_ref(),
+                )
             });
             let elapsed_ms = batch_start_time.elapsed().as_millis() as u64;
             let (walk1, walk2) = source.walk_walls();
@@ -1042,7 +1091,7 @@ async fn scan_chunks_inner(
                     if let Some(p) = &prefetch {
                         p.abort();
                     }
-                    return Err(map_scan_error(e));
+                    return Err(e);
                 }
             };
 
@@ -1075,6 +1124,8 @@ async fn scan_chunks_inner(
             chunk_scanned_blocks += scanned;
             chunk_sapling += summary.received_sapling_note_count() as u64;
             chunk_orchard += summary.received_orchard_note_count() as u64;
+            // B8: credit the work of the blocks in this sub-batch's height range.
+            chunk_work += crate::work::work_in_heights(&chunk.blocks, sub_start, sub_end);
 
             debug!(
                 batch_start = sub_start,
@@ -1170,6 +1221,7 @@ async fn scan_chunks_inner(
         // Accumulate chunk totals into global stats.
         stats.blocks += chunk_scanned_blocks;
         stats.chunks += 1;
+        stats.work += chunk_work;
         stats.sapling_received += chunk_sapling;
         stats.orchard_received += chunk_orchard;
         notes_since_enhance += chunk_sapling + chunk_orchard;
@@ -1177,6 +1229,7 @@ async fn scan_chunks_inner(
         // Bump the shared progress counter (poll-based; Relaxed ordering).
         if let Some(ref p) = progress {
             p.add_scanned(chunk_scanned_blocks);
+            p.add_scanned_work(chunk_work);
         }
 
         // T5.1 per-chunk info log (kept at chunk granularity — would spam on fast devices
@@ -1527,7 +1580,6 @@ async fn scan_chunks_from_treestate_inner(
         let from_state = next_state
             .to_chain_state()
             .map_err(|e| SlipstreamError::Wallet(format!("chain state: {e}")))?;
-        let network = session.network;
         let len = chunk.blocks.len();
 
         let scan_start_t = Instant::now();
@@ -1537,41 +1589,23 @@ async fn scan_chunks_from_treestate_inner(
                 SlipstreamError::Wallet(format!("height {chunk_start} exceeds u32"))
             })?;
             tokio::task::block_in_place(|| {
-                if let Some(wb) = wb.as_mut() {
-                    // T6.9 write-behind: virtualized reads + stash.
-                    scan_cached_blocks(
-                        &network,
-                        &source,
-                        &mut wb.facade,
-                        BlockHeight::from(from_height),
-                        &from_state,
-                        len,
-                    )
+                let target = if let Some(wb) = wb.as_mut() {
+                    ScanTarget::Deferred(&mut wb.facade)
                 } else if sparse {
-                    let mut facade = crate::persist::SparseFacade {
-                        inner: session.db_mut(),
-                        sparse: &mut sparse_state,
-                    };
-                    scan_cached_blocks(
-                        &network,
-                        &source,
-                        &mut facade,
-                        BlockHeight::from(from_height),
-                        &from_state,
-                        len,
-                    )
+                    ScanTarget::Sparse(&mut sparse_state)
                 } else {
-                    scan_cached_blocks(
-                        &network,
-                        &source,
-                        session.db_mut(),
-                        BlockHeight::from(from_height),
-                        &from_state,
-                        len,
-                    )
-                }
-            })
-            .map_err(map_scan_error)?
+                    ScanTarget::Inline
+                };
+                scan_batch(
+                    session,
+                    &source,
+                    BlockHeight::from(from_height),
+                    &from_state,
+                    len,
+                    target,
+                    None,
+                )
+            })?
         };
         let elapsed_ms = scan_start_t.elapsed().as_millis() as u64;
 
@@ -1587,6 +1621,8 @@ async fn scan_chunks_from_treestate_inner(
             - u64::from(u32::from(summary.scanned_range().start));
         stats.blocks += scanned;
         stats.chunks += 1;
+        // The whole chunk is one scan call on this path, so its work is the credit.
+        stats.work += chunk.work;
         stats.sapling_received += summary.received_sapling_note_count() as u64;
         stats.orchard_received += summary.received_orchard_note_count() as u64;
         info!(

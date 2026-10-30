@@ -596,6 +596,8 @@ type IronwoodSparseTree = OrchardSparseTree;
 /// invalidate it explicitly).
 #[derive(Default)]
 pub struct SparseTreeState {
+    // Commit evidence outlives the async scan owner on the deferred path.
+    committed_progress: Option<crate::events::ProgressArc>,
     sapling: Option<SaplingSparseTree>,
     orchard: Option<OrchardSparseTree>,
     /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
@@ -636,6 +638,10 @@ pub struct SparseTreeState {
 }
 
 impl SparseTreeState {
+    pub(crate) fn attach_progress(&mut self, progress: Option<crate::events::ProgressArc>) {
+        self.committed_progress = progress;
+    }
+
     /// \[B6\] Set the anchor-retention policy (see the field docs). Public for
     /// integration tests and direct hosts; production plumbs it from
     /// `EngineConfig::anchor_retention`.
@@ -1367,6 +1373,7 @@ pub fn sparse_put_blocks(
         census_orchard,
         graft,
         graft_verdict_totals,
+        committed_progress,
         ..
     } = sparse
     else {
@@ -2096,6 +2103,11 @@ pub fn sparse_put_blocks(
         Ok(())
     })?;
     let txn_ms = t_txn.elapsed().as_millis();
+    if let Some(progress) = committed_progress {
+        // The scan-queue update is durable now. Publish before fallible graft
+        // cleanup, and while a deferred job still owns its wallet writer gate.
+        progress.note_work_completed(u64::from(first_height)..u64::from(last_height) + 1);
+    }
 
     // v0.4 Plan A: buffer rows of the row sets built/grafted this call are dead now
     // the txn committed: exactly their positions, never the rest of their shard.
@@ -3755,7 +3767,9 @@ pub struct WriteBehindFacade {
 /// the state the previous calls left), and the unit keeps the first call's
 /// `from_state`. Larger units amortize the per-commit cost (transaction, the
 /// frontier insert and its checks, flush) — normal-era 10,000-block units
-/// were 26 % faster than 2,000-block ones.
+/// were 26 % faster than 2,000-block ones, and 20,000-block / 100,000-commitment
+/// units another 10 % faster than those (3,300,000 to the tip on an 8-core
+/// Graviton: 49.8 -> 45.2 s, the scan's wait on the persist lane 22 -> 13 s).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommitLimits {
     pub max_blocks: u64,
@@ -3763,13 +3777,18 @@ pub struct CommitLimits {
 }
 
 impl CommitLimits {
-    /// 10,000 blocks: the gRPC chunk size, whose commit unit the OHTTP window
-    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`) would otherwise shrink fivefold.
-    pub const DEFAULT_MAX_BLOCKS: u64 = 10_000;
-    /// 50,000 commitments: about one normal-era 10,000-block unit, and below one
-    /// sandblasting-era byte-split sub-chunk (~67,000), so dense chunks still
-    /// commit one by one and a unit's tree work and memory stay bounded.
-    pub const DEFAULT_MAX_OUTPUTS: u64 = 50_000;
+    /// 20,000 blocks: two gRPC chunks, ten OHTTP windows
+    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`). The limit is checked after a scan call is
+    /// added, so a unit can run past it by one call. A stop or an error exit drains the unit
+    /// being committed and drops only the one being filled; a killed process can also lose
+    /// the ones still being committed (`persist_depth` of them), all scanned again.
+    pub const DEFAULT_MAX_BLOCKS: u64 = 20_000;
+    /// 100,000 commitments (all pools, Ironwood included): about two normal-era units,
+    /// and below one merged dense scan call (`EngineConfig::DEFAULT_SCAN_MERGE_OUTPUTS`),
+    /// so a dense call closes the unit it is added to (which can then hold up to one dense
+    /// call more than this). A unit's scanned blocks (commitments and wallet data, tens of
+    /// MB at worst) stay bounded.
+    pub const DEFAULT_MAX_OUTPUTS: u64 = 100_000;
 
     fn reached(&self, pending: &PendingPersist) -> bool {
         pending.last_height + 1 - pending.first_height >= self.max_blocks
@@ -4568,9 +4587,13 @@ impl PersistLane {
     }
 
     /// [B4-16 drain] Attach the handle's shared progress so every deferred commit holds
-    /// the writer gate for its whole life. The production scan path attaches; oracle and
-    /// test drivers (no stop()/start() drain to serve) may skip.
+    /// the writer gate for its whole life and publishes confirmed completion from its
+    /// owned tree state. Attach before submitting the first unit. Oracle and test
+    /// drivers with no progress handle may skip.
     pub fn attach_writer_gate(&mut self, progress: crate::events::ProgressArc) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.attach_progress(Some(progress.clone()));
+        }
         self.progress = Some(progress);
     }
 

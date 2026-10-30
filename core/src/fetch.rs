@@ -113,12 +113,25 @@ pub struct FetchPlan {
 ///   budget, so the added workers do not park on it;
 /// * while the scanner waits for at least [`KICK_SCAN_WAIT_FRACTION`] of a
 ///   window, a head stream (the plan chunk the release waits for) that
-///   delivered far less than the best window of any stream of this fetch
+///   delivered far less than the other streams did in the same window
 ///   ([`KICK_RATE_FRACTION`], or under 64 KiB) is cut and requested again from
 ///   its resume height on a fresh connection: a mobile link leaves single
 ///   connections trickling (TCP backoff) while new ones are fine, and a
 ///   trickle never trips the idle timeout. The blocks it received are handed on
-///   first; the restart does not count against the chunk's retry budget.
+///   first; the restart does not count against the chunk's retry budget. A
+///   restart after which the chunk stays slow doubles the wait before the next
+///   one, up to [`KICK_MAX_COOLDOWN`]: on a full link a fresh connection gets no
+///   more of it, and every restart costs a new request (over Tor, a new circuit).
+///
+/// A boost has to pay for itself: in its second window, while the scanner still
+/// waits and extra workers run, the fetch's byte rate must be at least
+/// [`BOOST_MIN_GAIN`] times the rate of the window before the boost. If it is not,
+/// the link is already full (more streams only split it, and the head chunk gets
+/// a smaller share), so the boost is withdrawn like an ended one and not retried
+/// for [`BOOST_RETRY_WINDOWS`] windows, doubling with each further withdrawal; a
+/// boost that pays off clears the doubling. A boost that started before any
+/// unboosted window received bytes has no rate to beat and is withdrawn the same
+/// way; its retry wait measures the base workers for the next one.
 ///
 /// The ahead budget is unchanged (the head chunk never waits on it), so memory
 /// stays bounded as without the boost. After [`BOOST_COLD_WINDOWS`] consecutive
@@ -153,9 +166,19 @@ pub const KICK_RATE_FRACTION: f64 = 0.125;
 const KICK_MIN_WINDOW_BYTES: u64 = 64 * 1024;
 /// Shortest time between two restarts of the same worker's stream.
 const KICK_COOLDOWN: Duration = Duration::from_secs(30);
-/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, far below
-/// a regional gateway's per-client limits (96 in flight, 12 heavy; a block range
-/// counts as a normal request).
+/// Longest time between two restarts of a plan chunk that stays slow after them.
+pub const KICK_MAX_COOLDOWN: Duration = Duration::from_secs(120);
+/// Last boost window in which its gain is judged: by then a boost whose extra workers
+/// delivered nothing is judged on the rate alone.
+pub const BOOST_GAIN_LAST_WINDOW: u32 = 4;
+/// Factor by which a boost must raise the fetch's byte rate, or it is withdrawn.
+pub const BOOST_MIN_GAIN: f64 = 1.2;
+/// Windows a withdrawn boost waits before it may start again (first withdrawal).
+pub const BOOST_RETRY_WINDOWS: u32 = 12;
+/// The retry wait doubles with each withdrawal in a row, at most this many times.
+const BOOST_RETRY_MAX_DOUBLINGS: u32 = 4;
+/// Workers a boost adds through an OHTTP gateway: 4 + 2 block streams, well within
+/// the deployment's per-connection capacity (a block range counts as a normal request).
 pub const BOOST_EXTRA_OHTTP_STREAMS: usize = 2;
 
 /// [v0.7 P2] Detector thresholds. Defaults are the shipped policy; the
@@ -1596,6 +1619,7 @@ async fn release_ordered(
             // Bump the shared progress counter (poll-based; Relaxed — no ordering guarantee).
             if let Some(p) = progress {
                 p.add_fetched(chunk_block_count);
+                p.add_fetched_work(chunk.work);
             }
             queue.send(chunk).await?;
             if let Some(height) = released_through {
@@ -1775,6 +1799,9 @@ struct TrackedWorker {
     /// `slot.bytes` at the start of the window.
     window_bytes: u64,
     last_kick: Option<Instant>,
+    /// Restarts after which the worker's head stream stayed slow (any plan chunk:
+    /// head chunks are short-lived while chunks are cut).
+    slow_kicks: u32,
 }
 
 /// The adaptive prefetch of one fetch (see [`FetchBoost`]).
@@ -1797,8 +1824,18 @@ struct Booster {
     window_waited: Duration,
     window_sent: (u64, u64),
     state: BoostState,
-    /// Most bytes one stream delivered in a window so far.
-    best_window_bytes: u64,
+    /// Byte rate of the last window with bytes before the current boost started.
+    pre_boost_rate: Option<f64>,
+    /// Byte rate of the last unboosted window that received bytes.
+    last_rate: Option<f64>,
+    /// Windows closed since the current boost started.
+    boost_windows: u32,
+    /// Whether the current boost's gain was judged (paid off, withdrawn or given up on).
+    gain_checked: bool,
+    /// Most bytes one stream received in a window, falling 10 % per window: the head is
+    /// compared with it as well as with this window's other streams, which deliver nothing
+    /// once they park on the ahead budget behind a slow head.
+    recent_best: u64,
 }
 
 impl Booster {
@@ -1833,6 +1870,7 @@ impl Booster {
                     slot: Arc::clone(slot),
                     window_bytes: 0,
                     last_kick: None,
+                    slow_kicks: 0,
                 })
                 .collect(),
             extras: Vec::new(),
@@ -1841,7 +1879,11 @@ impl Booster {
             window_waited,
             window_sent,
             state: BoostState::default(),
-            best_window_bytes: 0,
+            pre_boost_rate: None,
+            last_rate: None,
+            boost_windows: 0,
+            gain_checked: false,
+            recent_best: 0,
         }
     }
 
@@ -1855,8 +1897,8 @@ impl Booster {
         }
     }
 
-    /// Closes one window: decides to boost, retune or end the boost, and cuts a
-    /// slow head stream.
+    /// Closes one window: decides to boost, retune, withdraw or end the boost,
+    /// and cuts a slow head stream.
     fn evaluate(&mut self, workers: &mut JoinSet<Result<(), SlipstreamError>>) {
         self.drop_sender_if_plan_out();
         let now = Instant::now();
@@ -1873,8 +1915,28 @@ impl Booster {
             return;
         }
         let fraction = waited.as_secs_f64() / elapsed.as_secs_f64();
+        let rate = per_stream.iter().sum::<u64>() as f64 / elapsed.as_secs_f64();
+        if self.boosted() {
+            if self.check_boost_gain(rate, fraction, &per_stream) {
+                // Withdrawn: this window starts the retry wait, nothing else to decide.
+                return;
+            }
+        } else if rate > 0.0 && self.live_extras() == 0 {
+            // Only a window without extras of an earlier boost measures the base workers.
+            self.last_rate = Some(rate);
+        }
         match self.state.observe(fraction) {
-            BoostStep::Start => self.start(workers, fraction),
+            BoostStep::Start if self.live_extras() > 0 => {
+                // Extras of an earlier boost are still finishing their chunk: their bytes
+                // would count as this boost's, so it starts once they are gone.
+                self.state.defer_start();
+            }
+            BoostStep::Start => {
+                self.pre_boost_rate = self.last_rate;
+                self.boost_windows = 0;
+                self.gain_checked = false;
+                self.start(workers, fraction);
+            }
             BoostStep::Stop => self.stop(fraction),
             BoostStep::Stay if self.boosted() => self.top_up_workers(workers),
             BoostStep::Stay => {}
@@ -1885,7 +1947,7 @@ impl Booster {
     }
 
     /// Bytes each tracked worker received in the window that just closed (in
-    /// `self.workers` order); updates the best window.
+    /// `self.workers` order).
     fn close_stream_windows(&mut self) -> Vec<u64> {
         let mut got = Vec::with_capacity(self.workers.len());
         for w in &mut self.workers {
@@ -1894,30 +1956,108 @@ impl Booster {
             w.window_bytes = total;
             got.push(delta);
         }
-        self.best_window_bytes = got.iter().copied().fold(self.best_window_bytes, u64::max);
+        let window_max = got.iter().copied().max().unwrap_or(0);
+        self.recent_best = decayed_best(self.recent_best, window_max);
         got
+    }
+
+    /// Withdraws a boost that did not raise the fetch's byte rate (see [`FetchBoost`]);
+    /// returns whether it did. Judged once, in the first window from the second on in
+    /// which the scanner still waits (else the boost did its job and ends the usual way)
+    /// and the extra workers delivered bytes (over Tor a new circuit can take a window or
+    /// two). A boost whose extras still deliver nothing at [`BOOST_GAIN_LAST_WINDOW`] while
+    /// the scanner waits is judged then, on the same rate test, and so withdrawn unless the
+    /// head restarts alone raised the rate.
+    fn check_boost_gain(&mut self, rate: f64, fraction: f64, per_stream: &[u64]) -> bool {
+        self.boost_windows += 1;
+        if self.gain_checked || self.boost_windows < 2 {
+            return false;
+        }
+        let extras_delivered = per_stream.iter().skip(self.base_streams).any(|&b| b > 0);
+        if fraction < BOOST_ON_FRACTION {
+            // The scanner no longer waits: the boost did its job and ends the usual way.
+            self.gain_checked = true;
+            return false;
+        }
+        // Extras that delivered nothing by BOOST_GAIN_LAST_WINDOW (no circuit, no
+        // connection) are judged anyway: the boost then only adds load.
+        if (!extras_delivered || self.live_extras() == 0)
+            && self.boost_windows < BOOST_GAIN_LAST_WINDOW
+        {
+            return false;
+        }
+        self.gain_checked = true;
+        if boost_raised_rate(self.pre_boost_rate, rate) {
+            self.state.boost_paid_off();
+            return false;
+        }
+        let retry_windows = self.state.withdraw();
+        self.boost_on.store(false, Ordering::Relaxed);
+        self.dispatcher.set_cutting(false);
+        self.dispatcher
+            .set_target_bytes(chunk_target_bytes(self.ahead, self.base_streams));
+        match self.pre_boost_rate {
+            Some(base) => info!(
+                before_kbps = (base / 1024.0) as u64,
+                boosted_kbps = (rate / 1024.0) as u64,
+                retry_windows,
+                "fetch boost withdrawn: more streams did not speed up the download"
+            ),
+            None => info!(
+                boosted_kbps = (rate / 1024.0) as u64,
+                retry_windows, "fetch boost withdrawn: no unboosted rate to compare it with"
+            ),
+        }
+        true
     }
 
     /// Restarts the stream of the head plan chunk when it is slow (see [`FetchBoost`]).
     fn kick_slow_head(&mut self, per_stream: &[u64], now: Instant) {
         let floor = self.floor.load(Ordering::Acquire);
-        let best = self.best_window_bytes;
-        for (w, &delta) in self.workers.iter_mut().zip(per_stream) {
+        let recent_best = self.recent_best;
+        for (i, (w, &delta)) in self.workers.iter_mut().zip(per_stream).enumerate() {
             if !w.slot.holds(floor) {
                 continue;
             }
+            // The other streams of this window: a head as slow as they are is on a
+            // full link, where a fresh connection gets no more of it.
+            let others_best = per_stream
+                .iter()
+                .enumerate()
+                .filter(|&(j, _)| j != i)
+                .map(|(_, &b)| b)
+                .max()
+                .unwrap_or(0);
+            // Parked or finished peers deliver nothing, so the recent best stands in for them.
+            let reference = others_best.max(recent_best);
+            // On a slow link everyone is slow: the link is full, and only a head far behind
+            // the others is restarted.
+            // Under eight times the absolute floor the floor would flag a head that keeps
+            // pace with its peers, so only the relative test applies there.
+            let slow = if reference < 8 * KICK_MIN_WINDOW_BYTES {
+                (delta as f64) < KICK_RATE_FRACTION * reference as f64
+            } else {
+                head_is_slow(delta, reference)
+            };
+            let plan_index = w.slot.plan_index.load(Ordering::Relaxed);
+            if !slow {
+                // The last restart helped (or none was needed).
+                w.slow_kicks = 0;
+            }
             let cooling = w
                 .last_kick
-                .is_some_and(|t| now.duration_since(t) < KICK_COOLDOWN);
-            if !cooling && head_is_slow(delta, best) {
+                .is_some_and(|t| now.duration_since(t) < kick_cooldown(w.slow_kicks));
+            if !cooling && slow {
                 info!(
-                    plan_index = w.slot.plan_index.load(Ordering::Relaxed),
+                    plan_index,
                     window_kb = delta / 1024,
-                    best_window_kb = best / 1024,
+                    reference_kb = reference / 1024,
+                    restarts = w.slow_kicks + 1,
                     "head stream slow while the scanner waits — restarting it"
                 );
                 w.slot.kick();
                 w.last_kick = Some(now);
+                w.slow_kicks += 1;
             }
         }
     }
@@ -1979,13 +2119,29 @@ impl Booster {
                 slot,
                 window_bytes: 0,
                 last_kick: None,
+                slow_kicks: 0,
             });
         }
     }
 }
 
+/// The recent best per-stream window after one more window: the previous one less 10 %,
+/// or this window's best stream if higher.
+fn decayed_best(prev: u64, window_max: u64) -> u64 {
+    (prev - prev / 10).max(window_max)
+}
+
+/// Wait before restarting a head stream again after `slow_kicks` restarts of its
+/// plan chunk after which it stayed slow: [`KICK_COOLDOWN`], doubling from the
+/// second such restart on, up to [`KICK_MAX_COOLDOWN`].
+fn kick_cooldown(slow_kicks: u32) -> Duration {
+    KICK_COOLDOWN
+        .saturating_mul(1 << slow_kicks.saturating_sub(1).min(8))
+        .min(KICK_MAX_COOLDOWN)
+}
+
 /// Whether a head stream that received `window_bytes` in a window is slow next to
-/// the best window `best_window_bytes` of any stream of the fetch.
+/// the best window `best_window_bytes` of the other streams of the fetch.
 fn head_is_slow(window_bytes: u64, best_window_bytes: u64) -> bool {
     window_bytes < KICK_MIN_WINDOW_BYTES
         || (window_bytes as f64) < KICK_RATE_FRACTION * best_window_bytes as f64
@@ -1999,6 +2155,15 @@ enum BoostStep {
     Stay,
 }
 
+/// Whether a boost that is being judged raised the byte rate enough to stay. A boost
+/// that started before any unboosted window received bytes (a Tor circuit still being
+/// built, the first chunks slow) has no rate to beat: it is withdrawn, and the windows
+/// of its retry wait measure the base workers, so the next boost is judged on a rate.
+/// Keeping it instead left the extra streams on a slow link for the whole sync.
+fn boost_raised_rate(pre_boost_rate: Option<f64>, rate: f64) -> bool {
+    pre_boost_rate.is_some_and(|base| rate >= base * BOOST_MIN_GAIN)
+}
+
 /// The booster's on/off hysteresis over closed windows (see [`FetchBoost`]).
 #[derive(Debug, Default)]
 struct BoostState {
@@ -2007,11 +2172,19 @@ struct BoostState {
     hot: u32,
     /// Consecutive windows without waiting while on.
     cold: u32,
+    /// Windows left before a withdrawn boost may start again.
+    retry_in: u32,
+    /// Boosts withdrawn in a row (see [`Self::withdraw`]).
+    withdrawals: u32,
 }
 
 impl BoostState {
     /// Records one window in which the scanner waited for `fraction` of the time.
     fn observe(&mut self, fraction: f64) -> BoostStep {
+        if self.retry_in > 0 {
+            self.retry_in -= 1;
+            return BoostStep::Stay;
+        }
         if !self.on {
             self.hot = if fraction >= BOOST_ON_FRACTION {
                 self.hot + 1
@@ -2023,6 +2196,7 @@ impl BoostState {
                     on: true,
                     hot: 0,
                     cold: 0,
+                    ..*self
                 };
                 return BoostStep::Start;
             }
@@ -2033,11 +2207,36 @@ impl BoostState {
                 0
             };
             if self.cold >= BOOST_COLD_WINDOWS {
+                // The scanner stopped waiting: the boost did its job, so the next
+                // withdrawal waits the shortest time again.
                 *self = Self::default();
                 return BoostStep::Stop;
             }
         }
         BoostStep::Stay
+    }
+
+    /// Ends a boost that did not pay off; returns the windows it waits before it may
+    /// start again ([`BOOST_RETRY_WINDOWS`], doubling with each withdrawal in a row).
+    fn withdraw(&mut self) -> u32 {
+        let doublings = self.withdrawals.min(BOOST_RETRY_MAX_DOUBLINGS);
+        *self = Self {
+            retry_in: BOOST_RETRY_WINDOWS << doublings,
+            withdrawals: self.withdrawals + 1,
+            ..Self::default()
+        };
+        self.retry_in
+    }
+
+    /// A boost raised the byte rate: the next withdrawal waits the shortest time again.
+    /// Undoes a `Start` that cannot happen yet; the next fetch-bound window starts it.
+    fn defer_start(&mut self) {
+        self.on = false;
+        self.hot = BOOST_HOT_WINDOWS.saturating_sub(1);
+    }
+
+    fn boost_paid_off(&mut self) {
+        self.withdrawals = 0;
     }
 }
 
@@ -2392,8 +2591,7 @@ mod boost_tests {
     fn boost_ends_after_consecutive_calm_windows() {
         let mut st = BoostState {
             on: true,
-            hot: 0,
-            cold: 0,
+            ..BoostState::default()
         };
         for _ in 0..BOOST_COLD_WINDOWS - 1 {
             assert_eq!(st.observe(0.0), BoostStep::Stay);
@@ -2408,6 +2606,91 @@ mod boost_tests {
         }
         assert_eq!(st.observe(0.0), BoostStep::Stop);
         assert!(!st.on);
+    }
+
+    #[test]
+    fn a_withdrawn_boost_waits_longer_each_time_until_one_pays_off() {
+        let mut st = BoostState::default();
+        for round in 0..=BOOST_RETRY_MAX_DOUBLINGS + 1 {
+            assert_eq!(st.observe(1.0), BoostStep::Stay);
+            assert_eq!(st.observe(1.0), BoostStep::Start);
+            let wait = st.withdraw();
+            assert_eq!(
+                wait,
+                BOOST_RETRY_WINDOWS << round.min(BOOST_RETRY_MAX_DOUBLINGS)
+            );
+            assert!(!st.on);
+            for _ in 0..wait {
+                assert_eq!(st.observe(1.0), BoostStep::Stay, "no boost while waiting");
+            }
+        }
+        assert_eq!(st.observe(1.0), BoostStep::Stay);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+        st.boost_paid_off();
+        assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS);
+    }
+
+    #[test]
+    fn a_boost_without_an_unboosted_rate_is_withdrawn() {
+        assert!(!boost_raised_rate(None, 0.0));
+        assert!(
+            !boost_raised_rate(None, 1e9),
+            "no rate to compare: withdrawn"
+        );
+        assert!(boost_raised_rate(Some(1000.0), 1000.0 * BOOST_MIN_GAIN));
+        assert!(!boost_raised_rate(
+            Some(1000.0),
+            1000.0 * BOOST_MIN_GAIN - 1.0
+        ));
+    }
+
+    #[test]
+    fn a_boost_that_ends_because_the_scanner_caught_up_clears_the_doubling() {
+        let mut st = BoostState::default();
+        st.observe(1.0);
+        st.observe(1.0);
+        st.withdraw();
+        for _ in 0..BOOST_RETRY_WINDOWS {
+            st.observe(1.0);
+        }
+        st.observe(1.0);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+        for _ in 0..BOOST_COLD_WINDOWS - 1 {
+            st.observe(0.0);
+        }
+        assert_eq!(st.observe(0.0), BoostStep::Stop);
+        assert_eq!(st.withdraw(), BOOST_RETRY_WINDOWS);
+    }
+
+    #[test]
+    fn the_recent_best_falls_ten_percent_per_window_and_rises_at_once() {
+        assert_eq!(decayed_best(0, 640), 640);
+        assert_eq!(decayed_best(1000, 100), 900);
+        assert_eq!(decayed_best(1000, 2000), 2000);
+        let mut b = 1000;
+        for _ in 0..200 {
+            b = decayed_best(b, 0);
+        }
+        assert!(b < 10, "decays towards zero: {b}");
+    }
+
+    #[test]
+    fn a_deferred_start_starts_on_the_next_fetch_bound_window() {
+        let mut st = BoostState::default();
+        assert_eq!(st.observe(1.0), BoostStep::Stay);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+        st.defer_start();
+        assert!(!st.on);
+        assert_eq!(st.observe(1.0), BoostStep::Start);
+    }
+
+    #[test]
+    fn restarts_of_a_chunk_that_stays_slow_back_off_to_the_cap() {
+        assert_eq!(kick_cooldown(0), KICK_COOLDOWN);
+        assert_eq!(kick_cooldown(1), KICK_COOLDOWN);
+        assert_eq!(kick_cooldown(2), KICK_COOLDOWN * 2);
+        assert_eq!(kick_cooldown(3), KICK_MAX_COOLDOWN);
+        assert_eq!(kick_cooldown(u32::MAX), KICK_MAX_COOLDOWN);
     }
 }
 

@@ -39,6 +39,7 @@ pub mod probe;
 pub mod throttle;
 pub mod treestate;
 pub mod verify;
+pub mod work;
 
 // Issue #4: the zcash_client_sqlite wallet-storage backend and — today — the
 // engine loop that is hard-wired to it. A future non-sqlite backend would slot
@@ -66,6 +67,8 @@ pub mod migrations;
 pub mod oracle;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod persist;
+#[cfg(feature = "zcash_client_sqlite")]
+mod progress_scope;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod reconcile;
 #[cfg(feature = "zcash_client_sqlite")]

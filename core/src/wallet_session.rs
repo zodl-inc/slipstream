@@ -615,6 +615,98 @@ impl WalletSession {
         .map_err(|e| wallet_err("seed_block_metadata insert", e))?;
         Ok(())
     }
+
+    /// Builds the output-weighted progress estimator from upstream's own completed-subtree rows
+    /// (`{sapling,orchard,ironwood}_tree_shards.subtree_end_height`), read-only. No table of
+    /// ours is involved, so a wallet upgraded from an older engine is covered the same way.
+    ///
+    /// Progress is presentation state: any error is logged and yields `None`, and the caller
+    /// then reports progress in blocks. This never fails a pass.
+    ///
+    /// Returns `None` when no pool has subtree data (the scheduler then reports progress in
+    /// blocks). On a read error it logs and returns `None` as well.
+    pub fn build_work_estimator(&self) -> Option<crate::work::WorkEstimator> {
+        match self.read_work_estimator() {
+            Ok(est) => est,
+            Err(e) => {
+                tracing::warn!(%e, "work estimator read failed; progress falls back to blocks");
+                None
+            }
+        }
+    }
+
+    fn read_work_estimator(&self) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
+        // Wrap blocking sqlite operations in block_in_place so they don't block the runtime.
+        // Same runtime_flavor guard as the graft sweep in `scheduler::run_to_completion`.
+        if tokio::runtime::Handle::try_current().ok().is_some_and(|h| {
+            matches!(
+                h.runtime_flavor(),
+                tokio::runtime::RuntimeFlavor::MultiThread
+            )
+        }) {
+            tokio::task::block_in_place(|| self.read_work_estimator_blocking())
+        } else {
+            self.read_work_estimator_blocking()
+        }
+    }
+
+    fn read_work_estimator_blocking(
+        &self,
+    ) -> Result<Option<crate::work::WorkEstimator>, SlipstreamError> {
+        let conn = Connection::open_with_flags(
+            &self.db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|e| wallet_err("work estimator open", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| wallet_err("work estimator busy_timeout", e))?;
+        crate::work::estimator_from_shards(&self.network, |label| read_subtree_ends(&conn, label))
+    }
+}
+
+/// `(shard_index, subtree_end_height)` of every completed subtree of `pool` (a `work::POOLS`
+/// label), from upstream's shard table. The table name comes from a fixed match, never from
+/// the caller's string.
+pub(crate) fn read_subtree_ends(
+    conn: &Connection,
+    pool: &str,
+) -> Result<Vec<(u64, u64)>, SlipstreamError> {
+    let sql = match pool {
+        "sapling" => {
+            "SELECT shard_index, subtree_end_height FROM sapling_tree_shards \
+             WHERE subtree_end_height IS NOT NULL ORDER BY shard_index"
+        }
+        "orchard" => {
+            "SELECT shard_index, subtree_end_height FROM orchard_tree_shards \
+             WHERE subtree_end_height IS NOT NULL ORDER BY shard_index"
+        }
+        "ironwood" => {
+            "SELECT shard_index, subtree_end_height FROM ironwood_tree_shards \
+             WHERE subtree_end_height IS NOT NULL ORDER BY shard_index"
+        }
+        other => {
+            return Err(SlipstreamError::Wallet(format!(
+                "work estimator: unknown pool {other}"
+            )));
+        }
+    };
+    let mut stmt = conn
+        .prepare(sql)
+        .map_err(|e| wallet_err("work estimator prepare", e))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+        .map_err(|e| wallet_err("work estimator query", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (idx, end) = row.map_err(|e| wallet_err("work estimator row", e))?;
+        let (Ok(idx), Ok(end)) = (u64::try_from(idx), u64::try_from(end)) else {
+            return Err(SlipstreamError::Wallet(format!(
+                "work estimator: negative shard row ({idx}, {end}) in {pool}"
+            )));
+        };
+        out.push((idx, end));
+    }
+    Ok(out)
 }
 
 /// TEST_UFVK: mainnet UFVK for the canonical darkside seed used in this repo's test suite.
@@ -720,6 +812,44 @@ mod tests {
         assert!(
             min_id >= 3_402_985 - 10_000,
             "flood rows below the margin are gone"
+        );
+    }
+
+    /// The estimator reads upstream's own shard rows, read-only: a fresh wallet has none (block
+    /// progress), and completed-subtree rows make it usable with the expected values.
+    #[test]
+    fn work_estimator_from_upstream_shard_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("data.db");
+        let s = WalletSession::open(Network::MainNetwork, &path).expect("open");
+        assert!(
+            s.build_work_estimator().is_none(),
+            "no shard rows ⇒ block progress"
+        );
+
+        let conn = Connection::open(&path).expect("side conn");
+        conn.execute(
+            "INSERT INTO sapling_tree_shards (shard_index, subtree_end_height) VALUES (?1, ?2), (?3, ?4)",
+            rusqlite::params![0i64, 500_000i64, 1i64, 600_000i64],
+        )
+        .expect("insert shard rows");
+        // A shard still being filled has no end height and must be ignored.
+        conn.execute(
+            "INSERT INTO sapling_tree_shards (shard_index, subtree_end_height) VALUES (?1, NULL)",
+            rusqlite::params![2i64],
+        )
+        .expect("insert open shard");
+
+        assert_eq!(
+            read_subtree_ends(&conn, "sapling").expect("read"),
+            vec![(0, 500_000), (1, 600_000)]
+        );
+        assert!(read_subtree_ends(&conn, "sapling; DROP TABLE x").is_err());
+
+        let est = s.build_work_estimator().expect("usable");
+        assert_eq!(
+            est.range(500_001, 600_000),
+            100_000 * crate::work::BLOCK_WEIGHT + 65_536
         );
     }
 
