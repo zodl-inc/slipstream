@@ -104,13 +104,25 @@ pub async fn restore_anchor(
                 .unwrap_or(0);
             let fetched = async {
                 let mut client = client_via(endpoint, tor).await?;
-                let tip = usable_height(grpc::get_latest_block_height(&mut client).await.ok()?)?;
+                let tip = usable_height(
+                    grpc::with_ohttp_endpoint(
+                        endpoint,
+                        tor.is_some(),
+                        grpc::get_latest_block_height(&mut client),
+                    )
+                    .await
+                    .ok()?,
+                )?;
                 let anchor_height = tip
                     .saturating_sub(ANCHOR_MAX_REORG_BLOCKS)
                     .max(sapling_activation);
-                let ts = grpc::get_tree_state(&mut client, anchor_height)
-                    .await
-                    .ok()?;
+                let ts = grpc::with_ohttp_endpoint(
+                    endpoint,
+                    tor.is_some(),
+                    grpc::get_tree_state(&mut client, anchor_height),
+                )
+                .await
+                .ok()?;
                 if usable_height(ts.height)? != anchor_height {
                     return None;
                 }
@@ -172,7 +184,15 @@ pub fn offline_anchor(intent: AnchorIntent) -> Anchor {
 /// tip included.
 async fn tip_via(endpoint: &Endpoint, tor: Option<&TorConn>) -> Option<u64> {
     let mut client = client_via(endpoint, tor).await?;
-    usable_height(grpc::get_latest_block_height(&mut client).await.ok()?)
+    usable_height(
+        grpc::with_ohttp_endpoint(
+            endpoint,
+            tor.is_some(),
+            grpc::get_latest_block_height(&mut client),
+        )
+        .await
+        .ok()?,
+    )
 }
 
 /// `height` if a host can use it; `None`, the unreachable-server answer, above `i32::MAX`.

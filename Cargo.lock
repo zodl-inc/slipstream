@@ -8313,6 +8313,7 @@ dependencies = [
 name = "zodl-slipstream"
 version = "0.4.0"
 dependencies = [
+ "aes-gcm",
  "arti-client",
  "base64",
  "bls12_381",
@@ -8320,6 +8321,8 @@ dependencies = [
  "ff 0.14.0",
  "futures-util",
  "group 0.14.0",
+ "hkdf",
+ "hpke",
  "http",
  "http-body",
  "http-body-util",
@@ -8341,6 +8344,7 @@ dependencies = [
  "schemerz-rusqlite",
  "secrecy",
  "serde_json",
+ "sha2 0.10.9",
  "shardtree",
  "sinsemilla",
  "tempfile",

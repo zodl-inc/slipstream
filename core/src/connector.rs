@@ -266,24 +266,28 @@ impl TorConn {
         // circuit is cut at the per-attempt timeout and the next attempt draws a new isolated
         // circuit, instead of blocking on arti's long internal timeout. The healthy case connects
         // on attempt 1 with no added latency.
-        retry_tor_connect(per_attempt, |attempt| {
-            // `.uniqueTor` (and a bulk worker's own circuit) = a fresh isolated circuit EACH
-            // attempt (so a retry escapes a stuck circuit); `.defaultTor` = the default circuit
-            // (a retry still gets a fresh isolated one, since the default one just failed us).
-            let client = match (mode, attempt) {
-                (TorMode::Default | TorMode::Shared, 1) => self.client.clone(),
-                _ => self.client.isolated_client(),
-            };
-            let client_trace_prefix = self.client_trace_prefix.clone();
-            async move {
-                match relay {
-                    Some(relay) => {
-                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
+        grpc::with_ohttp_endpoint(
+            endpoint,
+            true,
+            retry_tor_connect(per_attempt, |attempt| {
+                // `.uniqueTor` (and a bulk worker's own circuit) = a fresh isolated circuit EACH
+                // attempt (so a retry escapes a stuck circuit); `.defaultTor` = the default circuit
+                // (a retry still gets a fresh isolated one, since the default one just failed us).
+                let client = match (mode, attempt) {
+                    (TorMode::Default | TorMode::Shared, 1) => self.client.clone(),
+                    _ => self.client.isolated_client(),
+                };
+                let client_trace_prefix = self.client_trace_prefix.clone();
+                async move {
+                    match relay {
+                        Some(relay) => {
+                            Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
+                        }
+                        None => Self::connect_direct_over_tor(client, endpoint).await,
                     }
-                    None => Self::connect_direct_over_tor(client, endpoint).await,
                 }
-            }
-        })
+            }),
+        )
         .await
     }
 
@@ -583,6 +587,12 @@ where
 {
     let mut last_err: Option<SlipstreamError> = None;
     for attempt in 1..=TOR_CONNECT_ATTEMPTS {
+        let health = grpc::current_ohttp_health_route().map(|route| {
+            crate::transport_health::begin_request(
+                &route,
+                crate::transport_health::HealthScope::Route,
+            )
+        });
         match tokio::time::timeout(per_attempt, connect(attempt)).await {
             Ok(Ok(c)) => {
                 grpc::net_stats::record(grpc::net_stats::NetEvent::TorChannel);
@@ -603,6 +613,12 @@ where
                 });
             }
             Err(_elapsed) => {
+                if let Some(health) = health {
+                    health.record(
+                        crate::transport_health::HealthOutcome::TransportUnavailable,
+                        crate::transport_health::HealthStage::Connection,
+                    );
+                }
                 tracing::warn!(
                     attempt,
                     timeout_secs = per_attempt.as_secs(),
@@ -678,6 +694,43 @@ mod tests {
             port: 443,
             tls: true,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_tor_connect_deadline_is_recorded_before_fresh_circuit_retry() {
+        use crate::transport_health::{self, HealthOutcome, HealthRoute, HealthScope, HealthStage};
+        let route = HealthRoute {
+            gateway_host: "health-connect.invalid".into(),
+            relay_url: "https://health-connect-relay.invalid/relay".into(),
+            via_tor: true,
+        };
+        let subscription = transport_health::subscribe(route.clone(), 42, Arc::new(|_| {}));
+        let result = grpc::with_ohttp_health_route(
+            Some(route),
+            retry_tor_connect(Duration::from_secs(30), |attempt| {
+                if attempt > 1 {
+                    assert!(
+                        subscription
+                            .snapshot()
+                            .observations
+                            .iter()
+                            .any(|o| o.scope == HealthScope::Route
+                                && o.outcome == HealthOutcome::TransportUnavailable
+                                && o.stage == HealthStage::Connection)
+                    );
+                }
+                std::future::pending::<Result<(), SlipstreamError>>()
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            subscription
+                .snapshot()
+                .observations
+                .iter()
+                .any(|o| o.outcome == HealthOutcome::TransportUnavailable)
+        );
     }
 
     #[tokio::test]

@@ -167,7 +167,12 @@ pub async fn probe_tip(
 ) -> Result<u64, SlipstreamError> {
     // Public tip data (ZIP circuit isolation policy): the session's shared connection.
     let mut client = connect_via(&config.endpoint, tor, ConnPurpose::SyncShared).await?;
-    let tip = grpc::get_latest_block_height(&mut client).await;
+    let tip = grpc::with_ohttp_endpoint(
+        &config.endpoint,
+        tor.is_some(),
+        grpc::get_latest_block_height(&mut client),
+    )
+    .await;
     if tip.is_err()
         && let Some(t) = tor
     {
@@ -268,8 +273,12 @@ pub async fn sync_once(
         if session.has_account_for_ufvk(ufvk)? {
             continue;
         }
-        let birthday_ts =
-            grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1).await?;
+        let birthday_ts = grpc::with_ohttp_endpoint(
+            &config.endpoint,
+            tor.is_some(),
+            grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1),
+        )
+        .await?;
         if let Some(ref p) = progress {
             p.touch(); // liveness: a server response is forward progress
         }
@@ -289,7 +298,12 @@ pub async fn sync_once(
     } else {
         session.next_subtree_root_start()?
     };
-    let roots = grpc::get_subtree_roots_from(&mut client, roots_start, progress.as_deref()).await?;
+    let roots = grpc::with_ohttp_endpoint(
+        &config.endpoint,
+        tor.is_some(),
+        grpc::get_subtree_roots_from(&mut client, roots_start, progress.as_deref()),
+    )
+    .await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -304,7 +318,12 @@ pub async fn sync_once(
         "subtree roots updated"
     );
 
-    let tip = grpc::get_latest_block_height(&mut client).await?;
+    let tip = grpc::with_ohttp_endpoint(
+        &config.endpoint,
+        tor.is_some(),
+        grpc::get_latest_block_height(&mut client),
+    )
+    .await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -327,9 +346,21 @@ pub async fn sync_once(
     let transparent = match tor {
         Some(t) => {
             let mut utxo_client = t.connect_isolated(&config.endpoint).await?;
-            refresh_utxos(&mut session, &mut utxo_client, progress.as_deref()).await?
+            grpc::with_ohttp_endpoint(
+                &config.endpoint,
+                true,
+                refresh_utxos(&mut session, &mut utxo_client, progress.as_deref()),
+            )
+            .await?
         }
-        None => refresh_utxos(&mut session, &mut client, progress.as_deref()).await?,
+        None => {
+            grpc::with_ohttp_endpoint(
+                &config.endpoint,
+                false,
+                refresh_utxos(&mut session, &mut client, progress.as_deref()),
+            )
+            .await?
+        }
     };
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
@@ -431,13 +462,17 @@ pub async fn sync_once(
     // Stats are merged into the report's `enhance` field so the stage-split log
     // reports total enhancement time (per-range runs + this final run) correctly.
     let enhance_started = Instant::now();
-    let final_enhance = run_enhancement_isolated(
-        &mut session,
-        &mut client,
-        config.network,
-        progress.clone(),
-        &mut skipped_keys,
-        tor.map(|t| (t, &config.endpoint)),
+    let final_enhance = grpc::with_ohttp_endpoint(
+        &config.endpoint,
+        tor.is_some(),
+        run_enhancement_isolated(
+            &mut session,
+            &mut client,
+            config.network,
+            progress.clone(),
+            &mut skipped_keys,
+            tor.map(|t| (t, &config.endpoint)),
+        ),
     )
     .await?;
     let final_enhance_elapsed = enhance_started.elapsed();

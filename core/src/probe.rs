@@ -155,7 +155,7 @@ async fn probe_one(endpoint: Endpoint, deadline: Instant) -> ProbeResult {
     };
     let Ok(Ok(tip)) = timeout(
         remaining(deadline),
-        grpc::get_latest_block_height(&mut client),
+        grpc::with_ohttp_endpoint(&endpoint, false, grpc::get_latest_block_height(&mut client)),
     )
     .await
     else {

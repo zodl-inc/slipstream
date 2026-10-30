@@ -1137,9 +1137,11 @@ async fn open_and_pump(
         // (Longer for OHTTP gateways, whose buffered response = the whole chunk —
         // grpc::range_open_timeout.)
         grpc::net_stats::record(grpc::net_stats::NetEvent::GetBlockRange);
+        let health = grpc::unary_health_request();
         let opened = tokio::time::timeout(open_timeout, client.get_block_range(req))
             .await
             .map_err(|_| {
+                grpc::record_unary_deadline(&health);
                 SlipstreamError::Transport(format!(
                     "get_block_range {}..{}: timed out after {}s",
                     cursor.resume_from,
@@ -1179,18 +1181,21 @@ async fn open_and_pump(
         // OHTTP connector): the blocks before it are handed on, the rest is asked for in
         // smaller windows.
         let mut refused = false;
-        let pumped = pump_block_window(
-            &mut stream,
-            cursor,
-            window_end,
-            plan.split_bytes,
-            plan.chunk_timeout,
-            gate,
-            out,
-            progress,
-            &mut refused,
-            slot,
-            dispatcher,
+        let pumped = grpc::with_ohttp_stream_request(
+            health,
+            pump_block_window(
+                &mut stream,
+                cursor,
+                window_end,
+                plan.split_bytes,
+                plan.chunk_timeout,
+                gate,
+                out,
+                progress,
+                &mut refused,
+                slot,
+                dispatcher,
+            ),
         )
         .await;
         match pumped {
@@ -1329,18 +1334,22 @@ async fn worker(
             // A kick meant for a stream that is gone (the previous chunk's, or an
             // attempt that ended otherwise) does not cut this one.
             slot.clear_kick();
-            match open_and_pump(
-                &mut client,
-                &mut cursor,
-                &plan,
-                &gate,
-                &out,
-                open_timeout,
-                progress.as_deref(),
-                &mut max_span,
-                split_on_invalid,
-                Some(&slot),
-                Some(&dispatcher),
+            match grpc::with_ohttp_endpoint(
+                &endpoint,
+                tor.is_some(),
+                open_and_pump(
+                    &mut client,
+                    &mut cursor,
+                    &plan,
+                    &gate,
+                    &out,
+                    open_timeout,
+                    progress.as_deref(),
+                    &mut max_span,
+                    split_on_invalid,
+                    Some(&slot),
+                    Some(&dispatcher),
+                ),
             )
             .await
             {
@@ -3414,6 +3423,49 @@ mod tests {
             .map(|s| (s.blocks.iter().map(|b| b.height).collect(), s.is_last))
             .collect();
         assert_eq!(shape, vec![(vec![100, 101], false), (vec![102], true)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_block_stream_deadline_keeps_original_request_start() {
+        use crate::transport_health::{self, HealthOutcome, HealthRoute, HealthScope, HealthStage};
+        let route = HealthRoute {
+            gateway_host: "health-fetch.invalid".into(),
+            relay_url: "https://health-fetch-relay.invalid/relay".into(),
+            via_tor: true,
+        };
+        let subscription = transport_health::subscribe(route.clone(), 42, Arc::new(|_| {}));
+        let request = Arc::new(transport_health::begin_request(
+            &route,
+            HealthScope::Lightwalletd,
+        ));
+        let id = request.request_id();
+        let (tx, _rx) = mpsc::channel::<SubChunk>(64);
+        let gate = open_gate();
+        let mut cursor = test_cursor(0, 100, 129);
+        let mut stream = Box::pin(stream::pending::<Result<CompactBlock, tonic::Status>>());
+        let result = grpc::with_ohttp_stream_request(
+            Some(request),
+            pump_block_stream(
+                &mut stream,
+                &mut cursor,
+                usize::MAX >> 8,
+                Duration::from_secs(5),
+                &gate,
+                &tx,
+                None,
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        let snapshot = subscription.snapshot();
+        let observation = snapshot
+            .observations
+            .iter()
+            .find(|o| o.request_id == id)
+            .expect("deadline retains its request ticket");
+        assert_eq!(observation.outcome, HealthOutcome::TransportUnavailable);
+        assert_eq!(observation.stage, HealthStage::ResponseBody);
+        assert!(observation.route.via_tor);
     }
 
     /// A stream that goes silent still fails the attempt (idle timeout); the

@@ -1326,13 +1326,17 @@ async fn scan_chunks_inner(
                 flush_stage_lines(&mut wb.stage_lines, true);
             }
             let started = Instant::now();
-            match run_enhancement_lazily_isolated(
-                session,
-                &mut enhance_client,
-                network,
-                progress.clone(),
-                skipped_keys,
-                tor.map(|t| (t, &endpoint)),
+            match grpc::with_ohttp_endpoint(
+                &endpoint,
+                tor.is_some(),
+                run_enhancement_lazily_isolated(
+                    session,
+                    &mut enhance_client,
+                    network,
+                    progress.clone(),
+                    skipped_keys,
+                    tor.map(|t| (t, &endpoint)),
+                ),
             )
             .await
             {

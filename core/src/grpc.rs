@@ -147,7 +147,9 @@ pub(crate) async fn retry_get_tree_state(
             crate::connector::ConnPurpose::MetadataUnique
         };
         let mut client = crate::connector::connect_via(endpoint, tor, purpose).await?;
-        match get_tree_state(&mut client, height).await {
+        match with_ohttp_endpoint(endpoint, tor.is_some(), get_tree_state(&mut client, height))
+            .await
+        {
             Ok(ts) => {
                 // Liveness: a server response is forward progress (tree states ride
                 // isolated Tor circuits when Tor is on and can take seconds each).
@@ -183,19 +185,85 @@ pub(crate) async fn retry_get_tree_state(
     }
 }
 
+tokio::task_local! {
+    static OHTTP_HEALTH_ROUTE: Option<crate::transport_health::HealthRoute>;
+    static OHTTP_STREAM_REQUEST: Option<Arc<crate::transport_health::HealthRequest>>;
+}
+
+/// Explicitly scope the exact network future. Tokio does not inherit this into spawned tasks.
+pub(crate) async fn with_ohttp_health_route<T>(
+    route: Option<crate::transport_health::HealthRoute>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    OHTTP_HEALTH_ROUTE
+        .scope(route, OHTTP_STREAM_REQUEST.scope(None, future))
+        .await
+}
+
+pub(crate) fn current_ohttp_health_route() -> Option<crate::transport_health::HealthRoute> {
+    OHTTP_HEALTH_ROUTE.try_with(Clone::clone).ok().flatten()
+}
+
+pub(crate) async fn with_ohttp_endpoint<T>(
+    endpoint: &Endpoint,
+    via_tor: bool,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    let route =
+        crate::ohttp::relay_for(&endpoint.host).map(|relay| crate::transport_health::HealthRoute {
+            gateway_host: endpoint.host.clone(),
+            relay_url: relay.to_owned(),
+            via_tor,
+        });
+    with_ohttp_health_route(route, future).await
+}
+
+pub(crate) async fn with_ohttp_stream_request<T>(
+    request: Option<Arc<crate::transport_health::HealthRequest>>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    OHTTP_STREAM_REQUEST.scope(request, future).await
+}
+
+pub(crate) fn unary_health_request() -> Option<Arc<crate::transport_health::HealthRequest>> {
+    current_ohttp_health_route().map(|route| {
+        Arc::new(crate::transport_health::begin_request(
+            &route,
+            crate::transport_health::HealthScope::Lightwalletd,
+        ))
+    })
+}
+
+pub(crate) fn record_unary_deadline(request: &Option<Arc<crate::transport_health::HealthRequest>>) {
+    if let Some(request) = request {
+        request.record(
+            crate::transport_health::HealthOutcome::TransportUnavailable,
+            crate::transport_health::HealthStage::ResponseHead,
+        );
+    }
+}
+
 /// Awaits a unary gRPC call under [`UNARY_TIMEOUT`]; maps the gRPC status
 /// into [`SlipstreamError::Transport`] or [`SlipstreamError::PolicyDenied`].
 async fn with_unary_timeout<T>(
     context: &str,
     fut: impl std::future::Future<Output = Result<tonic::Response<T>, tonic::Status>>,
 ) -> Result<T, SlipstreamError> {
+    let health = OHTTP_STREAM_REQUEST
+        .try_with(Clone::clone)
+        .ok()
+        .flatten()
+        .or_else(unary_health_request);
     match tokio::time::timeout(UNARY_TIMEOUT, fut).await {
         Ok(Ok(resp)) => Ok(resp.into_inner()),
         Ok(Err(status)) => Err(status_err(context, status)),
-        Err(_) => Err(SlipstreamError::Transport(format!(
-            "{context}: timed out after {}s",
-            UNARY_TIMEOUT.as_secs()
-        ))),
+        Err(_) => {
+            record_unary_deadline(&health);
+            Err(SlipstreamError::Transport(format!(
+                "{context}: timed out after {}s",
+                UNARY_TIMEOUT.as_secs()
+            )))
+        }
     }
 }
 
@@ -210,6 +278,16 @@ where
     tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
         .await
         .map_err(|_| {
+            OHTTP_STREAM_REQUEST
+                .try_with(|request| {
+                    if let Some(request) = request {
+                        request.record(
+                            crate::transport_health::HealthOutcome::TransportUnavailable,
+                            crate::transport_health::HealthStage::ResponseBody,
+                        );
+                    }
+                })
+                .ok();
             SlipstreamError::Transport(format!(
                 "{context}: stream idle timeout ({}s without a message)",
                 STREAM_IDLE_TIMEOUT.as_secs()
@@ -388,21 +466,27 @@ async fn collect_subtree_roots<H: HashSer>(
     req.set_shielded_protocol(protocol);
     let context = format!("get_subtree_roots({label} from {start_index})");
     net_stats::record(net_stats::NetEvent::GetSubtreeRoots);
-    let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
-    collect_stream(
-        &mut stream,
-        &context,
-        "subtree root stream",
-        progress,
-        |r| {
-            let node = H::read(&r.root_hash[..])
-                .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
-            Ok(CommitmentTreeRoot::from_parts(
-                zcash_protocol::consensus::BlockHeight::from_u32(r.completing_block_height as u32),
-                node,
-            ))
-        },
-    )
+    let health = unary_health_request();
+    with_ohttp_stream_request(health, async {
+        let mut stream = with_unary_timeout(&context, client.get_subtree_roots(req)).await?;
+        collect_stream(
+            &mut stream,
+            &context,
+            "subtree root stream",
+            progress,
+            |r| {
+                let node = H::read(&r.root_hash[..])
+                    .map_err(|e| SlipstreamError::Transport(format!("{label} root: {e}")))?;
+                Ok(CommitmentTreeRoot::from_parts(
+                    zcash_protocol::consensus::BlockHeight::from_u32(
+                        r.completing_block_height as u32,
+                    ),
+                    node,
+                ))
+            },
+        )
+        .await
+    })
     .await
 }
 
@@ -472,6 +556,7 @@ pub async fn get_transaction(
     net_stats::record(net_stats::NetEvent::GetTransaction);
     // B2: unary deadline; the not-found mapping below needs the raw status, so this
     // call cannot reuse with_unary_timeout's uniform error mapping.
+    let health = unary_health_request();
     let outcome = tokio::time::timeout(
         UNARY_TIMEOUT,
         client.get_transaction(TxFilter {
@@ -481,6 +566,7 @@ pub async fn get_transaction(
     )
     .await
     .map_err(|_| {
+        record_unary_deadline(&health);
         SlipstreamError::Transport(format!(
             "get_transaction: timed out after {}s",
             UNARY_TIMEOUT.as_secs()
@@ -515,15 +601,19 @@ pub async fn get_taddress_txids(
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<RawTransaction>, SlipstreamError> {
     net_stats::record(net_stats::NetEvent::GetTaddressTxids);
-    let mut stream =
-        with_unary_timeout("get_taddress_txids", client.get_taddress_txids(filter)).await?;
-    collect_stream(
-        &mut stream,
-        "get_taddress_txids",
-        "taddress txid stream",
-        progress,
-        Ok,
-    )
+    let health = unary_health_request();
+    with_ohttp_stream_request(health, async {
+        let mut stream =
+            with_unary_timeout("get_taddress_txids", client.get_taddress_txids(filter)).await?;
+        collect_stream(
+            &mut stream,
+            "get_taddress_txids",
+            "taddress txid stream",
+            progress,
+            Ok,
+        )
+        .await
+    })
     .await
 }
 
@@ -561,22 +651,26 @@ pub async fn get_address_utxos(
     progress: Option<&crate::events::Progress>,
 ) -> Result<Vec<GetAddressUtxosReply>, SlipstreamError> {
     net_stats::record(net_stats::NetEvent::GetAddressUtxos);
-    let mut stream = with_unary_timeout(
-        "get_address_utxos",
-        client.get_address_utxos_stream(GetAddressUtxosArg {
-            addresses,
-            start_height,
-            max_entries: 0,
-        }),
-    )
-    .await?;
-    collect_stream(
-        &mut stream,
-        "get_address_utxos",
-        "utxo stream",
-        progress,
-        Ok,
-    )
+    let health = unary_health_request();
+    with_ohttp_stream_request(health, async {
+        let mut stream = with_unary_timeout(
+            "get_address_utxos",
+            client.get_address_utxos_stream(GetAddressUtxosArg {
+                addresses,
+                start_height,
+                max_entries: 0,
+            }),
+        )
+        .await?;
+        collect_stream(
+            &mut stream,
+            "get_address_utxos",
+            "utxo stream",
+            progress,
+            Ok,
+        )
+        .await
+    })
     .await
 }
 
@@ -719,6 +813,84 @@ pub mod net_stats {
 
 #[cfg(test)]
 mod tests {
+
+    #[tokio::test(start_paused = true)]
+    async fn health_nested_public_route_shadows_private_scope() {
+        use crate::transport_health::{self, HealthRoute};
+        let route = HealthRoute {
+            gateway_host: "health-private.invalid".into(),
+            relay_url: "https://health-private-relay.invalid/relay".into(),
+            via_tor: true,
+        };
+        let subscription = transport_health::subscribe(route.clone(), 42, Arc::new(|_| {}));
+        let public = Endpoint {
+            host: "public-lightwalletd.invalid".into(),
+            port: 443,
+            tls: true,
+        };
+        let result = with_ohttp_health_route(
+            Some(route),
+            with_ohttp_endpoint(
+                &public,
+                false,
+                with_unary_timeout::<()>("public", std::future::pending()),
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(subscription.snapshot().observations.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_concurrent_selected_endpoints_keep_routes_and_tor_modes() {
+        use crate::transport_health::{self, HealthOutcome, HealthRoute};
+        let first = Endpoint {
+            host: "ohttp-gateway.example".into(),
+            port: 443,
+            tls: true,
+        };
+        let selected = Endpoint {
+            host: "ohttp-gateway-testnet.example".into(),
+            port: 443,
+            tls: true,
+        };
+        let first_route = HealthRoute {
+            gateway_host: first.host.clone(),
+            relay_url: crate::ohttp::relay_for(&first.host).unwrap().into(),
+            via_tor: false,
+        };
+        let selected_route = HealthRoute {
+            gateway_host: selected.host.clone(),
+            relay_url: crate::ohttp::relay_for(&selected.host).unwrap().into(),
+            via_tor: true,
+        };
+        let subscriptions = [
+            transport_health::subscribe(first_route.clone(), 41, Arc::new(|_| {})),
+            transport_health::subscribe(selected_route.clone(), 42, Arc::new(|_| {})),
+        ];
+        let start = transport_health::monotonic_time_nanoseconds();
+        let (a, b) = tokio::join!(
+            with_ohttp_endpoint(
+                &first,
+                false,
+                with_unary_timeout::<()>("first", std::future::pending())
+            ),
+            with_ohttp_endpoint(
+                &selected,
+                true,
+                with_unary_timeout::<()>("selected", std::future::pending())
+            )
+        );
+        assert!(a.is_err() && b.is_err());
+        for (subscription, route) in subscriptions.iter().zip([first_route, selected_route]) {
+            let snapshot = subscription.snapshot();
+            assert!(snapshot.observations.iter().any(|o| !o.historical
+                && o.started_at_nanoseconds >= start
+                && o.route == route
+                && o.outcome == HealthOutcome::TransportUnavailable));
+            assert!(snapshot.observations.iter().all(|o| o.route == route));
+        }
+    }
 
     /// The in-process OHTTP channel is still a direct channel when its relay leg
     /// does not use Tor. Opening the pipe performs no relay or gateway network request.

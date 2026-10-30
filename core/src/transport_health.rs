@@ -368,7 +368,17 @@ impl HealthRequest {
         self
     }
 
+    /// An authenticated inner response proves the route worked, independently of its
+    /// backend result. Preserve this logical request's start and local identity.
+    pub fn record_route_usable(&self, stage: HealthStage) {
+        self.record_scope(HealthScope::Route, HealthOutcome::Usable, stage);
+    }
+
     pub fn record(&self, outcome: HealthOutcome, stage: HealthStage) {
+        self.record_scope(self.scope, outcome, stage);
+    }
+
+    fn record_scope(&self, scope: HealthScope, outcome: HealthOutcome, stage: HealthStage) {
         static NEXT_VERSION: AtomicU64 = AtomicU64::new(1);
         // Capture evidence time on the producer, never on the notification worker.
         let observed_at_nanoseconds = monotonic_time_nanoseconds();
@@ -377,7 +387,7 @@ impl HealthRequest {
         let observation = HealthObservation {
             source: HealthSource::Native,
             route: self.route.route.clone(),
-            scope: self.scope,
+            scope,
             outcome,
             stage,
             generation: self
@@ -431,6 +441,24 @@ mod tests {
 
     fn quiet(route: &HealthRoute, generation: u64) -> HealthSubscription {
         subscribe(route.clone(), generation, Arc::new(|_| {}))
+    }
+
+    #[test]
+    fn route_success_preserves_the_logical_service_request_identity() {
+        let route = route();
+        let subscription = quiet(&route, 7);
+        let request = begin_request(&route, HealthScope::Lightwalletd);
+        request.record_route_usable(HealthStage::ResponseHead);
+        request.record(HealthOutcome::BackendUnavailable, HealthStage::Complete);
+        let observations = subscription.snapshot().observations;
+        assert_eq!(observations.len(), 2);
+        assert_eq!(observations[0].scope, HealthScope::Route);
+        assert_eq!(observations[0].outcome, HealthOutcome::Usable);
+        assert_eq!(observations[0].request_id, observations[1].request_id);
+        assert_eq!(
+            observations[0].started_at_nanoseconds,
+            observations[1].started_at_nanoseconds
+        );
     }
 
     // Losing retained evidence or replacing its timestamps would manufacture fresh traffic.

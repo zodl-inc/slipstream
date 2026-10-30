@@ -74,8 +74,13 @@ fn fetch_transaction(
     match isolate {
         None => {
             let mut c = client.expect("a non-isolated fetch has an open client");
+            let route = grpc::current_ohttp_health_route();
             Box::pin(async move {
-                let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
+                let raw = grpc::with_ohttp_health_route(
+                    route,
+                    grpc::get_transaction(&mut c, *txid.as_ref()),
+                )
+                .await;
                 (txid, want_enhance, raw)
             })
         }
@@ -87,7 +92,12 @@ fn fetch_transaction(
                         SlipstreamError::Transport(format!("isolated fetch permits: {e}"))
                     })?;
                     let mut c = tor.connect_isolated(&endpoint).await?;
-                    grpc::get_transaction(&mut c, *txid.as_ref()).await
+                    grpc::with_ohttp_endpoint(
+                        &endpoint,
+                        true,
+                        grpc::get_transaction(&mut c, *txid.as_ref()),
+                    )
+                    .await
                 }
                 .await;
                 (txid, want_enhance, raw)
@@ -431,14 +441,27 @@ where
                 }
                 None => client.get().await?,
             };
-            apply_address_request(
-                session,
-                address_client,
-                &network,
-                tia,
-                block_range_end,
-                &mut stats,
-                progress.as_deref(),
+            let route = match &isolate {
+                Some((_, endpoint, _)) => crate::ohttp::relay_for(&endpoint.host).map(|relay| {
+                    crate::transport_health::HealthRoute {
+                        gateway_host: endpoint.host.clone(),
+                        relay_url: relay.into(),
+                        via_tor: true,
+                    }
+                }),
+                None => grpc::current_ohttp_health_route(),
+            };
+            grpc::with_ohttp_health_route(
+                route,
+                apply_address_request(
+                    session,
+                    address_client,
+                    &network,
+                    tia,
+                    block_range_end,
+                    &mut stats,
+                    progress.as_deref(),
+                ),
             )
             .await?;
         }

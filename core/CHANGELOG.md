@@ -11,6 +11,14 @@ workspace.
 ## [Unreleased]
 
 ### Added
+- Native OHTTP traffic now publishes typed health evidence before sync retry
+  backoff, including key-configuration fallback, authenticated backend responses,
+  streamed body failures and cancellation. Route success remains separate from
+  backend failure. Rate-limit evidence retains the relay's actual pause deadline;
+  policy, configuration, crypto and size rejections do not imply a relay outage.
+  Exact endpoint and Tor scopes also report unary, block-stream and Tor setup
+  deadlines at their owning boundaries, without changing request replay or retry
+  policy. Cached warm-up alone supplies no usable-network evidence.
 - `transport_health` provides retained, typed OHTTP request observations and
   coalesced subscriptions. Success and failure evidence keep their original
   monotonic times, late subscribers receive bounded historical replay, and
