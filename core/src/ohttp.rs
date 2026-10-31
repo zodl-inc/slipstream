@@ -1039,6 +1039,23 @@ impl RequestHealth {
         self.state.lock().unwrap().1 = Some(outcome);
     }
 
+    fn observe_grpc_status(&self, status: Option<&str>) {
+        // Retain only canonical non-success standard statuses. A later authenticated
+        // success or malformed status replaces the candidate without completing the call.
+        self.state.lock().unwrap().1 = match status {
+            Some(
+                status @ ("1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "10" | "11" | "12"
+                | "13" | "14" | "15" | "16"),
+            ) => Some(grpc_health(Some(status))),
+            _ => None,
+        };
+    }
+
+    fn finish_body_failure(&self, fallback: HealthOutcome) {
+        let known = self.state.lock().unwrap().1;
+        self.finish(known.unwrap_or(fallback), HealthStage::ResponseBody);
+    }
+
     fn error(&self, client: &OhttpClient, error: &RoundTripError) {
         let (stage, classified, _) = *self.state.lock().unwrap();
         let outcome = match error {
@@ -2506,6 +2523,10 @@ impl OhttpClient {
                     .get("grpc-status")
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_owned);
+                let observe_grpc = grpc && initial.is_none();
+                if observe_grpc {
+                    health.observe_grpc_status(header_status.as_deref());
+                }
                 let observed = futures_util::stream::unfold(
                     (events, health, header_status),
                     move |(mut events, health, mut status)| async move {
@@ -2518,6 +2539,9 @@ impl OhttpClient {
                                     .find(|(name, _)| name.eq_ignore_ascii_case("grpc-status"))
                                 {
                                     status = Some(value.clone());
+                                    if observe_grpc {
+                                        health.observe_grpc_status(status.as_deref());
+                                    }
                                 }
                             }
                             Some(Ok(ResponseEvent::End)) => {
@@ -2528,14 +2552,12 @@ impl OhttpClient {
                                 };
                                 health.finish(outcome, HealthStage::Complete);
                             }
-                            Some(Err(PumpError::Transport(_))) => health.finish(
-                                HealthOutcome::TransportUnavailable,
-                                HealthStage::ResponseBody,
-                            ),
-                            Some(Err(PumpError::Decode(_) | PumpError::TooLarge(_))) => health
-                                .finish(HealthOutcome::ResponseRejected, HealthStage::ResponseBody),
-                            None => health
-                                .finish(HealthOutcome::ResponseRejected, HealthStage::ResponseBody),
+                            Some(Err(PumpError::Transport(_))) => {
+                                health.finish_body_failure(HealthOutcome::TransportUnavailable)
+                            }
+                            Some(Err(PumpError::Decode(_) | PumpError::TooLarge(_))) | None => {
+                                health.finish_body_failure(HealthOutcome::ResponseRejected)
+                            }
                             _ => {}
                         }
                         event.map(|event| (event, (events, health, status)))
@@ -3320,6 +3342,26 @@ pub(crate) mod tests {
         grpc_status: &str,
         content_type: &str,
     ) -> (Vec<u8>, Vec<u8>) {
+        fixture_response_with_statuses(
+            request,
+            status,
+            None,
+            Some(grpc_status),
+            content_type,
+            true,
+            true,
+        )
+    }
+
+    fn fixture_response_with_statuses(
+        request: &[u8],
+        status: u16,
+        header_status: Option<&str>,
+        trailer_status: Option<&str>,
+        content_type: &str,
+        body_message: bool,
+        final_chunk: bool,
+    ) -> (Vec<u8>, Vec<u8>) {
         use aes_gcm::{
             Aes128Gcm, Nonce,
             aead::{AeadInPlace, KeyInit},
@@ -3352,9 +3394,14 @@ pub(crate) mod tests {
         let mut head = vec![3]; // indeterminate-length Binary HTTP response
         fixture_varint(&mut head, status as usize);
         fixture_field(&mut head, "content-type", content_type);
+        if let Some(status) = header_status {
+            fixture_field(&mut head, "grpc-status", status);
+        }
         head.push(0); // end headers
-        head.push(5); // one empty gRPC message
-        head.extend_from_slice(&[0; 5]);
+        if body_message {
+            head.push(5); // one empty gRPC message
+            head.extend_from_slice(&[0; 5]);
+        }
         let tag = cipher
             .encrypt_in_place_detached(Nonce::from_slice(&nonce), b"", &mut head)
             .unwrap();
@@ -3363,16 +3410,439 @@ pub(crate) mod tests {
         fixture_varint(&mut first, head.len());
         first.extend_from_slice(&head);
         let mut end = vec![0]; // end body
-        fixture_field(&mut end, "grpc-status", grpc_status);
+        if let Some(status) = trailer_status {
+            fixture_field(&mut end, "grpc-status", status);
+        }
         end.push(0); // end trailers
         nonce[11] ^= 1;
         let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(&nonce), b"final", &mut end)
+            .encrypt_in_place_detached(
+                Nonce::from_slice(&nonce),
+                if final_chunk { b"final" } else { b"" },
+                &mut end,
+            )
             .unwrap();
         end.extend_from_slice(&tag);
-        let mut final_chunk = vec![0];
-        final_chunk.extend_from_slice(&end);
-        (first, final_chunk)
+        let mut last = Vec::new();
+        fixture_varint(&mut last, if final_chunk { 0 } else { end.len() });
+        last.extend_from_slice(&end);
+        (first, last)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_header_grpc_rejection_survives_tracked_rpc_deadline() {
+        use futures_util::StreamExt;
+        for (status, expected) in [
+            ("7", HealthOutcome::PolicyRejected),
+            ("16", HealthOutcome::PolicyRejected),
+            ("12", HealthOutcome::ConfigurationFailure),
+            ("4", HealthOutcome::BackendUnavailable),
+            ("14", HealthOutcome::BackendUnavailable),
+        ] {
+            let client = Arc::new(
+                health_fixture_client(&format!("health-header-deadline-{status}"), true).await,
+            );
+            let subscription = health_subscription(&client);
+            serve_in_process_relay(&client, move |req| async move {
+                let request = req.into_body().collect().await.unwrap().to_bytes();
+                let (first, _) = fixture_response_with_statuses(
+                    &request,
+                    200,
+                    Some(status),
+                    None,
+                    "application/grpc",
+                    false,
+                    true,
+                );
+                let frames = futures_util::stream::iter([Ok::<_, Infallible>(Frame::data(
+                    Bytes::from(first),
+                ))]);
+                Response::new(BodyExt::boxed(StreamBody::new(
+                    frames.chain(futures_util::stream::pending()),
+                )))
+            })
+            .await;
+            let raw = health_tonic_client(client.clone()).await;
+            let tracked = crate::grpc::TrackedConnection::ohttp(
+                raw,
+                OhttpConnector {
+                    client,
+                    health: None,
+                },
+                "http://health-gateway.invalid:443".into(),
+            );
+            let result = tracked
+                .call(async |client| crate::grpc::get_latest_block_height(client).await)
+                .await;
+            assert!(
+                matches!(result, Err(crate::error::SlipstreamError::Transport(ref message)) if message.contains("timed out after 30s")),
+                "{status}: {result:?}"
+            );
+            let observations = subscription.snapshot().observations;
+            assert!(
+                observations.iter().any(|o| o.scope == HealthScope::Route
+                    && o.outcome == HealthOutcome::Usable
+                    && o.stage == HealthStage::ResponseHead),
+                "{status}: {observations:?}"
+            );
+            let terminal: Vec<_> = observations
+                .iter()
+                .filter(|o| o.scope == HealthScope::Lightwalletd)
+                .collect();
+            assert_eq!(terminal.len(), 1, "{status}: {observations:?}");
+            assert_eq!(terminal[0].outcome, expected, "{status}: {observations:?}");
+            assert_eq!(terminal[0].stage, HealthStage::ResponseBody);
+            assert!(
+                !observations
+                    .iter()
+                    .any(|o| o.outcome == HealthOutcome::TransportUnavailable)
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_header_grpc_rejection_survives_body_failure() {
+        use futures_util::StreamExt;
+        for (status, expected) in [
+            ("1", HealthOutcome::Cancelled),
+            ("2", HealthOutcome::ResponseRejected),
+            ("3", HealthOutcome::ResponseRejected),
+            ("4", HealthOutcome::BackendUnavailable),
+            ("5", HealthOutcome::ResponseRejected),
+            ("6", HealthOutcome::ResponseRejected),
+            ("7", HealthOutcome::PolicyRejected),
+            ("8", HealthOutcome::ResponseRejected),
+            ("9", HealthOutcome::ResponseRejected),
+            ("10", HealthOutcome::ResponseRejected),
+            ("11", HealthOutcome::ResponseRejected),
+            ("12", HealthOutcome::ConfigurationFailure),
+            ("13", HealthOutcome::ResponseRejected),
+            ("14", HealthOutcome::BackendUnavailable),
+            ("15", HealthOutcome::ResponseRejected),
+            ("16", HealthOutcome::PolicyRejected),
+        ] {
+            for failure in ["reset", "truncation", "corruption", "premature-end"] {
+                let client =
+                    health_fixture_client(&format!("health-header-body-{status}-{failure}"), true)
+                        .await;
+                let subscription = health_subscription(&client);
+                serve_in_process_relay_with_body_error(&client, move |req| async move {
+                    let request = req.into_body().collect().await.unwrap().to_bytes();
+                    let (first, mut end) = fixture_response_with_statuses(
+                        &request,
+                        200,
+                        Some(status),
+                        None,
+                        "application/grpc",
+                        false,
+                        true,
+                    );
+                    let first = futures_util::stream::iter([Ok::<_, std::io::Error>(Frame::data(
+                        Bytes::from(first),
+                    ))]);
+                    let tail = futures_util::stream::once(async move {
+                        // Let the authenticated head reach the consumer before the failure.
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        match failure {
+                            "reset" => Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "fixture body reset",
+                            )),
+                            "truncation" => {
+                                end.pop();
+                                Ok(Frame::data(Bytes::from(end)))
+                            }
+                            "corruption" => {
+                                *end.last_mut().unwrap() ^= 1;
+                                Ok(Frame::data(Bytes::from(end)))
+                            }
+                            _ => Ok(Frame::data(Bytes::new())),
+                        }
+                    });
+                    Response::new(BodyExt::boxed(StreamBody::new(first.chain(Box::pin(tail)))))
+                })
+                .await;
+                let (_, _, mut events) = client
+                    .round_trip_stream(test_request(), || {})
+                    .await
+                    .unwrap();
+                assert!(
+                    subscription
+                        .snapshot()
+                        .observations
+                        .iter()
+                        .all(|o| o.scope == HealthScope::Route),
+                    "no terminal result at head"
+                );
+                let mut errors = 0;
+                let mut ended = false;
+                let mut frames = GrpcFrames::new(header_fields(&[("grpc-status", status)]));
+                let mut public_trailers = Vec::new();
+                while let Some(event) = events.next().await {
+                    if let Err(error) = &event {
+                        errors += 1;
+                        match failure {
+                            "corruption" | "truncation" => assert!(
+                                matches!(error, PumpError::Decode(message) if message.contains("finish decode"))
+                            ),
+                            "reset" => assert!(
+                                matches!(error, PumpError::Transport(message) if message.contains("read chunk"))
+                            ),
+                            _ => assert!(
+                                matches!(error, PumpError::Transport(message) if message.contains("incomplete response"))
+                            ),
+                        }
+                    }
+                    ended |= matches!(&event, Ok(ResponseEvent::End));
+                    if let Some(frame) = frames.frame(event) {
+                        if let Ok(trailers) = frame.into_trailers() {
+                            public_trailers.push(trailers);
+                        }
+                    }
+                }
+                assert!(
+                    !ended,
+                    "{status}/{failure}: incomplete response must not complete"
+                );
+                assert_eq!(errors, 1, "{status}/{failure}");
+                assert_eq!(public_trailers.len(), 1, "{status}/{failure}");
+                assert_eq!(
+                    grpc_status(&public_trailers[0]),
+                    Some(if matches!(failure, "corruption" | "truncation") {
+                        "13"
+                    } else {
+                        "14"
+                    }),
+                    "{status}/{failure}: the public gRPC body failure is unchanged",
+                );
+                drop(events);
+                let observations = subscription.snapshot().observations;
+                let terminal: Vec<_> = observations
+                    .iter()
+                    .filter(|o| o.scope == HealthScope::Lightwalletd)
+                    .collect();
+                assert_eq!(terminal.len(), 1, "{status}/{failure}: {observations:?}");
+                assert_eq!(
+                    terminal[0].outcome, expected,
+                    "{status}/{failure}: {observations:?}"
+                );
+                assert_eq!(terminal[0].stage, HealthStage::ResponseBody);
+                assert!(
+                    !observations
+                        .iter()
+                        .any(|o| o.outcome == HealthOutcome::TransportUnavailable)
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_header_grpc_status_preserves_trailer_and_cancel_semantics() {
+        use futures_util::StreamExt;
+        for (name, header_status, trailer_status, content_type, mode, expected) in [
+            (
+                "trailer-success",
+                Some("7"),
+                Some("0"),
+                "application/grpc",
+                "complete",
+                HealthOutcome::Usable,
+            ),
+            (
+                "trailer-rejection",
+                Some("12"),
+                Some("16"),
+                "application/grpc",
+                "complete",
+                HealthOutcome::PolicyRejected,
+            ),
+            (
+                "header-only-rejection",
+                Some("7"),
+                None,
+                "application/grpc",
+                "complete",
+                HealthOutcome::PolicyRejected,
+            ),
+            (
+                "trailer-success-incomplete",
+                Some("7"),
+                Some("0"),
+                "application/grpc",
+                "incomplete-trailer",
+                HealthOutcome::TransportUnavailable,
+            ),
+            (
+                "trailer-rejection-incomplete",
+                Some("12"),
+                Some("16"),
+                "application/grpc",
+                "incomplete-trailer",
+                HealthOutcome::PolicyRejected,
+            ),
+            (
+                "header-success",
+                Some("0"),
+                None,
+                "application/grpc",
+                "eof",
+                HealthOutcome::TransportUnavailable,
+            ),
+            (
+                "header-absent",
+                None,
+                None,
+                "application/grpc",
+                "eof",
+                HealthOutcome::TransportUnavailable,
+            ),
+            (
+                "header-malformed",
+                Some("bogus"),
+                None,
+                "application/grpc",
+                "eof",
+                HealthOutcome::TransportUnavailable,
+            ),
+            (
+                "header-noncanonical",
+                Some("07"),
+                None,
+                "application/grpc",
+                "eof",
+                HealthOutcome::TransportUnavailable,
+            ),
+            (
+                "header-out-of-range",
+                Some("17"),
+                None,
+                "application/grpc",
+                "eof",
+                HealthOutcome::TransportUnavailable,
+            ),
+            (
+                "nongrpc",
+                Some("7"),
+                None,
+                "text/html",
+                "eof",
+                HealthOutcome::ResponseRejected,
+            ),
+            (
+                "cancel",
+                Some("7"),
+                None,
+                "application/grpc",
+                "cancel",
+                HealthOutcome::Cancelled,
+            ),
+        ] {
+            let client =
+                health_fixture_client(&format!("health-header-semantics-{name}"), true).await;
+            let subscription = health_subscription(&client);
+            serve_in_process_relay(&client, move |req| async move {
+                let request = req.into_body().collect().await.unwrap().to_bytes();
+                let (first, end) = fixture_response_with_statuses(
+                    &request,
+                    200,
+                    header_status,
+                    trailer_status,
+                    content_type,
+                    false,
+                    mode != "incomplete-trailer",
+                );
+                let first = futures_util::stream::iter([Ok::<_, Infallible>(Frame::data(
+                    Bytes::from(first),
+                ))]);
+                let tail = futures_util::stream::once(async move {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if mode == "cancel" {
+                        return std::future::pending().await;
+                    }
+                    Ok::<_, Infallible>(Frame::data(Bytes::from(if mode == "eof" {
+                        Vec::new()
+                    } else {
+                        end
+                    })))
+                });
+                Response::new(BodyExt::boxed(StreamBody::new(first.chain(Box::pin(tail)))))
+            })
+            .await;
+            let (_, _, mut events) = client
+                .round_trip_stream(test_request(), || {})
+                .await
+                .unwrap();
+            let at_head = subscription.snapshot().observations;
+            assert!(
+                at_head
+                    .iter()
+                    .any(|o| o.scope == HealthScope::Route && o.outcome == HealthOutcome::Usable)
+            );
+            if content_type == "application/grpc" {
+                assert!(
+                    at_head.iter().all(|o| o.scope == HealthScope::Route),
+                    "{name}: premature completion {at_head:?}"
+                );
+            }
+            let mut ended = false;
+            let mut errors = Vec::new();
+            let mut public_trailers = Vec::new();
+            let mut frames = GrpcFrames::new(header_status.map_or_else(HeaderMap::new, |status| {
+                header_fields(&[("grpc-status", status)])
+            }));
+            if mode != "cancel" {
+                while let Some(event) = events.next().await {
+                    ended |= matches!(&event, Ok(ResponseEvent::End));
+                    if let Err(error) = &event {
+                        errors.push(match error {
+                            PumpError::Transport(message)
+                            | PumpError::Decode(message)
+                            | PumpError::TooLarge(message) => message.clone(),
+                        });
+                    }
+                    if let Some(frame) = frames.frame(event) {
+                        if let Ok(trailers) = frame.into_trailers() {
+                            public_trailers.push(trailers);
+                        }
+                    }
+                }
+                assert_eq!(ended, mode == "complete", "{name}");
+                assert_eq!(
+                    errors.len(),
+                    usize::from(mode != "complete"),
+                    "{name}: {errors:?}"
+                );
+                assert_eq!(public_trailers.len(), 1, "{name}: {public_trailers:?}");
+                assert_eq!(
+                    grpc_status(&public_trailers[0]),
+                    if mode == "complete" {
+                        trailer_status.or(header_status)
+                    } else {
+                        Some("14")
+                    },
+                    "{name}"
+                );
+            }
+            drop(events);
+            let observations = subscription.snapshot().observations;
+            let terminal: Vec<_> = observations
+                .iter()
+                .filter(|o| o.scope == HealthScope::Lightwalletd)
+                .collect();
+            assert_eq!(terminal.len(), 1, "{name}: {observations:?}");
+            assert_eq!(terminal[0].outcome, expected, "{name}: {observations:?}");
+            assert_eq!(
+                terminal[0].stage,
+                if content_type != "application/grpc" {
+                    HealthStage::ResponseHead
+                } else if mode == "complete" {
+                    HealthStage::Complete
+                } else {
+                    HealthStage::ResponseBody
+                },
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]
