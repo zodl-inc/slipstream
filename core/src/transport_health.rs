@@ -111,7 +111,7 @@ pub struct HealthObservation {
 pub struct HealthSnapshot {
     pub generation: u64,
     pub version: u64,
-    /// Latest evidence per scope and outcome category (at most 7 × 9 observations).
+    /// At most 126 entries: seven scopes × nine outcomes × two purpose classes.
     /// Success and failure coexist so a coalesced wake cannot erase their ordering.
     pub observations: Vec<HealthObservation>,
 }
@@ -196,13 +196,29 @@ pub fn monotonic_time_nanoseconds() -> u64 {
 fn retain(observations: &mut Vec<HealthObservation>, observation: HealthObservation) {
     let existing = observations.iter_mut().find(|old| {
         old.scope == observation.scope
+            && (old.purpose == HealthPurpose::Diagnostic)
+                == (observation.purpose == HealthPurpose::Diagnostic)
             && std::mem::discriminant(&old.outcome) == std::mem::discriminant(&observation.outcome)
     });
     if let Some(old) = existing {
-        // A writer delayed on a lock must not replace evidence captured later.
-        if (observation.observed_at_nanoseconds, observation.version)
-            > (old.observed_at_nanoseconds, old.version)
+        let newer = if observation.purpose != HealthPurpose::Diagnostic
+            && observation.scope == HealthScope::Route
+            && observation.outcome == HealthOutcome::Usable
         {
+            (
+                observation.started_at_nanoseconds,
+                observation.observed_at_nanoseconds,
+                observation.version,
+            ) > (
+                old.started_at_nanoseconds,
+                old.observed_at_nanoseconds,
+                old.version,
+            )
+        } else {
+            (observation.observed_at_nanoseconds, observation.version)
+                > (old.observed_at_nanoseconds, old.version)
+        };
+        if newer {
             *old = observation;
         }
     } else {
@@ -441,6 +457,150 @@ mod tests {
 
     fn quiet(route: &HealthRoute, generation: u64) -> HealthSubscription {
         subscribe(route.clone(), generation, Arc::new(|_| {}))
+    }
+
+    #[test]
+    fn ordinary_route_recovery_survives_late_older_completion() {
+        let route = route();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (snap_tx, snap_rx) = mpsc::channel();
+        let release = Arc::new(Barrier::new(2));
+        let callback_release = release.clone();
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let subscription = subscribe(
+            route.clone(),
+            7,
+            Arc::new(move |snapshot| {
+                if first.swap(false, Ordering::Relaxed) {
+                    entered_tx.send(()).unwrap();
+                    callback_release.wait();
+                }
+                snap_tx.send(snapshot).unwrap();
+            }),
+        );
+        begin_request(&route, HealthScope::Lightwalletd)
+            .record(HealthOutcome::TransportUnavailable, HealthStage::Connection);
+        entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut old = begin_request(&route, HealthScope::Lightwalletd);
+        old.started_at_nanoseconds = 10;
+        let mut fresh = begin_request(&route, HealthScope::Lightwalletd).with_context(
+            HealthPurpose::UserOperation,
+            Some(HealthOperation {
+                id: [9; 16],
+                started_at_nanoseconds: 20,
+            }),
+        );
+        fresh.started_at_nanoseconds = 30;
+        fresh.record_route_usable(HealthStage::ResponseHead);
+        let expected = subscription
+            .snapshot()
+            .observations
+            .into_iter()
+            .find(|o| o.scope == HealthScope::Route && o.outcome == HealthOutcome::Usable)
+            .unwrap();
+        old.record_route_usable(HealthStage::Complete);
+        let version = subscription.snapshot().version;
+        // Release before assertions so a RED cannot strand the real callback worker.
+        release.wait();
+        let delivered = loop {
+            let snapshot = snap_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            if snapshot.version == version {
+                break snapshot;
+            }
+        };
+        let success = delivered
+            .observations
+            .iter()
+            .find(|o| o.scope == HealthScope::Route)
+            .unwrap();
+        assert_eq!(
+            success, &expected,
+            "late older completion erased fresh ordinary recovery"
+        );
+        let mut historical = expected;
+        historical.historical = true;
+        let replay = quiet(&route, 8).snapshot();
+        assert_eq!(
+            replay
+                .observations
+                .iter()
+                .find(|o| o.scope == HealthScope::Route),
+            Some(&historical)
+        );
+    }
+
+    #[test]
+    fn diagnostic_retention_cannot_replace_ordinary_evidence() {
+        let route = route();
+        let subscription = quiet(&route, 7);
+        let ordinary = begin_request(&route, HealthScope::Lightwalletd);
+        ordinary.record_route_usable(HealthStage::ResponseHead);
+        ordinary.record(HealthOutcome::TransportUnavailable, HealthStage::Connection);
+        let expected = subscription.snapshot().observations;
+        let diagnostic = begin_request(&route, HealthScope::Lightwalletd)
+            .with_context(HealthPurpose::Diagnostic, None);
+        diagnostic.record_route_usable(HealthStage::ResponseHead);
+        diagnostic.record(
+            HealthOutcome::TransportUnavailable,
+            HealthStage::ResponseBody,
+        );
+        let snapshot = subscription.snapshot();
+        assert_eq!(
+            snapshot.observations.len(),
+            4,
+            "diagnostics must have separate finite buckets"
+        );
+        for observation in expected {
+            assert!(snapshot.observations.contains(&observation));
+        }
+        let mut old_failure = begin_request(&route, HealthScope::Lightwalletd);
+        old_failure.started_at_nanoseconds = 1;
+        old_failure.record(HealthOutcome::TransportUnavailable, HealthStage::Complete);
+        assert!(
+            subscription
+                .snapshot()
+                .observations
+                .iter()
+                .any(|o| o.purpose != HealthPurpose::Diagnostic
+                    && o.scope == HealthScope::Lightwalletd
+                    && o.request_id == old_failure.request_id())
+        );
+        for scope in [
+            HealthScope::Route,
+            HealthScope::Lightwalletd,
+            HealthScope::ExchangeRates,
+            HealthScope::Swaps,
+            HealthScope::Voting,
+            HealthScope::Flexa,
+            HealthScope::Other,
+        ] {
+            for outcome in [
+                HealthOutcome::Usable,
+                HealthOutcome::TransportUnavailable,
+                HealthOutcome::BackendUnavailable,
+                HealthOutcome::RateLimited {
+                    retry_not_before_nanoseconds: 900,
+                },
+                HealthOutcome::PolicyRejected,
+                HealthOutcome::ConfigurationFailure,
+                HealthOutcome::ResponseRejected,
+                HealthOutcome::Cancelled,
+                HealthOutcome::Inconclusive,
+            ] {
+                for purpose in [
+                    HealthPurpose::Background,
+                    HealthPurpose::UserOperation,
+                    HealthPurpose::Diagnostic,
+                ] {
+                    for _ in 0..100 {
+                        begin_request(&route, scope)
+                            .with_context(purpose, None)
+                            .record(outcome, HealthStage::Complete);
+                    }
+                }
+            }
+        }
+        assert_eq!(subscription.snapshot().observations.len(), 126);
     }
 
     #[test]

@@ -11,6 +11,9 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+- `transport_health::HealthSnapshot` preserves newer-start ordinary route success
+  beside diagnostic evidence, even when an older request finishes later. Original
+  failure ordering and request metadata remain intact. No caller changes are needed.
 - Unsupported OHTTP success-status rejections retain their typed health outcome
   when the response body idles or fails to read, while accepted responses with
   failed bodies still report transport unavailability. Public errors, body limits
