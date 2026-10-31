@@ -1455,7 +1455,11 @@ where
                 }
                 Err(HttpsError::Read(detail)) => {
                     if let Some(health) = health {
-                        health.boundary(HealthStage::ResponseBody);
+                        // A body read failure does not invalidate a known rejected head.
+                        let mut state = health.state.lock().unwrap();
+                        if state.1.is_none() {
+                            state.0 = HealthStage::ResponseBody;
+                        }
                     }
                     return Err(RoundTripError::Transport(detail));
                 }
@@ -4269,6 +4273,122 @@ pub(crate) mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn health_buffered_unsupported_head_survives_body_idle() {
+        assert_buffered_body_failure_health(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_buffered_unsupported_head_survives_body_read_error() {
+        assert_buffered_body_failure_health(true).await;
+    }
+
+    async fn assert_buffered_body_failure_health(read_error: bool) {
+        use futures_util::StreamExt;
+
+        for status in [200, 201] {
+            let relay = format!("https://health-body-failure-{status}-{read_error}.invalid/relay");
+            let gateway = "health-body-failure.invalid";
+            let client = get_or_create_client(
+                gateway,
+                &relay,
+                Dialer::Direct,
+                get_default_client_trace_prefix(),
+                ClientProfile::SLIPSTREAM_HTTP,
+            )
+            .await
+            .unwrap();
+            cache_a_key(&client).await;
+            let subscription = health_subscription(&client);
+            let calls = Arc::new(AtomicUsize::new(0));
+            serve_in_process_relay_with_body_error(&client, {
+                let calls = calls.clone();
+                move |request| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    async move {
+                        assert_eq!(request.method(), Method::POST);
+                        let first = futures_util::stream::iter([Ok::<_, std::io::Error>(
+                            Frame::data(Bytes::from_static(b"x")),
+                        )]);
+                        let failure = futures_util::stream::once(async move {
+                            if !read_error {
+                                return std::future::pending().await;
+                            }
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            Err(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "fixture body reset",
+                            ))
+                        });
+                        let mut response = Response::new(BodyExt::boxed(StreamBody::new(
+                            first.chain(Box::pin(failure)),
+                        )));
+                        *response.status_mut() = StatusCode::from_u16(status).unwrap();
+                        response
+                    }
+                }
+            })
+            .await;
+            let dispatches = AtomicUsize::new(0);
+            let started = tokio::time::Instant::now();
+            let result = http_round_trip_via(
+                &relay,
+                gateway,
+                Dialer::Direct,
+                "POST",
+                parse_http_target("https://origin.invalid/data").unwrap(),
+                &[],
+                b"body",
+                None,
+                || {
+                    dispatches.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+            .await;
+            assert!(
+                matches!(&result, Err(HttpRoundTripError::Failed(_))),
+                "{result:?}"
+            );
+            let expected_message = format!(
+                "read health-body-failure-{status}-{read_error}.invalid: {}",
+                if read_error {
+                    "error reading a body from connection"
+                } else {
+                    "idle timeout (30s without data)"
+                },
+            );
+            assert!(
+                matches!(&result, Err(HttpRoundTripError::Failed(message)) if message == &expected_message),
+                "{result:?}",
+            );
+            assert_eq!(
+                started.elapsed(),
+                Duration::from_secs(if read_error { 1 } else { 30 }),
+                "body failure precedes the unchanged 100-second exchange deadline: {result:?}",
+            );
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no replay or key refetch");
+            let snapshot = subscription.snapshot();
+            let expected = if status == 200 {
+                HealthOutcome::TransportUnavailable
+            } else {
+                HealthOutcome::ResponseRejected
+            };
+            assert_eq!(snapshot.observations.len(), 1, "{snapshot:?}");
+            let observation = &snapshot.observations[0];
+            assert_eq!(observation.scope, HealthScope::Other);
+            assert_eq!(observation.outcome, expected, "{status}: {snapshot:?}");
+            assert_eq!(
+                observation.stage,
+                if status == 200 {
+                    HealthStage::ResponseBody
+                } else {
+                    HealthStage::ResponseHead
+                },
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn health_tracked_unary_owner_preserves_native_key_rejection() {
         for (status, expected) in [
             (429, None),
@@ -6262,6 +6382,15 @@ pub(crate) mod tests {
     where
         H: Fn(Request<Incoming>) -> Fut + Send + 'static,
         Fut: Future<Output = Response<BoxBody<Bytes, Infallible>>> + Send + 'static,
+    {
+        serve_in_process_relay_with_body_error(client, handler).await;
+    }
+
+    async fn serve_in_process_relay_with_body_error<H, Fut, E>(client: &OhttpClient, handler: H)
+    where
+        H: Fn(Request<Incoming>) -> Fut + Send + 'static,
+        Fut: Future<Output = Response<BoxBody<Bytes, E>>> + Send + 'static,
+        E: std::error::Error + Send + Sync + 'static,
     {
         let (client_io, server_io) = tokio::io::duplex(64 * 1024);
         let relay = hyper::service::service_fn(move |req: Request<Incoming>| {

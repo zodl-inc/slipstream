@@ -11,6 +11,10 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+- Unsupported OHTTP success-status rejections retain their typed health outcome
+  when the response body idles or fails to read, while accepted responses with
+  failed bodies still report transport unavailability. Public errors, body limits
+  and timeout/retry behavior remain unchanged.
 - Known OHTTP policy, configuration, size and rate-limit outcomes survive an
   error body that outlasts a caller deadline. Native handlers and their exact
   deadline owners share one request's evidence; concurrent calls remain independent.
