@@ -37,6 +37,7 @@ pub mod network;
 pub mod ohttp;
 pub mod probe;
 pub mod throttle;
+pub mod tor_startup;
 pub mod transport_health;
 pub mod treestate;
 pub mod verify;
@@ -101,7 +102,10 @@ pub use error::SlipstreamError;
 pub use events::{Bound, Event, Progress, ProgressArc, Snapshot, SyncMode};
 pub use network::{CustomActivations, SlipstreamNetwork};
 #[cfg(feature = "zcash_client_sqlite")]
-pub use session::{SessionConfig, SessionReporter, TorSessionConfig, run_session};
+pub use session::{
+    SessionConfig, SessionReporter, TorSessionConfig, run_session, run_session_with_tor_startup,
+};
+pub use tor_startup::{TorStartupControl, TorStartupPhase, TorStartupSnapshot};
 /// Re-exported so hosts configure the anchor-retention policy from the same types
 /// the wallet itself is configured with — the grid must match or a migration
 /// transfer anchored to a boundary this engine did not retain becomes unprovable.

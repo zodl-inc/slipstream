@@ -23,6 +23,11 @@ workspace.
   deadline owners share one request's evidence; concurrent calls remain independent.
 
 ### Added
+- Opt-in `run_session_with_tor_startup` retains typed, generation-scoped Tor
+  readiness and failure status. A host-supplied monotonic deadline bounds pass
+  admission, bootstrap and retry backoff together; cancellation or dropping an
+  unfinished session interrupts startup without entering the request loop or
+  falling back to direct. Existing session callers retain their retry policy.
 - Native OHTTP traffic now publishes typed health evidence before sync retry
   backoff, including key-configuration fallback, authenticated backend responses,
   streamed body failures and cancellation. Route success remains separate from
