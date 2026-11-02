@@ -180,10 +180,11 @@ pub struct Progress {
     /// pass never switches unit mid-way (the floor and the pass start would otherwise mix
     /// block and work permille).
     pass_unit: AtomicU64,
-    /// The unit (blocks or work) of the current `progress_permille_floor`. Can be UNSET before
-    /// the first floor update. Scope expansion compares units one-directionally: a BLOCKS seed
-    /// is rejected against a WORK floor (transient failure), but a WORK seed can re-baseline
-    /// a BLOCKS floor. UNSET acts as a wildcard (accepts any seed).
+    /// The retained provenance of `progress_permille_floor`. Can be UNSET before the first
+    /// rising reading. Rising readings promote BLOCKS to WORK, preserving WORK provenance
+    /// through later BLOCKS fallback advances. Scope expansion rejects a BLOCKS seed against
+    /// a WORK floor, but an initial BLOCKS-only floor still permits rebasing from a WORK seed.
+    /// UNSET acts as a wildcard (accepts any seed).
     floor_unit: AtomicU64,
     /// [API v2.1 E-2/E-3] Count of successful `update_chain_tip` persists across the handle's
     /// life. Bumped by the ENGINE only (never by the E-3 open-time seed, which stores a
@@ -681,14 +682,16 @@ impl Progress {
         self.last_progress_unix.load(Ordering::Relaxed)
     }
 
-    /// Get the floor's unit: PASS_UNIT_UNSET, PASS_UNIT_BLOCKS, or PASS_UNIT_WORK.
+    /// Get the floor's retained unit: PASS_UNIT_UNSET, PASS_UNIT_BLOCKS, or PASS_UNIT_WORK.
+    /// Once a rising reading establishes WORK provenance, BLOCKS fallback cannot replace it.
     pub fn floor_unit(&self) -> u64 {
         self.floor_unit.load(Ordering::Relaxed)
     }
 
     /// Fold `raw` (0..=1000) into the session-monotonic floor and return the floor.
     /// fetch_max keeps reported progress from ever regressing while the handle lives.
-    /// Updates floor_unit when the floor advances.
+    /// Promotes floor_unit only when the floor advances, retaining WORK provenance across
+    /// BLOCKS fallback readings.
     #[inline]
     pub fn permille_floor(&self, raw: u64, unit: u64) -> u64 {
         let clamped = raw.min(1000);
@@ -696,11 +699,11 @@ impl Progress {
             .progress_permille_floor
             .fetch_max(clamped, Ordering::Relaxed);
         if clamped > old {
-            // Floor advanced: update its unit.
+            // Floor advanced: promote its unit without losing established WORK provenance.
             // Relaxed ordering is sufficient: no cross-field invariants are promised to
             // concurrent readers. Each field is independent, and the consumer needs only
             // an eventually-consistent view for UI display.
-            self.floor_unit.store(unit, Ordering::Relaxed);
+            self.floor_unit.fetch_max(unit, Ordering::Relaxed);
         }
         self.progress_permille_floor.load(Ordering::Relaxed)
     }
@@ -756,10 +759,11 @@ impl Progress {
     /// to take and publish fields in a safe order before the floor moves.
     ///
     /// Unit guard is one-directional: rejects a BLOCKS seed against a WORK floor (transient
-    /// estimator failure), but allows a WORK seed to re-baseline a BLOCKS floor. UNSET floor
-    /// acts as a wildcard (any seed unit accepted).
+    /// estimator failure), but allows a WORK seed to re-baseline an initial BLOCKS-only floor.
+    /// Retained WORK provenance prevents fallback advances from reopening that initial correction.
+    /// UNSET floor acts as a wildcard (any seed unit accepted).
     ///
-    /// Accepted cost of the asymmetry: a BLOCKS floor left by a pass that ran in blocks and
+    /// Accepted cost of the asymmetry: an initial BLOCKS-only floor left by a pass that
     /// stopped mid-way can be re-baselined by the next pass's WORK seed when the two units
     /// disagree by more than the epsilon, without a change of scope. The drop is display-only
     /// and the next readings climb from the truthful position.
@@ -1419,6 +1423,17 @@ mod tests {
             2,
             "tx_set_version is monotonic per handle"
         );
+    }
+
+    #[test]
+    fn permille_floor_retains_work_provenance_through_block_fallback() {
+        let p = Progress::default();
+        assert_eq!(p.permille_floor(551, PASS_UNIT_WORK), 551);
+        assert_eq!(p.permille_floor(636, PASS_UNIT_BLOCKS), 636);
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
+        assert_eq!(p.permille_floor(636, PASS_UNIT_BLOCKS), 636);
+        assert_eq!(p.permille_floor(90, PASS_UNIT_BLOCKS), 636);
+        assert_eq!(p.floor_unit(), PASS_UNIT_WORK);
     }
 
     #[cfg(feature = "zcash_client_sqlite")]
