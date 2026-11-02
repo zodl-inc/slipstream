@@ -11,6 +11,9 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+- Bounded Tor startup waits for traffic readiness before publishing a fresh
+  connection, within the original admission/bootstrap/retry deadline. Legacy
+  unbounded startup behavior is unchanged. No caller changes are needed.
 - `transport_health::HealthSnapshot` preserves newer-start ordinary route success
   beside diagnostic evidence, even when an older request finishes later. Original
   failure ordering and request metadata remain intact. No caller changes are needed.
