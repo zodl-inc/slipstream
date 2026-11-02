@@ -782,7 +782,7 @@ async fn pump_chunked_body(
     }
 }
 
-/// What [`run_exchange_chunked`] needs from the relay's answer to one sealed POST, whatever
+/// What [`run_exchange_chunked_observed`] needs from the relay's answer to one sealed POST, whatever
 /// became of its body. Keeps one exchange loop (re-sealing, key refetch, outer-status and
 /// content-type checks) for the buffered and the streamed paths.
 trait OuterAnswer {
@@ -1387,17 +1387,6 @@ fn bhttp_response_within(
     })
 }
 
-/// The relay POST loop for chunked OHTTP. Returns the decoder and the relay's answer (buffered
-/// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
-/// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
-/// is retried once; an outer 400 or 422 refetches the key and retries once. An answer that a
-/// size guard refused ([`HttpsError::TooLarge`]) is final: [`RoundTripError::ResponseTooLarge`],
-/// not posted again. Only a success answer can be refused so: an error page is read within a
-/// fixed 64 KiB guard and keeps its status (see [`read_error_body`]).
-///
-/// The caller's dispatch hook is not called here but inside `post`, at the moment the sealed
-/// request is handed to the relay connection: until then a post may still fail without having
-/// sent anything.
 #[cfg(test)]
 async fn run_exchange_chunked<A, P, PF, R, RF>(
     key: KeyConfig,
@@ -1415,6 +1404,17 @@ where
     run_exchange_chunked_observed(key, request, post, refetch, None).await
 }
 
+/// The relay POST loop for chunked OHTTP. Returns the decoder and the relay's answer (buffered
+/// or streamed, per `post`). **Every post is sealed afresh** (a new ephemeral key, so new
+/// ciphertext): the gateway answers a repeated ciphertext with 409. A pre-send transport failure
+/// is retried once; an outer 400 or 422 refetches the key and retries once. An answer that a
+/// size guard refused ([`HttpsError::TooLarge`]) is final: [`RoundTripError::ResponseTooLarge`],
+/// not posted again. Only a success answer can be refused so: an error page is read within a
+/// fixed 64 KiB guard and keeps its status (see [`read_error_body`]).
+///
+/// The caller's dispatch hook is not called here but inside `post`, at the moment the sealed
+/// request is handed to the relay connection: until then a post may still fail without having
+/// sent anything.
 async fn run_exchange_chunked_observed<A, P, PF, R, RF>(
     mut key: KeyConfig,
     request: &BhttpRequest,
@@ -1851,6 +1851,7 @@ impl OhttpClient {
     /// when the connection is ready, on HTTP/1.1 when TLS and the handshake are done. A failure
     /// before that point (connect, TLS, handshake, a connection that is not ready) never calls
     /// it, so it marks the exchanges that may have reached the far end.
+    #[allow(clippy::too_many_arguments)] // Explicit request inputs and per-attempt health attribution.
     async fn https_once<F: Fn()>(
         &self,
         target: &HttpsTarget,
@@ -1956,10 +1957,6 @@ impl OhttpClient {
         })
     }
 
-    /// POST one sealed chunked request body to the relay. Returns buffered response, read
-    /// through `guard` (the caller's choice, so a request that allows only a small answer does
-    /// not buffer a large one). `on_send` is called as [`Self::https_once`] describes, so not
-    /// when the relay's pause stops the post or the connection cannot be made ready.
     #[cfg(test)]
     async fn post_sealed<F: Fn()>(
         &self,
@@ -1970,6 +1967,10 @@ impl OhttpClient {
         self.post_sealed_observed(body, guard, on_send, None).await
     }
 
+    /// POST one sealed chunked request body to the relay. Returns buffered response, read
+    /// through `guard` (the caller's choice, so a request that allows only a small answer does
+    /// not buffer a large one). `on_send` is called as [`Self::https_once`] describes, so not
+    /// when the relay's pause stops the post or the connection cannot be made ready.
     async fn post_sealed_observed<F: Fn()>(
         &self,
         body: Vec<u8>,
@@ -1997,7 +1998,7 @@ impl OhttpClient {
     }
 
     /// POST one sealed chunked request body to the relay. Returns the response with its body
-    /// unread. `on_send` is called as for [`Self::post_sealed`].
+    /// unread. `on_send` is called as for [`Self::post_sealed_observed`].
     async fn post_sealed_stream<F: Fn()>(
         &self,
         body: Vec<u8>,
@@ -3594,10 +3595,10 @@ pub(crate) mod tests {
                         }
                     }
                     ended |= matches!(&event, Ok(ResponseEvent::End));
-                    if let Some(frame) = frames.frame(event) {
-                        if let Ok(trailers) = frame.into_trailers() {
-                            public_trailers.push(trailers);
-                        }
+                    if let Some(frame) = frames.frame(event)
+                        && let Ok(trailers) = frame.into_trailers()
+                    {
+                        public_trailers.push(trailers);
                     }
                 }
                 assert!(
@@ -3800,10 +3801,10 @@ pub(crate) mod tests {
                             | PumpError::TooLarge(message) => message.clone(),
                         });
                     }
-                    if let Some(frame) = frames.frame(event) {
-                        if let Ok(trailers) = frame.into_trailers() {
-                            public_trailers.push(trailers);
-                        }
+                    if let Some(frame) = frames.frame(event)
+                        && let Ok(trailers) = frame.into_trailers()
+                    {
+                        public_trailers.push(trailers);
                     }
                 }
                 assert_eq!(ended, mode == "complete", "{name}");

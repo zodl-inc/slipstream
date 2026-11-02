@@ -245,11 +245,11 @@ impl HealthSubscription {
     pub fn close(&mut self) {
         self.subscriber.state.lock().unwrap().closed = true;
         let _ = self.subscriber.wake.try_send(());
-        if let Some(worker) = self.worker.take() {
-            if worker.thread().id() != thread::current().id() {
-                // A consumer panic must not turn teardown into a second panic.
-                let _ = worker.join();
-            }
+        if let Some(worker) = self.worker.take()
+            && worker.thread().id() != thread::current().id()
+        {
+            // A consumer panic must not turn teardown into a second panic.
+            let _ = worker.join();
         }
     }
 }

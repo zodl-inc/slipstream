@@ -4469,6 +4469,27 @@ type PersistTaskOutput = (
     Result<std::time::Duration, SqliteClientError>,
 );
 
+/// Per-lane test synchronization. Dropping the release sender also wakes the worker.
+#[cfg(test)]
+pub(crate) struct PersistLanePause {
+    arrived: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl PersistLanePause {
+    pub(crate) async fn arrived(&mut self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.arrived)
+            .await
+            .expect("deferred worker reaches pause")
+            .expect("deferred worker signals arrival");
+    }
+
+    pub(crate) fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
 /// The write-behind persist lane: owns a SECOND `WalletDb` connection to the
 /// same wallet file (WAL) and the per-range `SparseTreeState`. Runs at most
 /// ONE deferred commit at a time via `spawn_blocking` (ownership ping-pongs
@@ -4519,6 +4540,8 @@ pub struct PersistLane {
     total_wait: std::time::Duration,
     /// Σ commit wall time measured inside the deferred closures.
     total_busy: std::time::Duration,
+    #[cfg(test)]
+    before_next_job: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl PersistLane {
@@ -4583,6 +4606,8 @@ impl PersistLane {
             depth: depth.max(1),
             total_wait: std::time::Duration::ZERO,
             total_busy: std::time::Duration::ZERO,
+            #[cfg(test)]
+            before_next_job: None,
         })
     }
 
@@ -4595,6 +4620,25 @@ impl PersistLane {
             sparse.attach_progress(Some(progress.clone()));
         }
         self.progress = Some(progress);
+    }
+
+    /// Pause only this lane's next worker, after its real writer token is held.
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_job_for_test(&mut self) -> PersistLanePause {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        assert!(
+            self.before_next_job.is_none(),
+            "a pause is already installed"
+        );
+        self.before_next_job = Some(Box::new(move || {
+            let _ = arrived.send(());
+            let _ = released.recv();
+        }));
+        PersistLanePause {
+            arrived: arrival,
+            release,
+        }
     }
 
     pub fn total_wait(&self) -> std::time::Duration {
@@ -4768,8 +4812,14 @@ impl PersistLane {
             .map(crate::events::WalletWriterGate::hold);
         self.in_flight_span = span;
         let liveness = self.progress.clone();
+        #[cfg(test)]
+        let before_next_job = self.before_next_job.take();
         self.in_flight = Some(tokio::task::spawn_blocking(move || {
             let _gate = gate;
+            #[cfg(test)]
+            if let Some(hook) = before_next_job {
+                hook();
+            }
             let started = std::time::Instant::now();
             let result = job(&mut db, &mut sparse).map(|()| started.elapsed());
             // Liveness: a finished commit is forward progress for the stall clock
@@ -5507,6 +5557,89 @@ mod write_behind_tests {
         assert!(
             lane.total_busy() >= Duration::from_millis(140),
             "busy accounted"
+        );
+    }
+
+    fn initialized_lane(dir: &std::path::Path) -> PersistLane {
+        drop(
+            crate::wallet_session::WalletSession::open(
+                crate::network::SlipstreamNetwork::MAIN,
+                &dir.join("lane.db"),
+            )
+            .expect("initialize wallet"),
+        );
+        lane(dir)
+    }
+
+    async fn submit_tip(lane: &mut PersistLane, height: u32) {
+        lane.submit_job(
+            (u64::from(height), u64::from(height)),
+            Box::new(move |db, _| db.update_chain_tip(BlockHeight::from(height))),
+        )
+        .await
+        .expect("submit real wallet update");
+    }
+
+    #[tokio::test]
+    async fn lane_pause_does_not_block_other_wallet() {
+        let first = tempfile::tempdir().expect("first wallet");
+        let second = tempfile::tempdir().expect("second wallet");
+        let mut paused = initialized_lane(first.path());
+        let progress = Arc::new(crate::events::Progress::default());
+        paused.attach_writer_gate(Arc::clone(&progress));
+        let mut pause = paused.pause_before_next_job_for_test();
+        submit_tip(&mut paused, 3_000_000).await;
+        pause.arrived().await;
+        assert_eq!(progress.wallet_writers(), 1);
+        let mut other = initialized_lane(second.path());
+        submit_tip(&mut other, 3_000_001).await;
+        tokio::time::timeout(Duration::from_secs(5), other.drain())
+            .await
+            .expect("other wallet proceeds")
+            .expect("other wallet commits");
+        assert_eq!(
+            other
+                .db
+                .as_mut()
+                .expect("other db")
+                .chain_height()
+                .expect("other tip"),
+            Some(BlockHeight::from(3_000_001))
+        );
+        assert_eq!(progress.wallet_writers(), 1);
+        pause.release();
+        paused.drain().await.expect("paused wallet commits");
+        assert_eq!(progress.wallet_writers(), 0);
+        assert_eq!(
+            paused
+                .db
+                .as_mut()
+                .expect("paused db")
+                .chain_height()
+                .expect("paused tip"),
+            Some(BlockHeight::from(3_000_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_pause_release_drop_unblocks_worker() {
+        let dir = tempfile::tempdir().expect("wallet");
+        let mut lane = initialized_lane(dir.path());
+        let progress = Arc::new(crate::events::Progress::default());
+        lane.attach_writer_gate(Arc::clone(&progress));
+        let mut pause = lane.pause_before_next_job_for_test();
+        submit_tip(&mut lane, 3_000_000).await;
+        pause.arrived().await;
+        assert_eq!(progress.wallet_writers(), 1);
+        drop(pause);
+        tokio::time::timeout(Duration::from_secs(5), lane.drain())
+            .await
+            .expect("drop releases worker")
+            .expect("real wallet commit");
+        assert_eq!(progress.wallet_writers(), 0);
+        assert_eq!(
+            lane.db.as_mut().expect("db").chain_height().expect("tip"),
+            Some(BlockHeight::from(3_000_000))
         );
     }
 
