@@ -312,19 +312,19 @@ fn cached_or_new_client(
 /// No endpoints or signing keys are bundled. A network without a gateway host, relay URL
 /// or signer has no relay; an absent DNS name disables only its DNS fallback.
 pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
-    zodl_ohttp_client::relay_for(canonical_gateway_host(gateway_host)?)
+    configured_gateway_hosts(gateway_host).find_map(zodl_ohttp_client::relay_for)
 }
 
-/// DNS host matching ignores ASCII case, while the core expects its exact configured string.
-/// Preserve configured order for routing; network resolution rejects ambiguous identities.
-fn canonical_gateway_host(gateway_host: &str) -> Option<&'static str> {
+/// Matching DNS spellings in core configuration order. Relay lookup takes the first
+/// available route; network resolution separately rejects ambiguous identities.
+fn configured_gateway_hosts(gateway_host: &str) -> impl Iterator<Item = &'static str> + '_ {
     [
         zodl_ohttp_client::GATEWAY_HOST_MAINNET,
         zodl_ohttp_client::GATEWAY_HOST_TESTNET,
     ]
     .into_iter()
     .flatten()
-    .find(|configured| configured.eq_ignore_ascii_case(gateway_host))
+    .filter(move |configured| configured.eq_ignore_ascii_case(gateway_host))
 }
 
 /// Object-safe alias for the byte stream underneath TLS (a plain TCP socket or an arti Tor
@@ -595,7 +595,8 @@ fn unix_now() -> Result<u64, String> {
 /// The network a configured DNS gateway serves, ignoring case. The envelope and wallet must
 /// both use that network (`EngineConfig::validate`, [`http_round_trip`]).
 pub(crate) fn gateway_network(gateway_host: &str) -> Result<Network, String> {
-    let canonical = canonical_gateway_host(gateway_host)
+    let canonical = configured_gateway_hosts(gateway_host)
+        .next()
         .ok_or_else(|| format!("no OHTTP network configured for gateway host {gateway_host}"))?;
     if zodl_ohttp_client::GATEWAY_HOST_MAINNET
         .zip(zodl_ohttp_client::GATEWAY_HOST_TESTNET)
@@ -5611,15 +5612,38 @@ pub(crate) mod tests {
                     }
                 }
             }
-            "ambiguous-hosts" => {
+            "ambiguous-hosts" | "ambiguous-partial-mainnet" => {
                 for host in [
                     mainnet_gateway().to_owned(),
+                    mainnet_gateway().to_ascii_lowercase(),
                     testnet_gateway().to_ascii_uppercase(),
                 ] {
                     assert!(
                         relay_for(&host).is_some(),
                         "recognized gateways must retain OHTTP routing"
                     );
+                    let expected_relay = if case == "ambiguous-partial-mainnet" {
+                        option_env!("ZODL_OHTTP_RELAY_URL_TESTNET")
+                    } else {
+                        option_env!("ZODL_OHTTP_RELAY_URL_MAINNET")
+                    };
+                    assert!(
+                        relay_for(&host) == expected_relay,
+                        "use an available deterministic relay"
+                    );
+                    let config = crate::config::EngineConfig::new(
+                        crate::Network::TestNetwork,
+                        "/tmp/unused-ambiguous-config.db".into(),
+                        crate::config::Endpoint {
+                            host: host.clone(),
+                            port: 443,
+                            tls: true,
+                        },
+                    );
+                    assert!(matches!(
+                        config.validate(),
+                        Err(crate::error::SlipstreamError::Config(_))
+                    ));
                     let client = OhttpClient::new(
                         &host,
                         "https://ambiguous-config.invalid/relay",

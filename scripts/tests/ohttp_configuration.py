@@ -44,9 +44,11 @@ def environment(case):
     if case == "mixed-case":
         env["ZODL_OHTTP_GATEWAY_HOST_MAINNET"] = "Main-With-Testnet-In-Name.Example"
         env["ZODL_OHTTP_GATEWAY_HOST_TESTNET"] = "Alternate-Chain.Example"
-    if case == "ambiguous-hosts":
+    if case in ("ambiguous-hosts", "ambiguous-partial-mainnet"):
         env["ZODL_OHTTP_GATEWAY_HOST_MAINNET"] = "Shared-Gateway.Example"
         env["ZODL_OHTTP_GATEWAY_HOST_TESTNET"] = "shared-gateway.example"
+    if case == "ambiguous-partial-mainnet":
+        del env["ZODL_OHTTP_SIGNING_PUBKEY_MAINNET"]
     if case == "no-dns":
         del env["ZODL_OHTTP_KEYS_DNS_NAME_TESTNET"]
     if case == "no-signing":
@@ -60,8 +62,8 @@ def main():
             raise SystemExit("provide a command after --")
         result = subprocess.run(sys.argv[2:], cwd=ROOT, env=environment("complete"))
         raise SystemExit(result.returncode)
-    for case in sys.argv[1:] or ["complete", "no-dns", "no-signing", "mixed-case", "ambiguous-hosts"]:
-        if case not in ("complete", "no-dns", "no-signing", "mixed-case", "ambiguous-hosts"):
+    for case in sys.argv[1:] or ["complete", "no-dns", "no-signing", "mixed-case", "ambiguous-hosts", "ambiguous-partial-mainnet"]:
+        if case not in ("complete", "no-dns", "no-signing", "mixed-case", "ambiguous-hosts", "ambiguous-partial-mainnet"):
             raise SystemExit("unknown configuration case")
         print("OHTTP configuration case:", case, flush=True)
         subprocess.run([
