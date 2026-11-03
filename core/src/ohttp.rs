@@ -306,7 +306,7 @@ fn cached_or_new_client(
 /// Relay URL for a given gateway host. One relay per gateway: mainnet and testnet gateways use
 /// different HPKE keys, and an RFC 9458 relay has a single fixed gateway target.
 ///
-/// Uses Fastly-hosted relays in production (`relay.example.invalid`).
+/// Production relay selection is owned by `zodl-ohttp-client`.
 /// Relay URLs can be overridden at build time via environment variables
 /// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET` (see `zodl-ohttp-client`
 /// documentation).
@@ -6275,16 +6275,79 @@ pub(crate) mod tests {
         }
     }
 
-    /// Verify signed-config with REAL live fixtures from Fastly relay endpoints (P1/P2/P3 fix).
+    #[test]
+    fn live_fixture_urls_use_injected_relays() {
+        let urls = live_fixture_config_urls(|name| match name {
+            "ZODL_OHTTP_RELAY_URL_MAINNET" => {
+                Some("https://mainnet-relay.example.invalid/relay".to_owned())
+            }
+            "ZODL_OHTTP_RELAY_URL_TESTNET" => {
+                Some("https://testnet-relay.example.invalid/custom/relay".to_owned())
+            }
+            _ => panic!("unexpected environment variable"),
+        })
+        .expect("configured fixtures");
+        assert_eq!(
+            urls,
+            [
+                "https://mainnet-relay.example.invalid/ohttp-configs/signed",
+                "https://testnet-relay.example.invalid/ohttp-configs/signed",
+            ]
+        );
+    }
+
+    #[test]
+    fn live_fixture_urls_require_each_input_without_disclosing_values() {
+        for missing in [
+            "ZODL_OHTTP_RELAY_URL_MAINNET",
+            "ZODL_OHTTP_RELAY_URL_TESTNET",
+        ] {
+            for absent in [None, Some("".to_owned())] {
+                let error = live_fixture_config_urls(|name| {
+                    if name == missing {
+                        absent.clone()
+                    } else {
+                        Some("https://private.example.invalid/relay".to_owned())
+                    }
+                })
+                .expect_err("missing live input must fail before network access");
+                assert!(error.contains(missing));
+                assert!(error.contains("set"));
+                assert!(!error.contains("private.example.invalid"));
+            }
+        }
+    }
+
+    // Read at test execution time, independently of the native client's build-time routing.
+    // Inject the reader so offline tests never mutate process-global environment variables.
+    fn live_fixture_config_urls(
+        mut read: impl FnMut(&str) -> Option<String>,
+    ) -> Result<[String; 2], String> {
+        let mut config_url = |name| {
+            let guidance = || format!("set {name} to a nonempty HTTPS relay URL for live fixtures");
+            let relay = read(name)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(guidance)?;
+            signed_config_url(&relay, ClientProfile::SLIPSTREAM.signed_config_url)
+                .map_err(|_| guidance())
+        };
+        Ok([
+            config_url("ZODL_OHTTP_RELAY_URL_MAINNET")?,
+            config_url("ZODL_OHTTP_RELAY_URL_TESTNET")?,
+        ])
+    }
+
+    /// Verify signed-config with real live fixtures from environment-supplied relay endpoints.
     /// Tests both mainnet and testnet with valid envelopes, tampered signatures, wrong network.
     #[tokio::test]
     #[ignore = "network"]
     async fn verify_signed_config_with_live_fixtures() {
         let profile = ClientProfile::SLIPSTREAM;
         let now = unix_now().expect("clock");
+        let [mainnet_url, testnet_url] = live_fixture_config_urls(|name| std::env::var(name).ok())
+            .unwrap_or_else(|error| panic!("{error}"));
 
-        // Testnet signed config: direct fetch for testing (relay URLs come from zodl-ohttp-client)
-        let testnet_url = "https://testnet-simulator-relay.example.invalid/ohttp-configs/signed";
+        // Testnet signed config: direct fetch for testing from the supplied relay.
         let testnet_resp = reqwest::get(testnet_url)
             .await
             .expect("fetch testnet signed config")
@@ -6305,8 +6368,7 @@ pub(crate) mod tests {
             testnet_result
         );
 
-        // Mainnet signed config: direct fetch for testing (relay URLs come from zodl-ohttp-client)
-        let mainnet_url = "https://mainnet-relay.example.invalid/ohttp-configs/signed";
+        // Mainnet signed config: direct fetch for testing from the supplied relay.
         let mainnet_resp = reqwest::get(mainnet_url)
             .await
             .expect("fetch mainnet signed config")
