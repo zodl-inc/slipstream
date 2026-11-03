@@ -48,10 +48,10 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     config::Endpoint,
-    connector::{ConnPurpose, LazyConnection, TorConn, connect_via},
+    connector::{ConnPurpose, LazyConnection, TorConn, connect_via_tracked as connect_via},
     error::SlipstreamError,
     events::Progress,
-    grpc::{self, LwdClient},
+    grpc::{self, LwdClient, TrackedConnection},
     wallet_session::WalletSession,
 };
 
@@ -66,16 +66,21 @@ type FetchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = FetchResul
 /// One `GetTransaction`: over a clone of `client` (Tor off), or over a fresh isolated Tor
 /// client, at most [`ISOLATED_FETCH_CONCURRENCY`] at a time.
 fn fetch_transaction(
-    client: Option<LwdClient>,
+    client: Option<TrackedConnection>,
     isolate: Option<&(TorConn, Endpoint, Arc<tokio::sync::Semaphore>)>,
     txid: zcash_primitives::transaction::TxId,
     want_enhance: bool,
 ) -> FetchFuture {
     match isolate {
         None => {
-            let mut c = client.expect("a non-isolated fetch has an open client");
+            let c = client.expect("a non-isolated fetch has an open client");
+            let route = grpc::current_ohttp_health_route();
             Box::pin(async move {
-                let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
+                let raw = grpc::with_ohttp_health_route(
+                    route,
+                    c.call(async |client| grpc::get_transaction(client, *txid.as_ref()).await),
+                )
+                .await;
                 (txid, want_enhance, raw)
             })
         }
@@ -86,8 +91,13 @@ fn fetch_transaction(
                     let _permit = permits.acquire_owned().await.map_err(|e| {
                         SlipstreamError::Transport(format!("isolated fetch permits: {e}"))
                     })?;
-                    let mut c = tor.connect_isolated(&endpoint).await?;
-                    grpc::get_transaction(&mut c, *txid.as_ref()).await
+                    let c = tor.connect_isolated_tracked(&endpoint).await?;
+                    grpc::with_ohttp_endpoint(
+                        &endpoint,
+                        true,
+                        c.call(async |client| grpc::get_transaction(client, *txid.as_ref()).await),
+                    )
+                    .await
                 }
                 .await;
                 (txid, want_enhance, raw)
@@ -119,7 +129,7 @@ fn txid_retry_backoff(attempt: u32) -> std::time::Duration {
 /// errors (wallet DB, decode, policy denial, rate limit with the whole-round
 /// backoff already applied) propagate immediately.
 async fn fetch_with_retry(
-    client: Option<LwdClient>,
+    client: Option<TrackedConnection>,
     isolate: Option<&(TorConn, Endpoint, Arc<tokio::sync::Semaphore>)>,
     txid: zcash_primitives::transaction::TxId,
     want_enhance: bool,
@@ -196,7 +206,7 @@ pub async fn run_enhancement(
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError> {
-    let open = client.clone();
+    let open = TrackedConnection::in_context(client.clone());
     let mut client = LazyConnection::new(move || std::future::ready(Ok(open.clone())));
     run_enhancement_lazily(session, &mut client, network, progress, skipped_keys).await
 }
@@ -224,7 +234,7 @@ pub async fn run_enhancement_isolated(
     skipped_keys: &mut HashSet<String>,
     isolate: Option<(&TorConn, &Endpoint)>,
 ) -> Result<EnhanceStats, SlipstreamError> {
-    let open = client.clone();
+    let open = TrackedConnection::in_context(client.clone());
     let mut client = LazyConnection::new(move || std::future::ready(Ok(open.clone())));
     run_enhancement_lazily_isolated(
         session,
@@ -239,7 +249,7 @@ pub async fn run_enhancement_isolated(
 
 /// A connect in progress, boxed so that [`enhancement_connection`] can name its type.
 type ConnectFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<LwdClient, SlipstreamError>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<TrackedConnection, SlipstreamError>> + Send + 'a>,
 >;
 
 /// The connection the scan's interleaved enhancement and the scheduler's per-range
@@ -249,7 +259,7 @@ type ConnectFuture<'a> = std::pin::Pin<
 pub(crate) fn enhancement_connection<'a>(
     endpoint: &'a Endpoint,
     tor: Option<&'a TorConn>,
-) -> LazyConnection<LwdClient, impl FnMut() -> ConnectFuture<'a> + Send> {
+) -> LazyConnection<TrackedConnection, impl FnMut() -> ConnectFuture<'a> + Send> {
     LazyConnection::new(move || -> ConnectFuture<'a> {
         Box::pin(connect_via(endpoint, tor, ConnPurpose::MetadataUnique))
     })
@@ -263,14 +273,14 @@ pub(crate) fn enhancement_connection<'a>(
 /// the run.
 pub(crate) async fn run_enhancement_lazily<F, Fut>(
     session: &mut WalletSession,
-    client: &mut LazyConnection<LwdClient, F>,
+    client: &mut LazyConnection<TrackedConnection, F>,
     network: crate::network::SlipstreamNetwork,
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
+    Fut: std::future::Future<Output = Result<TrackedConnection, SlipstreamError>>,
 {
     run_enhancement_lazily_isolated(session, client, network, progress, skipped_keys, None).await
 }
@@ -278,7 +288,7 @@ where
 /// Lazy enhancement retaining a fresh Tor circuit for each identifying request.
 pub(crate) async fn run_enhancement_lazily_isolated<F, Fut>(
     session: &mut WalletSession,
-    client: &mut LazyConnection<LwdClient, F>,
+    client: &mut LazyConnection<TrackedConnection, F>,
     network: crate::network::SlipstreamNetwork,
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
@@ -286,7 +296,7 @@ pub(crate) async fn run_enhancement_lazily_isolated<F, Fut>(
 ) -> Result<EnhanceStats, SlipstreamError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
+    Fut: std::future::Future<Output = Result<TrackedConnection, SlipstreamError>>,
 {
     let isolate = isolate.map(|(tor, endpoint)| {
         (
@@ -426,19 +436,35 @@ where
             let mut isolated;
             let address_client = match &isolate {
                 Some((tor, endpoint, _)) => {
-                    isolated = tor.connect_isolated(endpoint).await?;
+                    isolated = tor.connect_isolated_tracked(endpoint).await?;
                     &mut isolated
                 }
                 None => client.get().await?,
             };
-            apply_address_request(
-                session,
-                address_client,
-                &network,
-                tia,
-                block_range_end,
-                &mut stats,
-                progress.as_deref(),
+            let route = match &isolate {
+                Some((_, endpoint, _)) => crate::ohttp::relay_for(&endpoint.host).map(|relay| {
+                    crate::transport_health::HealthRoute {
+                        gateway_host: endpoint.host.clone(),
+                        relay_url: relay.into(),
+                        via_tor: true,
+                    }
+                }),
+                None => grpc::current_ohttp_health_route(),
+            };
+            grpc::with_ohttp_health_route(
+                route,
+                address_client.call(async |client| {
+                    apply_address_request(
+                        session,
+                        client,
+                        &network,
+                        tia,
+                        block_range_end,
+                        &mut stats,
+                        progress.as_deref(),
+                    )
+                    .await
+                }),
             )
             .await?;
         }
@@ -844,8 +870,8 @@ mod tests {
     fn no_server(
         connects: &std::cell::Cell<u32>,
     ) -> LazyConnection<
-        LwdClient,
-        impl FnMut() -> std::future::Ready<Result<LwdClient, SlipstreamError>> + '_,
+        TrackedConnection,
+        impl FnMut() -> std::future::Ready<Result<TrackedConnection, SlipstreamError>> + '_,
     > {
         LazyConnection::new(move || {
             connects.set(connects.get() + 1);

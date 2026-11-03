@@ -55,7 +55,7 @@ use tower_service::Service;
 use crate::{
     config::Endpoint,
     error::SlipstreamError,
-    grpc::{self, LwdClient},
+    grpc::{self, LwdClient, TrackedConnection},
     ohttp::{Dialer, OhttpConnector},
 };
 
@@ -158,7 +158,7 @@ pub struct TorConn {
     client: Arc<TorClient<PreferredRuntime>>,
     client_trace_prefix: Option<String>,
     /// [`TorMode::Shared`] connections, per endpoint (`host:port`), with their opening time.
-    shared: Arc<std::sync::Mutex<HashMap<String, (LwdClient, Instant)>>>,
+    shared: Arc<std::sync::Mutex<HashMap<String, (TrackedConnection, Instant)>>>,
 }
 
 impl TorConn {
@@ -243,6 +243,16 @@ impl TorConn {
         &self,
         endpoint: &Endpoint,
     ) -> Result<LwdClient, SlipstreamError> {
+        self.connect(TorMode::Isolated, endpoint)
+            .await
+            .map(TrackedConnection::into_client)
+    }
+
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub(crate) async fn connect_isolated_tracked(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<TrackedConnection, SlipstreamError> {
         self.connect(TorMode::Isolated, endpoint).await
     }
 
@@ -250,7 +260,7 @@ impl TorConn {
         &self,
         mode: TorMode,
         endpoint: &Endpoint,
-    ) -> Result<LwdClient, SlipstreamError> {
+    ) -> Result<TrackedConnection, SlipstreamError> {
         if mode == TorMode::Shared {
             return self.connect_shared(endpoint).await;
         }
@@ -266,24 +276,28 @@ impl TorConn {
         // circuit is cut at the per-attempt timeout and the next attempt draws a new isolated
         // circuit, instead of blocking on arti's long internal timeout. The healthy case connects
         // on attempt 1 with no added latency.
-        retry_tor_connect(per_attempt, |attempt| {
-            // `.uniqueTor` (and a bulk worker's own circuit) = a fresh isolated circuit EACH
-            // attempt (so a retry escapes a stuck circuit); `.defaultTor` = the default circuit
-            // (a retry still gets a fresh isolated one, since the default one just failed us).
-            let client = match (mode, attempt) {
-                (TorMode::Default | TorMode::Shared, 1) => self.client.clone(),
-                _ => self.client.isolated_client(),
-            };
-            let client_trace_prefix = self.client_trace_prefix.clone();
-            async move {
-                match relay {
-                    Some(relay) => {
-                        Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
+        grpc::with_ohttp_endpoint(
+            endpoint,
+            true,
+            retry_tor_connect(per_attempt, |attempt| {
+                // `.uniqueTor` (and a bulk worker's own circuit) = a fresh isolated circuit EACH
+                // attempt (so a retry escapes a stuck circuit); `.defaultTor` = the default circuit
+                // (a retry still gets a fresh isolated one, since the default one just failed us).
+                let client = match (mode, attempt) {
+                    (TorMode::Default | TorMode::Shared, 1) => self.client.clone(),
+                    _ => self.client.isolated_client(),
+                };
+                let client_trace_prefix = self.client_trace_prefix.clone();
+                async move {
+                    match relay {
+                        Some(relay) => {
+                            Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
+                        }
+                        None => Self::connect_direct_over_tor(client, endpoint).await,
                     }
-                    None => Self::connect_direct_over_tor(client, endpoint).await,
                 }
-            }
-        })
+            }),
+        )
         .await
     }
 
@@ -302,7 +316,10 @@ impl TorConn {
     /// channel multiplexes concurrent calls and redials a broken transport itself; callers that
     /// retry after a failure use an isolated connection, so a bad shared one is never retried
     /// into.
-    async fn connect_shared(&self, endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+    async fn connect_shared(
+        &self,
+        endpoint: &Endpoint,
+    ) -> Result<TrackedConnection, SlipstreamError> {
         let key = format!("{}:{}", endpoint.host, endpoint.port);
         {
             let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
@@ -330,7 +347,7 @@ impl TorConn {
         endpoint: &Endpoint,
         relay: &str,
         client_trace_prefix: Option<String>,
-    ) -> Result<LwdClient, SlipstreamError> {
+    ) -> Result<TrackedConnection, SlipstreamError> {
         tracing::info!(
             gateway = %endpoint.host,
             relay,
@@ -349,20 +366,24 @@ impl TorConn {
     async fn connect_ohttp_channel(
         connector: OhttpConnector,
         endpoint: &Endpoint,
-    ) -> Result<LwdClient, SlipstreamError> {
+    ) -> Result<TrackedConnection, SlipstreamError> {
         connector.warm_up_typed().await?;
         // Plain `http://`: the transport tonic sees is an in-memory pipe; TLS happens inside the
         // connector, towards the relay (tonic refuses `https://` without a tls_config).
         let pipe_uri = format!("http://{}:{}", endpoint.host, endpoint.port);
-        let channel = TonicEndpoint::from_shared(pipe_uri)
+        let channel = TonicEndpoint::from_shared(pipe_uri.clone())
             .map_err(|e| SlipstreamError::Transport(format!("endpoint uri: {e}")))?
             .connect_timeout(Duration::from_secs(10))
-            .connect_with_connector(connector)
+            .connect_with_connector(connector.clone())
             .await
             .map_err(|e| {
                 SlipstreamError::Transport(format!("ohttp connect {}: {e}", endpoint.host))
             })?;
-        Ok(LwdClient::new(channel))
+        Ok(TrackedConnection::ohttp(
+            LwdClient::new(channel),
+            connector,
+            pipe_uri,
+        ))
     }
 
     /// Non-OHTTP host: gRPC(+TLS) directly over a Tor stream — a port of
@@ -371,7 +392,7 @@ impl TorConn {
     async fn connect_direct_over_tor(
         client: Arc<TorClient<PreferredRuntime>>,
         endpoint: &Endpoint,
-    ) -> Result<LwdClient, SlipstreamError> {
+    ) -> Result<TrackedConnection, SlipstreamError> {
         let uri: Uri = endpoint
             .uri()
             .parse()
@@ -400,7 +421,7 @@ impl TorConn {
                     .unwrap_or_default();
                 SlipstreamError::Transport(format!("tor connect {}: {e}{source}", endpoint.host))
             })?;
-        Ok(LwdClient::new(channel))
+        Ok(TrackedConnection::plain(LwdClient::new(channel)))
     }
 }
 
@@ -502,7 +523,10 @@ pub async fn connect_via(
 ) -> Result<LwdClient, SlipstreamError> {
     let is_ohttp_gateway = crate::ohttp::relay_for(&endpoint.host).is_some();
     match (tor, route(purpose, is_ohttp_gateway)) {
-        (Some(t), Some(mode)) => t.connect(mode, endpoint).await,
+        (Some(t), Some(mode)) => t
+            .connect(mode, endpoint)
+            .await
+            .map(TrackedConnection::into_client),
         // Bulk streams get a relay connection of their own: a block-range body the scan is not
         // reading yet holds HTTP/2 flow-control window, and on a connection shared with the
         // tree-state and tip calls it stalled all of them (device, spam era: "no chunk received
@@ -512,6 +536,29 @@ pub async fn connect_via(
         }
         _ => connect_direct_with_retry(endpoint).await,
     }
+}
+
+pub(crate) async fn connect_via_tracked(
+    endpoint: &Endpoint,
+    tor: Option<&TorConn>,
+    purpose: ConnPurpose,
+) -> Result<TrackedConnection, SlipstreamError> {
+    if crate::ohttp::relay_for(&endpoint.host).is_none() {
+        return connect_via(endpoint, tor, purpose)
+            .await
+            .map(TrackedConnection::plain);
+    }
+    if let Some(tor) = tor {
+        return tor
+            .connect(route(purpose, true).expect("Tor purpose"), endpoint)
+            .await;
+    }
+    retry_transient(
+        || grpc::connect_tracked(endpoint, purpose != ConnPurpose::BulkFetch),
+        DIRECT_CONNECT_ATTEMPTS,
+        direct_connect_backoff,
+    )
+    .await
 }
 
 /// Bounded transient-failure retries for the DIRECT (non-Tor) connect path. The Tor path refreshes
@@ -583,7 +630,18 @@ where
 {
     let mut last_err: Option<SlipstreamError> = None;
     for attempt in 1..=TOR_CONNECT_ATTEMPTS {
-        match tokio::time::timeout(per_attempt, connect(attempt)).await {
+        let health = grpc::current_ohttp_health_route().map(|route| {
+            Arc::new(crate::ohttp::RequestHealth::for_route(
+                route,
+                crate::transport_health::HealthScope::Route,
+            ))
+        });
+        match tokio::time::timeout(
+            per_attempt,
+            grpc::with_owner_health(health.clone(), connect(attempt)),
+        )
+        .await
+        {
             Ok(Ok(c)) => {
                 grpc::net_stats::record(grpc::net_stats::NetEvent::TorChannel);
                 return Ok(c);
@@ -603,6 +661,9 @@ where
                 });
             }
             Err(_elapsed) => {
+                if let Some(health) = health {
+                    health.deadline(crate::transport_health::HealthStage::Connection);
+                }
                 tracing::warn!(
                     attempt,
                     timeout_secs = per_attempt.as_secs(),
@@ -678,6 +739,80 @@ mod tests {
             port: 443,
             tls: true,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_tor_warmup_owner_preserves_native_key_pause() {
+        use crate::transport_health::HealthOutcome;
+        let (connector, subscription, route, dispatches) =
+            crate::ohttp::tests::connector_with_trickling_key_pause().await;
+        let attempts = std::sync::atomic::AtomicU32::new(0);
+        let result = grpc::with_ohttp_health_route(
+            Some(route),
+            retry_tor_connect(Duration::from_secs(30), |_| {
+                attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                connector.warm_up_typed()
+            }),
+        )
+        .await;
+        assert!(matches!(result, Err(SlipstreamError::RateLimited(_))));
+        assert_eq!(
+            attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "original timeout then already-paused retry behavior"
+        );
+        assert_eq!(dispatches.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let snapshot = subscription.snapshot();
+        assert!(
+            snapshot
+                .observations
+                .iter()
+                .any(|o| matches!(o.outcome, HealthOutcome::RateLimited { .. }))
+        );
+        assert!(
+            !snapshot
+                .observations
+                .iter()
+                .any(|o| o.outcome == HealthOutcome::TransportUnavailable),
+            "{snapshot:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn health_tor_connect_deadline_is_recorded_before_fresh_circuit_retry() {
+        use crate::transport_health::{self, HealthOutcome, HealthRoute, HealthScope, HealthStage};
+        let route = HealthRoute {
+            gateway_host: "health-connect.invalid".into(),
+            relay_url: "https://health-connect-relay.invalid/relay".into(),
+            via_tor: true,
+        };
+        let subscription = transport_health::subscribe(route.clone(), 42, Arc::new(|_| {}));
+        let result = grpc::with_ohttp_health_route(
+            Some(route),
+            retry_tor_connect(Duration::from_secs(30), |attempt| {
+                if attempt > 1 {
+                    assert!(
+                        subscription
+                            .snapshot()
+                            .observations
+                            .iter()
+                            .any(|o| o.scope == HealthScope::Route
+                                && o.outcome == HealthOutcome::TransportUnavailable
+                                && o.stage == HealthStage::Connection)
+                    );
+                }
+                std::future::pending::<Result<(), SlipstreamError>>()
+            }),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            subscription
+                .snapshot()
+                .observations
+                .iter()
+                .any(|o| o.outcome == HealthOutcome::TransportUnavailable)
+        );
     }
 
     #[tokio::test]

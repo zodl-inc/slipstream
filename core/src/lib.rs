@@ -37,6 +37,7 @@ pub mod network;
 pub mod ohttp;
 pub mod probe;
 pub mod throttle;
+pub mod transport_health;
 pub mod treestate;
 pub mod verify;
 pub mod work;

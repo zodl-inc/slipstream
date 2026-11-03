@@ -992,13 +992,17 @@ pub async fn run_to_completion(
         {
             let enhance_started = std::time::Instant::now();
             let mut enhance_client = enhancement_connection(&config.endpoint, tor);
-            let enhance_result = run_enhancement_lazily_isolated(
-                session,
-                &mut enhance_client,
-                config.network,
-                progress.clone(),
-                skipped_keys,
-                tor.map(|t| (t, &config.endpoint)),
+            let enhance_result = crate::grpc::with_ohttp_endpoint(
+                &config.endpoint,
+                tor.is_some(),
+                run_enhancement_lazily_isolated(
+                    session,
+                    &mut enhance_client,
+                    config.network,
+                    progress.clone(),
+                    skipped_keys,
+                    tor.map(|t| (t, &config.endpoint)),
+                ),
             )
             .await;
             match enhance_result {
