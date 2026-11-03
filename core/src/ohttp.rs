@@ -4395,6 +4395,9 @@ pub(crate) mod tests {
             .unwrap(),
         );
         let subscription = health_subscription(&client);
+        // A relay key failure can recover through DNS. Keep both sources inside this
+        // failure fixture so deployed DNS cannot turn the expected failure into success.
+        let dns_queries = refuse_dns_queries(&client).await;
         serve_in_process_relay(&client, |_| async {
             let mut answer = Response::new(Full::new(Bytes::new()).boxed());
             *answer.status_mut() = StatusCode::FORBIDDEN;
@@ -4410,6 +4413,8 @@ pub(crate) mod tests {
             .await
             .is_err()
         );
+        assert_eq!(dns_queries.load(Ordering::SeqCst), DOH_RESOLVERS.len());
+
         assert!(
             subscription
                 .snapshot()
