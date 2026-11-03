@@ -95,7 +95,8 @@ const DUPLEX_BUF: usize = 4 << 20;
 const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// Idle timeout between chunks in a streaming OHTTP response. A healthy stream delivers chunks
-/// continuously; 30 s of silence means the connection is dead.
+/// continuously; 30 s of silence means the connection is dead, so a call given up after that
+/// silence also marks its pooled connection dead (see [`H2InFlight::dead_if_given_up_after`]).
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bound on opening a direct TCP connection to the relay.
@@ -117,11 +118,108 @@ const ERROR_BODY_GUARD_BYTES: usize = 64 * 1024;
 /// then. In-flight requests finish on the old one.
 const H2_MAX_CONNECTION_AGE: Duration = Duration::from_secs(10 * 60);
 
-/// HTTP/2 PING interval on a pooled relay connection (see [`OhttpClient::h2_sender`]).
-const H2_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+/// A pooled relay connection on which a prompt call ([`HeadWait::Prompt`]) is waiting on the
+/// network and no frame of any call has arrived for this long is taken as stalled: new calls
+/// dial a new connection. Below the engine's 30 s unary deadline, so the retry of a call stuck
+/// on a connection that died silently (mobile network handoff) dials a new one. A prompt call
+/// given up while still waiting on the network, with nothing arriving on the connection for
+/// [`H2_DEAD_IF_GIVEN_UP_AFTER`] since it started waiting, marks the connection dead (see
+/// [`H2InFlight`]), so a connection that died shortly before a call's deadline is not reused
+/// by its retry either; a frame for another call in the meantime keeps it alive.
+///
+/// A slow connection whose calls keep receiving frames is never taken as stalled. Frames count
+/// when the reader polls them, and a call whose reader has a frame and has not asked for the
+/// next one does not count as waiting, so a reader that pauses (a fetch worker parked on its
+/// ahead budget) never makes the connection look stalled. One connection cannot tell a lone
+/// call queued behind a saturated link (over Tor, other circuits on the same guard) from a dead
+/// connection: in both nothing arrives. Evidence from other connections could, but a handoff
+/// kills them all at once; the cost of a wrong guess is one new connection, never a cut call,
+/// because leaving the pool does not close a connection and the calls on it finish there.
+const H2_STALL_AFTER: Duration = Duration::from_secs(20);
 
-/// How long a PING may go unanswered before the pooled relay connection is closed.
-const H2_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// [`H2_STALL_AFTER`] for the mempool long poll ([`HeadWait::LongPoll`]): longer than the
+/// longest silence a healthy gateway allows it, which answers or closes within 25 s of the
+/// request (`LONG_POLL_MAX_INITIAL_SILENCE_SECS`), 3 s after a transaction, and at 80 s in any
+/// case; the 10 s over that cover the request's and the answer's way through the relay (over
+/// Tor on a busy link, several seconds). A long poll silent for longer is on a dead
+/// connection; one given up while waiting after such a silence marks it dead.
+const H2_LONG_POLL_STALL_AFTER: Duration = Duration::from_secs(35);
+
+/// A direct pooled relay connection with no call in flight for this long is not reused (the
+/// next call dials a new one) and leaves the pool by itself. A connection that died while idle
+/// (a network handoff with nothing in flight) cannot show it through its frames, and would
+/// otherwise take the next call until it stalls; a new direct connection costs only a TLS
+/// handshake. This also applies to a connection opened by `warm_up` that no call used within
+/// this time. Direct connections also find an idle death sooner through TCP keep-alive
+/// ([`DIRECT_TCP_KEEPALIVE_TIME`]). Over Tor an idle connection stays reusable (see
+/// `h2_sender`): a new one costs a stream and a TLS handshake through a circuit, and on a slow
+/// link those dials often time out.
+const H2_IDLE_REUSE: Duration = Duration::from_secs(30);
+
+/// How long a prompt call must have waited with nothing arriving on its connection for giving
+/// it up to mark the connection dead (see [`H2InFlight`]). Short, so a connection that died a
+/// few seconds before a call's deadline is not reused by the retry; long enough that a call
+/// cut on purpose while its data flows (a fetch kick, a stream cut) leaves its connection
+/// alone.
+const H2_DEAD_IF_GIVEN_UP_AFTER: Duration = Duration::from_secs(5);
+
+/// TCP keep-alive on a direct relay connection: after this long with nothing sent or received,
+/// the kernel probes the peer every [`DIRECT_TCP_KEEPALIVE_INTERVAL`] and closes the socket
+/// after [`DIRECT_TCP_KEEPALIVE_RETRIES`] unanswered probes, about 11 s after the connection
+/// went quiet. The probes are TCP-level, answered by the peer's kernel and sent only while the
+/// connection carries no data, so unlike an HTTP/2 PING they never queue behind data in
+/// flight. A connection that died while idle is then closed (`is_closed`) before most calls
+/// could reuse it. Over Tor the socket is arti's connection to the guard, and noticing a dead
+/// guard is arti's.
+const DIRECT_TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(5);
+/// See [`DIRECT_TCP_KEEPALIVE_TIME`].
+const DIRECT_TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+/// See [`DIRECT_TCP_KEEPALIVE_TIME`].
+const DIRECT_TCP_KEEPALIVE_RETRIES: u32 = 3;
+
+/// Whether a call's response is expected promptly or is a long poll; each has its own stall
+/// bound ([`H2_STALL_AFTER`], [`H2_LONG_POLL_STALL_AFTER`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HeadWait {
+    /// Every call but the long poll: its head follows the request within seconds and its body
+    /// keeps arriving.
+    Prompt,
+    /// `GetMempoolStream`, a long poll: the gateway answers once lightwalletd sends the first
+    /// transaction and may then send nothing for a while.
+    LongPoll,
+}
+
+// A call stuck on a dead connection must leave it before the engine retries the call, and a
+// healthy long poll is never silent as long as the long-poll bound.
+const _: () = assert!(H2_STALL_AFTER.as_secs() < crate::grpc::UNARY_TIMEOUT.as_secs());
+const _: () = assert!(H2_LONG_POLL_STALL_AFTER.as_secs() >= 25 + 10);
+
+impl HeadWait {
+    /// The head wait of a request to the inner `path`.
+    fn for_path(path: &[u8]) -> Self {
+        if path.ends_with(b"/GetMempoolStream") {
+            Self::LongPoll
+        } else {
+            Self::Prompt
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Prompt => 0,
+            Self::LongPoll => 1,
+        }
+    }
+
+    /// How long a waiting call of this kind may see nothing arrive before its connection counts
+    /// as stalled.
+    fn stall_after(self) -> Duration {
+        match self {
+            Self::Prompt => H2_STALL_AFTER,
+            Self::LongPoll => H2_LONG_POLL_STALL_AFTER,
+        }
+    }
+}
 
 /// Trailers-only metadata the in-process server attaches to a gRPC error so that the engine can
 /// tell an OHTTP outcome from an unreachable server (see `grpc::status_err`). It never leaves
@@ -392,6 +490,25 @@ pub enum Dialer {
     Tor(Arc<arti_client::TorClient<tor_rtcompat::PreferredRuntime>>),
 }
 
+/// Turns on TCP keep-alive on a direct relay socket (see [`DIRECT_TCP_KEEPALIVE_TIME`]). A
+/// failure only loses the earlier detection of an idle dead connection.
+fn set_tcp_keepalive(tcp: &tokio::net::TcpStream) {
+    let keepalive = socket2::TcpKeepalive::new().with_time(DIRECT_TCP_KEEPALIVE_TIME);
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
+    let keepalive = keepalive
+        .with_interval(DIRECT_TCP_KEEPALIVE_INTERVAL)
+        .with_retries(DIRECT_TCP_KEEPALIVE_RETRIES);
+    if let Err(e) = socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive) {
+        tracing::debug!(err = %e, "ohttp: could not turn on TCP keep-alive");
+    }
+}
+
 impl Dialer {
     pub fn is_tor(&self) -> bool {
         matches!(self, Dialer::Tor(_))
@@ -418,6 +535,7 @@ impl Dialer {
                     format!("connect {label}: {}", redact_host(&e, host, label))
                 })?;
                 let _ = tcp.set_nodelay(true);
+                set_tcp_keepalive(&tcp);
                 Ok(Box::new(tcp))
             }
             Dialer::Tor(client) => {
@@ -749,6 +867,9 @@ struct RelayStream {
     /// `Retry-After` of a 429, see [`retry_after`].
     retry_after: Option<Duration>,
     body: BoxBody<Bytes, hyper::Error>,
+    /// The activity of the pooled connection the answer came on (`None` for one that is not
+    /// pooled), for [`pump_chunked_body`] to retire it when it gives the body up as silent.
+    activity: Option<Arc<H2Activity>>,
 }
 
 /// The `Retry-After` of an outer answer as delay-seconds (RFC 9110, section 10.2.3), capped at
@@ -788,8 +909,11 @@ async fn pump_chunked_body(
     mut decoder: ChunkedResponseDecoder,
     mut guard: SizeGuard,
     tx: tokio::sync::mpsc::Sender<Result<ResponseEvent, PumpError>>,
+    activity: Option<Arc<H2Activity>>,
 ) {
     loop {
+        // Before the frame wait (and its timer) starts, so before the body's own wait clock.
+        let waiting_from = std::time::Instant::now();
         tokio::select! {
             biased;
             () = tx.closed() => {
@@ -830,6 +954,9 @@ async fn pump_chunked_body(
                         break;
                     }
                     Err(_) => {
+                        if let Some(activity) = &activity {
+                            activity.given_up_silent_since(waiting_from);
+                        }
                         let _ = tx
                             .send(Err(PumpError::transport("idle timeout: no chunk received in 30s")))
                             .await;
@@ -1731,8 +1858,377 @@ impl GrpcFrames {
 type EventStream =
     Pin<Box<dyn futures_util::Stream<Item = Result<ResponseEvent, PumpError>> + Send + Sync>>;
 
-/// A pooled HTTP/2 sender to the relay and the time its connection was opened.
-type PooledH2 = (http2::SendRequest<Full<Bytes>>, std::time::Instant);
+/// A pooled HTTP/2 sender to the relay, when its connection was opened, and how it is doing.
+#[derive(Clone)]
+struct PooledH2 {
+    sender: http2::SendRequest<Full<Bytes>>,
+    /// Identifies the connection, so a pool entry is only removed by calls or tasks of the
+    /// connection it holds, never once a newer one has replaced it.
+    id: u64,
+    opened: std::time::Instant,
+    activity: Arc<H2Activity>,
+}
+
+/// The next [`PooledH2::id`].
+static NEXT_H2_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// The pooled HTTP/2 relay connections of one client, by `host:port`.
+type H2Pool = Mutex<HashMap<String, PooledH2>>;
+
+impl PooledH2 {
+    /// A connection that is about to be pooled under `key` in `pool`. Once it has had no call
+    /// in flight for [`H2_IDLE_REUSE`] it leaves `pool` by itself (one task per connection,
+    /// [`H2Activity::schedule_idle_eviction`]),
+    /// so an idle connection nothing will reuse does not stay open (and, direct, keep sending
+    /// TCP keep-alive probes). `pool` is `None` for a connection that is not pooled.
+    fn new(
+        sender: http2::SendRequest<Full<Bytes>>,
+        pool: Option<(&Arc<H2Pool>, String)>,
+        idle_limit: Option<Duration>,
+    ) -> Self {
+        let id = NEXT_H2_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let activity = Arc::new(H2Activity::new(
+            pool.filter(|_| idle_limit.is_some())
+                .map(|(pool, key)| (Arc::downgrade(pool), key, id)),
+            idle_limit,
+        ));
+        activity.schedule_idle_eviction();
+        Self {
+            sender,
+            id,
+            opened: std::time::Instant::now(),
+            activity,
+        }
+    }
+
+    /// Whether a new call may use this connection: open, not past its age limit (Tor off), not
+    /// dead or stalled ([`H2_STALL_AFTER`]), and not idle for [`H2_IDLE_REUSE`] or longer.
+    fn reusable(&self, is_tor: bool) -> bool {
+        !self.sender.is_closed()
+            && (is_tor || self.opened.elapsed() < H2_MAX_CONNECTION_AGE)
+            && self.activity.usable()
+    }
+
+    /// Sends `req` on this connection, counting the call in flight until its response body ends
+    /// or is dropped, and telling the connection when the call waits on the network and when its
+    /// head and frames arrive ([`H2Activity`]). That is how a connection that died silently is
+    /// found: once a waiting call has seen nothing arrive for its bound ([`H2_STALL_AFTER`],
+    /// [`H2_LONG_POLL_STALL_AFTER`] for the long poll), new calls dial a new connection, and a
+    /// prompt call given up while still waiting marks the connection dead.
+    async fn send(
+        &mut self,
+        req: Request<Full<Bytes>>,
+        head_wait: HeadWait,
+    ) -> Result<http::Response<BoxBody<Bytes, hyper::Error>>, hyper::Error> {
+        let mut in_flight = self.activity.start(head_wait);
+        let response = match self.sender.send_request(req).await {
+            Ok(response) => response,
+            Err(e) => {
+                // An error is an answer: the connection said something (the caller unpools it).
+                in_flight.arrived();
+                in_flight.answered = true;
+                return Err(e);
+            }
+        };
+        // The head arrived; the call waits again only when its reader asks for a body frame.
+        in_flight.head_arrived = true;
+        in_flight.arrived();
+        Ok(response.map(|inner| TrackedBody { inner, in_flight }.boxed()))
+    }
+}
+
+/// What the calls on one pooled connection show about it: how many are in flight, how many of
+/// each kind are waiting on the network right now, since when none has been in flight, when a
+/// frame last arrived, and whether a call was given up unanswered on it.
+struct H2Activity {
+    in_flight: std::sync::atomic::AtomicUsize,
+    dead: std::sync::atomic::AtomicBool,
+    times: std::sync::Mutex<H2Times>,
+    /// The pool, key and id of the pooled connection, for the idle eviction.
+    evict: Option<(std::sync::Weak<H2Pool>, String, u64)>,
+    /// How long the connection may sit idle and still be reused ([`H2_IDLE_REUSE`] direct,
+    /// `None` over Tor: see [`H2_IDLE_REUSE`]).
+    idle_limit: Option<Duration>,
+}
+
+struct H2Times {
+    /// Calls waiting for their head, or for a body frame they have asked for, by
+    /// [`HeadWait::index`]. A call whose reader has a frame and has not asked for the next one is
+    /// not waiting: its silence is the reader's, not the connection's.
+    waiting: [usize; 2],
+    /// When the first of the calls of each kind now waiting started to wait.
+    waiting_since: [std::time::Instant; 2],
+    /// When a response head or body frame last arrived.
+    last_frame: std::time::Instant,
+    /// When the connection last had no call in flight (or was opened).
+    idle_since: std::time::Instant,
+}
+
+impl H2Times {
+    /// How long the waiting calls of `kind` have seen nothing arrive.
+    fn silence(&self, kind: HeadWait) -> Duration {
+        let i = kind.index();
+        self.last_frame.max(self.waiting_since[i]).elapsed()
+    }
+
+    /// Whether calls of `kind` are waiting and have seen nothing arrive for their stall bound.
+    fn stalled(&self, kind: HeadWait) -> bool {
+        self.waiting[kind.index()] > 0 && self.silence(kind) >= kind.stall_after()
+    }
+}
+
+impl H2Activity {
+    fn new(
+        evict: Option<(std::sync::Weak<H2Pool>, String, u64)>,
+        idle_limit: Option<Duration>,
+    ) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            in_flight: std::sync::atomic::AtomicUsize::new(0),
+            dead: std::sync::atomic::AtomicBool::new(false),
+            times: std::sync::Mutex::new(H2Times {
+                waiting: [0; 2],
+                waiting_since: [now; 2],
+                last_frame: now,
+                idle_since: now,
+            }),
+            evict,
+            idle_limit,
+        }
+    }
+
+    /// The pool handed the connection to a caller that has not started its call yet (it still
+    /// waits for the connection to be ready). Counts as use, under the pool lock, so the idle
+    /// eviction (which checks under the same lock) cannot take out a connection a call is about
+    /// to go to.
+    fn handed_out(&self) {
+        self.times().idle_since = std::time::Instant::now();
+    }
+
+    /// Whether the connection has had no call in flight for [`H2_IDLE_REUSE`].
+    fn idle(&self) -> bool {
+        self.idle_limit.is_some_and(|limit| {
+            self.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0
+                && self.times().idle_since.elapsed() >= limit
+        })
+    }
+
+    /// Starts the one task that takes the connection out of its pool once it has had no call
+    /// in flight for [`H2_IDLE_REUSE`]. The task wakes when the connection would reach that
+    /// idle time (or after [`H2_IDLE_REUSE`] while it is busy), and ends once it has removed
+    /// the entry, or the entry is no longer this connection, or the connection is gone. Needs a
+    /// tokio runtime; without one the connection only leaves the pool when replaced.
+    fn schedule_idle_eviction(self: &Arc<Self>) {
+        let Some((pool, key, id)) = self.evict.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let activity = Arc::downgrade(self);
+        runtime.spawn(async move {
+            loop {
+                let wait = match activity.upgrade() {
+                    Some(a) if a.in_flight.load(std::sync::atomic::Ordering::Acquire) == 0 => {
+                        H2_IDLE_REUSE.saturating_sub(a.times().idle_since.elapsed())
+                    }
+                    Some(_) => H2_IDLE_REUSE,
+                    None => return,
+                };
+                tokio::time::sleep(wait + Duration::from_secs(1)).await;
+                let (Some(pool), Some(activity)) = (pool.upgrade(), activity.upgrade()) else {
+                    return;
+                };
+                let mut pool = pool.lock().await;
+                if !pool.get(&key).is_some_and(|e| e.id == id) {
+                    return;
+                }
+                if activity.idle() {
+                    pool.remove(&key);
+                    tracing::debug!(pool_key = %key, "ohttp: idle relay connection left the pool");
+                    return;
+                }
+            }
+        });
+    }
+
+    fn times(&self) -> std::sync::MutexGuard<'_, H2Times> {
+        self.times.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Counts one call in flight until the returned guard drops (when its response body ends or
+    /// is dropped, or the call fails). The call starts out waiting for its head.
+    fn start(self: &Arc<Self>, head_wait: HeadWait) -> H2InFlight {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut call = H2InFlight {
+            activity: Arc::clone(self),
+            kind: head_wait,
+            waiting: false,
+            waiting_since: std::time::Instant::now(),
+            head_arrived: false,
+            answered: false,
+        };
+        call.wait();
+        call
+    }
+
+    /// The body pump gave a call up after [`CHUNK_IDLE_TIMEOUT`] without a frame: marks the
+    /// connection dead unless a frame for any call arrived after `since`, when the pump started
+    /// to wait. The call's own drop may not: the pump's timer starts before the body is polled,
+    /// so when it fires the call has been waiting a little less than its bound.
+    fn given_up_silent_since(&self, since: std::time::Instant) {
+        // Under `times`, like `H2InFlight::drop` (see `usable`).
+        let times = self.times();
+        if times.last_frame <= since {
+            self.dead.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether new calls may still go to this connection: not dead, not idle for
+    /// [`H2_IDLE_REUSE`], and not stalled (calls waiting on it while nothing has arrived for
+    /// their stall bound).
+    fn usable(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        // One snapshot: `H2InFlight::drop` marks the connection dead, takes the call off
+        // `in_flight` and resets `idle_since` while holding `times`, so `dead` is read under the
+        // same lock. Read before taking it, a lookup racing the last stalled call's drop could
+        // combine the old `dead == false` with the new idle state and hand out a dead connection.
+        let times = self.times();
+        if self.dead.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.in_flight.load(Ordering::Acquire) == 0 {
+            return self
+                .idle_limit
+                .is_none_or(|limit| times.idle_since.elapsed() < limit);
+        }
+        !times.stalled(HeadWait::Prompt) && !times.stalled(HeadWait::LongPoll)
+    }
+}
+
+/// One call in flight on a pooled connection (see [`H2Activity::start`]).
+struct H2InFlight {
+    activity: Arc<H2Activity>,
+    kind: HeadWait,
+    /// Whether the call is waiting on the network (counted in `H2Times::waiting`).
+    waiting: bool,
+    /// When the call last started waiting.
+    waiting_since: std::time::Instant,
+    /// Whether the response head arrived: the call now waits for body frames.
+    head_arrived: bool,
+    /// Whether the connection answered the call: its body ended, or an error came back.
+    answered: bool,
+}
+
+impl H2InFlight {
+    /// How long the connection must have been silent when the call is given up while waiting
+    /// for that to mark it dead. A prompt call: [`H2_DEAD_IF_GIVEN_UP_AFTER`]. A long poll
+    /// still waiting for its head: [`H2_LONG_POLL_STALL_AFTER`], the longest silence a healthy
+    /// gateway allows. A long poll in its body: [`CHUNK_IDLE_TIMEOUT`], after which the body
+    /// pump gives the stream up as dead, before the long-poll bound could be reached.
+    fn dead_if_given_up_after(&self) -> Duration {
+        match (self.kind, self.head_arrived) {
+            (HeadWait::Prompt, _) => H2_DEAD_IF_GIVEN_UP_AFTER,
+            (HeadWait::LongPoll, false) => H2_LONG_POLL_STALL_AFTER,
+            (HeadWait::LongPoll, true) => CHUNK_IDLE_TIMEOUT,
+        }
+    }
+
+    /// The call is waiting on the network. The first waiter of its kind starts that kind's
+    /// silence clock, so earlier silence (a quiet long poll, a reader that paused) does not count
+    /// against it.
+    fn wait(&mut self) {
+        if self.waiting {
+            return;
+        }
+        let i = self.kind.index();
+        let now = std::time::Instant::now();
+        let mut times = self.activity.times();
+        if times.waiting[i] == 0 {
+            times.waiting_since[i] = now;
+        }
+        times.waiting[i] += 1;
+        self.waiting = true;
+        self.waiting_since = now;
+    }
+
+    /// Something arrived for the call: it no longer waits until its reader asks again.
+    fn arrived(&mut self) {
+        let mut times = self.activity.times();
+        times.last_frame = std::time::Instant::now();
+        if self.waiting {
+            times.waiting[self.kind.index()] -= 1;
+            self.waiting = false;
+        }
+    }
+}
+
+impl Drop for H2InFlight {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let a = &self.activity;
+        let mut times = a.times();
+        if self.waiting {
+            // Given up while waiting on the network, unanswered, with the connection silent (no
+            // frame for any call) for the call's bound (`dead_if_given_up_after`): a prompt call
+            // marks the connection dead after a short silence (it may have died just before the
+            // call's deadline), a long poll only after a silence no healthy gateway, or the body
+            // pump, accepts. The silence is the connection's now, counted from the later of the
+            // last frame and the call starting to wait: a frame for another call shortly before
+            // keeps the connection alive, one long before does not, and a call cut on purpose
+            // while its data was flowing (a fetch kick) leaves it alone. Without this, the last
+            // waiter leaving would make a stalled connection idle, and so reusable, again.
+            let silent_for = times.last_frame.max(self.waiting_since).elapsed();
+            if !self.answered && silent_for >= self.dead_if_given_up_after() {
+                a.dead.store(true, Ordering::Release);
+            }
+            times.waiting[self.kind.index()] -= 1;
+        }
+        if a.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            times.idle_since = std::time::Instant::now();
+        }
+    }
+}
+
+/// A response body that keeps its call counted in flight on the pooled connection until the
+/// body ends or is dropped, and tells the connection when the call waits on the network and
+/// when a frame arrives.
+struct TrackedBody {
+    inner: Incoming,
+    in_flight: H2InFlight,
+}
+
+impl hyper::body::Body for TrackedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        match &polled {
+            Poll::Pending => this.in_flight.wait(),
+            Poll::Ready(Some(Ok(_))) => this.in_flight.arrived(),
+            Poll::Ready(None) | Poll::Ready(Some(Err(_))) => {
+                // The end, or an error frame (a reset stream): either way the connection answered.
+                this.in_flight.arrived();
+                this.in_flight.answered = true;
+            }
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 struct OhttpClient {
     gateway_host: String,
@@ -1746,7 +2242,7 @@ struct OhttpClient {
     /// stack, a reliable way to crash qemu under connection churn. Over Tor this matters even
     /// more: every new connection would be a new circuit build.
     /// Each with the time it was opened, see [`H2_MAX_CONNECTION_AGE`].
-    h2_pool: Mutex<HashMap<String, PooledH2>>,
+    h2_pool: Arc<H2Pool>,
     /// Per-key lock to prevent concurrent dials to the same target (single-flight semantics).
     /// Concurrent callers that find no live connection wait for one in-progress dial to complete
     /// and share its resulting sender, so the connection storm (70 dials in seconds with 70
@@ -1800,7 +2296,7 @@ impl OhttpClient {
             key_config: Mutex::new(None),
             tls: Arc::new(tls),
             dialer,
-            h2_pool: Mutex::new(HashMap::new()),
+            h2_pool: Arc::new(Mutex::new(HashMap::new())),
             dial_locks: Mutex::new(HashMap::new()),
             #[cfg(feature = "client-trace")]
             client_trace: client_trace_prefix.map(|p| ClientTrace::new(&p, &profile.trace)),
@@ -1835,20 +2331,17 @@ impl OhttpClient {
     /// one in-progress dial to complete and share its resulting sender (no connection storm).
     /// Tor-dialer clients are never cached across calls (fresh client per call) to preserve
     /// circuit isolation — this single-flight applies WITHIN one client's concurrent calls only.
-    async fn h2_sender(
-        &self,
-        target: &HttpsTarget,
-    ) -> Result<Option<http2::SendRequest<Full<Bytes>>>, HttpsError> {
+    async fn h2_sender(&self, target: &HttpsTarget) -> Result<Option<PooledH2>, HttpsError> {
         let key = format!("{}:{}", target.host, target.port);
 
         // Fast path: check the pool without holding the dial lock.
         {
             let pool = self.h2_pool.lock().await;
-            if let Some((s, opened)) = pool.get(&key)
-                && !s.is_closed()
-                && (self.dialer.is_tor() || opened.elapsed() < H2_MAX_CONNECTION_AGE)
+            if let Some(entry) = pool.get(&key)
+                && entry.reusable(self.dialer.is_tor())
             {
-                return Ok(Some(s.clone()));
+                entry.activity.handed_out();
+                return Ok(Some(entry.clone()));
             }
         }
 
@@ -1868,11 +2361,11 @@ impl OhttpClient {
         // dialed already while we waited.
         {
             let pool = self.h2_pool.lock().await;
-            if let Some((s, opened)) = pool.get(&key)
-                && !s.is_closed()
-                && (self.dialer.is_tor() || opened.elapsed() < H2_MAX_CONNECTION_AGE)
+            if let Some(entry) = pool.get(&key)
+                && entry.reusable(self.dialer.is_tor())
             {
-                return Ok(Some(s.clone()));
+                entry.activity.handed_out();
+                return Ok(Some(entry.clone()));
             }
         }
 
@@ -1881,16 +2374,25 @@ impl OhttpClient {
         if !is_h2 {
             return Ok(None);
         }
-        // HTTP/2 PINGs detect a dead pooled connection (mobile network handoff: the TCP
-        // connection silently stops, nothing errors) within H2_KEEPALIVE_INTERVAL +
-        // H2_KEEPALIVE_TIMEOUT; hyper then closes it and the next caller redials. Without them
-        // every call multiplexed on it waited out its own 30 s deadline, and the retries found
-        // the same dead connection (device, hotspot: 23 tree states timed out together).
+        // A dead pooled connection (mobile network handoff: the TCP connection silently stops,
+        // nothing errors) must stop taking calls before the engine's 30 s deadline, or every
+        // call multiplexed on it waits that deadline out and the retries find the same dead
+        // connection (device, hotspot: 23 tree states timed out together). The frames the calls
+        // receive tell (`PooledH2::send`, `PooledH2::reusable`, H2_STALL_AFTER).
+        //
+        // No HTTP/2 keep-alive PINGs. hyper closes a connection whose PING answer is late even
+        // while DATA keeps arriving (in `PingSent` it no longer looks at the read time), and on
+        // a slow link the answer queues behind the data of every relay connection on that link:
+        // with a 10 s, then 30 s timeout a phone over Tor on a ~2 Mbit/s link lost healthy
+        // connections every 30 to 60 s, failing every block stream on them at once
+        // (`KeepAliveTimedOut`, then "error reading a body from connection: broken pipe";
+        // device tests 2026-10-30). No timeout is both long enough for that queue and short
+        // enough to find a dead connection in time. A connection no longer pooled closes once
+        // its last call ends (or its reader's idle timeout gives the call up) and its sender is
+        // dropped; an idle one is never reused
+        // (H2_IDLE_REUSE), so it needs no PING to keep a NAT entry warm either.
         let (sender, conn) = http2::Builder::new(TokioExecutor::new())
             .timer(TokioTimer::new())
-            .keep_alive_interval(H2_KEEPALIVE_INTERVAL)
-            .keep_alive_timeout(H2_KEEPALIVE_TIMEOUT)
-            .keep_alive_while_idle(true)
             .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
             .await
             .map_err(|e| {
@@ -1903,16 +2405,34 @@ impl OhttpClient {
         let host = target.host.clone();
         tokio::spawn(async move {
             if let Err(e) = conn.await {
-                tracing::debug!(host = %host, err = %e, "ohttp: h2 connection ended");
+                tracing::debug!(host = %host, err = ?e, "ohttp: h2 connection ended");
             }
         });
         tracing::info!(
             via_tor = self.dialer.is_tor(),
             "ohttp: opened pooled h2 connection"
         );
+        // Over Tor an idle connection stays pooled: a new one costs a stream and a TLS handshake
+        // through a circuit that, on a slow link, often takes several 8 s dial attempts (device
+        // test 2026-10-31: evicting idle Tor connections after 30 s made a pass fail on three
+        // timed-out dials). A connection whose guard died while idle is found by its next call
+        // instead (H2_STALL_AFTER, then H2_DEAD_IF_GIVEN_UP_AFTER).
+        let idle_limit = (!self.dialer.is_tor()).then_some(H2_IDLE_REUSE);
+        let entry = PooledH2::new(sender, Some((&self.h2_pool, key.clone())), idle_limit);
         let mut pool = self.h2_pool.lock().await;
-        pool.insert(key, (sender.clone(), std::time::Instant::now()));
-        Ok(Some(sender))
+        pool.insert(key, entry.clone());
+        Ok(Some(entry))
+    }
+
+    /// Takes connection `id` out of the pool, unless a newer one has replaced it under
+    /// `pool_key`. Returns whether it was removed.
+    async fn unpool(&self, pool_key: &str, id: u64) -> bool {
+        let mut pool = self.h2_pool.lock().await;
+        let same = pool.get(pool_key).is_some_and(|e| e.id == id);
+        if same {
+            pool.remove(pool_key);
+        }
+        same
     }
 
     fn build_request(
@@ -1960,14 +2480,15 @@ impl OhttpClient {
         health: Option<&RequestHealth>,
         role: HttpsHealthRole,
     ) -> Result<RelayAnswer, HttpsError> {
+        let head_wait = HeadWait::Prompt;
         let req = self
             .build_request(target, method, headers, body)
             .map_err(HttpsError::Configuration)?;
         let pool_key = format!("{}:{}", target.host, target.port);
         let resp = match self.h2_sender(target).await? {
-            Some(mut sender) => {
-                if let Err(e) = sender.ready().await {
-                    self.h2_pool.lock().await.remove(&pool_key);
+            Some(mut entry) => {
+                if let Err(e) = entry.sender.ready().await {
+                    self.unpool(&pool_key, entry.id).await;
                     let label = self.peer_label(target);
                     return Err(HttpsError::PreSend(format!(
                         "h2 ready {label}: {}",
@@ -1975,10 +2496,10 @@ impl OhttpClient {
                     )));
                 }
                 on_send();
-                match sender.send_request(req).await {
-                    Ok(r) => r.map(|b| b.boxed()),
+                match entry.send(req, head_wait).await {
+                    Ok(r) => r,
                     Err(e) => {
-                        self.h2_pool.lock().await.remove(&pool_key);
+                        self.unpool(&pool_key, entry.id).await;
                         return Err(HttpsError::classify_send_error(
                             e,
                             &target.host,
@@ -2111,6 +2632,7 @@ impl OhttpClient {
         &self,
         body: Vec<u8>,
         on_send: &F,
+        head_wait: HeadWait,
     ) -> Result<RelayStream, HttpsError> {
         self.relay_pause_before_post()?;
         #[cfg(feature = "client-trace")]
@@ -2118,8 +2640,15 @@ impl OhttpClient {
         #[cfg(not(feature = "client-trace"))]
         let trace: Option<String> = None;
         let headers = self.profile.headers.relay_post(trace.as_deref());
-        self.https_once_stream(&self.relay, Method::POST, &headers, body, on_send)
-            .await
+        self.https_once_stream(
+            &self.relay,
+            Method::POST,
+            &headers,
+            body,
+            on_send,
+            head_wait,
+        )
+        .await
     }
 
     /// Like https_once but returns the response stream instead of buffering the body. `on_send`
@@ -2131,15 +2660,17 @@ impl OhttpClient {
         headers: &[(&'static str, String)],
         body: Vec<u8>,
         on_send: &F,
+        head_wait: HeadWait,
     ) -> Result<RelayStream, HttpsError> {
         let req = self
             .build_request(target, method, headers, body)
             .map_err(HttpsError::Configuration)?;
         let pool_key = format!("{}:{}", target.host, target.port);
-        let resp = match self.h2_sender(target).await? {
-            Some(mut sender) => {
-                if let Err(e) = sender.ready().await {
-                    self.h2_pool.lock().await.remove(&pool_key);
+        let (resp, activity) = match self.h2_sender(target).await? {
+            Some(mut entry) => {
+                let act = Some(Arc::clone(&entry.activity));
+                if let Err(e) = entry.sender.ready().await {
+                    self.unpool(&pool_key, entry.id).await;
                     let label = self.peer_label(target);
                     return Err(HttpsError::PreSend(format!(
                         "h2 ready {label}: {}",
@@ -2147,10 +2678,10 @@ impl OhttpClient {
                     )));
                 }
                 on_send();
-                match sender.send_request(req).await {
-                    Ok(r) => r.map(|b| b.boxed()),
+                match entry.send(req, head_wait).await {
+                    Ok(r) => (r, act),
                     Err(e) => {
-                        self.h2_pool.lock().await.remove(&pool_key);
+                        self.unpool(&pool_key, entry.id).await;
                         return Err(HttpsError::classify_send_error(
                             e,
                             &target.host,
@@ -2168,7 +2699,7 @@ impl OhttpClient {
                     let _ = conn.await;
                 });
                 on_send();
-                sender
+                let resp = sender
                     .send_request(req)
                     .await
                     .map_err(|e| {
@@ -2178,7 +2709,8 @@ impl OhttpClient {
                             redact_host(e, &target.host, label)
                         ))
                     })?
-                    .map(|b| b.boxed())
+                    .map(|b| b.boxed());
+                (resp, None)
             }
         };
         let (parts, body) = resp.into_parts();
@@ -2193,6 +2725,7 @@ impl OhttpClient {
             content_type,
             retry_after: retry_after(&parts.headers),
             body,
+            activity,
         })
     }
 
@@ -2737,10 +3270,11 @@ impl OhttpClient {
         self.check_relay_pause()?;
         let key = self.key_config_observed(false, health).await?;
         let this = self;
+        let head_wait = HeadWait::for_path(&request.path);
         let (decoder, answer) = run_exchange_chunked_observed(
             key,
             &request,
-            move |body| this.post_sealed_stream(body, on_dispatch),
+            move |body| this.post_sealed_stream(body, on_dispatch, head_wait),
             move || this.key_config_observed(true, health),
             health,
         )
@@ -2750,7 +3284,13 @@ impl OhttpClient {
         let (tx, rx) = mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
         let guard = this.profile.limits.response_guard();
 
-        tokio::spawn(pump_chunked_body(answer.body, decoder, guard, tx));
+        tokio::spawn(pump_chunked_body(
+            answer.body,
+            decoder,
+            guard,
+            tx,
+            answer.activity,
+        ));
 
         // Wait for first Head event
         let mut rx = tokio_stream::wrappers::ReceiverStream::new(rx);
@@ -3357,6 +3897,330 @@ pub(crate) mod tests {
     }
 
     use super::*;
+
+    /// The instant `by` before now, for the tests of `H2Activity` (it reads the real clock).
+    fn back(by: Duration) -> std::time::Instant {
+        std::time::Instant::now()
+            .checked_sub(by)
+            .expect("the clock is past the test offsets")
+    }
+
+    /// Makes every clock of `activity` read `by` ago.
+    fn age(activity: &H2Activity, by: Duration) {
+        let mut t = activity.times();
+        t.last_frame = back(by);
+        t.waiting_since = [back(by); 2];
+    }
+
+    fn is_dead(activity: &H2Activity) -> bool {
+        activity.dead.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    #[test]
+    fn a_waiting_prompt_call_with_no_frames_stalls_the_connection() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        assert!(activity.usable(), "just opened");
+        let mut call = activity.start(HeadWait::Prompt);
+        assert!(
+            activity.usable(),
+            "a call starting to wait gets the full window"
+        );
+        age(&activity, H2_STALL_AFTER + Duration::from_secs(1));
+        call.waiting_since = back(H2_STALL_AFTER + Duration::from_secs(1));
+        assert!(!activity.usable(), "waiting with nothing arriving: stalled");
+        drop(call);
+        assert!(
+            is_dead(&activity),
+            "given up while waiting with nothing since: dead"
+        );
+        assert!(!activity.usable());
+    }
+
+    #[test]
+    fn a_lookup_racing_the_last_stalled_call_drop_never_sees_it_usable() {
+        // Before and after the drop the connection is unusable (stalled, then dead); a lookup
+        // during the drop must not see the old `dead == false` with the new idle state.
+        let silent = H2_STALL_AFTER.max(H2_DEAD_IF_GIVEN_UP_AFTER) + Duration::from_secs(1);
+        let mut accepted = 0usize;
+        for _ in 0..20_000 {
+            let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+            let mut call = activity.start(HeadWait::Prompt);
+            age(&activity, silent);
+            call.waiting_since = back(silent);
+            assert!(!activity.usable(), "stalled before the drop");
+            let probe = Arc::clone(&activity);
+            let checker = std::thread::spawn(move || (0..64).filter(|_| probe.usable()).count());
+            drop(call);
+            accepted += checker.join().expect("checker thread");
+            assert!(is_dead(&activity), "given up while stalled: dead");
+        }
+        assert_eq!(accepted, 0, "a dead connection was reported usable");
+    }
+
+    #[test]
+    fn a_prompt_call_given_up_after_a_short_silence_marks_the_connection_dead() {
+        // The head arrived late, the connection died, and the deadline came before the
+        // silence reached the stall bound: the retry must not reuse it.
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut call = activity.start(HeadWait::Prompt);
+        call.arrived();
+        call.wait();
+        activity.times().last_frame = back(H2_DEAD_IF_GIVEN_UP_AFTER + Duration::from_secs(2));
+        call.waiting_since = back(H2_DEAD_IF_GIVEN_UP_AFTER + Duration::from_secs(1));
+        drop(call);
+        assert!(is_dead(&activity));
+    }
+
+    #[test]
+    fn a_call_cut_on_purpose_right_away_does_not_mark_the_connection_dead() {
+        // A fetch kick or stream cut drops a call that was just waiting for its next frame.
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut call = activity.start(HeadWait::Prompt);
+        call.arrived();
+        call.wait();
+        drop(call);
+        assert!(!is_dead(&activity));
+    }
+
+    #[test]
+    fn a_call_given_up_while_another_call_receives_data_does_not_mark_dead() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut call = activity.start(HeadWait::Prompt);
+        let mut other = activity.start(HeadWait::Prompt);
+        // Waiting long enough that, without the other call's frame, giving it up marks dead.
+        call.waiting_since = back(H2_STALL_AFTER + Duration::from_secs(1));
+        other.arrived(); // a frame for the other call: the connection is alive
+        drop(call);
+        assert!(!is_dead(&activity));
+        assert!(activity.usable());
+    }
+
+    #[test]
+    fn a_call_given_up_long_after_another_calls_last_frame_marks_dead() {
+        // Call A waits; call B gets its last frame early and ends; then nothing arrives. When
+        // A is given up the connection has been silent past the stall bound: it must not turn
+        // reusable once A, its last call, leaves.
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut call = activity.start(HeadWait::Prompt);
+        let mut other = activity.start(HeadWait::Prompt);
+        call.waiting_since = back(H2_STALL_AFTER + Duration::from_secs(10));
+        activity.times().waiting_since = [back(H2_STALL_AFTER + Duration::from_secs(10)); 2];
+        other.arrived();
+        other.answered = true;
+        activity.times().last_frame = back(H2_STALL_AFTER + Duration::from_secs(9));
+        drop(other);
+        assert!(!activity.usable(), "waiting with nothing arriving: stalled");
+        drop(call);
+        assert!(
+            is_dead(&activity),
+            "the old frame does not vouch for the connection"
+        );
+        assert!(!activity.usable(), "a stalled connection stays out of use");
+    }
+
+    #[test]
+    fn a_long_poll_given_up_by_the_body_pump_marks_dead() {
+        // The head arrived, then no body frame: the body pump drops the stream after
+        // CHUNK_IDLE_TIMEOUT, before the long-poll stall bound.
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut poll = activity.start(HeadWait::LongPoll);
+        poll.head_arrived = true;
+        poll.arrived();
+        poll.wait();
+        age(&activity, CHUNK_IDLE_TIMEOUT);
+        poll.waiting_since = back(CHUNK_IDLE_TIMEOUT);
+        drop(poll);
+        assert!(is_dead(&activity));
+        assert!(!activity.usable(), "the next call dials a new connection");
+    }
+
+    /// The body pump's timer starts before the body is polled, so when it fires the call's own
+    /// wait is a little short of [`CHUNK_IDLE_TIMEOUT`] and its drop alone does not mark the
+    /// connection dead: the pump does. Paused time moves the pump's timer but not the real clock
+    /// `H2Activity` reads, so here the call's wait is short of the bound by nearly all of it.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_poll_the_body_pump_gives_up_on_retires_its_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A closed port: a call that does not reuse the pooled connection fails to dial.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        drop(listener);
+        let client = client_with_a_key_for_a_relay_on(port).await;
+        let posts = Arc::new(AtomicUsize::new(0));
+        serve_in_process_relay(&client, {
+            let posts = Arc::clone(&posts);
+            move |_req| {
+                posts.fetch_add(1, Ordering::SeqCst);
+                async {
+                    // The outer head, then a body that stays silent.
+                    let silent =
+                        futures_util::stream::pending::<Result<Frame<Bytes>, Infallible>>();
+                    let mut answer = Response::new(BodyExt::boxed(StreamBody::new(silent)));
+                    answer.headers_mut().insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static(CONTENT_TYPE_CHUNKED_RES),
+                    );
+                    answer
+                }
+            }
+        })
+        .await;
+        let mempool = || {
+            BhttpRequest::new(
+                "POST",
+                "gw.example",
+                "/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream",
+            )
+            .header("content-type", "application/grpc")
+            .body(vec![0, 0, 0, 0, 0])
+        };
+
+        let started = tokio::time::Instant::now();
+        let err = client
+            .round_trip_stream(mempool(), || {})
+            .await
+            .err()
+            .expect("a silent body is given up");
+        assert!(matches!(err, RoundTripError::Transport(_)), "{err:?}");
+        assert!(
+            started.elapsed() >= CHUNK_IDLE_TIMEOUT,
+            "given up by the pump"
+        );
+        let pooled = client
+            .h2_pool
+            .lock()
+            .await
+            .get(&format!("127.0.0.1:{port}"))
+            .cloned()
+            .expect("pooled");
+        assert!(is_dead(&pooled.activity));
+        assert!(
+            !pooled.reusable(false),
+            "the next call dials a new connection"
+        );
+
+        let _ = client.round_trip_stream(mempool(), || {}).await;
+        assert_eq!(
+            posts.load(Ordering::SeqCst),
+            1,
+            "the next call did not reuse it"
+        );
+    }
+
+    #[test]
+    fn the_body_pump_giving_up_leaves_a_connection_with_recent_frames_alone() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let since = back(Duration::from_millis(1));
+        let mut other = activity.start(HeadWait::Prompt);
+        other.arrived(); // a frame for another call after the pump started to wait
+        activity.given_up_silent_since(since);
+        assert!(!is_dead(&activity));
+        activity.given_up_silent_since(std::time::Instant::now());
+        assert!(is_dead(&activity));
+    }
+
+    #[test]
+    fn a_prompt_call_after_a_quiet_long_poll_gets_its_own_window() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let _poll = activity.start(HeadWait::LongPoll);
+        age(&activity, H2_STALL_AFTER + Duration::from_secs(1));
+        let _call = activity.start(HeadWait::Prompt);
+        assert!(
+            activity.usable(),
+            "the prompt window counts from the prompt call"
+        );
+    }
+
+    #[test]
+    fn a_long_poll_stalls_only_past_the_longest_healthy_silence() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut poll = activity.start(HeadWait::LongPoll);
+        age(&activity, H2_STALL_AFTER + Duration::from_secs(1));
+        assert!(activity.usable(), "a healthy gateway can be this quiet");
+        age(&activity, H2_LONG_POLL_STALL_AFTER + Duration::from_secs(1));
+        poll.waiting_since = back(H2_LONG_POLL_STALL_AFTER + Duration::from_secs(1));
+        assert!(!activity.usable(), "no healthy gateway is this quiet");
+        drop(poll);
+        assert!(is_dead(&activity));
+    }
+
+    #[test]
+    fn a_quiet_long_poll_given_up_early_or_an_answered_call_does_not_mark_dead() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut poll = activity.start(HeadWait::LongPoll);
+        age(&activity, H2_STALL_AFTER + Duration::from_secs(1));
+        poll.waiting_since = back(H2_STALL_AFTER + Duration::from_secs(1));
+        drop(poll);
+        assert!(!is_dead(&activity), "within the long-poll bound");
+
+        let mut call = activity.start(HeadWait::Prompt);
+        call.answered = true;
+        drop(call);
+        assert!(
+            !is_dead(&activity),
+            "an answered call proves the connection works"
+        );
+    }
+
+    #[test]
+    fn a_reader_that_paused_does_not_make_the_connection_look_stalled() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut call = activity.start(HeadWait::Prompt);
+        call.arrived(); // a frame arrived; the reader has not asked for the next one yet
+        age(&activity, H2_STALL_AFTER + Duration::from_secs(1));
+        assert!(activity.usable(), "nobody waits on the network");
+        call.answered = true;
+        drop(call);
+        assert!(!is_dead(&activity), "not waiting when it ended");
+    }
+
+    #[test]
+    fn handing_a_connection_out_counts_as_use() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        activity.times().idle_since = back(H2_IDLE_REUSE + Duration::from_secs(1));
+        assert!(activity.idle());
+        activity.handed_out();
+        assert!(!activity.idle(), "a caller is about to use it");
+        assert!(activity.usable());
+    }
+
+    #[test]
+    fn a_pooled_connection_idle_for_the_reuse_limit_is_not_reused() {
+        let activity = Arc::new(H2Activity::new(None, Some(H2_IDLE_REUSE)));
+        let mut first = activity.start(HeadWait::Prompt);
+        let mut second = activity.start(HeadWait::Prompt);
+        second.answered = true;
+        drop(second);
+        activity.times().idle_since = back(H2_IDLE_REUSE + Duration::from_secs(1));
+        assert!(activity.usable(), "a call is still in flight: not idle");
+        first.answered = true;
+        drop(first);
+        assert!(
+            activity.usable(),
+            "idle since the last call ended, not since it opened"
+        );
+        activity.times().idle_since = back(H2_IDLE_REUSE + Duration::from_secs(1));
+        assert!(!activity.usable(), "idle for the reuse limit");
+        assert!(!is_dead(&activity));
+    }
+
+    #[test]
+    fn only_the_mempool_long_poll_is_not_a_prompt_call() {
+        assert_eq!(
+            HeadWait::for_path(b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolStream"),
+            HeadWait::LongPoll
+        );
+        for path in [
+            &b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetBlockRange"[..],
+            b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetTreeState",
+            b"/cash.z.wallet.sdk.rpc.CompactTxStreamer/GetMempoolTx",
+        ] {
+            assert_eq!(HeadWait::for_path(path), HeadWait::Prompt);
+        }
+    }
     use base64::Engine;
     use std::cell::Cell;
     use std::sync::Mutex as StdMutex;
@@ -5334,7 +6198,7 @@ pub(crate) mod tests {
         })
         .await;
         let key = format!("{}:{}", client.relay.host, client.relay.port);
-        let opened = client.h2_pool.lock().await.get(&key).unwrap().1;
+        let opened = client.h2_pool.lock().await.get(&key).unwrap().opened;
         let raw = health_tonic_client(client.clone()).await;
         let tracked = crate::grpc::TrackedConnection::ohttp(
             raw,
@@ -5367,7 +6231,7 @@ pub(crate) mod tests {
         assert_ne!(rejection.request_id, timeout.request_id);
         assert_eq!(dispatches.load(Ordering::SeqCst), 2);
         assert_eq!(
-            client.h2_pool.lock().await.get(&key).unwrap().1,
+            client.h2_pool.lock().await.get(&key).unwrap().opened,
             opened,
             "the actual relay h2 connection is reused"
         );
@@ -5410,7 +6274,7 @@ pub(crate) mod tests {
             })
             .await;
             let key = format!("{}:{}", client.relay.host, client.relay.port);
-            let opened = client.h2_pool.lock().await.get(&key).unwrap().1;
+            let opened = client.h2_pool.lock().await.get(&key).unwrap().opened;
             let raw = health_tonic_client(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
@@ -5475,7 +6339,10 @@ pub(crate) mod tests {
                 2,
                 "no observation-only dispatch/replay"
             );
-            assert_eq!(client.h2_pool.lock().await.get(&key).unwrap().1, opened);
+            assert_eq!(
+                client.h2_pool.lock().await.get(&key).unwrap().opened,
+                opened
+            );
         }
     }
 
@@ -6489,6 +7356,7 @@ pub(crate) mod tests {
                 body: Full::new(Bytes::from_static(b"x"))
                     .map_err(|never: Infallible| match never {})
                     .boxed(),
+                activity: None,
             }
         }
         let err = run_exchange_chunked(
@@ -7353,7 +8221,7 @@ pub(crate) mod tests {
         });
         client.h2_pool.lock().await.insert(
             format!("{}:{}", client.relay.host, client.relay.port),
-            (sender, std::time::Instant::now()),
+            PooledH2::new(sender, None, Some(H2_IDLE_REUSE)),
         );
     }
 
@@ -7569,7 +8437,7 @@ pub(crate) mod tests {
 
         let streamed = tokio::time::timeout(
             Duration::from_secs(10),
-            client.post_sealed_stream(vec![0u8; 32], &hook),
+            client.post_sealed_stream(vec![0u8; 32], &hook, HeadWait::Prompt),
         )
         .await
         .expect("the post must finish")
@@ -8087,6 +8955,7 @@ pub(crate) mod tests {
                     body: Full::new(Bytes::new())
                         .map_err(|never: Infallible| match never {})
                         .boxed(),
+                    activity: None,
                 })
             },
             || async { unreachable!("no refetch on 200") },
@@ -8097,7 +8966,13 @@ pub(crate) mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let body = StreamBody::new(PendingBody(dropped.clone())).boxed();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
-        let task = tokio::spawn(pump_chunked_body(body, decoder, SizeGuard::new(None), tx));
+        let task = tokio::spawn(pump_chunked_body(
+            body,
+            decoder,
+            SizeGuard::new(None),
+            tx,
+            None,
+        ));
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(
@@ -8144,6 +9019,7 @@ pub(crate) mod tests {
                     body: Full::new(Bytes::new())
                         .map_err(|never: Infallible| match never {})
                         .boxed(),
+                    activity: None,
                 })
             },
             || async { unreachable!("no refetch on 429") },
@@ -8536,6 +9412,7 @@ pub(crate) mod tests {
                     body: Full::new(Bytes::new())
                         .map_err(|never: Infallible| match never {})
                         .boxed(),
+                    activity: None,
                 })
             },
             || async { unreachable!("no refetch on 200") },
@@ -8546,7 +9423,7 @@ pub(crate) mod tests {
             .map_err(|never: Infallible| match never {})
             .boxed();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<ResponseEvent, PumpError>>(16);
-        pump_chunked_body(body, decoder, SizeGuard::new(None), tx).await;
+        pump_chunked_body(body, decoder, SizeGuard::new(None), tx, None).await;
         assert!(matches!(
             rx.recv().await,
             Some(Err(PumpError::Transport(_)))
@@ -8706,6 +9583,7 @@ pub(crate) mod tests {
             Err(RoundTripError::RateLimited { .. })
         ));
     }
+
     /// The testnet endpoint values of the build: gateway host, relay URL, DNS TXT name and
     /// signing key.
     fn configured_testnet_endpoints() -> (
