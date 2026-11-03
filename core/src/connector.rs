@@ -735,7 +735,7 @@ mod tests {
 
     fn ohttp_endpoint() -> Endpoint {
         Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: crate::ohttp::tests::testnet_gateway().into(),
             port: 443,
             tls: true,
         }
@@ -982,7 +982,7 @@ mod tests {
             route(ConnPurpose::MetadataDefault, true),
             Some(TorMode::Default)
         );
-        assert!(crate::ohttp::relay_for("ohttp-gateway-testnet.example").is_some());
+        assert!(crate::ohttp::relay_for(crate::ohttp::tests::testnet_gateway()).is_some());
         // Public sync metadata shares the session connection on the default circuit.
         assert_eq!(route(ConnPurpose::SyncShared, true), Some(TorMode::Shared));
         assert_eq!(route(ConnPurpose::SyncShared, false), Some(TorMode::Shared));
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn bulk_chunk_cap_applies_to_ohttp_only() {
         let gw = Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: crate::ohttp::tests::testnet_gateway().into(),
             port: 443,
             tls: true,
         };

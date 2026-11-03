@@ -81,7 +81,7 @@ use zodl_ohttp_client::{
     GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfig, Network,
     NetworkRule, RelayBackoff, ResponseEvent, SizeGuard, check_size, doh_query_url,
     encapsulate_chunked_request, envelope_from_doh_json, key_config_dns_name, signed_config_url,
-    verify_signed_config,
+    verify_signed_config_with,
 };
 
 #[cfg(feature = "client-trace")]
@@ -306,12 +306,25 @@ fn cached_or_new_client(
 /// Relay URL for a given gateway host. One relay per gateway: mainnet and testnet gateways use
 /// different HPKE keys, and an RFC 9458 relay has a single fixed gateway target.
 ///
-/// Production relay selection is owned by `zodl-ohttp-client`.
-/// Relay URLs can be overridden at build time via environment variables
-/// `ZODL_OHTTP_RELAY_URL_MAINNET` and `ZODL_OHTTP_RELAY_URL_TESTNET` (see `zodl-ohttp-client`
-/// documentation).
+/// Gateway hosts, relay URLs, signing public keys and DNS TXT names come from the
+/// `ZODL_OHTTP_GATEWAY_HOST_*`, `ZODL_OHTTP_RELAY_URL_*`, `ZODL_OHTTP_SIGNING_PUBKEY_*`
+/// and `ZODL_OHTTP_KEYS_DNS_NAME_*` build-time inputs of `zodl-ohttp-client`.
+/// No endpoints or signing keys are bundled. A network without a gateway host, relay URL
+/// or signer has no relay; an absent DNS name disables only its DNS fallback.
 pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
-    zodl_ohttp_client::relay_for(gateway_host)
+    zodl_ohttp_client::relay_for(canonical_gateway_host(gateway_host)?)
+}
+
+/// DNS host matching ignores ASCII case, while the core expects its exact configured string.
+/// Preserve configured order for routing; network resolution rejects ambiguous identities.
+fn canonical_gateway_host(gateway_host: &str) -> Option<&'static str> {
+    [
+        zodl_ohttp_client::GATEWAY_HOST_MAINNET,
+        zodl_ohttp_client::GATEWAY_HOST_TESTNET,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|configured| configured.eq_ignore_ascii_case(gateway_host))
 }
 
 /// Object-safe alias for the byte stream underneath TLS (a plain TCP socket or an arti Tor
@@ -579,11 +592,19 @@ fn unix_now() -> Result<u64, String> {
         .map_err(|e| format!("system time: {e}"))
 }
 
-/// The network a gateway serves, by exact host: the envelope must name it, and the wallet using
-/// the gateway must be on it (`EngineConfig::validate`, [`http_round_trip`]).
+/// The network a configured DNS gateway serves, ignoring case. The envelope and wallet must
+/// both use that network (`EngineConfig::validate`, [`http_round_trip`]).
 pub(crate) fn gateway_network(gateway_host: &str) -> Result<Network, String> {
+    let canonical = canonical_gateway_host(gateway_host)
+        .ok_or_else(|| format!("no OHTTP network configured for gateway host {gateway_host}"))?;
+    if zodl_ohttp_client::GATEWAY_HOST_MAINNET
+        .zip(zodl_ohttp_client::GATEWAY_HOST_TESTNET)
+        .is_some_and(|(mainnet, testnet)| mainnet.eq_ignore_ascii_case(testnet))
+    {
+        return Err("ambiguous OHTTP gateway: mainnet and testnet hosts must be distinct".into());
+    }
     NetworkRule::KnownHosts
-        .network_for(gateway_host)
+        .network_for(canonical)
         .map_err(|e| e.to_string())
 }
 
@@ -619,8 +640,21 @@ fn open_signed_keys(
     now: u64,
 ) -> Result<CachedKey, String> {
     let network = gateway_network(gateway_host)?;
-    let keys = verify_signed_config(json, network, now, &profile.signed_config)
-        .map_err(|e| e.to_string())?;
+    let signer = network.pinned_signing_key().map_err(|e| e.to_string())?;
+    open_signed_keys_with(profile, json, network, &signer, now)
+}
+
+/// The shared verification and selection boundary, with the signer resolved by the caller.
+fn open_signed_keys_with(
+    profile: &ClientProfile,
+    json: &[u8],
+    network: Network,
+    signer: &zodl_ohttp_client::VerifyingKey,
+    now: u64,
+) -> Result<CachedKey, String> {
+    let keys =
+        verify_signed_config_with(json, network.as_str(), signer, now, &profile.signed_config)
+            .map_err(|e| e.to_string())?;
     let config = KeyConfig::select_with(&keys.document, &profile.key_selection)
         .map_err(|e| e.to_string())?;
     Ok(CachedKey {
@@ -2127,10 +2161,19 @@ impl OhttpClient {
             }
         }
 
-        // The relay's running pause, and a relay or signed config URL that is not https, fail
-        // closed before any request and without the DNS fallback. The gateway host is only looked
-        // up when the relay has failed: a host outside the static configuration keeps the relay
-        // error.
+        // Resolve the configured signer before dispatch: a missing trust anchor cannot
+        // be repaired by either a relay fetch or DNS fallback.
+        gateway_network(&self.gateway_host)
+            .and_then(|network| network.pinned_signing_key().map_err(|e| e.to_string()))
+            .map_err(|detail| {
+                if let Some(health) = health {
+                    health.classify(HealthOutcome::ConfigurationFailure);
+                }
+                RoundTripError::Transport(detail)
+            })?;
+
+        // The relay's running pause, and a relay or signed config URL that is not https,
+        // fail closed before any request and without the DNS fallback.
         self.check_relay_pause()?;
         parse_https(&self.relay_url).map_err(RoundTripError::Transport)?;
         let signed_config_url_str =
@@ -2231,12 +2274,15 @@ impl OhttpClient {
         let Ok(network) = gateway_network(&self.gateway_host) else {
             return Err(relay_err);
         };
+        let Some(dns_name) = key_config_dns_name(network) else {
+            return Err(relay_err);
+        };
         tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
-
-        let dns_name = key_config_dns_name(network);
         for resolver in DOH_RESOLVERS {
             self.check_relay_pause()?;
-            let doh_url = doh_query_url(resolver, network);
+            let Some(doh_url) = doh_query_url(resolver, network) else {
+                return Err(relay_err);
+            };
             tracing::debug!(resolver = %resolver, dns_name = %dns_name, "ohttp: trying DoH resolver");
 
             let dns_result = async {
@@ -3183,6 +3229,37 @@ fn grpc_error_with(
 
 #[cfg(test)]
 pub(crate) mod tests {
+    pub(crate) fn mainnet_gateway() -> &'static str {
+        env!(
+            "ZODL_OHTTP_GATEWAY_HOST_MAINNET",
+            "set ZODL_OHTTP_GATEWAY_HOST_MAINNET for configured transport tests"
+        )
+    }
+
+    pub(crate) fn testnet_gateway() -> &'static str {
+        env!(
+            "ZODL_OHTTP_GATEWAY_HOST_TESTNET",
+            "set ZODL_OHTTP_GATEWAY_HOST_TESTNET for configured transport tests"
+        )
+    }
+
+    /// A public synthetic signer. Only the fixture supplies it; production resolves its
+    /// trust anchor from the native core before entering this same verification boundary.
+    fn open_fixture_signed_keys(
+        profile: &ClientProfile,
+        json: &[u8],
+        gateway_host: &str,
+        now: u64,
+    ) -> Result<CachedKey, String> {
+        let signer = zodl_ohttp_client::VerifyingKey::from_bytes(&[
+            0xa0, 0x9a, 0xa5, 0xf4, 0x7a, 0x67, 0x59, 0x80, 0x2f, 0xf9, 0x55, 0xf8, 0xdc, 0x2d,
+            0x2a, 0x14, 0xa5, 0xc9, 0x9d, 0x23, 0xbe, 0x97, 0xf8, 0x64, 0x12, 0x7f, 0xf9, 0x38,
+            0x34, 0x55, 0xa4, 0xf0,
+        ])
+        .expect("public test key");
+        open_signed_keys_with(profile, json, gateway_network(gateway_host)?, &signer, now)
+    }
+
     use super::*;
     use base64::Engine;
     use std::cell::Cell;
@@ -3959,10 +4036,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn health_key_verification_after_fallback_keeps_configuration_classification() {
         use crate::transport_health::{HealthOutcome, HealthStage};
-        // Unknown gateway intentionally has no DNS record: real key fetch and the actual
-        // fallback gate return its original typed verification failure without a DNS leak.
+        // A real key fetch and refused in-process DNS resolvers preserve the original
+        // typed verification failure without contacting any live endpoint.
         let client = OhttpClient::new(
-            "health-no-dns.invalid",
+            testnet_gateway(),
             "https://health-key-verification.invalid/relay",
             Dialer::Direct,
             None,
@@ -3970,16 +4047,23 @@ pub(crate) mod tests {
         )
         .unwrap();
         let subscription = health_subscription(&client);
+        let dns_queries = refuse_dns_queries(&client).await;
         serve_in_process_relay(&client, |_| async {
             Response::new(Full::new(Bytes::from_static(b"invalid signed envelope")).boxed())
         })
         .await;
+        let error = client
+            .round_trip_stream(test_request(), || {})
+            .await
+            .err()
+            .expect("key fetch must fail");
         assert!(
-            client
-                .round_trip_stream(test_request(), || {})
-                .await
-                .is_err()
+            error
+                .to_string()
+                .contains("relay envelope verification failed"),
+            "{error:?}"
         );
+        assert_eq!(dns_queries.load(Ordering::SeqCst), DOH_RESOLVERS.len());
         assert!(
             subscription
                 .snapshot()
@@ -3999,7 +4083,8 @@ pub(crate) mod tests {
 
     async fn health_tonic_client(client: Arc<OhttpClient>) -> crate::grpc::LwdClient {
         let channel =
-            tonic::transport::Endpoint::from_static("http://ohttp-gateway-testnet.example:443")
+            tonic::transport::Endpoint::from_shared(format!("http://{}:443", testnet_gateway()))
+                .unwrap()
                 .connect_with_connector(OhttpConnector {
                     client,
                     health: None,
@@ -4013,7 +4098,7 @@ pub(crate) mod tests {
     async fn health_real_outer_unary_deadline_reports_before_native_head_timeout() {
         use crate::transport_health::{HealthOutcome, HealthScope, HealthStage};
         let mut client = health_fixture_client("health-outer-deadline", true).await;
-        client.gateway_host = "ohttp-gateway-testnet.example".into();
+        client.gateway_host = testnet_gateway().into();
         // The explicit route scope must use this fixture relay, so construct it directly.
         let route = HealthRoute {
             gateway_host: client.gateway_host.clone(),
@@ -4131,7 +4216,7 @@ pub(crate) mod tests {
     #[tokio::test(start_paused = true)]
     async fn health_follow_tip_owner_captures_the_selected_endpoint_deadline() {
         use crate::transport_health::HealthOutcome;
-        let gateway = "ohttp-gateway-testnet.example";
+        let gateway = testnet_gateway();
         let relay = relay_for(gateway).unwrap();
         let client = get_or_create_client(
             gateway,
@@ -4239,7 +4324,7 @@ pub(crate) mod tests {
     async fn health_key_dns_fallback_preserves_typed_origin_failure() {
         use crate::transport_health::{HealthOutcome, HealthStage};
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://health-real-fallback.invalid/relay",
             Dialer::Direct,
             None,
@@ -4253,7 +4338,9 @@ pub(crate) mod tests {
         .await;
         let lookups = Arc::new(AtomicUsize::new(0));
         for resolver in DOH_RESOLVERS {
-            let target = parse_https(&doh_query_url(resolver, Network::Testnet)).unwrap();
+            let target =
+                parse_https(&doh_query_url(resolver, Network::Testnet).expect("configured DNS"))
+                    .unwrap();
             let peer = OhttpClient::new(
                 "unused.invalid",
                 &format!("https://{}:{}{}", target.host, target.port, target.path),
@@ -4298,7 +4385,7 @@ pub(crate) mod tests {
         use crate::transport_health::{HealthOutcome, HealthStage};
         let client = Arc::new(
             OhttpClient::new(
-                "unknown-health.invalid",
+                testnet_gateway(),
                 "https://health-warmup.invalid/relay",
                 Dialer::Direct,
                 None,
@@ -4461,7 +4548,7 @@ pub(crate) mod tests {
     async fn health_oversized_signed_config_is_configuration_failure() {
         use crate::transport_health::{HealthOutcome, HealthStage};
         let client = OhttpClient::new(
-            "health-config-size.invalid",
+            testnet_gateway(),
             "https://health-config-size-relay.invalid/relay",
             Dialer::Direct,
             None,
@@ -4469,13 +4556,15 @@ pub(crate) mod tests {
         )
         .unwrap();
         let subscription = health_subscription(&client);
+        let dns_queries = refuse_dns_queries(&client).await;
         serve_in_process_relay(&client, |_| async { filler_answer(64 * 1024 + 1) }).await;
-        assert!(
-            client
-                .round_trip_stream(test_request(), || {})
-                .await
-                .is_err()
-        );
+        let error = client
+            .round_trip_stream(test_request(), || {})
+            .await
+            .err()
+            .expect("key fetch must fail");
+        assert!(error.to_string().contains("65536"), "{error:?}");
+        assert_eq!(dns_queries.load(Ordering::SeqCst), DOH_RESOLVERS.len());
         assert!(
             subscription
                 .snapshot()
@@ -4870,7 +4959,7 @@ pub(crate) mod tests {
         ] {
             let client = Arc::new(
                 OhttpClient::new(
-                    "health-owner-rejection.invalid",
+                    testnet_gateway(),
                     &format!("https://health-owner-key-{status}.invalid/relay"),
                     Dialer::Direct,
                     None,
@@ -4962,7 +5051,7 @@ pub(crate) mod tests {
             .unwrap();
         let client = Arc::new(
             OhttpClient::new(
-                "health-tor-owner.invalid",
+                testnet_gateway(),
                 "https://health-tor-owner-relay.invalid/relay",
                 Dialer::Tor(tor),
                 None,
@@ -5007,7 +5096,7 @@ pub(crate) mod tests {
     async fn health_recoverable_outer_rejection_resets_before_key_fetch_blackhole() {
         for status in [400, 422] {
             let relay = format!("https://health-reset-{status}.invalid/relay");
-            let gateway = "health-reset.invalid";
+            let gateway = testnet_gateway();
             let client = get_or_create_client(
                 gateway,
                 &relay,
@@ -5328,7 +5417,7 @@ pub(crate) mod tests {
     async fn http_round_trip_refuses_a_gateway_of_another_network() {
         let dispatched = std::sync::atomic::AtomicBool::new(false);
         let err = http_round_trip_with_dispatch(
-            "ohttp-gateway.example",
+            mainnet_gateway(),
             NetworkType::Test,
             Dialer::Direct,
             "GET",
@@ -5345,12 +5434,10 @@ pub(crate) mod tests {
             "{err:?}"
         );
         assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
-        assert!(check_gateway_network("ohttp-gateway.example", NetworkType::Main).is_ok());
-        assert!(check_gateway_network("ohttp-gateway-testnet.example", NetworkType::Test).is_ok());
-        assert!(
-            check_gateway_network("ohttp-gateway-testnet.example", NetworkType::Main).is_err()
-        );
-        assert!(check_gateway_network("ohttp-gateway.example", NetworkType::Regtest).is_err());
+        assert!(check_gateway_network(mainnet_gateway(), NetworkType::Main).is_ok());
+        assert!(check_gateway_network(testnet_gateway(), NetworkType::Test).is_ok());
+        assert!(check_gateway_network(testnet_gateway(), NetworkType::Main).is_err());
+        assert!(check_gateway_network(mainnet_gateway(), NetworkType::Regtest).is_err());
         assert!(check_gateway_network("gw.example", NetworkType::Main).is_err());
     }
 
@@ -5479,10 +5566,180 @@ pub(crate) mod tests {
         assert!(KeyConfig::select_with(&doc, &ClientProfile::SLIPSTREAM.key_selection).is_err());
     }
 
+    /// Recompiled by scripts/tests/ohttp_configuration.py with complete, absent-source,
+    /// mixed-case and ambiguous-host inputs. Each case uses the real core's configuration.
+    #[tokio::test]
+    async fn compiled_configuration_contract() {
+        let case = std::env::var("SLIPSTREAM_TEST_CONFIGURATION")
+            .unwrap_or_else(|_| "complete".to_owned());
+        match case.as_str() {
+            "complete" => {
+                let main = mainnet_gateway();
+                let test = testnet_gateway();
+                // Static failure diagnostics keep actual Actions configuration out of logs.
+                assert!(relay_for(main) == option_env!("ZODL_OHTTP_RELAY_URL_MAINNET"));
+                assert!(relay_for(test) == option_env!("ZODL_OHTTP_RELAY_URL_TESTNET"));
+                assert!(matches!(gateway_network(main), Ok(Network::Mainnet)));
+                assert!(matches!(gateway_network(test), Ok(Network::Testnet)));
+                assert!(check_gateway_network(test, NetworkType::Main).is_err());
+                assert!(check_gateway_network(main, NetworkType::Test).is_err());
+                assert!(relay_for("unknown-gateway.invalid").is_none());
+                assert!(gateway_network("unknown-gateway.invalid").is_err());
+                for (host, network, relay) in [
+                    (
+                        main,
+                        Network::Mainnet,
+                        option_env!("ZODL_OHTTP_RELAY_URL_MAINNET"),
+                    ),
+                    (
+                        test,
+                        Network::Testnet,
+                        option_env!("ZODL_OHTTP_RELAY_URL_TESTNET"),
+                    ),
+                ] {
+                    for spelling in [host.to_ascii_lowercase(), host.to_ascii_uppercase()] {
+                        assert!(
+                            relay_for(&spelling) == relay,
+                            "DNS hosts are case insensitive"
+                        );
+                        assert!(gateway_network(&spelling) == Ok(network));
+                    }
+                    for lookalike in [format!("prefix.{host}"), format!("{host}.attacker.invalid")]
+                    {
+                        assert!(relay_for(&lookalike).is_none());
+                        assert!(gateway_network(&lookalike).is_err());
+                    }
+                }
+            }
+            "ambiguous-hosts" => {
+                for host in [
+                    mainnet_gateway().to_owned(),
+                    testnet_gateway().to_ascii_uppercase(),
+                ] {
+                    assert!(
+                        relay_for(&host).is_some(),
+                        "recognized gateways must retain OHTTP routing"
+                    );
+                    let client = OhttpClient::new(
+                        &host,
+                        "https://ambiguous-config.invalid/relay",
+                        Dialer::Direct,
+                        None,
+                        ClientProfile::SLIPSTREAM,
+                    )
+                    .unwrap();
+                    let requests = Arc::new(AtomicUsize::new(0));
+                    serve_in_process_relay(&client, {
+                        let requests = requests.clone();
+                        move |_| {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            async {
+                                let mut response = Response::new(Full::new(Bytes::new()).boxed());
+                                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                                response
+                            }
+                        }
+                    })
+                    .await;
+                    let error = client
+                        .key_config(false)
+                        .await
+                        .expect_err("ambiguous network");
+                    assert_eq!(
+                        requests.load(Ordering::SeqCst),
+                        0,
+                        "ambiguous gateway must not dispatch"
+                    );
+                    assert!(error.to_string().contains("ambiguous"), "{error:?}");
+                    assert!(gateway_network(&host).is_err());
+                }
+            }
+            "no-dns" | "no-signing" => {
+                let gateway = testnet_gateway();
+                let relay = "https://configuration-contract.invalid/relay";
+                let client = OhttpClient::new(
+                    gateway,
+                    relay,
+                    Dialer::Direct,
+                    None,
+                    ClientProfile::SLIPSTREAM,
+                )
+                .unwrap();
+                let requests = Arc::new(AtomicUsize::new(0));
+                // A real in-process h2 peer observes any key fetch. A 429 terminates
+                // an accidental fetch without starting a live DNS fallback.
+                serve_in_process_relay(&client, {
+                    let requests = requests.clone();
+                    move |_| {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        async {
+                            let mut answer = Response::new(Full::new(Bytes::new()).boxed());
+                            *answer.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+                            answer
+                        }
+                    }
+                })
+                .await;
+                if case == "no-signing" {
+                    let error = client.key_config(false).await.expect_err("no signing key");
+                    assert_eq!(
+                        requests.load(Ordering::SeqCst),
+                        0,
+                        "no request without a signer"
+                    );
+                    assert!(error.to_string().contains("signing key"), "{error:?}");
+                    assert!(relay_for(gateway).is_none());
+                } else {
+                    // Populate the actual resolver pool keys, so a bug dispatches
+                    // to these peers rather than making live Internet requests.
+                    for resolver in DOH_RESOLVERS {
+                        let target = parse_https(resolver).unwrap();
+                        let peer = OhttpClient::new(
+                            "unused.invalid",
+                            resolver,
+                            Dialer::Direct,
+                            None,
+                            ClientProfile::SLIPSTREAM,
+                        )
+                        .unwrap();
+                        let requests = requests.clone();
+                        serve_in_process_relay(&peer, move |_| {
+                            requests.fetch_add(1, Ordering::SeqCst);
+                            async {
+                                let mut answer = Response::new(Full::new(Bytes::new()).boxed());
+                                *answer.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                                answer
+                            }
+                        })
+                        .await;
+                        let key = format!("{}:{}", target.host, target.port);
+                        let sender = peer.h2_pool.lock().await.remove(&key).unwrap();
+                        client.h2_pool.lock().await.insert(key, sender);
+                    }
+                    let error = client
+                        .key_config_from_dns(RoundTripError::Transport(
+                            "original relay failure".into(),
+                        ))
+                        .await
+                        .expect_err("no DNS source");
+                    assert_eq!(
+                        requests.load(Ordering::SeqCst),
+                        0,
+                        "missing DNS source must not query DoH"
+                    );
+                    assert!(
+                        matches!(error, RoundTripError::Transport(m) if m == "original relay failure")
+                    );
+                }
+            }
+            other => panic!("unknown configuration case: {other}"),
+        }
+    }
+
     #[test]
     fn relay_mapping_covers_both_gateways() {
-        assert!(relay_for("ohttp-gateway-testnet.example").is_some());
-        assert!(relay_for("ohttp-gateway.example").is_some());
+        assert!(relay_for(testnet_gateway()).is_some());
+        assert!(relay_for(mainnet_gateway()).is_some());
         assert!(relay_for("zec.rocks").is_none());
     }
 
@@ -5495,7 +5752,7 @@ pub(crate) mod tests {
             "configs": base64::prelude::BASE64_STANDARD.encode(&config_doc),
             "not_before": not_before,
             "not_after": not_after,
-            "key_id": "a3620fb6",
+            "key_id": "1325b850",
             "sig": base64::prelude::BASE64_STANDARD.encode([0u8; 64]),
         });
         serde_json::to_vec(&envelope).unwrap()
@@ -5507,13 +5764,9 @@ pub(crate) mod tests {
     fn rejects_invalid_signature_in_signed_config() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now - 60, now + 3600);
-        let err = open_signed_keys(
-            &ClientProfile::SLIPSTREAM,
-            &json,
-            "ohttp-gateway-testnet.example",
-            now,
-        )
-        .expect_err("verify must reject an invalid signature");
+        let err =
+            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, testnet_gateway(), now)
+                .expect_err("verify must reject an invalid signature");
         assert!(err.contains("bad signature"), "got: {err}");
     }
 
@@ -5522,13 +5775,9 @@ pub(crate) mod tests {
     fn rejects_expired_signed_config() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now - 7200, now - 3600);
-        let err = open_signed_keys(
-            &ClientProfile::SLIPSTREAM,
-            &json,
-            "ohttp-gateway-testnet.example",
-            now,
-        )
-        .expect_err("must reject expired config");
+        let err =
+            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, testnet_gateway(), now)
+                .expect_err("must reject expired config");
         assert!(err.contains("validity window"), "got: {err}");
     }
 
@@ -5537,13 +5786,9 @@ pub(crate) mod tests {
     fn rejects_long_validity_window() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now, now + 25 * 60 * 60);
-        let err = open_signed_keys(
-            &ClientProfile::SLIPSTREAM,
-            &json,
-            "ohttp-gateway-testnet.example",
-            now,
-        )
-        .expect_err("must reject validity window >24h");
+        let err =
+            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, testnet_gateway(), now)
+                .expect_err("must reject validity window >24h");
         assert!(err.contains("longer than a day"), "got: {err}");
     }
 
@@ -5553,14 +5798,24 @@ pub(crate) mod tests {
     fn rejects_envelope_for_the_other_network() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now - 60, now + 3600);
-        let err = open_signed_keys(
+        let err =
+            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, mainnet_gateway(), now)
+                .expect_err("network binding");
+        assert!(err.contains("signed for"), "got: {err}");
+
+        let mut mainnet_envelope: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        mainnet_envelope["network"] = serde_json::json!("mainnet");
+        let err = open_fixture_signed_keys(
             &ClientProfile::SLIPSTREAM,
-            &json,
-            "ohttp-gateway.example",
+            &serde_json::to_vec(&mainnet_envelope).unwrap(),
+            testnet_gateway(),
             now,
         )
-        .expect_err("network binding");
-        assert!(err.contains("signed for"), "got: {err}");
+        .expect_err("testnet must reject a mainnet envelope before checking its signature");
+        assert!(
+            err.contains("signed for mainnet, not testnet"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -5808,6 +6063,17 @@ pub(crate) mod tests {
             .await
             .expect("bind fake relay");
         let relay_addr = listener.local_addr().expect("relay addr");
+        let relay_url = format!("https://127.0.0.1:{}/relay", relay_addr.port());
+        let client = get_or_create_client(
+            testnet_gateway(),
+            &relay_url,
+            Dialer::Direct,
+            get_default_client_trace_prefix(),
+            ClientProfile::SLIPSTREAM_HTTP,
+        )
+        .await
+        .expect("configured client");
+        let dns_queries = refuse_dns_queries(&client).await;
 
         // Fake relay: accept one connection, read what the client sends first, hang up.
         let relay_task = tokio::spawn(async move {
@@ -5824,8 +6090,8 @@ pub(crate) mod tests {
         let result = tokio::time::timeout(
             Duration::from_secs(20),
             http_round_trip_via(
-                &format!("https://127.0.0.1:{}/relay", relay_addr.port()),
-                "test-gateway.zodl.com",
+                &relay_url,
+                testnet_gateway(),
                 Dialer::Direct,
                 "POST",
                 parse_http_target("https://origin.invalid/api/vote").expect("target"),
@@ -5847,6 +6113,7 @@ pub(crate) mod tests {
             first_bytes.len() > 2 && first_bytes[0] == 0x16 && first_bytes[1] == 0x03,
             "relay must receive a TLS ClientHello, got {first_bytes:02x?}"
         );
+        assert_eq!(dns_queries.load(Ordering::SeqCst), DOH_RESOLVERS.len());
         // The relay hung up without a TLS answer, so the call fails - at the relay.
         let err = result
             .expect_err("a fake relay cannot complete the exchange")
@@ -6223,7 +6490,7 @@ pub(crate) mod tests {
         use zcash_client_backend::proto::service::{BlockId, BlockRange};
 
         let ep = crate::config::Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: testnet_gateway().into(),
             port: 443,
             tls: true,
         };
@@ -6356,12 +6623,7 @@ pub(crate) mod tests {
             .expect("read testnet body");
 
         // Valid testnet envelope should verify
-        let testnet_result = open_signed_keys(
-            &profile,
-            &testnet_resp,
-            "ohttp-gateway-testnet.example",
-            now,
-        );
+        let testnet_result = open_signed_keys(&profile, &testnet_resp, testnet_gateway(), now);
         assert!(
             testnet_result.is_ok(),
             "testnet signed config must verify: {:?}",
@@ -6377,8 +6639,7 @@ pub(crate) mod tests {
             .expect("read mainnet body");
 
         // Valid mainnet envelope should verify
-        let mainnet_result =
-            open_signed_keys(&profile, &mainnet_resp, "ohttp-gateway.example", now);
+        let mainnet_result = open_signed_keys(&profile, &mainnet_resp, mainnet_gateway(), now);
         assert!(
             mainnet_result.is_ok(),
             "mainnet signed config must verify: {:?}",
@@ -6397,24 +6658,14 @@ pub(crate) mod tests {
         envelope["sig"] =
             serde_json::Value::String(base64::prelude::BASE64_STANDARD.encode(&sig_bytes));
         let tampered_json = serde_json::to_vec(&envelope).expect("re-serialize");
-        let tampered_result = open_signed_keys(
-            &profile,
-            &tampered_json,
-            "ohttp-gateway-testnet.example",
-            now,
-        );
+        let tampered_result = open_signed_keys(&profile, &tampered_json, testnet_gateway(), now);
         assert!(
             tampered_result.is_err(),
             "tampered signature must be rejected"
         );
 
         // Wrong-network test: mainnet config to testnet gateway (P3)
-        let wrong_network = open_signed_keys(
-            &profile,
-            &mainnet_resp,
-            "ohttp-gateway-testnet.example",
-            now,
-        );
+        let wrong_network = open_signed_keys(&profile, &mainnet_resp, testnet_gateway(), now);
         assert!(
             wrong_network.is_err(),
             "mainnet config to testnet gateway must be rejected (network binding)"
@@ -6453,7 +6704,7 @@ pub(crate) mod tests {
         );
 
         let ep = crate::config::Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: testnet_gateway().into(),
             port: 443,
             tls: true,
         };
@@ -6892,7 +7143,7 @@ pub(crate) mod tests {
     /// [`cache_a_key`]).
     async fn client_with_a_key(relay_url: &str) -> OhttpClient {
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay_url,
             Dialer::Direct,
             None,
@@ -6906,6 +7157,36 @@ pub(crate) mod tests {
     /// [`client_with_a_key`] for a relay on loopback port `port`.
     async fn client_with_a_key_for_a_relay_on(port: u16) -> OhttpClient {
         client_with_a_key(&format!("https://127.0.0.1:{port}/relay")).await
+    }
+
+    async fn refuse_dns_queries(client: &OhttpClient) -> Arc<AtomicUsize> {
+        let requests = Arc::new(AtomicUsize::new(0));
+        for resolver in DOH_RESOLVERS {
+            let url = doh_query_url(resolver, Network::Testnet).expect("configured DNS fixture");
+            let target = parse_https(&url).unwrap();
+            let peer = OhttpClient::new(
+                "unused.invalid",
+                &url,
+                Dialer::Direct,
+                None,
+                ClientProfile::SLIPSTREAM,
+            )
+            .unwrap();
+            let requests = requests.clone();
+            serve_in_process_relay(&peer, move |_| {
+                requests.fetch_add(1, Ordering::SeqCst);
+                async {
+                    let mut answer = Response::new(Full::new(Bytes::new()).boxed());
+                    *answer.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+                    answer
+                }
+            })
+            .await;
+            let key = format!("{}:{}", target.host, target.port);
+            let sender = peer.h2_pool.lock().await.remove(&key).unwrap();
+            client.h2_pool.lock().await.insert(key, sender);
+        }
+        requests
     }
 
     /// Puts an in-process relay behind the pooled h2 connection of `client` to its relay, where
@@ -6952,7 +7233,7 @@ pub(crate) mod tests {
     /// with a valid key already cached must stop warm-up before opening a channel.
     pub(crate) async fn connector_with_cached_relay_pause() -> OhttpConnector {
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://tor-warm-up-cached-pause.invalid/relay",
             Dialer::Direct,
             None,
@@ -6975,7 +7256,7 @@ pub(crate) mod tests {
     pub(crate) async fn connector_with_fresh_key_fetch_rate_limit()
     -> (OhttpConnector, Arc<AtomicUsize>) {
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://tor-warm-up-fresh-key-429.invalid/relay",
             Dialer::Direct,
             None,
@@ -7093,7 +7374,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_pause_noticed_at_the_post_is_not_dispatched() {
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://relay-pause-at-post-test.invalid/relay",
             Dialer::Direct,
             None,
@@ -7122,7 +7403,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_post_calls_the_hook_right_before_the_relay_gets_the_request() {
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://relay-hook-at-send-test.invalid/relay",
             Dialer::Direct,
             None,
@@ -7183,7 +7464,7 @@ pub(crate) mod tests {
 
         let flag = Arc::new(AtomicBool::new(false));
         let fut = http_round_trip_with_dispatch(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             NetworkType::Test,
             Dialer::Direct,
             "GET",
@@ -7490,7 +7771,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn an_announced_length_past_the_guard_is_refused_without_waiting_for_the_body() {
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://relay-announced-length-test.invalid/relay",
             Dialer::Direct,
             None,
@@ -7526,7 +7807,7 @@ pub(crate) mod tests {
     /// inside the general cap.
     #[tokio::test]
     async fn the_public_functions_carry_the_ceiling_to_the_read() {
-        let gateway = "ohttp-gateway-testnet.example";
+        let gateway = testnet_gateway();
         let relay_url = relay_for(gateway).expect("a relay for the testnet gateway");
         let client = get_or_create_client(
             gateway,
@@ -7799,7 +8080,7 @@ pub(crate) mod tests {
     async fn a_429_without_retry_after_starts_the_default_pause() {
         let relay = "https://relay-429-default-pause-test.invalid/relay";
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Direct,
             None,
@@ -7916,7 +8197,7 @@ pub(crate) mod tests {
     async fn a_relay_pause_holds_later_requests_without_posting() {
         let relay = "https://relay-pause-test.invalid/relay";
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Direct,
             None,
@@ -7932,7 +8213,7 @@ pub(crate) mod tests {
         assert!(RelayBackoff::global().remaining(relay).is_some());
 
         let other = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Direct,
             None,
@@ -7963,7 +8244,7 @@ pub(crate) mod tests {
     async fn a_relay_pause_holds_the_key_fetch_without_the_dns_fallback() {
         let relay = "https://relay-pause-key-test.invalid/relay";
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Direct,
             None,
@@ -7997,7 +8278,7 @@ pub(crate) mod tests {
     async fn a_pause_begun_during_the_relay_fetch_holds_the_dns_fallback() {
         let relay = "https://relay-pause-dns-test.invalid/relay";
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Direct,
             None,
@@ -8041,7 +8322,7 @@ pub(crate) mod tests {
         )));
 
         let client = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             "https://relay-429-key-test.invalid/relay",
             Dialer::Direct,
             None,
@@ -8144,59 +8425,41 @@ pub(crate) mod tests {
         ));
     }
 
-    /// DNS fallback: Parse and verify a real DoH JSON response.
-    /// Note: Full integration tests (relay failure -> DNS fallback, relay verify failure -> DNS,
-    /// etc.) would require mocking the network layer.
-    #[tokio::test]
-    async fn dns_response_parsing_and_verification() {
-        use zodl_ohttp_client::SignedConfigPolicy;
-
-        // Real captured mainnet DoH JSON from Cloudflare (2026-10-20)
-        let cloudflare_fixture = r#"{
-  "Status": 0,
-  "TC": false,
-  "RD": true,
-  "RA": true,
-  "AD": false,
-  "CD": false,
-  "Question": [
-    {
-      "name": "ohttp-keys.example",
-      "type": 16
-    }
-  ],
-  "Answer": [
-    {
-      "name": "ohttp-keys.example",
-      "type": 16,
-      "TTL": 300,
-      "data": "\"eyJ2IjoxLCJuZXR3b3JrIjoibWFpbm5ldCIsImNvbmZpZ3MiOiJBQ2tEQUNEY0w0ei9KdWxPVzlSamREc3R3c2dsMmo2Vk9JWXRkOW95Y2J5M0hVT3FCd0FFQUFFQUFRPT0iLCJub3RfYmVmb3JlIjoxNzkyNTE1MzAwLCJub3RfYWZ0ZXIiOjE3OTI1MzY5MDAsImtleV9pZCI6ImJhOGEyZGJkIiwic2lnIjoiYVB4blc2L1VIOElvYkxTSXM\" \"2c1FQbmcrZjdGU1c2dVlZS25yZmhEMFZKWFRTVWNLWWw3WEdnM0MrcytzdEtHSXlnNVM4NHNvZEhsV2tpWFN1OHJtQ3c9PSJ9\""
-    }
-  ]
-}"#;
-
-        // Parse the envelope from the fixture
-        let envelope = envelope_from_doh_json(cloudflare_fixture.as_bytes(), Network::Mainnet)
-            .expect("parse fixture");
-
-        // Verify it's a valid signed config
-        let now = 1792515300 + 60; // Within the validity window
-        let keys = verify_signed_config(
-            &envelope,
-            Network::Mainnet,
-            now,
-            &SignedConfigPolicy::LIBRARY,
+    /// A public synthetic envelope survives split TXT decoding and the same signed-key
+    /// verification/selection path used for relay and DNS responses.
+    #[test]
+    fn dns_response_parsing_and_verification() {
+        let envelope = br#"{"v":1,"network":"testnet","configs":"ACkBACDNzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzQAEAAEAAQ==","not_before":1700000000,"not_after":1700021600,"key_id":"1325b850","sig":"l7xx3/Q7BNFQfnt79s+enN5Lk6KC8S9f1mE9ZhSjaYGxqeSLRyuwgddKLBhwz1boZ2y2q7oWwkmGuUd5GllVDg=="}"#;
+        let name = key_config_dns_name(Network::Testnet).expect("configured DNS fixture");
+        let encoded = base64::prelude::BASE64_STANDARD.encode(envelope);
+        let (first, second) = encoded.split_at(encoded.len() / 2);
+        let answer = serde_json::to_vec(&serde_json::json!({
+            "Status": 0,
+            "Answer": [{
+                "name": name, "type": 16, "TTL": 300,
+                "data": format!("\"{first}\" \"{second}\""),
+            }],
+        }))
+        .unwrap();
+        let parsed = envelope_from_doh_json(&answer, Network::Testnet).expect("parse answer");
+        assert_eq!(parsed, envelope);
+        let keys = open_fixture_signed_keys(
+            &ClientProfile::SLIPSTREAM,
+            &parsed,
+            testnet_gateway(),
+            1_700_000_060,
         )
-        .expect("verify");
-
-        assert_eq!(keys.not_after, 1792536900);
-
-        // Select a key from it - just verify it succeeds
-        let _config =
-            KeyConfig::select_with(&keys.document, &ClientProfile::SLIPSTREAM.key_selection)
-                .expect("select");
-        // Note: config.key_id() returns a u8 (the HPKE key_id from the config), not the signing
-        // key identifier "ba8a2dbd" from the envelope JSON.
+        .expect("verify and select public test key");
+        assert_eq!(keys.not_after, 1_700_021_600);
+        assert_eq!(keys.config.key_id(), 1);
+        let error = open_fixture_signed_keys(
+            &ClientProfile::SLIPSTREAM,
+            &parsed,
+            mainnet_gateway(),
+            1_700_000_060,
+        )
+        .expect_err("testnet envelope cannot authenticate mainnet");
+        assert!(error.contains("signed for testnet"), "{error}");
     }
 
     /// DNS resolvers are tried in order; the second succeeds when the first fails.
@@ -8208,12 +8471,12 @@ pub(crate) mod tests {
         assert!(resolvers[0].contains("cloudflare"));
         assert!(resolvers[1].contains("google"));
 
-        let url0 = doh_query_url(resolvers[0], network);
+        let url0 = doh_query_url(resolvers[0], network).expect("configured DNS");
         assert!(url0.contains("cloudflare-dns.com"));
-        assert!(url0.contains("ohttp-keys.example"));
+        assert!(url0.contains(key_config_dns_name(network).expect("configured DNS")));
         assert!(url0.contains("type=TXT"));
 
-        let url1 = doh_query_url(resolvers[1], network);
+        let url1 = doh_query_url(resolvers[1], network).expect("configured DNS");
         assert!(url1.contains("dns.google"));
         assert!(url1.contains("edns_client_subnet=0.0.0.0/0"));
     }
@@ -8271,7 +8534,7 @@ pub(crate) mod tests {
     async fn tor_and_direct_fetches_keep_separate_cache_and_pause_keys() {
         let relay = "https://relay-tor-separation.invalid/relay";
         let direct = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Direct,
             None,
@@ -8279,7 +8542,7 @@ pub(crate) mod tests {
         )
         .expect("direct client");
         let tor = OhttpClient::new(
-            "ohttp-gateway-testnet.example",
+            testnet_gateway(),
             relay,
             Dialer::Tor(
                 arti_client::TorClient::builder()

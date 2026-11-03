@@ -1053,12 +1053,12 @@ mod tests {
     async fn health_concurrent_selected_endpoints_keep_routes_and_tor_modes() {
         use crate::transport_health::{self, HealthOutcome, HealthRoute};
         let first = Endpoint {
-            host: "ohttp-gateway.example".into(),
+            host: crate::ohttp::tests::mainnet_gateway().into(),
             port: 443,
             tls: true,
         };
         let selected = Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: crate::ohttp::tests::testnet_gateway().into(),
             port: 443,
             tls: true,
         };
@@ -1106,7 +1106,7 @@ mod tests {
     async fn ohttp_channel_is_included_in_direct_channel_accounting() {
         let before = net_stats::totals();
         let endpoint = Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: crate::ohttp::tests::testnet_gateway().into(),
             port: 443,
             tls: true,
         };

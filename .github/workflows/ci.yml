@@ -24,6 +24,16 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+  ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ vars.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+  ZODL_OHTTP_RELAY_URL_MAINNET: ${{ vars.ZODL_OHTTP_RELAY_URL_MAINNET }}
+  ZODL_OHTTP_RELAY_URL_TESTNET: ${{ vars.ZODL_OHTTP_RELAY_URL_TESTNET }}
+  ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+  ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ vars.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+  ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+  ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ vars.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+
 jobs:
   test:
     name: Test (default features)
@@ -34,7 +44,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
@@ -42,6 +52,8 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test --workspace --verbose
+      - name: Check OHTTP configuration variants
+        run: python3 scripts/tests/ohttp_configuration.py
       - name: Verify working directory is clean
         run: git diff --exit-code
 
@@ -54,7 +66,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
@@ -77,6 +89,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check OHTTP workflow contract
+        run: ruby scripts/tests/ohttp_workflow_test.rb
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -89,7 +103,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
@@ -107,7 +121,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}

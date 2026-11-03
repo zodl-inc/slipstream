@@ -63,11 +63,33 @@ not.
 ## Build & test
 
 ```sh
-cargo test -p zodl-slipstream -p slipstream-cli   # the always-green gate (228 + 32 tests)
-cargo build --workspace                           # full workspace incl. the parked gpuhash
+# Public synthetic configuration for hermetic transport tests.
+python3 scripts/tests/ohttp_configuration.py -- cargo test --workspace
+# Check host routing/casing/ambiguity and rebuild without DNS / without a signing key.
+python3 scripts/tests/ohttp_configuration.py
+ruby scripts/tests/ohttp_workflow_test.rb
+cargo build --workspace  # full workspace incl. the parked gpuhash
 ```
 
-Edition 2024, Rust 1.90+. Dependencies are published crates.io releases.
+Edition 2024, Rust 1.90+. The OHTTP core is pinned to a private Git dependency;
+Cargo needs read access to `zodl-inc/zodl-ohttp`.
+
+Deployment builds supply `ZODL_OHTTP_GATEWAY_HOST_MAINNET`,
+`ZODL_OHTTP_GATEWAY_HOST_TESTNET`, `ZODL_OHTTP_RELAY_URL_MAINNET`,
+`ZODL_OHTTP_RELAY_URL_TESTNET`, `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`,
+`ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`, `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET` and
+`ZODL_OHTTP_KEYS_DNS_NAME_TESTNET` when compiling Cargo dependencies. These are
+build-time inputs with no bundled endpoint or signing-key defaults. Missing a
+gateway, relay or signing key disables that network's relay mapping; a missing
+DNS name disables its DNS fallback. Gateway matching ignores DNS letter case;
+ambiguous mainnet/testnet host identity is rejected before verification or dispatch.
+CI reads all eight from Actions variables.
+
+The test wrapper overrides these names with public example hosts and public test
+signing keys, without reading shell startup files or fetching configuration. Its
+configuration regression cases use `--locked --offline` after dependencies have
+been fetched. Explicitly requested live tests require real compiled configuration
+and the runtime relay variables described in their prerequisite errors.
 
 ## Documentation
 

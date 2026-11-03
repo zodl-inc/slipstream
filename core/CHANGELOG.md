@@ -11,6 +11,12 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+- OHTTP uses the final `zodl-inc/zodl-ohttp` core with explicit build-time gateway,
+  relay, signing-key and optional DNS configuration. Missing signing configuration
+  fails before a key fetch; an absent DNS source preserves the relay failure without
+  contacting a resolver. Gateway identity comes from exact configured DNS hosts,
+  ignoring letter case, with ambiguous mainnet/testnet identities rejected before
+  verification or dispatch.
 - Bounded Tor startup waits for traffic readiness before publishing a fresh
   connection, within the original admission/bootstrap/retry deadline. Legacy
   unbounded startup behavior is unchanged. No caller changes are needed.
