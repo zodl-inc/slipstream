@@ -3378,7 +3378,7 @@ mod tests {
     }
 
     // Scan through the real production persistence targets. Deferred success
-    // abandons the async lane owner while SQLite still blocks its transaction.
+    // abandons the async lane owner while its real worker holds the writer gate.
     async fn commit_interrupted_prefix(
         p: &std::sync::Arc<Progress>,
         range: std::ops::Range<u64>,
@@ -3511,11 +3511,17 @@ mod tests {
                 assert_eq!(count, 0);
                 return;
             }
-            lock.execute_batch("BEGIN IMMEDIATE").expect("hold commit");
+            let mut pause = lane.pause_before_next_job_for_test();
             lane.submit(pending).await.expect("submit prefix");
+            pause.arrived().await;
             assert_eq!(p.wallet_writers(), 1);
             drop(lane);
-            lock.execute_batch("COMMIT").expect("release commit");
+            assert_eq!(
+                p.wallet_writers(),
+                1,
+                "worker owns the gate after lane drop"
+            );
+            pause.release();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
                 while p.wallet_writers() != 0 {
                     tokio::task::yield_now().await;

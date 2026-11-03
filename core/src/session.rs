@@ -42,6 +42,7 @@ use crate::events::Progress;
 #[cfg(test)]
 use crate::ffi_handle::EVENT_RING_CAP;
 use crate::ffi_handle::{FfiSlipstreamEvent, SyncState};
+use crate::tor_startup::TorStartupControl;
 
 /// Per-session configuration: the per-pass engine config + accounts to bootstrap + optional Tor.
 #[derive(Clone)]
@@ -471,6 +472,7 @@ fn reusable_tor_conn(
                 && owner.upgrade().is_some_and(|o| Arc::ptr_eq(&o, pass_lock))
         })
         .map(|(_, _, tc)| tc.clone())
+        .filter(|tc| tc.client().bootstrap_status().ready_for_traffic())
 }
 
 /// Drop the Tor client kept for the handle owning `pass_lock` (and any entry whose handle is
@@ -531,6 +533,113 @@ fn remember_tor_conn(
     ));
 }
 
+/// The bootstrap policy shared by the real session and hermetic transport fixtures.
+/// Only the network/cache operations are injected; retries retain their real backoff.
+async fn bootstrap_tor_with_retry<T, C, B, F>(
+    reporter: &SessionReporter,
+    bounded_startup: bool,
+    mut cached: C,
+    mut bootstrap: B,
+) -> Result<T, SlipstreamError>
+where
+    C: FnMut() -> Option<T>,
+    B: FnMut() -> F,
+    F: std::future::Future<Output = Result<T, SlipstreamError>>,
+{
+    let mut boot_failures: u32 = 0;
+    loop {
+        if let Some(tc) = cached() {
+            tracing::info!("slipstream Tor client reused from the previous session");
+            return Ok(tc);
+        }
+        match bootstrap().await {
+            Ok(tc) => {
+                tracing::info!("slipstream Tor bootstrapped (engine-owned isolated circuits)");
+                return Ok(tc);
+            }
+            Err(err) => {
+                if bounded_startup && !err.is_transient() {
+                    reporter.set_state(SyncState::Idle);
+                    return Err(err);
+                }
+                boot_failures = boot_failures.saturating_add(1);
+                let backoff = sync_retry_backoff(boot_failures);
+                tracing::warn!(
+                    %err,
+                    boot_failures,
+                    backoff_secs = backoff.as_secs(),
+                    "Tor bootstrap failed (transient) — retrying; NOT falling back to direct"
+                );
+                reporter.set_state(SyncState::Idle);
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+}
+
+/// Prepare a Tor connection, injecting only external transport/status operations.
+async fn prepare_tor_connection<T, B, R, S>(
+    bootstrap: B,
+    bounded_startup: bool,
+    readiness: R,
+) -> Result<T, SlipstreamError>
+where
+    B: std::future::Future<Output = Result<T, SlipstreamError>>,
+    R: FnOnce(&T) -> (bool, S),
+    S: futures_util::Stream<Item = bool>,
+{
+    let tc = bootstrap.await?;
+    if bounded_startup {
+        let (ready, events) = readiness(&tc);
+        wait_for_tor_traffic_readiness(ready, events).await?;
+    }
+    Ok(tc)
+}
+
+/// Publish prepared connections only after their startup generation accepts them.
+/// In particular, a synchronous cancellation during the final readiness poll
+/// must not cache a connection that `run` will reject as retired.
+async fn admit_tor_preparation<T, F, M>(
+    startup: Option<&TorStartupControl>,
+    prepare: F,
+    remember: M,
+) -> Result<T, crate::tor_startup::TorStartupPhase>
+where
+    F: std::future::Future<Output = Result<T, SlipstreamError>>,
+    M: FnOnce(&T),
+{
+    let prepared = match startup {
+        Some(control) => control.run(prepare).await?,
+        None => prepare
+            .await
+            .expect("legacy Tor bootstrap retries all errors"),
+    };
+    remember(&prepared);
+    Ok(prepared)
+}
+
+/// Wait without producing request/health traffic or resetting the startup budget.
+/// The caller subscribes before taking its initial readiness snapshot.
+async fn wait_for_tor_traffic_readiness(
+    initially_ready: bool,
+    events: impl futures_util::Stream<Item = bool>,
+) -> Result<(), SlipstreamError> {
+    use futures_util::StreamExt;
+
+    if initially_ready {
+        return Ok(());
+    }
+    futures_util::pin_mut!(events);
+    while let Some(ready) = events.next().await {
+        if ready {
+            return Ok(());
+        }
+    }
+    Err(SlipstreamError::Transport(
+        "Tor traffic readiness stream closed during startup".into(),
+    ))
+}
+
 /// Run a full sync session: resilient Tor bootstrap (never falls back to direct) → resilient
 /// initial pass (T8.7, with [B4-16] non-transient revival) → tip-following loop with mempool
 /// monitoring, until the future is dropped or aborted by the host (via the `AbortHandle`
@@ -562,70 +671,108 @@ pub async fn run_session(
     reporter: SessionReporter,
     pass_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
-    // ── Serialize overlapping passes on this handle (Keystone restore race, 2026-06-30) ───────
-    // Hold the pass lock for the WHOLE session — this is the OUTERMOST local. On a
-    // start()-while-running restart the host aborts the previous task (lib.rs
-    // `zcashlc_slipstream_start`), but tokio's `abort()` is ASYNCHRONOUS: the old pass keeps
-    // running until its next await. Acquiring here makes this new pass wait until the aborted old
-    // pass has unwound and dropped its guard; because guards drop in reverse acquisition order, the
-    // old pass's `WalletSession` (and its `data.db` connection) is already closed by then — so the
-    // two passes never touch `data.db` concurrently. Without this, `importAccount`'s restart raced
-    // two passes on one DB → panic → `SyncState::Error(2)` (the `rustSlipstreamSyncFailed` dialog a
-    // Keystone restore hit). The host always abort()s the old task before spawning the new one, so
-    // the old holder is guaranteed to release — no deadlock. A tokio `Mutex` is not poisoned by a
-    // panic/cancel, so even a panicking old pass frees the lock cleanly.
-    let _pass_guard = pass_lock.lock().await;
+    run_session_with_tor_startup(config, reporter, pass_lock, None).await;
+}
 
-    // A new session gets a fresh block-download failure count: a host start or restart is a
-    // new attempt (see `Progress::begin_session`).
-    reporter.progress.begin_session();
+/// Run a session with retained status for an opt-in Tor startup generation.
+/// Dropping the returned future, even before polling it, cancels unfinished startup.
+/// The supplied absolute deadline includes pass admission and all bootstrap retries.
+/// `Some(startup)` requires `config.tor`; failure returns without entering the request loop.
+/// Existing abort/pass-lock semantics continue to own the full session lifetime after Ready.
+pub fn run_session_with_tor_startup(
+    config: SessionConfig,
+    reporter: SessionReporter,
+    pass_lock: Arc<tokio::sync::Mutex<()>>,
+    startup: Option<TorStartupControl>,
+) -> impl std::future::Future<Output = ()> + Send {
+    let guard = startup.as_ref().map(TorStartupControl::cancel_on_drop);
+    async move {
+        let _startup_guard = guard;
+        run_session_body(config, reporter, pass_lock, startup).await;
+    }
+}
 
-    // Notify SyncStarted (tag=1) — emitted exactly ONCE, before any retry or follow pass.
-    reporter.push_event(FfiSlipstreamEvent { tag: 1, value: 0 });
-
-    // ── Engine-owned Tor bootstrap ───────────────────────────────────────────
-    // When Tor is enabled, bootstrap an arti client on THIS tokio runtime (Client::create binds
-    // to PreferredRuntime::current(), so no block_on / no cross-runtime). Bootstrapping is
-    // RESILIENT: a transient failure shows Disconnected and retries forever — we NEVER fall back
-    // to direct, because Tor was explicitly requested and a direct fallback would silently
-    // de-anonymise the sync. Once up, the client is held for the whole session (initial pass +
-    // follow loop); metadata calls get isolated circuits, bulk fetch stays direct (per-call
-    // policy in connector.rs).
-    let tor_conn: Option<TorConn> = match config.tor {
-        None => None,
-        Some(ref t) => {
-            let mut boot_failures: u32 = 0;
-            loop {
-                if let Some(tc) =
-                    reusable_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone)
-                {
-                    tracing::info!("slipstream Tor client reused from the previous session");
-                    break Some(tc);
-                }
-                match TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone, None).await {
-                    Ok(tc) => {
-                        tracing::info!(
-                            "slipstream Tor bootstrapped (engine-owned isolated circuits)"
-                        );
-                        remember_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone, &tc);
-                        break Some(tc);
-                    }
-                    Err(err) => {
-                        boot_failures += 1;
-                        let backoff = sync_retry_backoff(boot_failures);
-                        tracing::warn!(
-                            %err,
-                            boot_failures,
-                            backoff_secs = backoff.as_secs(),
-                            "Tor bootstrap failed (transient) — retrying; NOT falling back to direct"
-                        );
-                        reporter.set_state(SyncState::Idle);
-                        tokio::time::sleep(backoff).await;
-                    }
-                }
-            }
+async fn run_session_body(
+    config: SessionConfig,
+    reporter: SessionReporter,
+    pass_lock: Arc<tokio::sync::Mutex<()>>,
+    startup: Option<TorStartupControl>,
+) {
+    let bounded_startup = startup.is_some();
+    let prepare = async {
+        // ── Serialize overlapping passes on this handle (Keystone restore race, 2026-06-30) ───────
+        // Hold the pass lock for the WHOLE session — this is the OUTERMOST local. On a
+        // start()-while-running restart the host aborts the previous task (lib.rs
+        // `zcashlc_slipstream_start`), but tokio's `abort()` is ASYNCHRONOUS: the old pass keeps
+        // running until its next await. Acquiring here makes this new pass wait until the aborted old
+        // pass has unwound and dropped its guard; because guards drop in reverse acquisition order, the
+        // old pass's `WalletSession` (and its `data.db` connection) is already closed by then — so the
+        // two passes never touch `data.db` concurrently. Without this, `importAccount`'s restart raced
+        // two passes on one DB → panic → `SyncState::Error(2)` (the `rustSlipstreamSyncFailed` dialog a
+        // Keystone restore hit). The host always abort()s the old task before spawning the new one, so
+        // the old holder is guaranteed to release — no deadlock. A tokio `Mutex` is not poisoned by a
+        // panic/cancel, so even a panicking old pass frees the lock cleanly.
+        let pass_guard = pass_lock.lock().await;
+        if bounded_startup && config.tor.is_none() {
+            return Err(SlipstreamError::Config(
+                "Tor startup requires Tor session configuration".into(),
+            ));
         }
+
+        // A new session gets a fresh block-download failure count: a host start or restart is a
+        // new attempt (see `Progress::begin_session`).
+        reporter.progress.begin_session();
+
+        // Notify SyncStarted (tag=1) — emitted exactly ONCE, before any retry or follow pass.
+        reporter.push_event(FfiSlipstreamEvent { tag: 1, value: 0 });
+
+        // ── Engine-owned Tor bootstrap ───────────────────────────────────────────
+        // When Tor is enabled, bootstrap an arti client on THIS tokio runtime (Client::create binds
+        // to PreferredRuntime::current(), so no block_on / no cross-runtime). Bootstrapping is
+        // RESILIENT: a transient failure shows Disconnected and retries (bounded by the opt-in
+        // startup deadline, otherwise forever) — we NEVER fall back
+        // to direct, because Tor was explicitly requested and a direct fallback would silently
+        // de-anonymise the sync. Once up, the client is held for the whole session (initial pass +
+        // follow loop); every purpose uses the Tor circuit policy in connector.rs.
+        let tor_conn: Option<TorConn> = match config.tor {
+            None => None,
+            Some(ref t) => {
+                let tc = prepare_tor_connection(
+                    bootstrap_tor_with_retry(
+                        &reporter,
+                        bounded_startup,
+                        || reusable_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone),
+                        || TorConn::bootstrap(&t.dir, t.dangerously_trust_everyone, None),
+                    ),
+                    bounded_startup,
+                    |tc| {
+                        use futures_util::StreamExt;
+                        // Subscribe before reading status so a transition cannot be lost.
+                        let events = tc.client().bootstrap_events();
+                        let ready = tc.client().bootstrap_status().ready_for_traffic();
+                        (ready, events.map(|status| status.ready_for_traffic()))
+                    },
+                )
+                .await?;
+                Some(tc)
+            }
+        };
+
+        Ok((pass_guard, tor_conn))
     };
+    let (_pass_guard, tor_conn) =
+        match admit_tor_preparation(startup.as_ref(), prepare, |(_, tor_conn)| {
+            if let (Some(t), Some(tc)) = (&config.tor, tor_conn) {
+                remember_tor_conn(&pass_lock, &t.dir, t.dangerously_trust_everyone, tc);
+            }
+        })
+        .await
+        {
+            Ok(prepared) => prepared,
+            // Retained startup status belongs to this generation, never OHTTP
+            // health or endpoint failure. No direct request loop is entered.
+            Err(_) => return,
+        };
 
     // ── Initial pass: RESILIENT retry loop (T8.7) ────────────────────────────
     // A foreground wallet must NEVER surface a hard sync error for a recoverable
@@ -1513,5 +1660,580 @@ mod tests {
         failures.probe_failed();
         failures.probe_ok();
         assert_eq!(failures.total(), 0);
+    }
+
+    fn startup_test_config() -> SessionConfig {
+        let mut engine = EngineConfig::new(
+            crate::Network::TestNetwork,
+            std::path::PathBuf::from("/unused-startup-test.db"),
+            crate::config::Endpoint {
+                host: "localhost".into(),
+                port: 9067,
+                tls: false,
+            },
+        );
+        engine.fetch_streams = 0;
+        SessionConfig {
+            engine,
+            accounts: Vec::new(),
+            tor: Some(TorSessionConfig {
+                dir: std::path::PathBuf::from("/nonexistent-slipstream-startup-test-directory"),
+                dangerously_trust_everyone: false,
+            }),
+        }
+    }
+
+    fn startup_test_reporter() -> SessionReporter {
+        SessionReporter {
+            progress: Arc::new(Progress::default()),
+            state: Arc::new(Mutex::new(SyncState::Idle)),
+            events: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    // Mutating prepare to publish as soon as bootstrap returns must fail this
+    // test even when the status source has not become ready for traffic.
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_fresh_bootstrap_waits_for_traffic_readiness() {
+        use crate::tor_startup::TorStartupPhase;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let control = TorStartupControl::new(40, Instant::now() + Duration::from_secs(60));
+        let remembered = AtomicUsize::new(0);
+        let requests = AtomicUsize::new(0);
+        let (_ready, updates) = tokio::sync::mpsc::unbounded_channel::<bool>();
+        let prepare = prepare_tor_connection(std::future::ready(Ok(())), true, |_| {
+            (
+                false,
+                futures_util::stream::unfold(updates, |mut rx| async {
+                    rx.recv().await.map(|ready| (ready, rx))
+                }),
+            )
+        });
+        let startup = admit_tor_preparation(Some(&control), prepare, |_| {
+            remembered.fetch_add(1, Ordering::SeqCst);
+        });
+        tokio::pin!(startup);
+        let request_loop = async {
+            if startup.as_mut().await.is_ok() {
+                requests.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        tokio::pin!(request_loop);
+        assert!(
+            futures_util::poll!(&mut request_loop).is_pending(),
+            "bootstrap completion must not admit requests before traffic readiness"
+        );
+        assert_eq!(control.snapshot().phase, TorStartupPhase::Starting);
+        assert_eq!(remembered.load(Ordering::SeqCst), 0);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_cancelled_during_ready_poll_never_publishes() {
+        use crate::tor_startup::TorStartupPhase;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let control = TorStartupControl::new(42, Instant::now() + Duration::from_secs(60));
+        let remembered = AtomicUsize::new(0);
+        let requests = AtomicUsize::new(0);
+        let prepare = prepare_tor_connection(std::future::ready(Ok(())), true, |_| {
+            // Readiness may arrive in the same poll that retires this generation.
+            control.cancel();
+            (true, futures_util::stream::empty())
+        });
+        let result = admit_tor_preparation(Some(&control), prepare, |_| {
+            remembered.fetch_add(1, Ordering::SeqCst);
+        })
+        .await;
+        if result.is_ok() {
+            requests.fetch_add(1, Ordering::SeqCst);
+        }
+        assert_eq!(result, Err(TorStartupPhase::Cancelled));
+        assert_eq!(control.snapshot().phase, TorStartupPhase::Cancelled);
+        assert_eq!(
+            remembered.load(Ordering::SeqCst),
+            0,
+            "cancelled startup must not publish a connection even within its readiness poll"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    struct ReadinessPreparation {
+        control: TorStartupControl,
+        future: Option<
+            futures_util::future::BoxFuture<
+                'static,
+                Result<(), crate::tor_startup::TorStartupPhase>,
+            >,
+        >,
+        admission: Option<tokio::sync::OwnedMutexGuard<()>>,
+        updates: Option<tokio::sync::mpsc::UnboundedSender<bool>>,
+        remembered: Arc<std::sync::atomic::AtomicUsize>,
+        requests: Arc<std::sync::atomic::AtomicUsize>,
+        attempts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ReadinessPreparation {
+        async fn new(bounded: bool, initially_ready: bool, failures: usize) -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let control = TorStartupControl::new(41, Instant::now() + Duration::from_secs(60));
+            let worker_control = control.clone();
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            let admission = Some(Arc::clone(&lock).lock_owned().await);
+            let (updates, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let remembered = Arc::new(AtomicUsize::new(0));
+            let worker_remembered = Arc::clone(&remembered);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let worker_requests = Arc::clone(&requests);
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let worker_attempts = Arc::clone(&attempts);
+            let future = Box::pin(async move {
+                let prepare = async {
+                    let _guard = lock.lock().await;
+                    prepare_tor_connection(
+                        bootstrap_tor_with_retry(
+                            &startup_test_reporter(),
+                            bounded,
+                            || None,
+                            || {
+                                let attempt = worker_attempts.fetch_add(1, Ordering::SeqCst);
+                                std::future::ready(if attempt < failures {
+                                    Err(SlipstreamError::Transport("injected retry".into()))
+                                } else {
+                                    Ok(())
+                                })
+                            },
+                        ),
+                        bounded,
+                        |_| {
+                            (
+                                initially_ready,
+                                futures_util::stream::unfold(receiver, |mut rx| async {
+                                    rx.recv().await.map(|ready| (ready, rx))
+                                }),
+                            )
+                        },
+                    )
+                    .await
+                };
+                let startup = bounded.then_some(&worker_control);
+                let result = admit_tor_preparation(startup, prepare, |_| {
+                    worker_remembered.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+                if result.is_ok() {
+                    worker_requests.fetch_add(1, Ordering::SeqCst);
+                }
+                result
+            });
+            Self {
+                control,
+                future: Some(future),
+                admission,
+                updates: Some(updates),
+                remembered,
+                requests,
+                attempts,
+            }
+        }
+
+        async fn poll(
+            &mut self,
+        ) -> std::task::Poll<Result<(), crate::tor_startup::TorStartupPhase>> {
+            futures_util::poll!(self.future.as_mut().unwrap().as_mut())
+        }
+
+        fn assert_counts(&self, remembered: usize, requests: usize) {
+            use std::sync::atomic::Ordering;
+            assert_eq!(self.remembered.load(Ordering::SeqCst), remembered);
+            assert_eq!(self.requests.load(Ordering::SeqCst), requests);
+        }
+
+        fn assert_retired(&self) {
+            self.assert_counts(0, 0);
+            if let Some(updates) = &self.updates {
+                assert!(
+                    updates.send(true).is_err(),
+                    "retired startup must drop its readiness source"
+                );
+            }
+            self.assert_counts(0, 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_arrives_within_original_budget() {
+        use std::sync::atomic::Ordering;
+        let start = Instant::now();
+        let mut test = ReadinessPreparation::new(true, false, 1).await;
+        assert!(test.poll().await.is_pending());
+        tokio::time::advance(Duration::from_secs(40)).await;
+        drop(test.admission.take());
+        assert!(test.poll().await.is_pending());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(test.poll().await.is_pending());
+        assert_eq!(test.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Starting
+        );
+        test.assert_counts(0, 0);
+        tokio::time::advance(Duration::from_secs(16)).await;
+        test.updates.as_ref().unwrap().send(false).unwrap();
+        assert!(test.poll().await.is_pending());
+        test.assert_counts(0, 0);
+        test.updates.as_ref().unwrap().send(true).unwrap();
+        assert_eq!(test.poll().await, std::task::Poll::Ready(Ok(())));
+        assert_eq!(Instant::now() - start, Duration::from_secs(59));
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Ready
+        );
+        test.assert_counts(1, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_wait_uses_remaining_deadline() {
+        let start = Instant::now();
+        let mut test = ReadinessPreparation::new(true, false, 1).await;
+        assert!(test.poll().await.is_pending());
+        tokio::time::advance(Duration::from_secs(40)).await;
+        drop(test.admission.take());
+        assert!(test.poll().await.is_pending());
+        tokio::time::advance(Duration::from_secs(3)).await;
+        assert!(test.poll().await.is_pending());
+        tokio::time::advance(Duration::from_secs(17)).await;
+        assert_eq!(
+            test.poll().await,
+            std::task::Poll::Ready(Err(crate::tor_startup::TorStartupPhase::TimedOut))
+        );
+        assert_eq!(Instant::now() - start, Duration::from_secs(60));
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::TimedOut
+        );
+        test.assert_retired();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_ready_before_subscription() {
+        let start = Instant::now();
+        let mut test = ReadinessPreparation::new(true, true, 0).await;
+        drop(test.updates.take());
+        drop(test.admission.take());
+        assert_eq!(test.poll().await, std::task::Poll::Ready(Ok(())));
+        assert_eq!(Instant::now(), start);
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Ready
+        );
+        test.assert_counts(1, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_stream_closed_fails() {
+        let mut test = ReadinessPreparation::new(true, false, 0).await;
+        drop(test.admission.take());
+        assert!(test.poll().await.is_pending());
+        drop(test.updates.take());
+        assert_eq!(
+            test.poll().await,
+            std::task::Poll::Ready(Err(crate::tor_startup::TorStartupPhase::Failed))
+        );
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Failed
+        );
+        test.assert_retired();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_cancelled_ignores_late_ready() {
+        let mut test = ReadinessPreparation::new(true, false, 0).await;
+        drop(test.admission.take());
+        assert!(test.poll().await.is_pending());
+        test.control.cancel();
+        // A ready update already queued at cancellation cannot publish a connection.
+        test.updates.as_ref().unwrap().send(true).unwrap();
+        assert_eq!(
+            test.poll().await,
+            std::task::Poll::Ready(Err(crate::tor_startup::TorStartupPhase::Cancelled))
+        );
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Cancelled
+        );
+        test.assert_retired();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_readiness_dropped_ignores_late_ready() {
+        let mut test = ReadinessPreparation::new(true, false, 0).await;
+        drop(test.admission.take());
+        assert!(test.poll().await.is_pending());
+        drop(test.future.take());
+        assert_eq!(
+            test.control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Cancelled
+        );
+        test.assert_retired();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_legacy_bootstrap_does_not_wait() {
+        let mut test = ReadinessPreparation::new(false, false, 0).await;
+        drop(test.admission.take());
+        assert_eq!(test.poll().await, std::task::Poll::Ready(Ok(())));
+        test.assert_counts(1, 1);
+    }
+
+    #[tokio::test]
+    async fn tor_startup_unpolled_session_drop_is_cancelled() {
+        let control = crate::tor_startup::TorStartupControl::new(
+            20,
+            Instant::now() + Duration::from_secs(60),
+        );
+        let future = run_session_with_tor_startup(
+            startup_test_config(),
+            startup_test_reporter(),
+            Arc::new(tokio::sync::Mutex::new(())),
+            Some(control.clone()),
+        );
+        drop(future);
+        assert_eq!(
+            control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Cancelled
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_cancelled_while_queued_never_enters_request_loop() {
+        let control = TorStartupControl::new(21, Instant::now() + Duration::from_secs(60));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = lock.lock().await;
+        let reporter = startup_test_reporter();
+        let worker = tokio::spawn(run_session_with_tor_startup(
+            startup_test_config(),
+            reporter.clone(),
+            Arc::clone(&lock),
+            Some(control.clone()),
+        ));
+        tokio::task::yield_now().await;
+        control.cancel();
+        let stopped = tokio::time::timeout(Duration::from_secs(1), worker).await;
+        assert!(
+            stopped.is_ok(),
+            "cancel must interrupt pass admission without waiting for the old pass"
+        );
+        drop(held);
+        assert!(
+            reporter.events.lock().unwrap().is_empty(),
+            "cancelled queued startup must not begin a session"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_queue_wait_uses_absolute_deadline() {
+        let control = TorStartupControl::new(22, Instant::now() + Duration::from_secs(60));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let _held = lock.lock().await;
+        let reporter = startup_test_reporter();
+        let worker = tokio::spawn(run_session_with_tor_startup(
+            startup_test_config(),
+            reporter.clone(),
+            Arc::clone(&lock),
+            Some(control.clone()),
+        ));
+        let stopped = tokio::time::timeout(Duration::from_secs(61), worker).await;
+        assert!(
+            stopped.is_ok(),
+            "deadline must include pass ownership admission"
+        );
+        assert_eq!(
+            control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::TimedOut
+        );
+        assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_failed_configuration_never_enters_request_loop() {
+        let control = TorStartupControl::new(23, Instant::now() + Duration::from_secs(60));
+        let reporter = startup_test_reporter();
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_session_with_tor_startup(
+                startup_test_config(),
+                reporter.clone(),
+                Arc::new(tokio::sync::Mutex::new(())),
+                Some(control.clone()),
+            ),
+        )
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "non-transient bootstrap configuration error must terminate startup"
+        );
+        assert_eq!(
+            control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Failed
+        );
+        assert!(
+            !reporter
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.tag == 4),
+            "startup failure must not reach the invalid engine configuration or report endpoint failure"
+        );
+        assert_eq!(*reporter.state.lock().unwrap(), SyncState::Idle);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_missing_tor_configuration_cannot_start_direct() {
+        let control = TorStartupControl::new(24, Instant::now() + Duration::from_secs(60));
+        let reporter = startup_test_reporter();
+        let mut config = startup_test_config();
+        config.tor = None;
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(1),
+            run_session_with_tor_startup(
+                config,
+                reporter.clone(),
+                Arc::new(tokio::sync::Mutex::new(())),
+                Some(control.clone()),
+            ),
+        )
+        .await;
+        assert!(
+            stopped.is_ok(),
+            "Tor-required startup must reject missing Tor configuration before the direct engine loop"
+        );
+        assert_eq!(
+            control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Failed
+        );
+        assert!(reporter.events.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tor_startup_unready_cached_connection_is_not_reused() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut builder = arti_client::config::TorClientConfigBuilder::from_directories(
+            directory.path().join("state"),
+            directory.path().join("cache"),
+        );
+        builder.storage().permissions().dangerously_trust_everyone();
+        let client = arti_client::TorClient::with_runtime(
+            tor_rtcompat::PreferredRuntime::current().unwrap(),
+        )
+        .config(builder.build().unwrap())
+        .bootstrap_behavior(arti_client::BootstrapBehavior::Manual)
+        .create_unbootstrapped()
+        .unwrap();
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        remember_tor_conn(
+            &lock,
+            directory.path(),
+            true,
+            &TorConn::from_client(client, None),
+        );
+        let cached = reusable_tor_conn(&lock, directory.path(), true);
+        forget_tor_conns(&lock);
+        assert!(
+            cached.is_none(),
+            "cached existence alone cannot mark Tor ready without a usable bootstrap status"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_budget_includes_queue_and_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let start = Instant::now();
+        let control = TorStartupControl::new(25, start + Duration::from_secs(60));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let held = Arc::clone(&lock).lock_owned().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let worker_attempts = Arc::clone(&attempts);
+        let worker_control = control.clone();
+        let worker = tokio::spawn(async move {
+            worker_control
+                .run(async {
+                    let _guard = lock.lock().await;
+                    bootstrap_tor_with_retry(
+                        &startup_test_reporter(),
+                        true,
+                        || None,
+                        || {
+                            worker_attempts.fetch_add(1, Ordering::SeqCst);
+                            std::future::ready(Err::<(), _>(SlipstreamError::Transport(
+                                "injected bootstrap failure".into(),
+                            )))
+                        },
+                    )
+                    .await
+                })
+                .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(40)).await;
+        drop(held);
+        assert_eq!(
+            worker.await.unwrap(),
+            Err(crate::tor_startup::TorStartupPhase::TimedOut)
+        );
+        assert_eq!(Instant::now() - start, Duration::from_secs(60));
+        // Attempts at t=40,43,49; the t=61 retry must never start.
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn tor_startup_cached_connection_ready() {
+        let control = TorStartupControl::new(26, Instant::now() + Duration::from_secs(60));
+        let result = control
+            .run(bootstrap_tor_with_retry(
+                &startup_test_reporter(),
+                true,
+                || Some(42u8),
+                || async { panic!("a valid cached connection must not bootstrap again") },
+            ))
+            .await;
+        assert_eq!(result, Ok(42));
+        assert_eq!(
+            control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Ready
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_startup_cancel_interrupts_pending_bootstrap() {
+        let control = TorStartupControl::new(27, Instant::now() + Duration::from_secs(60));
+        let worker_control = control.clone();
+        let (started, bootstrapping) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let worker = tokio::spawn(async move {
+            worker_control
+                .run(bootstrap_tor_with_retry(
+                    &startup_test_reporter(),
+                    true,
+                    || None,
+                    || {
+                        let _ = started.take().unwrap().send(());
+                        std::future::pending::<Result<(), SlipstreamError>>()
+                    },
+                ))
+                .await
+        });
+        bootstrapping.await.unwrap();
+        control.cancel();
+        assert_eq!(
+            worker.await.unwrap(),
+            Err(crate::tor_startup::TorStartupPhase::Cancelled)
+        );
+        assert_eq!(
+            control.snapshot().phase,
+            crate::tor_startup::TorStartupPhase::Cancelled
+        );
     }
 }
