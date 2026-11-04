@@ -3326,13 +3326,17 @@ fn grpc_error_with(
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) fn mainnet_gateway() -> &'static str {
-        option_env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET")
-            .expect("set ZODL_OHTTP_GATEWAY_HOST_MAINNET for configured transport tests")
+        match option_env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET") {
+            Some(host) => host,
+            None => panic!("set ZODL_OHTTP_GATEWAY_HOST_MAINNET for configured transport tests"),
+        }
     }
 
     pub(crate) fn testnet_gateway() -> &'static str {
-        option_env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET")
-            .expect("set ZODL_OHTTP_GATEWAY_HOST_TESTNET for configured transport tests")
+        match option_env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET") {
+            Some(host) => host,
+            None => panic!("set ZODL_OHTTP_GATEWAY_HOST_TESTNET for configured transport tests"),
+        }
     }
 
     /// A public synthetic signer. Only the fixture supplies it; production resolves its
