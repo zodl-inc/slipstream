@@ -2930,7 +2930,7 @@ fn grpc_request(
     headers: &HeaderMap,
     body: &[u8],
 ) -> BhttpRequest {
-    let mut request = BhttpRequest::new(method, gateway_host, path).body(body);
+    let mut request = BhttpRequest::new(method, gateway_host.to_ascii_lowercase(), path).body(body);
     for (name, value) in headers {
         if forward_header(name) {
             request = request.header(name.as_str(), value.as_bytes());
@@ -2954,7 +2954,7 @@ fn http_bhttp_request(
     headers: &[(String, String)],
     body: &[u8],
 ) -> BhttpRequest {
-    let mut request = BhttpRequest::new(method, target.host, target.path)
+    let mut request = BhttpRequest::new(method, target.host.to_ascii_lowercase(), target.path)
         .scheme(target.scheme)
         .body(body);
     for (name, value) in headers {
@@ -5834,6 +5834,112 @@ pub(crate) mod tests {
             err.contains("signed for mainnet, not testnet"),
             "got: {err}"
         );
+    }
+
+    // Decode known-length BHTTP independently of the request builder under test.
+    fn decode_wire_request(mut wire: &[u8]) -> BhttpRequest {
+        fn integer(wire: &mut &[u8]) -> usize {
+            let width = 1usize << (wire[0] >> 6);
+            let mut value = usize::from(wire[0] & 0x3f);
+            for byte in &wire[1..width] {
+                value = (value << 8) | usize::from(*byte);
+            }
+            *wire = &wire[width..];
+            value
+        }
+        fn field(wire: &mut &[u8]) -> Vec<u8> {
+            let len = integer(wire);
+            let value = wire[..len].to_vec();
+            *wire = &wire[len..];
+            value
+        }
+        assert_eq!(integer(&mut wire), 0, "known-length request framing");
+        let method = field(&mut wire);
+        let scheme = field(&mut wire);
+        let authority = field(&mut wire);
+        let path = field(&mut wire);
+        let section = field(&mut wire);
+        let mut section = section.as_slice();
+        let mut headers = Vec::new();
+        while !section.is_empty() {
+            headers.push((field(&mut section), field(&mut section)));
+        }
+        let body = field(&mut wire);
+        assert!(field(&mut wire).is_empty(), "empty trailers");
+        assert!(wire.is_empty(), "no trailing bytes");
+        BhttpRequest {
+            method,
+            scheme,
+            authority,
+            path,
+            headers,
+            body,
+        }
+    }
+
+    #[test]
+    fn grpc_request_mixed_case_authority_is_lowercase_on_wire() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/grpc"));
+        headers.insert("grpc-timeout", HeaderValue::from_static("5S"));
+        headers.insert("x-secret", HeaderValue::from_static("Value-AbC"));
+        for (authority, expected) in [
+            ("MiXeD.Gateway.Example", b"mixed.gateway.example".as_slice()),
+            (
+                "MiXeD.Gateway.Example:8443",
+                b"mixed.gateway.example:8443".as_slice(),
+            ),
+        ] {
+            let request = grpc_request(
+                authority,
+                "POST",
+                "/CaseSensitive/Path?Token=AbC",
+                &headers,
+                b"Body-AbC",
+            );
+            let wire =
+                encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).expect("encode");
+            let decoded = decode_wire_request(&wire);
+            assert_eq!(decoded.authority, expected);
+            assert_eq!(decoded.method, b"POST");
+            assert_eq!(decoded.scheme, b"https");
+            assert_eq!(decoded.path, b"/CaseSensitive/Path?Token=AbC");
+            assert_eq!(decoded.body, b"Body-AbC");
+            assert!(
+                decoded
+                    .headers
+                    .contains(&(b"content-type".to_vec(), b"application/grpc".to_vec()))
+            );
+            assert!(
+                decoded
+                    .headers
+                    .contains(&(b"grpc-timeout".to_vec(), b"5S".to_vec()))
+            );
+            assert!(!decoded.headers.iter().any(|(name, _)| name == b"x-secret"));
+        }
+    }
+
+    #[test]
+    fn extension_request_mixed_case_authority_is_lowercase_on_wire() {
+        let target =
+            parse_http_target("https://MiXeD.Gateway.Example/CaseSensitive/Path?Token=AbC")
+                .expect("target");
+        let headers = [("X-Custom".to_string(), "Value-AbC".to_string())];
+        let request = http_bhttp_request("POST", target, &headers, b"Body-AbC");
+        let wire =
+            encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM_HTTP.encode).expect("encode");
+        let decoded = decode_wire_request(&wire);
+        assert_eq!(decoded.authority, b"mixed.gateway.example");
+        assert_eq!(decoded.method, b"POST");
+        assert_eq!(decoded.scheme, b"https");
+        assert_eq!(decoded.path, b"/CaseSensitive/Path?Token=AbC");
+        assert_eq!(decoded.body, b"Body-AbC");
+        assert!(
+            decoded
+                .headers
+                .contains(&(b"x-custom".to_vec(), b"Value-AbC".to_vec()))
+        );
+        assert!(!decoded.headers.iter().any(|(name, _)| name == b"X-Custom"));
     }
 
     #[test]

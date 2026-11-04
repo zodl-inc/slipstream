@@ -12,6 +12,10 @@ workspace.
 
 ### Fixed
 
+- OHTTP gRPC and extension requests ASCII-lowercase their encoded BHTTP authority.
+  Authority ports, paths, query strings, bodies and existing header policies are
+  preserved. Stored configuration spelling and public interfaces are unchanged.
+
 - OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
   empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
   remain supported when split into valid chunks. Public function signatures are unchanged.
