@@ -28,6 +28,7 @@ end
 raise "no Cargo jobs checked" if cargo_jobs.empty?
 cargo_jobs.each do |name, job|
   effective = workflow.fetch("env", {}).merge(job.fetch("env", {}))
+  raise "#{name}: strict OHTTP build policy missing" unless effective["ZODL_OHTTP_REQUIRE"] == "1"
   required.each do |key|
     raise "#{name}: missing Actions secret #{key}" unless effective[key] == "${{ secrets.#{key} }}"
   end
@@ -56,5 +57,5 @@ raise "wrong private repository token scope" unless token.fetch("with").fetch("r
 manifest = File.read(File.join(root, "core/Cargo.toml"))
 lock = File.read(File.join(root, "Cargo.lock"))
 raise "old dependency URL" if [manifest, lock].any? { |text| text.include?("https://github.com/zodl-inc/ohttp.git") }
-raise "final library missing" unless manifest.include?("https://github.com/zodl-inc/zodl-ohttp.git") && manifest.include?("650bb4ac5015dde96f22b67d7d77dc1020be9ed8")
+raise "final library missing" unless manifest.include?("https://github.com/zodl-inc/zodl-ohttp.git") && manifest.include?("0324db3240adf00ea847aa0a93e8d765e32b61da") && lock.include?("#0324db3240adf00ea847aa0a93e8d765e32b61da")
 puts "OHTTP workflow contract: #{cargo_jobs.length} Cargo jobs, eight secrets, final dependency and token scope verified"

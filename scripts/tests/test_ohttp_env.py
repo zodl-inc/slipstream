@@ -24,6 +24,7 @@ import unittest
 from unittest.mock import patch
 
 RUNNER = Path(__file__).resolve().parents[1] / "ci/ohttp_env.py"
+MATRIX = Path(__file__).resolve().with_name("ohttp_configuration.py")
 NAMES = tuple("ZODL_OHTTP_" + suffix for suffix in (
     "GATEWAY_HOST_MAINNET", "GATEWAY_HOST_TESTNET", "RELAY_URL_MAINNET", "RELAY_URL_TESTNET",
     "SIGNING_PUBKEY_MAINNET", "SIGNING_PUBKEY_TESTNET", "KEYS_DNS_NAME_MAINNET", "KEYS_DNS_NAME_TESTNET"))
@@ -70,12 +71,60 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(self.runner.configuration_hash(values), EXPECTED)
         self.assertEqual(values, before)
 
-    def test_matching_relay_key_and_dns_are_allowed(self):
-        values = dict(VALUES)
-        for kind in ("RELAY_URL", "SIGNING_PUBKEY", "KEYS_DNS_NAME"):
-            values[f"ZODL_OHTTP_{kind}_TESTNET"] = values[f"ZODL_OHTTP_{kind}_MAINNET"]
+    def test_corresponding_network_values_must_differ_ignoring_ascii_case(self):
+        for first, second in ((0, 1), (2, 3), (4, 5), (6, 7)):
+            for case_only in (False, True):
+                values = dict(VALUES)
+                matching = values[NAMES[first]]
+                if case_only:
+                    matching = matching.upper().replace("HTTPS://", "https://", 1)
+                values[NAMES[second]] = matching
+                with self.subTest(name=NAMES[second], case_only=case_only):
+                    with self.assertRaises(ValueError) as failure:
+                        self.runner.configuration_hash(values)
+                    self.assertIn(NAMES[first], str(failure.exception))
+                    self.assertIn(NAMES[second], str(failure.exception))
+                    for value in values.values():
+                        self.assertNotIn(value, str(failure.exception))
+
+    def test_malformed_inputs_are_rejected_without_values(self):
+        bad_hosts = ("é.example", "host.example.", "-host.example", "host..example",
+                     "a" * 64 + ".example", "a." * 127 + "a", "host:443", "https://host.example")
+        bad_relays = ("http://relay.example", "https://", "https://user@relay.example",
+                      "https://relay.example/white space", "https://relay.example/\x00")
+        bad_keys = ("a" * 63, "g" * 64, "é" * 64)
+        for name in NAMES:
+            if "SIGNING_PUBKEY" in name:
+                malformed = bad_keys
+            elif "RELAY_URL" in name:
+                malformed = bad_relays
+            else:
+                malformed = bad_hosts
+            for value in malformed:
+                values = dict(VALUES)
+                values[name] = value
+                with self.subTest(name=name, value=value):
+                    with self.assertRaises(ValueError) as failure:
+                        self.runner.configuration_hash(values)
+                    self.assertIn(name, str(failure.exception))
+                    self.assertNotIn(value, str(failure.exception))
+
+    def test_valid_case_and_url_spelling_are_preserved(self):
+        values = {name: value.upper() if "RELAY_URL" not in name else value for name, value in VALUES.items()}
+        before = dict(values)
         self.assertIsNone(self.runner.validate_configuration(values))
-        self.assertEqual(len(self.runner.configuration_hash(values)), 64)
+        self.assertNotEqual(self.runner.configuration_hash(values), EXPECTED)
+        self.assertEqual(values, before)
+        for relay in ("https://relay.example:8443/path?query=value", "https://[::1]/relay"):
+            values = dict(VALUES, ZODL_OHTTP_RELAY_URL_MAINNET=relay)
+            self.assertIsNone(self.runner.validate_configuration(values))
+
+    def test_digest_preserves_utf8_bytes_and_excludes_build_policy(self):
+        values = dict(VALUES, ZODL_OHTTP_RELAY_URL_MAINNET="https://main.example.invalid/relây")
+        self.assertEqual(self.runner.configuration_hash(values),
+                         "5bb7495555789759a9f5dd299d1b8b38417b2b79741a2096dfa9c07ef3186a02")
+        self.assertEqual(values["ZODL_OHTTP_RELAY_URL_MAINNET"], "https://main.example.invalid/relây")
+        self.assertEqual(self.runner.configuration_hash(dict(VALUES, ZODL_OHTTP_REQUIRE="1")), EXPECTED)
 
     def test_digest_uses_fixed_order_and_each_original_value(self):
         self.assertEqual(self.runner.configuration_hash(dict(reversed(list(VALUES.items())))), EXPECTED)
@@ -89,10 +138,6 @@ class ConfigurationTests(unittest.TestCase):
                 changed[name] = "changed." + changed[name]
             with self.subTest(name=name):
                 self.assertNotEqual(self.runner.configuration_hash(changed), EXPECTED)
-        # Byte lengths must count UTF-8 bytes, and presence validation does not own format.
-        unicode_values = dict(VALUES, ZODL_OHTTP_KEYS_DNS_NAME_MAINNET="é.example")
-        self.assertIsNone(self.runner.validate_configuration(unicode_values))
-        self.assertNotEqual(self.runner.configuration_hash(unicode_values), EXPECTED)
 
     def test_cli_requires_inputs_and_never_acquires_configuration(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,6 +170,37 @@ class ConfigurationTests(unittest.TestCase):
                         for value in VALUES.values():
                             self.assertNotIn(value, result.stderr)
             self.assertFalse(marker.exists(), "CLI attempted configuration acquisition")
+
+
+class MatrixDiagnosticsTests(unittest.TestCase):
+    def run_matrix_with_cargo_output(self, case, output, returncode):
+        with tempfile.TemporaryDirectory() as directory:
+            cargo = Path(directory) / "cargo"
+            cargo.write_text(f"#!{sys.executable}\nimport sys\nsys.stderr.write({output!r})\nsys.exit({returncode})\n")
+            cargo.chmod(0o755)
+            return subprocess.run([sys.executable, "-B", str(MATRIX), case],
+                                  env={"PATH": directory}, capture_output=True, text=True)
+
+    def test_rerun_metadata_does_not_establish_the_rejected_variable(self):
+        output = ("failed to run custom build command for `zodl-ohttp-client v0.1.2`\n"
+                  "--- stdout\n" + "\n".join("cargo:rerun-if-env-changed=" + name for name in NAMES)
+                  + "\n--- stderr\ninvalid OHTTP build configuration:\n"
+                  "ZODL_OHTTP_REQUIRE must be 1, 0 or unset\n")
+        result = self.run_matrix_with_cargo_output("no-dns", output, 101)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("expected core build rejection", result.stdout)
+
+    def test_success_without_running_the_contract_is_rejected(self):
+        result = self.run_matrix_with_cargo_output(
+            "complete", "test result: ok. 0 passed; 0 failed; 1 filtered out\n", 0)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    def test_expected_core_diagnostic_is_accepted(self):
+        output = ("failed to run custom build command for `zodl-ohttp-client v0.1.2`\n"
+                  "--- stderr\ninvalid OHTTP build configuration:\n"
+                  "ZODL_OHTTP_KEYS_DNS_NAME_TESTNET missing\n")
+        result = self.run_matrix_with_cargo_output("no-dns", output, 101)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

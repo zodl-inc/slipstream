@@ -309,8 +309,8 @@ fn cached_or_new_client(
 /// Gateway hosts, relay URLs, signing public keys and DNS TXT names come from the
 /// `ZODL_OHTTP_GATEWAY_HOST_*`, `ZODL_OHTTP_RELAY_URL_*`, `ZODL_OHTTP_SIGNING_PUBKEY_*`
 /// and `ZODL_OHTTP_KEYS_DNS_NAME_*` build-time inputs of `zodl-ohttp-client`.
-/// No endpoints or signing keys are bundled. A network without a gateway host, relay URL
-/// or signer has no relay; an absent DNS name disables only its DNS fallback.
+/// No endpoints or signing keys are bundled. Each network is compiled with all four inputs
+/// or none. Partial networks and corresponding values shared between networks fail the build.
 pub fn relay_for(gateway_host: &str) -> Option<&'static str> {
     configured_gateway_hosts(gateway_host).find_map(zodl_ohttp_client::relay_for)
 }
@@ -3326,17 +3326,13 @@ fn grpc_error_with(
 #[cfg(test)]
 pub(crate) mod tests {
     pub(crate) fn mainnet_gateway() -> &'static str {
-        env!(
-            "ZODL_OHTTP_GATEWAY_HOST_MAINNET",
-            "set ZODL_OHTTP_GATEWAY_HOST_MAINNET for configured transport tests"
-        )
+        option_env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET")
+            .expect("set ZODL_OHTTP_GATEWAY_HOST_MAINNET for configured transport tests")
     }
 
     pub(crate) fn testnet_gateway() -> &'static str {
-        env!(
-            "ZODL_OHTTP_GATEWAY_HOST_TESTNET",
-            "set ZODL_OHTTP_GATEWAY_HOST_TESTNET for configured transport tests"
-        )
+        option_env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET")
+            .expect("set ZODL_OHTTP_GATEWAY_HOST_TESTNET for configured transport tests")
     }
 
     /// A public synthetic signer. Only the fixture supplies it; production resolves its
@@ -5671,8 +5667,8 @@ pub(crate) mod tests {
         assert!(KeyConfig::select_with(&doc, &ClientProfile::SLIPSTREAM.key_selection).is_err());
     }
 
-    /// Recompiled by scripts/tests/ohttp_configuration.py with complete, absent-source,
-    /// mixed-case and ambiguous-host inputs. Each case uses the real core's configuration.
+    /// Recompiled by scripts/tests/ohttp_configuration.py with complete, mixed-case,
+    /// absent and single-network inputs. Invalid states must fail before reaching this test.
     #[tokio::test]
     async fn compiled_configuration_contract() {
         let case = std::env::var("SLIPSTREAM_TEST_CONFIGURATION")
@@ -5716,149 +5712,43 @@ pub(crate) mod tests {
                     }
                 }
             }
-            "ambiguous-hosts" | "ambiguous-partial-mainnet" => {
-                for host in [
-                    mainnet_gateway().to_owned(),
-                    mainnet_gateway().to_ascii_lowercase(),
-                    testnet_gateway().to_ascii_uppercase(),
+            "none" | "mainnet-only" | "testnet-only" => {
+                for (network_name, configured, original, relay, network, absent_host) in [
+                    (
+                        "mainnet",
+                        zodl_ohttp_client::GATEWAY_HOST_MAINNET,
+                        option_env!("ZODL_OHTTP_GATEWAY_HOST_MAINNET"),
+                        option_env!("ZODL_OHTTP_RELAY_URL_MAINNET"),
+                        Network::Mainnet,
+                        "main-with-testnet-in-name.example",
+                    ),
+                    (
+                        "testnet",
+                        zodl_ohttp_client::GATEWAY_HOST_TESTNET,
+                        option_env!("ZODL_OHTTP_GATEWAY_HOST_TESTNET"),
+                        option_env!("ZODL_OHTTP_RELAY_URL_TESTNET"),
+                        Network::Testnet,
+                        "alternate-chain.example",
+                    ),
                 ] {
+                    let enabled = case == format!("{network_name}-only");
+                    assert!(configured.is_some() == enabled);
                     assert!(
-                        relay_for(&host).is_some(),
-                        "recognized gateways must retain OHTTP routing"
+                        configured == original,
+                        "preserve the compiled host spelling"
                     );
-                    let expected_relay = if case == "ambiguous-partial-mainnet" {
-                        option_env!("ZODL_OHTTP_RELAY_URL_TESTNET")
+                    if let Some(host) = configured {
+                        assert!(relay_for(host) == relay);
+                        assert!(relay.is_some());
+                        assert!(gateway_network(host) == Ok(network));
                     } else {
-                        option_env!("ZODL_OHTTP_RELAY_URL_MAINNET")
-                    };
-                    assert!(
-                        relay_for(&host) == expected_relay,
-                        "use an available deterministic relay"
-                    );
-                    let config = crate::config::EngineConfig::new(
-                        crate::Network::TestNetwork,
-                        "/tmp/unused-ambiguous-config.db".into(),
-                        crate::config::Endpoint {
-                            host: host.clone(),
-                            port: 443,
-                            tls: true,
-                        },
-                    );
-                    assert!(matches!(
-                        config.validate(),
-                        Err(crate::error::SlipstreamError::Config(_))
-                    ));
-                    let client = OhttpClient::new(
-                        &host,
-                        "https://ambiguous-config.invalid/relay",
-                        Dialer::Direct,
-                        None,
-                        ClientProfile::SLIPSTREAM,
-                    )
-                    .unwrap();
-                    let requests = Arc::new(AtomicUsize::new(0));
-                    serve_in_process_relay(&client, {
-                        let requests = requests.clone();
-                        move |_| {
-                            requests.fetch_add(1, Ordering::SeqCst);
-                            async {
-                                let mut response = Response::new(Full::new(Bytes::new()).boxed());
-                                *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                                response
-                            }
-                        }
-                    })
-                    .await;
-                    let error = client
-                        .key_config(false)
-                        .await
-                        .expect_err("ambiguous network");
-                    assert_eq!(
-                        requests.load(Ordering::SeqCst),
-                        0,
-                        "ambiguous gateway must not dispatch"
-                    );
-                    assert!(error.to_string().contains("ambiguous"), "{error:?}");
-                    assert!(gateway_network(&host).is_err());
-                }
-            }
-            "no-dns" | "no-signing" => {
-                let gateway = testnet_gateway();
-                let relay = "https://configuration-contract.invalid/relay";
-                let client = OhttpClient::new(
-                    gateway,
-                    relay,
-                    Dialer::Direct,
-                    None,
-                    ClientProfile::SLIPSTREAM,
-                )
-                .unwrap();
-                let requests = Arc::new(AtomicUsize::new(0));
-                // A real in-process h2 peer observes any key fetch. A 429 terminates
-                // an accidental fetch without starting a live DNS fallback.
-                serve_in_process_relay(&client, {
-                    let requests = requests.clone();
-                    move |_| {
-                        requests.fetch_add(1, Ordering::SeqCst);
-                        async {
-                            let mut answer = Response::new(Full::new(Bytes::new()).boxed());
-                            *answer.status_mut() = StatusCode::TOO_MANY_REQUESTS;
-                            answer
-                        }
+                        assert!(relay.is_none());
+                        assert!(relay_for(absent_host).is_none());
+                        assert!(gateway_network(absent_host).is_err());
                     }
-                })
-                .await;
-                if case == "no-signing" {
-                    let error = client.key_config(false).await.expect_err("no signing key");
-                    assert_eq!(
-                        requests.load(Ordering::SeqCst),
-                        0,
-                        "no request without a signer"
-                    );
-                    assert!(error.to_string().contains("signing key"), "{error:?}");
-                    assert!(relay_for(gateway).is_none());
-                } else {
-                    // Populate the actual resolver pool keys, so a bug dispatches
-                    // to these peers rather than making live Internet requests.
-                    for resolver in DOH_RESOLVERS {
-                        let target = parse_https(resolver).unwrap();
-                        let peer = OhttpClient::new(
-                            "unused.invalid",
-                            resolver,
-                            Dialer::Direct,
-                            None,
-                            ClientProfile::SLIPSTREAM,
-                        )
-                        .unwrap();
-                        let requests = requests.clone();
-                        serve_in_process_relay(&peer, move |_| {
-                            requests.fetch_add(1, Ordering::SeqCst);
-                            async {
-                                let mut answer = Response::new(Full::new(Bytes::new()).boxed());
-                                *answer.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
-                                answer
-                            }
-                        })
-                        .await;
-                        let key = format!("{}:{}", target.host, target.port);
-                        let sender = peer.h2_pool.lock().await.remove(&key).unwrap();
-                        client.h2_pool.lock().await.insert(key, sender);
-                    }
-                    let error = client
-                        .key_config_from_dns(RoundTripError::Transport(
-                            "original relay failure".into(),
-                        ))
-                        .await
-                        .expect_err("no DNS source");
-                    assert_eq!(
-                        requests.load(Ordering::SeqCst),
-                        0,
-                        "missing DNS source must not query DoH"
-                    );
-                    assert!(
-                        matches!(error, RoundTripError::Transport(m) if m == "original relay failure")
-                    );
                 }
+                assert!(relay_for("unknown-gateway.invalid").is_none());
+                assert!(gateway_network("unknown-gateway.invalid").is_err());
             }
             other => panic!("unknown configuration case: {other}"),
         }

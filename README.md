@@ -65,7 +65,7 @@ not.
 ```sh
 # Public synthetic configuration for hermetic transport tests.
 python3 scripts/tests/ohttp_configuration.py -- cargo test --workspace
-# Check host routing/casing/ambiguity and rebuild without DNS / without a signing key.
+# Compile complete, absent and single-network states; reject partial or shared values.
 python3 scripts/tests/ohttp_configuration.py
 python3 -B -m unittest discover -s scripts/tests -p test_ohttp_env.py
 ruby scripts/tests/ohttp_workflow_test.rb
@@ -80,16 +80,18 @@ Deployment builds supply `ZODL_OHTTP_GATEWAY_HOST_MAINNET`,
 `ZODL_OHTTP_RELAY_URL_TESTNET`, `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`,
 `ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`, `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET` and
 `ZODL_OHTTP_KEYS_DNS_NAME_TESTNET` when compiling Cargo dependencies. These are
-build-time inputs with no bundled endpoint or signing-key defaults. Missing a
-gateway, relay or signing key disables that network's relay mapping; a missing
-DNS name disables its DNS fallback. Gateway matching ignores DNS letter case;
-ambiguous mainnet/testnet host identity is rejected before verification or dispatch.
+build-time inputs with no bundled endpoint or signing-key defaults. Each network
+requires all four inputs or none. An incomplete network fails the build. With
+`ZODL_OHTTP_REQUIRE` unset or `0`, zero, one or both complete networks are supported.
+`ZODL_OHTTP_REQUIRE=1` requires all eight inputs. Corresponding mainnet/testnet
+values must differ ignoring ASCII case. Gateway matching ignores DNS letter case.
 GitHub CI requires all eight as Actions secrets (`secrets.ZODL_OHTTP_*`). A
-preflight rejects missing or empty inputs before Rust caches or Cargo run, and a
+strict preflight rejects missing, empty, malformed or shared inputs before Rust
+caches or Cargo run. CI also sets `ZODL_OHTTP_REQUIRE=1`. A
 versioned digest of the original values binds native caches to the configuration.
 The preflight reads only the inherited environment and never fetches configuration.
-Standalone/core builds retain the optional network behavior described above;
-configuration format validation remains owned by the OHTTP core.
+The native OHTTP core independently validates the same build contract. The strict
+policy flag is not a secret or part of the eight-input configuration digest.
 
 The test wrapper overrides these names with public example hosts and public test
 signing keys, without reading shell startup files or fetching configuration. Its
