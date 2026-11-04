@@ -11,6 +11,21 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+
+- OHTTP gRPC and extension requests ASCII-lowercase their encoded BHTTP authority.
+  Authority ports, paths, query strings, bodies and existing header policies are
+  preserved. Stored configuration spelling and public interfaces are unchanged.
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+- OHTTP uses `zodl-ohttp-client` 0.1.2 with explicit build-time gateway host,
+  relay URL, signing key and DNS name. Each network requires all four values or none.
+  `ZODL_OHTTP_REQUIRE=1` requires all eight values, and corresponding mainnet/testnet
+  values must differ ignoring ASCII case. Incomplete, malformed or shared
+  configuration fails the build. Zero, one or both complete networks are supported
+  with strict mode off. Gateway identity comes from exact configured DNS hosts,
+  ignoring letter case.
 - Bounded Tor startup waits for traffic readiness before publishing a fresh
   connection, within the original admission/bootstrap/retry deadline. Legacy
   unbounded startup behavior is unchanged. No caller changes are needed.

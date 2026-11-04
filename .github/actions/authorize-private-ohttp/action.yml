@@ -1,6 +1,6 @@
 name: "Authorize cargo against the private ohttp repository"
 description: >-
-  Mints a short-lived read token for zodl-inc/ohttp and points cargo's git fetches at it.
+  Mints a short-lived read token for zodl-inc/zodl-ohttp and points cargo's git fetches at it.
   `zodl-ohttp-client` (the shared sans-IO OHTTP core) is a git dependency on that private repo,
   and cargo fetches the source while resolving the dependency graph, so every job that runs
   cargo needs read access.
@@ -11,7 +11,7 @@ description: >-
 inputs:
   app-id:
     description: >-
-      App ID of the GitHub App holding Contents:Read on zodl-inc/ohttp. Leave empty to skip the
+      App ID of the GitHub App holding Contents:Read on zodl-inc/zodl-ohttp. Leave empty to skip the
       credential setup entirely.
     required: false
     default: ""
@@ -33,7 +33,7 @@ runs:
         # The App is installed on zodl-inc, not on this repository's owner, so the installation
         # to mint against has to be named explicitly.
         owner: zodl-inc
-        repositories: ohttp
+        repositories: zodl-ohttp
         # Fetching a git dependency is a read of repository contents and nothing more.
         permission-contents: read
 

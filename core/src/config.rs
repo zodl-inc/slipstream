@@ -456,7 +456,7 @@ impl EngineConfig {
             crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
         info!(
             chosen = outcome.chosen,
-            host = endpoints[outcome.chosen].host.as_str(),
+            host = crate::ohttp::log_host(&endpoints[outcome.chosen].host),
             port = endpoints[outcome.chosen].port,
             probe_ms = outcome.elapsed.as_millis() as u64,
             "wire probe committed"
@@ -596,23 +596,27 @@ mod tests {
                 ep,
             )
         };
-        assert!(main(gateway("ohttp-gateway.example")).validate().is_ok());
         assert!(
-            test(gateway("ohttp-gateway-testnet.example"))
+            main(gateway(crate::ohttp::tests::mainnet_gateway()))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            test(gateway(crate::ohttp::tests::testnet_gateway()))
                 .validate()
                 .is_ok()
         );
         assert!(matches!(
-            test(gateway("ohttp-gateway.example")).validate(),
+            test(gateway(crate::ohttp::tests::mainnet_gateway())).validate(),
             Err(SlipstreamError::Config(m)) if m.contains("mainnet")
         ));
         assert!(matches!(
-            main(gateway("ohttp-gateway-testnet.example")).validate(),
+            main(gateway(crate::ohttp::tests::testnet_gateway())).validate(),
             Err(SlipstreamError::Config(_))
         ));
         // An alternate gateway on the other network is refused as well.
-        let mut c = main(gateway("ohttp-gateway.example"));
-        c.alternate_endpoints = vec![gateway("ohttp-gateway-testnet.example")];
+        let mut c = main(gateway(crate::ohttp::tests::mainnet_gateway()));
+        c.alternate_endpoints = vec![gateway(crate::ohttp::tests::testnet_gateway())];
         assert!(matches!(c.validate(), Err(SlipstreamError::Config(_))));
         // Clearnet servers are not checked.
         assert!(

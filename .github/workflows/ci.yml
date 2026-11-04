@@ -24,6 +24,17 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  ZODL_OHTTP_REQUIRE: "1"
+  ZODL_OHTTP_GATEWAY_HOST_MAINNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_MAINNET }}
+  ZODL_OHTTP_GATEWAY_HOST_TESTNET: ${{ secrets.ZODL_OHTTP_GATEWAY_HOST_TESTNET }}
+  ZODL_OHTTP_RELAY_URL_MAINNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_MAINNET }}
+  ZODL_OHTTP_RELAY_URL_TESTNET: ${{ secrets.ZODL_OHTTP_RELAY_URL_TESTNET }}
+  ZODL_OHTTP_SIGNING_PUBKEY_MAINNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_MAINNET }}
+  ZODL_OHTTP_SIGNING_PUBKEY_TESTNET: ${{ secrets.ZODL_OHTTP_SIGNING_PUBKEY_TESTNET }}
+  ZODL_OHTTP_KEYS_DNS_NAME_MAINNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_MAINNET }}
+  ZODL_OHTTP_KEYS_DNS_NAME_TESTNET: ${{ secrets.ZODL_OHTTP_KEYS_DNS_NAME_TESTNET }}
+
 jobs:
   test:
     name: Test (default features)
@@ -34,14 +45,23 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          hash="$(python3 scripts/ci/ohttp_env.py --hash)"
+          printf 'hash=%s\n' "$hash" >> "$GITHUB_OUTPUT"
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
           app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ohttp-${{ steps.ohttp-config.outputs.hash }}
       - name: Run tests
         run: cargo test --workspace --verbose
+      - name: Check OHTTP configuration variants
+        run: python3 scripts/tests/ohttp_configuration.py
       - name: Verify working directory is clean
         run: git diff --exit-code
 
@@ -54,12 +74,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          hash="$(python3 scripts/ci/ohttp_env.py --hash)"
+          printf 'hash=%s\n' "$hash" >> "$GITHUB_OUTPUT"
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
           app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ohttp-${{ steps.ohttp-config.outputs.hash }}
       # Compile-only: `darkside` tests need a live lightwalletd and `gpu` tests need a
       # GPU, so neither RUNS in CI. Building every target under all features is what
       # catches the cross-feature API drift a default-features build would miss.
@@ -77,6 +104,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Test OHTTP CI configuration helper
+        run: python3 -B -m unittest discover -s scripts/tests -p test_ohttp_env.py
+      - name: Check OHTTP workflow contract
+        run: ruby scripts/tests/ohttp_workflow_test.rb
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -89,12 +120,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          hash="$(python3 scripts/ci/ohttp_env.py --hash)"
+          printf 'hash=%s\n' "$hash" >> "$GITHUB_OUTPUT"
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
           app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ohttp-${{ steps.ohttp-config.outputs.hash }}
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
@@ -107,12 +145,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/ohttp repo.
+      - name: Validate OHTTP configuration
+        id: ohttp-config
+        run: |
+          hash="$(python3 scripts/ci/ohttp_env.py --hash)"
+          printf 'hash=%s\n' "$hash" >> "$GITHUB_OUTPUT"
+      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
       - uses: ./.github/actions/authorize-private-ohttp
         with:
           app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
           app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: ohttp-${{ steps.ohttp-config.outputs.hash }}
       # Denies rustdoc warnings (broken intra-doc links included) across public and
       # private items — the same doc hygiene librustzcash gates on.
       - name: Check intra-doc links

@@ -349,8 +349,7 @@ impl TorConn {
         client_trace_prefix: Option<String>,
     ) -> Result<TrackedConnection, SlipstreamError> {
         tracing::info!(
-            gateway = %endpoint.host,
-            relay,
+            network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
             "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
         );
         let connector = OhttpConnector::with_dialer(
@@ -377,7 +376,11 @@ impl TorConn {
             .connect_with_connector(connector.clone())
             .await
             .map_err(|e| {
-                SlipstreamError::Transport(format!("ohttp connect {}: {e}", endpoint.host))
+                tracing::debug!(host = %endpoint.host, err = %e, "ohttp connect over Tor failed");
+                SlipstreamError::Transport(format!(
+                    "ohttp connect {}: {e}",
+                    crate::ohttp::gateway_label(&endpoint.host)
+                ))
             })?;
         Ok(TrackedConnection::ohttp(
             LwdClient::new(channel),
@@ -419,7 +422,10 @@ impl TorConn {
                 let source = std::error::Error::source(&e)
                     .map(|s| format!(" ({s})"))
                     .unwrap_or_default();
-                SlipstreamError::Transport(format!("tor connect {}: {e}{source}", endpoint.host))
+                SlipstreamError::Transport(format!(
+                    "tor connect {}: {e}{source}",
+                    crate::ohttp::log_host(&endpoint.host)
+                ))
             })?;
         Ok(TrackedConnection::plain(LwdClient::new(channel)))
     }
@@ -735,7 +741,7 @@ mod tests {
 
     fn ohttp_endpoint() -> Endpoint {
         Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: crate::ohttp::tests::testnet_gateway().into(),
             port: 443,
             tls: true,
         }
@@ -982,7 +988,7 @@ mod tests {
             route(ConnPurpose::MetadataDefault, true),
             Some(TorMode::Default)
         );
-        assert!(crate::ohttp::relay_for("ohttp-gateway-testnet.example").is_some());
+        assert!(crate::ohttp::relay_for(crate::ohttp::tests::testnet_gateway()).is_some());
         // Public sync metadata shares the session connection on the default circuit.
         assert_eq!(route(ConnPurpose::SyncShared, true), Some(TorMode::Shared));
         assert_eq!(route(ConnPurpose::SyncShared, false), Some(TorMode::Shared));
@@ -991,7 +997,7 @@ mod tests {
     #[test]
     fn bulk_chunk_cap_applies_to_ohttp_only() {
         let gw = Endpoint {
-            host: "ohttp-gateway-testnet.example".into(),
+            host: crate::ohttp::tests::testnet_gateway().into(),
             port: 443,
             tls: true,
         };
