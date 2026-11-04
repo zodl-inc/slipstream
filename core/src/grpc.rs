@@ -491,7 +491,10 @@ pub(crate) async fn connect_tracked(
     // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
     // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
     if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
-        tracing::info!(gateway = %endpoint.host, relay, "lightwalletd via OHTTP (RFC 9458)");
+        tracing::info!(
+            network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
+            "lightwalletd via OHTTP (RFC 9458)"
+        );
         let connector = if shared {
             crate::ohttp::OhttpConnector::new(&endpoint.host, relay)
         } else {
@@ -511,8 +514,12 @@ pub(crate) async fn connect_tracked(
                 let source = std::error::Error::source(&e)
                     .map(|s| format!(" ({s})"))
                     .unwrap_or_default();
+                tracing::debug!(host = %endpoint.host, err = %e, "ohttp connect failed");
                 transport_err(
-                    &format!("ohttp connect {}", endpoint.host),
+                    &format!(
+                        "ohttp connect {}",
+                        crate::ohttp::gateway_label(&endpoint.host)
+                    ),
                     format!("{e}{source}"),
                 )
             })?;
@@ -531,10 +538,12 @@ pub(crate) async fn connect_tracked(
             .tls_config(ClientTlsConfig::new().with_webpki_roots())
             .map_err(|e| transport_err("tls config", e))?;
     }
-    let channel = ep
-        .connect()
-        .await
-        .map_err(|e| transport_err(&format!("connect {}", endpoint.host), e))?;
+    let channel = ep.connect().await.map_err(|e| {
+        transport_err(
+            &format!("connect {}", crate::ohttp::log_host(&endpoint.host)),
+            e,
+        )
+    })?;
     net_stats::record(net_stats::NetEvent::DirectChannel);
     Ok(TrackedConnection::plain(CompactTxStreamerClient::new(
         channel,

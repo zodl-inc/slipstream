@@ -349,8 +349,7 @@ impl TorConn {
         client_trace_prefix: Option<String>,
     ) -> Result<TrackedConnection, SlipstreamError> {
         tracing::info!(
-            gateway = %endpoint.host,
-            relay,
+            network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
             "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
         );
         let connector = OhttpConnector::with_dialer(
@@ -377,7 +376,11 @@ impl TorConn {
             .connect_with_connector(connector.clone())
             .await
             .map_err(|e| {
-                SlipstreamError::Transport(format!("ohttp connect {}: {e}", endpoint.host))
+                tracing::debug!(host = %endpoint.host, err = %e, "ohttp connect over Tor failed");
+                SlipstreamError::Transport(format!(
+                    "ohttp connect {}: {e}",
+                    crate::ohttp::gateway_label(&endpoint.host)
+                ))
             })?;
         Ok(TrackedConnection::ohttp(
             LwdClient::new(channel),
@@ -419,7 +422,10 @@ impl TorConn {
                 let source = std::error::Error::source(&e)
                     .map(|s| format!(" ({s})"))
                     .unwrap_or_default();
-                SlipstreamError::Transport(format!("tor connect {}: {e}{source}", endpoint.host))
+                SlipstreamError::Transport(format!(
+                    "tor connect {}: {e}{source}",
+                    crate::ohttp::log_host(&endpoint.host)
+                ))
             })?;
         Ok(TrackedConnection::plain(LwdClient::new(channel)))
     }

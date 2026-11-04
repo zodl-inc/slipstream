@@ -456,7 +456,7 @@ impl EngineConfig {
             crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
         info!(
             chosen = outcome.chosen,
-            host = endpoints[outcome.chosen].host.as_str(),
+            host = crate::ohttp::log_host(&endpoints[outcome.chosen].host),
             port = endpoints[outcome.chosen].port,
             probe_ms = outcome.elapsed.as_millis() as u64,
             "wire probe committed"

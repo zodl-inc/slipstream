@@ -124,7 +124,7 @@ pub async fn probe_endpoints(endpoints: &[Endpoint], budget: Duration) -> ProbeO
     for (i, r) in results.iter().enumerate() {
         info!(
             index = i,
-            host = r.endpoint.host.as_str(),
+            host = crate::ohttp::log_host(&r.endpoint.host),
             port = r.endpoint.port,
             tip = r.tip,
             sample_mbps = r.sample_mbps.map(|m| format!("{m:.2}")),

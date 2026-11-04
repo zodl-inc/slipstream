@@ -29,7 +29,22 @@ raise "no Cargo jobs checked" if cargo_jobs.empty?
 cargo_jobs.each do |name, job|
   effective = workflow.fetch("env", {}).merge(job.fetch("env", {}))
   required.each do |key|
-    raise "#{name}: missing Actions variable #{key}" unless effective[key] == "${{ vars.#{key} }}"
+    raise "#{name}: missing Actions secret #{key}" unless effective[key] == "${{ secrets.#{key} }}"
+  end
+  steps = job.fetch("steps")
+  checkout = steps.index { |step| step.fetch("uses", "").start_with?("actions/checkout@") }
+  preflight = steps.index { |step| step["id"] == "ohttp-config" }
+  raise "#{name}: configuration preflight must follow checkout" unless checkout && preflight && checkout < preflight
+  run = steps.fetch(preflight).fetch("run", "")
+  raise "#{name}: preflight does not hash inherited configuration" unless run.include?("python3 scripts/ci/ohttp_env.py --hash") && run.include?("GITHUB_OUTPUT") && run.include?("hash=")
+  steps.each_with_index do |step, index|
+    cache = step.fetch("uses", "").start_with?("Swatinem/rust-cache@")
+    cargo = step.fetch("run", "").match?(/\bcargo (test|check|clippy|doc)\b/)
+    raise "#{name}: cache/Cargo precedes preflight" if (cache || cargo) && index <= preflight
+    if cache
+      key = step.fetch("with", {}).fetch("shared-key", "")
+      raise "#{name}: cache is not bound to configuration" unless key.include?("${{ steps.ohttp-config.outputs.hash }}")
+    end
   end
 end
 test_steps = workflow.fetch("jobs").fetch("test").fetch("steps")
@@ -42,4 +57,4 @@ manifest = File.read(File.join(root, "core/Cargo.toml"))
 lock = File.read(File.join(root, "Cargo.lock"))
 raise "old dependency URL" if [manifest, lock].any? { |text| text.include?("https://github.com/zodl-inc/ohttp.git") }
 raise "final library missing" unless manifest.include?("https://github.com/zodl-inc/zodl-ohttp.git") && manifest.include?("650bb4ac5015dde96f22b67d7d77dc1020be9ed8")
-puts "OHTTP workflow contract: #{cargo_jobs.length} Cargo jobs, eight variables, final dependency and token scope verified"
+puts "OHTTP workflow contract: #{cargo_jobs.length} Cargo jobs, eight secrets, final dependency and token scope verified"

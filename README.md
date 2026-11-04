@@ -67,6 +67,7 @@ not.
 python3 scripts/tests/ohttp_configuration.py -- cargo test --workspace
 # Check host routing/casing/ambiguity and rebuild without DNS / without a signing key.
 python3 scripts/tests/ohttp_configuration.py
+python3 -B -m unittest discover -s scripts/tests -p test_ohttp_env.py
 ruby scripts/tests/ohttp_workflow_test.rb
 cargo build --workspace  # full workspace incl. the parked gpuhash
 ```
@@ -83,7 +84,12 @@ build-time inputs with no bundled endpoint or signing-key defaults. Missing a
 gateway, relay or signing key disables that network's relay mapping; a missing
 DNS name disables its DNS fallback. Gateway matching ignores DNS letter case;
 ambiguous mainnet/testnet host identity is rejected before verification or dispatch.
-CI reads all eight from Actions variables.
+GitHub CI requires all eight as Actions secrets (`secrets.ZODL_OHTTP_*`). A
+preflight rejects missing or empty inputs before Rust caches or Cargo run, and a
+versioned digest of the original values binds native caches to the configuration.
+The preflight reads only the inherited environment and never fetches configuration.
+Standalone/core builds retain the optional network behavior described above;
+configuration format validation remains owned by the OHTTP core.
 
 The test wrapper overrides these names with public example hosts and public test
 signing keys, without reading shell startup files or fetching configuration. Its

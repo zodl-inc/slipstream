@@ -410,7 +410,7 @@ pub async fn sync_once(
                 warn!(
                     measured_mbps = format!("{measured_mbps:.2}").as_str(),
                     floor_mbps = format!("{floor_mbps:.2}").as_str(),
-                    from = attempt_config.endpoint.host.as_str(),
+                    from = crate::ohttp::log_host(&attempt_config.endpoint.host),
                     switch = wire_switches,
                     "wire collapse — failing over"
                 );
@@ -447,7 +447,7 @@ pub async fn sync_once(
                     candidates.swap_remove(outcome.chosen)
                 };
                 info!(
-                    to = next.host.as_str(),
+                    to = crate::ohttp::log_host(&next.host),
                     port = next.port,
                     "wire failover committed"
                 );

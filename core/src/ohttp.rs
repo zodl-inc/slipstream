@@ -327,6 +327,46 @@ fn configured_gateway_hosts(gateway_host: &str) -> impl Iterator<Item = &'static
     .filter(move |configured| configured.eq_ignore_ascii_case(gateway_host))
 }
 
+/// `host` for an info-level log line: a configured gateway host, an endpoint value of the build,
+/// is shown only as `ohttp-gateway`.
+pub(crate) fn log_host(host: &str) -> &str {
+    if configured_gateway_hosts(host).next().is_some() {
+        "ohttp-gateway"
+    } else {
+        host
+    }
+}
+
+/// A configured gateway host as an error message names it: its network and `ohttp-gateway`.
+/// Error messages reach info-level lines through `%err`, so they carry no endpoint value.
+pub(crate) fn gateway_label(host: &str) -> &'static str {
+    match gateway_network(host) {
+        Ok(Network::Mainnet) => "mainnet ohttp-gateway",
+        Ok(Network::Testnet) => "testnet ohttp-gateway",
+        Err(_) => "ohttp-gateway",
+    }
+}
+
+/// `message` with every spelling of `host` (ignoring ASCII case) replaced by `label`: an inner
+/// error (a TLS name mismatch, a Tor stream failure) may name the peer itself.
+fn redact_host(message: impl std::fmt::Display, host: &str, label: &str) -> String {
+    let message = message.to_string();
+    if host.is_empty() {
+        return message;
+    }
+    let lower = message.to_ascii_lowercase();
+    let needle = host.to_ascii_lowercase();
+    let mut out = String::with_capacity(message.len());
+    let mut rest = 0;
+    for (at, _) in lower.match_indices(&needle) {
+        out.push_str(&message[rest..at]);
+        out.push_str(label);
+        rest = at + needle.len();
+    }
+    out.push_str(&message[rest..]);
+    out
+}
+
 /// Object-safe alias for the byte stream underneath TLS (a plain TCP socket or an arti Tor
 /// stream); Rust allows only one non-auto trait per `dyn`, hence the blanket supertrait.
 trait AsyncIo: AsyncRead + AsyncWrite + Send + Unpin {}
@@ -357,7 +397,8 @@ impl Dialer {
         matches!(self, Dialer::Tor(_))
     }
 
-    async fn dial(&self, host: &str, port: u16) -> Result<BoxedIo, String> {
+    /// Opens a stream to `host`. Errors name the peer as `label`; the host is logged at debug.
+    async fn dial(&self, host: &str, port: u16, label: &str) -> Result<BoxedIo, String> {
         match self {
             Dialer::Direct => {
                 let tcp = tokio::time::timeout(
@@ -366,12 +407,16 @@ impl Dialer {
                 )
                 .await
                 .map_err(|_| {
+                    tracing::debug!(host, port, "ohttp: connect timed out");
                     format!(
-                        "connect {host}: exceeded {}s",
+                        "connect {label}: exceeded {}s",
                         DIRECT_DIAL_TIMEOUT.as_secs()
                     )
                 })?
-                .map_err(|e| format!("connect {host}: {e}"))?;
+                .map_err(|e| {
+                    tracing::debug!(host, port, err = %e, "ohttp: connect failed");
+                    format!("connect {label}: {}", redact_host(&e, host, label))
+                })?;
                 let _ = tcp.set_nodelay(true);
                 Ok(Box::new(tcp))
             }
@@ -388,7 +433,6 @@ impl Dialer {
                     match tokio::time::timeout(TOR_DIAL_TIMEOUT, c.connect((host, port))).await {
                         Ok(Ok(stream)) => {
                             tracing::info!(
-                                host,
                                 port,
                                 attempt,
                                 ms = started.elapsed().as_millis() as u64,
@@ -397,18 +441,19 @@ impl Dialer {
                             return Ok(Box::new(stream));
                         }
                         Ok(Err(e)) => {
-                            tracing::warn!(host, attempt, err = %e, "ohttp: tor dial failed — retrying on a fresh circuit");
-                            last_err = format!("tor connect {host}: {e}");
+                            tracing::warn!(attempt, err = %e, "ohttp: tor dial failed — retrying on a fresh circuit");
+                            tracing::debug!(host, port, attempt, err = %e, "ohttp: tor connect failed");
+                            last_err =
+                                format!("tor connect {label}: {}", redact_host(&e, host, label));
                         }
                         Err(_) => {
                             tracing::warn!(
-                                host,
                                 attempt,
                                 timeout_secs = TOR_DIAL_TIMEOUT.as_secs(),
                                 "ohttp: tor dial timed out — retrying on a fresh circuit"
                             );
                             last_err = format!(
-                                "tor connect {host}: exceeded {}s",
+                                "tor connect {label}: exceeded {}s",
                                 TOR_DIAL_TIMEOUT.as_secs()
                             );
                         }
@@ -597,7 +642,7 @@ fn unix_now() -> Result<u64, String> {
 pub(crate) fn gateway_network(gateway_host: &str) -> Result<Network, String> {
     let canonical = configured_gateway_hosts(gateway_host)
         .next()
-        .ok_or_else(|| format!("no OHTTP network configured for gateway host {gateway_host}"))?;
+        .ok_or("no OHTTP network configured for this gateway host")?;
     if zodl_ohttp_client::GATEWAY_HOST_MAINNET
         .zip(zodl_ohttp_client::GATEWAY_HOST_TESTNET)
         .is_some_and(|(mainnet, testnet)| mainnet.eq_ignore_ascii_case(testnet))
@@ -625,7 +670,7 @@ pub(crate) fn check_gateway_network(
         Ok(())
     } else {
         Err(format!(
-            "OHTTP gateway {gateway_host} serves {}, not this wallet's network",
+            "OHTTP gateway serves {}, not this wallet's network",
             gateway.as_str()
         ))
     }
@@ -671,9 +716,11 @@ struct HttpsTarget {
 }
 
 fn parse_https(url: &str) -> Result<HttpsTarget, String> {
-    let uri: Uri = url.parse().map_err(|e| format!("bad url {url}: {e}"))?;
+    let uri: Uri = url
+        .parse()
+        .map_err(|e| format!("bad relay/gateway URL: {e}"))?;
     if uri.scheme_str() != Some("https") {
-        return Err(format!("relay/gateway URL must be https: {url}"));
+        return Err("relay/gateway URL must be https".into());
     }
     Ok(HttpsTarget {
         host: uri.host().ok_or("url without host")?.to_string(),
@@ -915,7 +962,8 @@ impl HttpsError {
         }
     }
 
-    fn classify_tls_error(error: std::io::Error, target_host: &str) -> Self {
+    /// `label` names the peer; `target_host` is only redacted out of the inner error.
+    fn classify_tls_error(error: std::io::Error, target_host: &str, label: &str) -> Self {
         let rejected = error
             .get_ref()
             .and_then(|cause| cause.downcast_ref::<rustls::Error>())
@@ -928,7 +976,8 @@ impl HttpsError {
                         | rustls::Error::PeerIncompatible(_)
                 )
             });
-        let message = format!("tls {target_host}: {error}");
+        tracing::debug!(host = target_host, err = %error, "ohttp: tls failed");
+        let message = format!("tls {label}: {}", redact_host(&error, target_host, label));
         if rejected {
             Self::Configuration(message)
         } else {
@@ -941,8 +990,11 @@ impl HttpsError {
     /// relay, so every send error is treated as potentially post-send (`Other`) and never resealed
     /// or re-POSTed, to avoid repeating a request with side effects (ZIP Gateway rule 11). Only
     /// `ready()` failures, classified at their own call sites, are `PreSend`.
-    fn classify_send_error(e: impl std::fmt::Display, target_host: &str) -> Self {
-        HttpsError::Other(format!("h2 send {target_host}: {e}"))
+    fn classify_send_error(e: impl std::fmt::Display, target_host: &str, label: &str) -> Self {
+        HttpsError::Other(format!(
+            "h2 send {label}: {}",
+            redact_host(e, target_host, label)
+        ))
     }
 }
 
@@ -951,12 +1003,12 @@ impl HttpsError {
 /// pulled. Each data frame is counted with `guard` before it is buffered, so the read stops at
 /// the first one that goes past the limit and the frames behind it are never pulled from the
 /// peer. Both refusals are [`HttpsError::TooLarge`]. A read error, or [`CHUNK_IDLE_TIMEOUT`]
-/// without a frame, is [`HttpsError::Read`]. `host` names the peer in the messages.
+/// without a frame, is [`HttpsError::Read`]. `label` names the peer in the messages.
 async fn read_body_capped<B>(
     mut body: B,
     declared_len: Option<u64>,
     mut guard: SizeGuard,
-    host: &str,
+    label: &str,
 ) -> Result<Vec<u8>, HttpsError>
 where
     B: hyper::body::Body<Data = Bytes> + Unpin,
@@ -965,7 +1017,7 @@ where
     if let Some(declared) = declared_len {
         guard
             .check_declared(declared)
-            .map_err(|e| HttpsError::TooLarge(format!("read {host}: {e}")))?;
+            .map_err(|e| HttpsError::TooLarge(format!("read {label}: {e}")))?;
     }
     let mut bytes = Vec::new();
     loop {
@@ -973,18 +1025,18 @@ where
             .await
             .map_err(|_| {
                 HttpsError::Read(format!(
-                    "read {host}: idle timeout ({}s without data)",
+                    "read {label}: idle timeout ({}s without data)",
                     CHUNK_IDLE_TIMEOUT.as_secs()
                 ))
             })?
         else {
             break;
         };
-        let frame = frame.map_err(|e| HttpsError::Read(format!("read {host}: {e}")))?;
+        let frame = frame.map_err(|e| HttpsError::Read(format!("read {label}: {e}")))?;
         if let Ok(data) = frame.into_data() {
             guard
                 .push(data.len())
-                .map_err(|e| HttpsError::TooLarge(format!("read {host}: {e}")))?;
+                .map_err(|e| HttpsError::TooLarge(format!("read {label}: {e}")))?;
             bytes.extend_from_slice(&data);
         }
     }
@@ -1761,9 +1813,10 @@ impl OhttpClient {
         &self,
         target: &HttpsTarget,
     ) -> Result<(tokio_rustls::client::TlsStream<BoxedIo>, bool), HttpsError> {
+        let label = self.peer_label(target);
         let io = self
             .dialer
-            .dial(&target.host, target.port)
+            .dial(&target.host, target.port, label)
             .await
             .map_err(HttpsError::Other)?;
         let server_name = rustls::pki_types::ServerName::try_from(target.host.clone())
@@ -1771,7 +1824,7 @@ impl OhttpClient {
         let tls = tokio_rustls::TlsConnector::from(Arc::clone(&self.tls))
             .connect(server_name, io)
             .await
-            .map_err(|e| HttpsError::classify_tls_error(e, &target.host))?;
+            .map_err(|e| HttpsError::classify_tls_error(e, &target.host, label))?;
         let is_h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
         Ok((tls, is_h2))
     }
@@ -1840,14 +1893,23 @@ impl OhttpClient {
             .keep_alive_while_idle(true)
             .handshake::<_, Full<Bytes>>(TokioIo::new(tls))
             .await
-            .map_err(|e| HttpsError::Other(format!("h2 handshake {}: {e}", target.host)))?;
+            .map_err(|e| {
+                let label = self.peer_label(target);
+                HttpsError::Other(format!(
+                    "h2 handshake {label}: {}",
+                    redact_host(e, &target.host, label)
+                ))
+            })?;
         let host = target.host.clone();
         tokio::spawn(async move {
             if let Err(e) = conn.await {
                 tracing::debug!(host = %host, err = %e, "ohttp: h2 connection ended");
             }
         });
-        tracing::info!(host = %target.host, via_tor = self.dialer.is_tor(), "ohttp: opened pooled h2 connection");
+        tracing::info!(
+            via_tor = self.dialer.is_tor(),
+            "ohttp: opened pooled h2 connection"
+        );
         let mut pool = self.h2_pool.lock().await;
         pool.insert(key, (sender.clone(), std::time::Instant::now()));
         Ok(Some(sender))
@@ -1906,9 +1968,10 @@ impl OhttpClient {
             Some(mut sender) => {
                 if let Err(e) = sender.ready().await {
                     self.h2_pool.lock().await.remove(&pool_key);
+                    let label = self.peer_label(target);
                     return Err(HttpsError::PreSend(format!(
-                        "h2 ready {}: {e}",
-                        target.host
+                        "h2 ready {label}: {}",
+                        redact_host(e, &target.host, label)
                     )));
                 }
                 on_send();
@@ -1916,7 +1979,11 @@ impl OhttpClient {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
                         self.h2_pool.lock().await.remove(&pool_key);
-                        return Err(HttpsError::classify_send_error(e, &target.host));
+                        return Err(HttpsError::classify_send_error(
+                            e,
+                            &target.host,
+                            self.peer_label(target),
+                        ));
                     }
                 }
             }
@@ -1932,7 +1999,13 @@ impl OhttpClient {
                 sender
                     .send_request(req)
                     .await
-                    .map_err(|e| HttpsError::Other(format!("send {}: {e}", target.host)))?
+                    .map_err(|e| {
+                        let label = self.peer_label(target);
+                        HttpsError::Other(format!(
+                            "send {label}: {}",
+                            redact_host(e, &target.host, label)
+                        ))
+                    })?
                     .map(|b| b.boxed())
             }
         };
@@ -1976,7 +2049,7 @@ impl OhttpClient {
         // within the fixed small guard of `read_error_body`, so that its status, not its length,
         // is what the caller learns.
         let bytes = if parts.status.is_success() {
-            read_body_capped(body, declared_len, guard, &target.host).await?
+            read_body_capped(body, declared_len, guard, self.peer_label(target)).await?
         } else {
             read_error_body(body, &target.host).await
         };
@@ -2067,9 +2140,10 @@ impl OhttpClient {
             Some(mut sender) => {
                 if let Err(e) = sender.ready().await {
                     self.h2_pool.lock().await.remove(&pool_key);
+                    let label = self.peer_label(target);
                     return Err(HttpsError::PreSend(format!(
-                        "h2 ready {}: {e}",
-                        target.host
+                        "h2 ready {label}: {}",
+                        redact_host(e, &target.host, label)
                     )));
                 }
                 on_send();
@@ -2077,7 +2151,11 @@ impl OhttpClient {
                     Ok(r) => r.map(|b| b.boxed()),
                     Err(e) => {
                         self.h2_pool.lock().await.remove(&pool_key);
-                        return Err(HttpsError::classify_send_error(e, &target.host));
+                        return Err(HttpsError::classify_send_error(
+                            e,
+                            &target.host,
+                            self.peer_label(target),
+                        ));
                     }
                 }
             }
@@ -2093,7 +2171,13 @@ impl OhttpClient {
                 sender
                     .send_request(req)
                     .await
-                    .map_err(|e| HttpsError::Other(format!("send {}: {e}", target.host)))?
+                    .map_err(|e| {
+                        let label = self.peer_label(target);
+                        HttpsError::Other(format!(
+                            "send {label}: {}",
+                            redact_host(e, &target.host, label)
+                        ))
+                    })?
                     .map(|b| b.boxed())
             }
         };
@@ -2139,7 +2223,7 @@ impl OhttpClient {
                         return Ok(k.config);
                     }
                     tracing::info!(
-                        gateway = %self.gateway_host,
+                        network = ?gateway_network(&self.gateway_host).ok(),
                         not_after = k.not_after,
                         now,
                         "ohttp: cached key config expired, refreshing"
@@ -2239,7 +2323,7 @@ impl OhttpClient {
         };
 
         tracing::info!(
-            gateway = %self.gateway_host,
+            network = ?gateway_network(&self.gateway_host).ok(),
             key_id = cfg.config.key_id(),
             not_after = cfg.not_after,
             via_tor = self.dialer.is_tor(),
@@ -2346,6 +2430,19 @@ impl OhttpClient {
             .map_err(|e| HttpsError::RelayPaused(e.into_message()))
     }
 
+    /// How an error message names the peer of `target`: `relay` for this client's relay, a
+    /// configured gateway as [`gateway_label`], any other host (a DNS resolver) as `dns-resolver`.
+    /// The host is an endpoint value of the build and goes to debug lines only.
+    fn peer_label(&self, target: &HttpsTarget) -> &'static str {
+        if target.host.eq_ignore_ascii_case(&self.relay.host) {
+            "relay"
+        } else if configured_gateway_hosts(&target.host).next().is_some() {
+            gateway_label(&target.host)
+        } else {
+            "dns-resolver"
+        }
+    }
+
     /// Key of this relay in the shared key cache and the relay pause: fetches over Tor and outside
     /// Tor keep separate entries, so that neither links the two ("Retrieval, caching and
     /// rotation" in the ZIP).
@@ -2384,7 +2481,6 @@ impl OhttpClient {
         tracing::warn!(
             wait_secs = wait.as_secs(),
             retry_after_header = asked.is_some(),
-            relay = %self.relay_url,
             "ohttp: relay rate limit (429); holding requests through it"
         );
         RelayBackoff::global().note(&self.backoff_key(), wait);
@@ -3084,8 +3180,7 @@ fn http_target_and_relay(
     let target = parse_http_target(url)?;
 
     // Get relay URL for this gateway
-    let relay_url = relay_for(gateway_host)
-        .ok_or_else(|| format!("no relay configured for gateway {}", gateway_host))?;
+    let relay_url = relay_for(gateway_host).ok_or("no relay configured for this gateway")?;
 
     Ok((target, relay_url))
 }
@@ -4540,12 +4635,12 @@ pub(crate) mod tests {
             rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
         );
         assert!(matches!(
-            HttpsError::classify_tls_error(error, "relay.invalid"),
+            HttpsError::classify_tls_error(error, "relay.invalid", "relay"),
             HttpsError::Configuration(_)
         ));
         let error = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "TLS peer closed");
         assert!(matches!(
-            HttpsError::classify_tls_error(error, "relay.invalid"),
+            HttpsError::classify_tls_error(error, "relay.invalid", "relay"),
             HttpsError::Other(_)
         ));
     }
@@ -4915,7 +5010,7 @@ pub(crate) mod tests {
                 "{result:?}"
             );
             let expected_message = format!(
-                "read health-body-failure-{status}-{read_error}.invalid: {}",
+                "read relay: {}",
                 if read_error {
                     "error reading a body from connection"
                 } else {
@@ -5450,8 +5545,12 @@ pub(crate) mod tests {
     #[test]
     fn send_errors_are_never_pre_send() {
         // A send error cannot prove the request was not delivered, so it must not be retried.
-        match HttpsError::classify_send_error("stream closed", "relay.example") {
-            HttpsError::Other(m) => assert_eq!(m, "h2 send relay.example: stream closed"),
+        match HttpsError::classify_send_error(
+            "stream to Relay.Example closed",
+            "relay.example",
+            "relay",
+        ) {
+            HttpsError::Other(m) => assert_eq!(m, "h2 send relay: stream to relay closed"),
             other => panic!("send error must not be PreSend: {other:?}"),
         }
     }
@@ -6148,8 +6247,8 @@ pub(crate) mod tests {
             .expect_err("a fake relay cannot complete the exchange")
             .to_string();
         assert!(
-            err.contains("127.0.0.1"),
-            "error must name the relay: {err}"
+            err.contains("tls relay: ") && !err.contains("127.0.0.1"),
+            "error must name the relay by its role, not its host: {err}"
         );
         assert!(
             !err.contains("origin.invalid"),
@@ -8606,5 +8705,219 @@ pub(crate) mod tests {
             tor.check_relay_pause(),
             Err(RoundTripError::RateLimited { .. })
         ));
+    }
+    /// The testnet endpoint values of the build: gateway host, relay URL, DNS TXT name and
+    /// signing key.
+    fn configured_testnet_endpoints() -> (
+        &'static str,
+        &'static str,
+        Option<&'static str>,
+        Option<&'static str>,
+    ) {
+        let gateway = testnet_gateway();
+        (
+            gateway,
+            relay_for(gateway).expect("testnet relay"),
+            zodl_ohttp_client::key_config_dns_name(Network::Testnet),
+            zodl_ohttp_client::TESTNET_SIGNING_KEY_HEX,
+        )
+    }
+
+    /// The INFO+ lines logged on this thread while the guard lives.
+    #[derive(Clone, Default)]
+    struct Lines(Arc<StdMutex<Vec<u8>>>);
+    impl std::io::Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl Lines {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).expect("utf-8")
+        }
+    }
+
+    fn capture_info_logs() -> (Lines, tracing::subscriber::DefaultGuard) {
+        use tracing_subscriber::Layer as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::util::SubscriberInitExt as _;
+
+        let lines = Lines::default();
+        let guard = tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer({
+                        let lines = lines.clone();
+                        move || lines.clone()
+                    })
+                    .with_filter(tracing_subscriber::filter::LevelFilter::INFO),
+            )
+            .set_default();
+        (lines, guard)
+    }
+
+    /// Info-level logs reach the device log in every build, so no INFO+ line may carry an
+    /// endpoint value of the build: gateway host, relay URL or host, DNS TXT name, signing key.
+    #[tokio::test]
+    async fn info_logs_carry_no_endpoint_values() {
+        let (lines, _logs) = capture_info_logs();
+
+        let (gateway, relay, dns_name, signing_key) = configured_testnet_endpoints();
+        // Opening the pipe of a gateway endpoint makes no network request.
+        let endpoint = crate::config::Endpoint {
+            host: gateway.into(),
+            port: 443,
+            tls: true,
+        };
+        let _channel = crate::grpc::connect(&endpoint)
+            .await
+            .expect("open OHTTP pipe");
+
+        // An expired key, then a relay and DoH resolvers that refuse the fetch.
+        let client = OhttpClient::new(
+            gateway,
+            relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        *client.key_config.lock().await = Some(CachedKey {
+            config: test_key(),
+            not_after: 0,
+        });
+        let refuse = |_req: Request<Incoming>| async {
+            let mut answer = Response::new(Full::new(Bytes::new()).boxed());
+            *answer.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            answer
+        };
+        serve_in_process_relay(&client, refuse).await;
+        for resolver in DOH_RESOLVERS {
+            let peer = OhttpClient::new(
+                "unused.invalid",
+                resolver,
+                Dialer::Direct,
+                None,
+                ClientProfile::SLIPSTREAM,
+            )
+            .expect("resolver client");
+            serve_in_process_relay(&peer, refuse).await;
+            let key = format!("{}:{}", peer.relay.host, peer.relay.port);
+            let sender = peer.h2_pool.lock().await.remove(&key).expect("pooled");
+            client.h2_pool.lock().await.insert(key, sender);
+        }
+        let _ = client
+            .key_config(false)
+            .await
+            .expect_err("the fetch is refused");
+        assert_eq!(log_host(gateway), "ohttp-gateway");
+
+        let logs = lines.text();
+        for logged in [
+            "lightwalletd via OHTTP",
+            "cached key config expired",
+            "trying DNS",
+        ] {
+            assert!(logs.contains(logged), "logged at info: {logged}");
+        }
+        let relay_host = parse_https(relay).expect("relay URL").host;
+        for value in [
+            Some(gateway),
+            Some(relay),
+            Some(&relay_host),
+            dns_name,
+            signing_key,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            // The value itself stays out of the failure message.
+            assert!(
+                !logs.contains(value),
+                "an INFO+ line carries an endpoint value"
+            );
+        }
+    }
+
+    /// A relay that cannot be reached: its connect error is logged at info ("trying DNS") and
+    /// returned to the caller, whose error lines log it too. Both name the peer as `relay`,
+    /// never by its host. So do the other errors that name a gateway or relay.
+    #[tokio::test]
+    async fn connect_failures_carry_no_endpoint_values() {
+        let (lines, _logs) = capture_info_logs();
+
+        // A loopback port without a listener refuses the dial; no external network.
+        let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = closed.local_addr().expect("address").port();
+        drop(closed);
+        let relay_host = "127.0.0.1";
+        let relay = format!("https://{relay_host}:{port}/relay");
+        let (gateway, _, _, _) = configured_testnet_endpoints();
+        let client = OhttpClient::new(
+            gateway,
+            &relay,
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .expect("client");
+        let refuse = |_req: Request<Incoming>| async {
+            let mut answer = Response::new(Full::new(Bytes::new()).boxed());
+            *answer.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+            answer
+        };
+        for resolver in DOH_RESOLVERS {
+            let peer = OhttpClient::new(
+                "unused.invalid",
+                resolver,
+                Dialer::Direct,
+                None,
+                ClientProfile::SLIPSTREAM,
+            )
+            .expect("resolver client");
+            serve_in_process_relay(&peer, refuse).await;
+            let key = format!("{}:{}", peer.relay.host, peer.relay.port);
+            let sender = peer.h2_pool.lock().await.remove(&key).expect("pooled");
+            client.h2_pool.lock().await.insert(key, sender);
+        }
+        let err = client
+            .key_config(false)
+            .await
+            .expect_err("the relay is unreachable")
+            .into_message();
+        assert!(err.starts_with("connect relay: "), "{err}");
+        assert!(
+            !err.contains(relay_host),
+            "the error carries the relay host"
+        );
+
+        let logs = lines.text();
+        assert!(logs.contains("trying DNS"), "logged at info: trying DNS");
+        assert!(
+            logs.contains("connect relay: "),
+            "the connect error is logged"
+        );
+        assert!(
+            !logs.contains(relay_host),
+            "an INFO+ line carries the relay host"
+        );
+
+        // Errors that name a configured gateway carry its network, not its host.
+        let wrong = check_gateway_network(gateway, NetworkType::Main).expect_err("testnet");
+        assert!(
+            !wrong.contains(gateway),
+            "the error carries the gateway host"
+        );
+        assert_eq!(gateway_label(gateway), "testnet ohttp-gateway");
+        // An inner error naming the peer, in any letter case, names its label instead.
+        assert_eq!(
+            redact_host("not valid for RELAY.example:443", "relay.example", "relay"),
+            "not valid for relay:443"
+        );
     }
 }
