@@ -8292,8 +8292,8 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-ohttp-client"
-version = "0.1.0"
-source = "git+https://github.com/zodl-inc/zodl-ohttp.git?rev=61ba3dbb48f76276f84d9efa2e4539b52455a769#61ba3dbb48f76276f84d9efa2e4539b52455a769"
+version = "0.1.1"
+source = "git+https://github.com/zodl-inc/zodl-ohttp.git?rev=650bb4ac5015dde96f22b67d7d77dc1020be9ed8#650bb4ac5015dde96f22b67d7d77dc1020be9ed8"
 dependencies = [
  "aes-gcm",
  "base64",

@@ -41,5 +41,5 @@ raise "wrong private repository token scope" unless token.fetch("with").fetch("r
 manifest = File.read(File.join(root, "core/Cargo.toml"))
 lock = File.read(File.join(root, "Cargo.lock"))
 raise "old dependency URL" if [manifest, lock].any? { |text| text.include?("https://github.com/zodl-inc/ohttp.git") }
-raise "final library missing" unless manifest.include?("https://github.com/zodl-inc/zodl-ohttp.git") && manifest.include?("61ba3dbb48f76276f84d9efa2e4539b52455a769")
+raise "final library missing" unless manifest.include?("https://github.com/zodl-inc/zodl-ohttp.git") && manifest.include?("650bb4ac5015dde96f22b67d7d77dc1020be9ed8")
 puts "OHTTP workflow contract: #{cargo_jobs.length} Cargo jobs, eight variables, final dependency and token scope verified"

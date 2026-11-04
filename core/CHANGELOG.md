@@ -11,6 +11,10 @@ workspace.
 ## [Unreleased]
 
 ### Fixed
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
 - OHTTP uses the final `zodl-inc/zodl-ohttp` core with explicit build-time gateway,
   relay, signing-key and optional DNS configuration. Missing signing configuration
   fails before a key fetch; an absent DNS source preserves the relay failure without
