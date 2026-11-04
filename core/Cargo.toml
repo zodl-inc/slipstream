@@ -64,6 +64,8 @@ http = "1"
 http-body = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+# TCP keep-alive on direct relay sockets (ohttp.rs, DIRECT_TCP_KEEPALIVE_TIME); `all` for the probe count.
+socket2 = { version = "0.6", features = ["all"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
