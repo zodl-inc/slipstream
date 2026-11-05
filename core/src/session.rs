@@ -883,6 +883,44 @@ impl FollowFailures {
     }
 }
 
+/// Report a recoverable follow catch-up failure through the host's state and event sinks.
+fn report_catch_up_failure(
+    err: &SlipstreamError,
+    failures: &mut FollowFailures,
+    reporter: &SessionReporter,
+    last_tip: u64,
+) {
+    if err.counts_as_unreachable() {
+        failures.catchup_failed();
+    }
+    // After N consecutive failures, surface Error(3) so hosts can react.
+    let total_failures = failures.total();
+    if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
+        tracing::error!(
+            %err,
+            probe_failures = failures.probe,
+            catchup_failures = failures.catchup,
+            total_failures,
+            last_tip,
+            failed_at_utc = %wall_clock_utc(),
+            "follow catch-up pass persistently failing — surfacing endpoint unreachable"
+        );
+        reporter.set_state(SyncState::Error(3));
+        reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
+    } else {
+        tracing::warn!(
+            %err,
+            probe_failures = failures.probe,
+            catchup_failures = failures.catchup,
+            total_failures,
+            last_tip,
+            failed_at_utc = %wall_clock_utc(),
+            "follow catch-up pass failed — staying synced, will retry"
+        );
+        reporter.set_state(SyncState::Done);
+    }
+}
+
 /// ── T8.1 follow loop: track the chain while the host keeps the task alive ────
 /// Extracted verbatim from `run_session`'s success arm ([B4-16] revival refactor) —
 /// behaviour unchanged. Returns only when the host stops a catch-up pass for a wallet change
@@ -1098,35 +1136,7 @@ async fn follow_loop(
                 // T8.7: a failed catch-up pass is RECOVERABLE — the wallet is still synced
                 // to last_tip. Track failures and surface Error(3) after the threshold.
                 CatchUpFailure::StaySynced => {
-                    if err.counts_as_unreachable() {
-                        failures.catchup_failed();
-                    }
-                    // After N consecutive failures, surface Error(3) so hosts can react.
-                    let total_failures = failures.total();
-                    if total_failures >= ENDPOINT_UNREACHABLE_THRESHOLD {
-                        tracing::error!(
-                            %err,
-                            probe_failures = failures.probe,
-                            catchup_failures = failures.catchup,
-                            total_failures,
-                            last_tip,
-                            failed_at_utc = %wall_clock_utc(),
-                            "follow catch-up pass persistently failing — surfacing endpoint unreachable"
-                        );
-                        reporter.set_state(SyncState::Error(3));
-                        reporter.push_event(FfiSlipstreamEvent { tag: 4, value: 3 });
-                    } else {
-                        tracing::warn!(
-                            %err,
-                            probe_failures = failures.probe,
-                            catchup_failures = failures.catchup,
-                            total_failures,
-                            last_tip,
-                            failed_at_utc = %wall_clock_utc(),
-                            "follow catch-up pass failed — staying synced, will retry"
-                        );
-                        reporter.set_state(SyncState::Done);
-                    }
+                    report_catch_up_failure(&err, &mut failures, reporter, last_tip);
                 }
             },
         }
@@ -1568,6 +1578,54 @@ mod tests {
             ENDPOINT_UNREACHABLE_THRESHOLD, 5,
             "threshold must be 5 (roughly 1-2 minutes at 10-30s jitter)"
         );
+    }
+
+    #[test]
+    fn local_catchup_errors_do_not_surface_endpoint_unreachable() {
+        for err in [
+            SlipstreamError::Config("invalid".into()),
+            SlipstreamError::Wallet("database is locked".into()),
+            SlipstreamError::Discontinuity {
+                at: 1,
+                detail: "prev-hash mismatch".into(),
+            },
+            SlipstreamError::ScanContinuity { at: 1 },
+            SlipstreamError::Stopped,
+        ] {
+            let reporter = reporter();
+            let mut failures = FollowFailures::default();
+            for _ in 0..=ENDPOINT_UNREACHABLE_THRESHOLD {
+                failures.probe_ok();
+                report_catch_up_failure(&err, &mut failures, &reporter, 1);
+                assert_eq!(
+                    *reporter.state.lock().unwrap(),
+                    SyncState::Done,
+                    "local failure must keep the wallet synced: {err:?}"
+                );
+                assert!(reporter.events.lock().unwrap().is_empty());
+            }
+            assert_eq!(failures.total(), 0, "{err:?}");
+        }
+    }
+
+    #[test]
+    fn transport_catchup_errors_surface_endpoint_unreachable_at_threshold() {
+        let reporter = reporter();
+        let mut failures = FollowFailures::default();
+        let err = SlipstreamError::Transport("offline".into());
+        for _ in 1..ENDPOINT_UNREACHABLE_THRESHOLD {
+            failures.probe_ok();
+            report_catch_up_failure(&err, &mut failures, &reporter, 1);
+            assert_eq!(*reporter.state.lock().unwrap(), SyncState::Done);
+            assert!(reporter.events.lock().unwrap().is_empty());
+        }
+        failures.probe_ok();
+        report_catch_up_failure(&err, &mut failures, &reporter, 1);
+        assert_eq!(*reporter.state.lock().unwrap(), SyncState::Error(3));
+        let events = reporter.events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].tag, 4);
+        assert_eq!(events[0].value, 3);
     }
 
     /// The pass-lock contract `run_session` relies on (Keystone restore race fix, 2026-06-30):

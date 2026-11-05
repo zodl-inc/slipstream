@@ -12,6 +12,10 @@ workspace.
 
 ### Fixed
 
+- Follow-loop endpoint-unreachable escalation counts only transport failures. Local
+  configuration, wallet, scan and stop errors, wire-collapse failover, and HTTP
+  policy, rate-limit and size outcomes do not trigger server switching.
+
 - OHTTP DNS fallback rate limits stay local to the responding resolver, allowing the
   next resolver to recover without pausing relay traffic or replacing relay health.
 
