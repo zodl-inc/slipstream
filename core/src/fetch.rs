@@ -900,6 +900,7 @@ where
     let mut refused = false;
     pump_block_window(
         stream,
+        grpc::StatusOrigin::RemoteServer,
         cursor,
         window_end,
         split_bytes,
@@ -946,6 +947,7 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn pump_block_window<S>(
     stream: &mut S,
+    status_origin: grpc::StatusOrigin,
     cursor: &mut PlanChunkCursor,
     window_end: u64,
     split_bytes: usize,
@@ -1021,7 +1023,7 @@ where
             Ok(block) => block,
             Err(status) => {
                 *refused = status.code() == tonic::Code::InvalidArgument;
-                let err = grpc::status_err(&ctx, status);
+                let err = grpc::status_err(&ctx, status, status_origin);
                 return flush_then_fail(splitter.finish(), cursor, gate, out, err).await;
             }
         };
@@ -1178,6 +1180,7 @@ async fn open_and_pump(
                 return Err(grpc::status_err(
                     &format!("get_block_range {}..{}", cursor.resume_from, window_end),
                     status,
+                    rpc.status_origin,
                 ));
             }
         };
@@ -1189,6 +1192,7 @@ async fn open_and_pump(
             health,
             pump_block_window(
                 &mut stream,
+                rpc.status_origin,
                 cursor,
                 window_end,
                 plan.split_bytes,
@@ -3545,6 +3549,7 @@ mod tests {
         );
         let out = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             109,
             usize::MAX >> 8,
@@ -3573,6 +3578,7 @@ mod tests {
         let mut s = stream::iter(items);
         let err = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             129,
             usize::MAX >> 8,
@@ -3846,6 +3852,7 @@ mod tests {
         let mut s = stream::iter(blocks.into_iter().map(Ok::<_, tonic::Status>));
         let out = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             199,
             4 * per_block as usize,
@@ -3902,6 +3909,7 @@ mod tests {
         let mut s = stream::iter(blocks.into_iter().map(Ok::<_, tonic::Status>));
         let out = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             999,
             16 * per_block as usize,
@@ -3941,6 +3949,7 @@ mod tests {
         );
         let out = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             199,
             1 << 20,
@@ -3979,6 +3988,7 @@ mod tests {
         );
         let out = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             999,
             1 << 20,
@@ -4090,6 +4100,7 @@ mod tests {
         .chain(stream::pending());
         let pump = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::RemoteServer,
             &mut cursor,
             119,
             1 << 30,
@@ -4124,6 +4135,69 @@ mod tests {
         assert_eq!(cursor.resume_from, 105);
     }
 
+    /// The tonic stream outlives the request's task-local scope. Its saved connection
+    /// origin must still classify local outcomes, while an unscoped channel stays remote.
+    #[tokio::test]
+    async fn stream_outcome_provenance_survives_call_scope() {
+        let endpoint = crate::config::Endpoint {
+            host: crate::ohttp::tests::testnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        let connection = grpc::connect_tracked(&endpoint, false).await.unwrap();
+        let rpc = connection
+            .call(async |client| grpc::request_client(client).await)
+            .await
+            .unwrap();
+        let unscoped = grpc::request_client(&rpc.client).await.unwrap();
+        for (origin, local) in [(rpc.status_origin, true), (unscoped.status_origin, false)] {
+            for (outcome, expected) in [
+                (crate::ohttp::OUTCOME_POLICY_DENIED, "policy"),
+                (crate::ohttp::OUTCOME_RATE_LIMITED, "rate"),
+                (crate::ohttp::OUTCOME_TOO_LARGE, "size"),
+            ] {
+                let mut status = tonic::Status::unavailable("stream failure");
+                status
+                    .metadata_mut()
+                    .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
+                let mut stream = stream::iter([Err(status)]);
+                let mut cursor = test_cursor(0, 100, 119);
+                let mut refused = false;
+                let (tx, _rx) = mpsc::channel(1);
+                let gate = open_gate();
+                let result = pump_block_window(
+                    &mut stream,
+                    origin,
+                    &mut cursor,
+                    119,
+                    1 << 20,
+                    Duration::from_secs(120),
+                    &gate,
+                    &tx,
+                    None,
+                    &mut refused,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_err();
+                if local {
+                    assert!(matches!(
+                        (expected, result),
+                        ("policy", SlipstreamError::PolicyDenied(_))
+                            | ("rate", SlipstreamError::RateLimited(_))
+                            | ("size", SlipstreamError::RequestTooLarge(_))
+                    ));
+                } else {
+                    assert!(
+                        matches!(result, SlipstreamError::Transport(_)),
+                        "{result:?}"
+                    );
+                }
+            }
+        }
+    }
+
     /// A kick that is pending when the stream fails with a permanent error (an
     /// OHTTP policy denial) does not turn the error into a restart: the error
     /// comes back as the attempt's result, non-transient, so the worker returns
@@ -4149,6 +4223,7 @@ mod tests {
         let mut refused = false;
         let out = pump_block_window(
             &mut s,
+            grpc::StatusOrigin::LocalOhttpBridge,
             &mut cursor,
             119,
             1 << 30,

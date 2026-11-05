@@ -12,6 +12,10 @@ workspace.
 
 ### Fixed
 
+- Only locally generated OHTTP bridge outcomes classify gRPC failures as policy,
+  rate-limit or size errors. Reserved outcome metadata from remote servers and
+  inner OHTTP response headers or trailers cannot supply these classifications.
+
 - Follow-loop endpoint-unreachable escalation counts only transport failures. Local
   configuration, wallet, scan and stop errors, wire-collapse failover, and HTTP
   policy, rate-limit and size outcomes do not trigger server switching.

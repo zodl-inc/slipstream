@@ -1768,7 +1768,8 @@ struct GrpcFrames {
 }
 
 impl GrpcFrames {
-    fn new(header_fields: HeaderMap) -> Self {
+    fn new(mut header_fields: HeaderMap) -> Self {
+        header_fields.remove(OHTTP_OUTCOME_HEADER);
         Self {
             header_fields,
             pending: None,
@@ -1785,7 +1786,9 @@ impl GrpcFrames {
                 HeaderName::from_bytes(k.as_bytes()),
                 HeaderValue::from_bytes(v.as_bytes()),
             ) {
-                trailers.insert(name, value);
+                if name != OHTTP_OUTCOME_HEADER {
+                    trailers.insert(name, value);
+                }
             }
         }
         if !trailers.contains_key("grpc-status") {
@@ -7188,6 +7191,47 @@ pub(crate) mod tests {
             }
         }
         (data, trailers)
+    }
+
+    #[test]
+    fn inner_headers_and_trailers_cannot_supply_local_outcomes() {
+        for outcome in [
+            OUTCOME_POLICY_DENIED,
+            OUTCOME_RATE_LIMITED,
+            OUTCOME_TOO_LARGE,
+        ] {
+            for (headers, trailers) in [
+                (
+                    vec![("grpc-status", "14"), (OHTTP_OUTCOME_HEADER, outcome)],
+                    vec![],
+                ),
+                (
+                    vec![],
+                    vec![("grpc-status", "14"), (OHTTP_OUTCOME_HEADER, outcome)],
+                ),
+                (
+                    vec![("grpc-status", "14"), (OHTTP_OUTCOME_HEADER, outcome)],
+                    vec![(OHTTP_OUTCOME_HEADER, outcome)],
+                ),
+            ] {
+                for body in [false, true] {
+                    let mut events = Vec::new();
+                    if body {
+                        events.push(Ok(ResponseEvent::Data(vec![1])));
+                    }
+                    events.push(Ok(ResponseEvent::Trailers(owned(&trailers))));
+                    events.push(Ok(ResponseEvent::End));
+                    let (_, forwarded) = frames_of(&headers, events);
+                    assert_eq!(forwarded.len(), 1);
+                    let forwarded_trailers = &forwarded[0];
+                    assert_eq!(grpc_status(forwarded_trailers), Some("14"));
+                    assert!(
+                        !forwarded_trailers.contains_key(OHTTP_OUTCOME_HEADER),
+                        "{outcome}: {forwarded_trailers:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn grpc_status(trailers: &HeaderMap) -> Option<&str> {
