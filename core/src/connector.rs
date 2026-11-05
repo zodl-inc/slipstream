@@ -235,8 +235,9 @@ impl TorConn {
 
     /// Open an isolated (`.uniqueTor`-style) lightwalletd client to `endpoint` through Tor.
     /// OHTTP gateways are OHTTP-encapsulated with the relay leg dialled through Tor; other hosts
-    /// are dialled directly over Tor. Public entry point for hosts outside the engine (the SDK's
-    /// FFI Tor client) that must share this routing policy.
+    /// are dialled directly over Tor. Public entry point for hosts that own the Tor runtime
+    /// and need the engine's routing policy. The SDK's separate FFI Tor client refuses OHTTP
+    /// gateways; its Swift OHTTP service handles them instead.
     pub async fn connect_isolated(
         &self,
         endpoint: &Endpoint,

@@ -40,12 +40,14 @@ where
     // DNS and all candidates consume one budget; a slow resolver cannot restart it.
     let deadline = Instant::now() + DIRECT_DIAL_TIMEOUT;
     timeout_at(deadline, async {
-        race_addresses(resolve.await?, connector).await
+        // Resolver diagnostics can contain hostnames or IPs. Preserve the kind and a fixed
+        // category without retaining the original error or its source chain.
+        let addresses = resolve
+            .await
+            .map_err(|error| io::Error::new(error.kind(), "address resolution failed"))?;
+        race_addresses(addresses, connector).await
     })
     .await
-    // A resolver/connector error can carry hostnames or resolved IPs. Only its category
-    // crosses the direct-dial boundary, including into the caller's diagnostics.
-    .map(|result| result.map_err(|error| io::Error::from(error.kind())))
 }
 
 async fn race_addresses<I, C, F, T>(addresses: I, mut connector: C) -> io::Result<T>
@@ -84,7 +86,9 @@ where
             result = active.next() => {
                 match result.expect("at least one active connection") {
                     Ok(stream) => return Ok(stream),
-                    Err(error) => last_error = error,
+                    // Connector errors may contain resolved addresses. Keep this category
+                    // distinct from resolver failures and an empty DNS answer.
+                    Err(error) => last_error = io::Error::new(error.kind(), "connection failed"),
                 }
                 // A failed attempt frees its slot immediately; do not delay recovery.
                 if let Some(address) = addresses.next() {
@@ -240,6 +244,40 @@ mod tests {
         assert!(result.is_err(), "DNS must not reset the connect budget");
         assert_eq!(started.elapsed(), Duration::from_secs(15));
         assert_eq!(attempts.borrow().active, 0);
+    }
+
+    // Resolver, empty-answer and connection failures must remain distinguishable without
+    // retaining endpoint-bearing diagnostics, even when all three have the same kind.
+    #[tokio::test]
+    async fn dns_failures_keep_safe_distinct_categories() {
+        let sensitive = "secret-relay.example at 192.0.2.42 and [2001:db8::42]";
+        let mut messages = Vec::new();
+        for resolved in [
+            Err(io::Error::new(io::ErrorKind::InvalidInput, sensitive)),
+            Ok(Vec::new()),
+            Ok(addresses()),
+        ] {
+            let error = connect(std::future::ready(resolved), |_| async {
+                Err::<SocketAddr, _>(io::Error::new(io::ErrorKind::InvalidInput, sensitive))
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            let diagnostic = format!("{error} {error:?}");
+            for endpoint in ["secret-relay.example", "192.0.2.42", "2001:db8::42"] {
+                assert!(
+                    !diagnostic.contains(endpoint),
+                    "leaked {endpoint}: {diagnostic}"
+                );
+            }
+            messages.push(error.to_string());
+        }
+        for (index, message) in messages.iter().enumerate() {
+            for other in &messages[index + 1..] {
+                assert_ne!(message, other, "failure categories must stay distinct");
+            }
+        }
     }
 
     // Endpoint-bearing DNS and connect diagnostics must never escape in dial errors.

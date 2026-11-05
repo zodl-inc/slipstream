@@ -53,7 +53,9 @@ pub struct SessionConfig {
     /// wallet does not already track it. Empty = nothing to import (a wallet a host already
     /// provisioned). Follow passes are always keyless regardless.
     pub accounts: Vec<(UnifiedFullViewingKey, BlockHeight)>,
-    /// `Some` routes metadata over isolated Tor circuits (bulk stays direct); `None` = all direct.
+    /// `Some` routes all lightwalletd traffic through Tor: bulk uses a circuit per connection,
+    /// and metadata uses its purpose's isolated, default or shared circuit. `None` = no Tor.
+    /// OHTTP gateways remain OHTTP-encapsulated with either setting.
     pub tor: Option<TorSessionConfig>,
 }
 
@@ -98,9 +100,11 @@ pub(crate) const FOLLOW_POLL_MIN_SECS: u64 = 10;
 /// Maximum follow-probe sleep (inclusive). Matches the old-SDK jitter ceiling.
 pub(crate) const FOLLOW_POLL_MAX_SECS: u64 = 30;
 
-/// Consecutive follow-tip probe failures after which the engine surfaces `SyncState::Error(3)`
-/// (endpoint unreachable). This allows hosts to react to persistent outages (e.g., switch servers).
-/// The counter resets on any successful probe. Lower than the old escalation-only cap because
+/// Outstanding combined probe and catch-up transport failures after which the engine surfaces
+/// `SyncState::Error(3)` (endpoint unreachable). Hosts can react to persistent outages
+/// (e.g., switch servers).
+/// Each counter resets only when its own operation succeeds; a successful probe does not clear
+/// failing catch-ups. Only transport failures count. Lower than the old escalation-only cap because
 /// surfacing an error enables the host's automatic recovery, which is more valuable than silently
 /// retrying forever.
 pub(crate) const ENDPOINT_UNREACHABLE_THRESHOLD: u32 = 5;
