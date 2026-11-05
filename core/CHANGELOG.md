@@ -12,6 +12,9 @@ workspace.
 
 ### Fixed
 
+- OHTTP DNS fallback rate limits stay local to the responding resolver, allowing the
+  next resolver to recover without pausing relay traffic or replacing relay health.
+
 - OHTTP gRPC and extension requests ASCII-lowercase their encoded BHTTP authority.
   Authority ports, paths, query strings, bodies and existing header policies are
   preserved. Stored configuration spelling and public interfaces are unchanged.
