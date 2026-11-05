@@ -167,6 +167,14 @@ writers with `ffi_handle::settle_passes` and `ffi_handle::drain_wallet_writers`,
 `ffi_handle::SlipstreamHandle` and call its `stop_for_wallet_change`, which does all of it
 (§9).
 
+Ordinary stop for backgrounding or shutdown (`SlipstreamHandle::stop`) makes the same
+next-block request before aborting. This keeps an abort from scanning already-fetched
+chunks for minutes before it can reach an `.await`. The tradeoff is a rescan on resume:
+earlier commits remain, but the interrupted scan call and any write-behind unit not yet
+submitted are discarded. It is not instantaneous: the current block's computation,
+queued trial decryption and in-flight database writes may still take time. Inspect the
+stop report; a next-block request alone does not prove the wallet file is quiet.
+
 ### 3.3 The poll loop (this is your entire integration)
 
 ```rust

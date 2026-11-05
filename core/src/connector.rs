@@ -115,9 +115,9 @@ fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
 }
 
 /// The full routing decision for one connect. With a Tor handle present (Tor ON) NOTHING bypasses
-/// Tor, whatever the host: OHTTP gateways and clearnet lightwalletd alike carry bulk on the default
-/// circuit and metadata on its usual circuit. `is_ohttp_gateway` is kept for call-site clarity and
-/// logging; it no longer changes the decision. Without Tor, [`connect_via`] goes direct (and
+/// Tor, whatever the host: OHTTP gateways and clearnet lightwalletd alike carry bulk on a circuit
+/// per connection and metadata on its usual circuit. `is_ohttp_gateway` is kept for call-site
+/// clarity and logging; it no longer changes the decision. Without Tor, [`connect_via`] goes direct (and
 /// `grpc::connect` speaks OHTTP to gateways over the direct relay leg).
 fn route(purpose: ConnPurpose, is_ohttp_gateway: bool) -> Option<TorMode> {
     let _ = is_ohttp_gateway;
@@ -501,8 +501,8 @@ impl Connector {
         }
     }
 
-    /// Tor-on: metadata over Tor, bulk still direct (unless the endpoint is an OHTTP gateway, in
-    /// which case bulk is OHTTP-over-Tor as well).
+    /// Tor-on: every purpose uses Tor, with a circuit per bulk connection for every host.
+    /// OHTTP gateways use Tor for the relay leg too.
     pub fn with_tor(endpoint: Endpoint, tor: TorConn) -> Self {
         Self {
             endpoint,

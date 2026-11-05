@@ -96,11 +96,10 @@ pub enum SlipstreamError {
     #[error("wire collapse: {measured_mbps:.2} MB/s sustained (floor {floor_mbps:.2})")]
     WireCollapse { measured_mbps: f64, floor_mbps: f64 },
 
-    /// The follow-tip loop detected N consecutive transport failures during probes or catch-up
-    /// passes, indicating the endpoint is persistently unreachable. Surfaces as
-    /// `SyncState::Error(3)` + tag-4/value=3 event to enable hosts to react (e.g., automatic server
-    /// switching). Each counter resets on its corresponding successful probe or pass. This is
-    /// NOT raised during the initial sync — only in the follow loop after the first pass succeeds.
+    /// Declared for endpoint-unreachable reporting, but not constructed by the engine.
+    /// The follow-tip loop instead emits `SyncState::Error(3)` and a tag-4/value=3 event
+    /// directly after its transport-failure threshold. Each counter resets on its
+    /// corresponding successful probe or pass; the initial sync does not use that threshold.
     #[error("endpoint unreachable after {attempts} consecutive failures; last: {last}")]
     EndpointUnreachable { attempts: u32, last: String },
 }
