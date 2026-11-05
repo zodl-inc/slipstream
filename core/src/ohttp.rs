@@ -2531,7 +2531,13 @@ impl OhttpClient {
             }
         };
         let (parts, body) = resp.into_parts();
-        self.note_retry_after(parts.status, &parts.headers);
+        let relay_exchange = match role {
+            HttpsHealthRole::RelayPost | HttpsHealthRole::KeyConfiguration => true,
+            HttpsHealthRole::KeyFallback => false,
+        };
+        if relay_exchange {
+            self.note_retry_after(parts.status, &parts.headers);
+        }
         let rejected_head = match role {
             HttpsHealthRole::RelayPost => parts.status != StatusCode::OK,
             HttpsHealthRole::KeyConfiguration => {
@@ -2550,7 +2556,8 @@ impl OhttpClient {
             }
             health.classify(classify_outer(parts.status));
         }
-        if parts.status == StatusCode::TOO_MANY_REQUESTS
+        if relay_exchange
+            && parts.status == StatusCode::TOO_MANY_REQUESTS
             && let Some(health) = health
         {
             let stage = health.state.lock().unwrap().0;
@@ -2886,6 +2893,29 @@ impl OhttpClient {
         relay_err: RoundTripError,
         health: Option<&RequestHealth>,
     ) -> Result<CachedKey, RoundTripError> {
+        if relay_failure_has_dns_fallback(&relay_err)
+            && gateway_network(&self.gateway_host)
+                .ok()
+                .and_then(key_config_dns_name)
+                .is_some()
+        {
+            tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
+        }
+        self.key_config_from_dns_with(relay_err, health, |envelope| {
+            open_signed_keys(&self.profile, envelope, &self.gateway_host, unix_now()?)
+        })
+        .await
+    }
+
+    async fn key_config_from_dns_with<F>(
+        &self,
+        relay_err: RoundTripError,
+        health: Option<&RequestHealth>,
+        verify: F,
+    ) -> Result<CachedKey, RoundTripError>
+    where
+        F: Fn(&[u8]) -> Result<CachedKey, String>,
+    {
         if !relay_failure_has_dns_fallback(&relay_err) {
             return Err(relay_err);
         }
@@ -2895,7 +2925,6 @@ impl OhttpClient {
         let Some(dns_name) = key_config_dns_name(network) else {
             return Err(relay_err);
         };
-        tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
         for resolver in DOH_RESOLVERS {
             self.check_relay_pause()?;
             let Some(doh_url) = doh_query_url(resolver, network) else {
@@ -2907,8 +2936,7 @@ impl OhttpClient {
                 let doh_body = self.fetch_dns_key_config(&doh_url, health).await?;
                 let envelope = envelope_from_doh_json(&doh_body, network)
                     .map_err(|e| format!("parse error: {}", e))?;
-                open_signed_keys(&self.profile, &envelope, &self.gateway_host, unix_now()?)
-                    .map_err(|e| format!("verification failed: {}", e))
+                verify(&envelope).map_err(|e| format!("verification failed: {}", e))
             }
             .await;
 
@@ -9465,6 +9493,216 @@ pub(crate) mod tests {
         )
         .expect_err("testnet envelope cannot authenticate mainnet");
         assert!(error.contains("signed for testnet"), "{error}");
+    }
+
+    // Each client owns its resolver pool; only its unique relay URL shares backoff.
+    async fn dns_failure_fixture(
+        label: &str,
+        status: StatusCode,
+        retry: Option<HeaderValue>,
+        failure_position: usize,
+        recover: bool,
+    ) -> (OhttpClient, Arc<StdMutex<Vec<usize>>>) {
+        let client = OhttpClient::new(
+            testnet_gateway(),
+            &format!("https://{label}.invalid/relay"),
+            Dialer::Direct,
+            None,
+            ClientProfile::SLIPSTREAM,
+        )
+        .unwrap();
+        let envelope = br#"{"v":1,"network":"testnet","configs":"ACkBACDNzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzQAEAAEAAQ==","not_before":1700000000,"not_after":1700021600,"key_id":"1325b850","sig":"l7xx3/Q7BNFQfnt79s+enN5Lk6KC8S9f1mE9ZhSjaYGxqeSLRyuwgddKLBhwz1boZ2y2q7oWwkmGuUd5GllVDg=="}"#;
+        let encoded = base64::prelude::BASE64_STANDARD.encode(envelope);
+        let answer = serde_json::to_vec(&serde_json::json!({
+            "Status": 0,
+            "Answer": [{
+                "name": key_config_dns_name(Network::Testnet).unwrap(),
+                "type": 16, "TTL": 300, "data": format!("\"{encoded}\""),
+            }],
+        }))
+        .unwrap();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        for (position, resolver) in DOH_RESOLVERS.iter().enumerate() {
+            let target = parse_https(&doh_query_url(resolver, Network::Testnet).unwrap()).unwrap();
+            let peer = OhttpClient::new(
+                "unused.invalid",
+                &format!("https://{}:{}{}", target.host, target.port, target.path),
+                Dialer::Direct,
+                None,
+                ClientProfile::SLIPSTREAM,
+            )
+            .unwrap();
+            let calls = calls.clone();
+            let answer = answer.clone();
+            let retry = retry.clone();
+            serve_in_process_relay(&peer, move |_| {
+                calls.lock().unwrap().push(position);
+                let mut response = Response::new(Full::new(Bytes::from(answer.clone())).boxed());
+                if position == failure_position || !recover {
+                    *response.status_mut() = if position == failure_position {
+                        status
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    if let Some(retry) = &retry {
+                        response.headers_mut().insert("retry-after", retry.clone());
+                    }
+                }
+                async move { response }
+            })
+            .await;
+            let key = format!("{}:{}", target.host, target.port);
+            let sender = peer.h2_pool.lock().await.remove(&key).unwrap();
+            client.h2_pool.lock().await.insert(key, sender);
+        }
+        (client, calls)
+    }
+
+    // A DNS error must not poison relay state, even when it carries Retry-After.
+    #[tokio::test]
+    async fn dns_429_does_not_pause_relay_or_finish_health() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for retry in [None, Some(HeaderValue::from_static("90"))] {
+                for (position, resolver) in DOH_RESOLVERS.iter().enumerate() {
+                    let label = format!(
+                        "dns-health-{}-{}-{position}",
+                        status.as_u16(),
+                        retry.is_some()
+                    );
+                    let (client, calls) =
+                        dns_failure_fixture(&label, status, retry.clone(), position, false).await;
+                    let other = OhttpClient::new(
+                        testnet_gateway(),
+                        &client.relay_url,
+                        Dialer::Direct,
+                        None,
+                        ClientProfile::SLIPSTREAM,
+                    )
+                    .unwrap();
+                    let health = RequestHealth::new(&client);
+                    health.boundary(HealthStage::KeyConfiguration);
+                    health.classify(HealthOutcome::ConfigurationFailure);
+                    let url = doh_query_url(resolver, Network::Testnet).unwrap();
+                    assert!(
+                        client
+                            .fetch_dns_key_config(&url, Some(&health))
+                            .await
+                            .is_err()
+                    );
+                    assert_eq!(*calls.lock().unwrap(), vec![position]);
+                    assert!(
+                        RelayBackoff::global()
+                            .remaining(&client.backoff_key())
+                            .is_none()
+                    );
+                    assert!(other.check_relay_pause().is_ok());
+                    assert_eq!(
+                        *health.state.lock().unwrap(),
+                        (
+                            HealthStage::KeyConfiguration,
+                            Some(HealthOutcome::ConfigurationFailure),
+                            false
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    // The first resolver's 429 must not block a valid signed answer from the second.
+    #[tokio::test]
+    async fn dns_429_allows_next_resolver_recovery() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for retry in [None, Some(HeaderValue::from_static("90"))] {
+                let label = format!("dns-recovery-{}-{}", status.as_u16(), retry.is_some());
+                let (client, calls) = dns_failure_fixture(&label, status, retry, 0, true).await;
+                let health = RequestHealth::new(&client);
+                health.boundary(HealthStage::KeyConfiguration);
+                health.classify(HealthOutcome::ConfigurationFailure);
+                let result = client
+                    .key_config_from_dns_with(
+                        RoundTripError::Transport("original relay failure".to_owned()),
+                        Some(&health),
+                        |envelope| {
+                            open_fixture_signed_keys(
+                                &client.profile,
+                                envelope,
+                                &client.gateway_host,
+                                1_700_000_060,
+                            )
+                        },
+                    )
+                    .await;
+                assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+                assert_eq!(result.expect("second resolver recovers").config.key_id(), 1);
+                assert!(
+                    RelayBackoff::global()
+                        .remaining(&client.backoff_key())
+                        .is_none()
+                );
+                assert!(!health.state.lock().unwrap().2);
+            }
+        }
+    }
+
+    // Exhausting DNS must preserve the original relay error and typed classification.
+    #[tokio::test]
+    async fn dns_429_preserves_original_failure_when_fallback_exhausted() {
+        for status in [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+        ] {
+            for retry in [None, Some(HeaderValue::from_static("90"))] {
+                for position in 0..DOH_RESOLVERS.len() {
+                    let label = format!(
+                        "dns-exhausted-{}-{}-{position}",
+                        status.as_u16(),
+                        retry.is_some()
+                    );
+                    let (client, calls) =
+                        dns_failure_fixture(&label, status, retry.clone(), position, false).await;
+                    let subscription = health_subscription(&client);
+                    let health = RequestHealth::new(&client);
+                    health.boundary(HealthStage::KeyConfiguration);
+                    health.classify(HealthOutcome::ConfigurationFailure);
+                    let err = client
+                        .key_config_from_dns_with(
+                            RoundTripError::Transport("original relay failure".to_owned()),
+                            Some(&health),
+                            |envelope| {
+                                open_fixture_signed_keys(
+                                    &client.profile,
+                                    envelope,
+                                    &client.gateway_host,
+                                    1_700_000_060,
+                                )
+                            },
+                        )
+                        .await
+                        .expect_err("both resolvers fail");
+                    assert_eq!(*calls.lock().unwrap(), vec![0, 1]);
+                    assert!(
+                        matches!(&err, RoundTripError::Transport(message) if message == "original relay failure")
+                    );
+                    assert!(
+                        RelayBackoff::global()
+                            .remaining(&client.backoff_key())
+                            .is_none()
+                    );
+                    health.error(&client, &err);
+                    let observations = subscription.snapshot().observations;
+                    assert_eq!(observations.len(), 1);
+                    assert_eq!(observations[0].outcome, HealthOutcome::ConfigurationFailure);
+                    assert_eq!(observations[0].stage, HealthStage::KeyConfiguration);
+                }
+            }
+        }
     }
 
     /// DNS resolvers are tried in order; the second succeeds when the first fails.
