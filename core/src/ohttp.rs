@@ -2893,6 +2893,14 @@ impl OhttpClient {
         relay_err: RoundTripError,
         health: Option<&RequestHealth>,
     ) -> Result<CachedKey, RoundTripError> {
+        if relay_failure_has_dns_fallback(&relay_err)
+            && gateway_network(&self.gateway_host)
+                .ok()
+                .and_then(key_config_dns_name)
+                .is_some()
+        {
+            tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
+        }
         self.key_config_from_dns_with(relay_err, health, |envelope| {
             open_signed_keys(&self.profile, envelope, &self.gateway_host, unix_now()?)
         })
@@ -2917,7 +2925,6 @@ impl OhttpClient {
         let Some(dns_name) = key_config_dns_name(network) else {
             return Err(relay_err);
         };
-        tracing::info!(err = %relay_err, "ohttp: relay key config failed, trying DNS");
         for resolver in DOH_RESOLVERS {
             self.check_relay_pause()?;
             let Some(doh_url) = doh_query_url(resolver, network) else {
