@@ -2249,9 +2249,7 @@ struct OhttpClient {
     /// Per-key lock to prevent concurrent dials to the same target (single-flight semantics).
     /// Concurrent callers that find no live connection wait for one in-progress dial to complete
     /// and share its resulting sender, so the connection storm (70 dials in seconds with 70
-    /// concurrent GetTransaction calls) never happens. With one dial at a time per key, rustls's
-    /// in-memory session resumption cache (default in ClientConfig) also starts working for later
-    /// reconnects.
+    /// concurrent GetTransaction calls) never happens.
     dial_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
     /// Only present when the `client-trace` feature is enabled.
@@ -2288,10 +2286,9 @@ impl OhttpClient {
         .with_root_certificates(roots)
         .with_no_client_auth();
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        // rustls ClientConfig defaults: session resumption enabled (in-memory cache, no storage
-        // backend), max_fragment_size None (16 KiB). With single-flight dials per key, the resumption
-        // cache now starts working for later reconnects (one dial at a time means the second dial
-        // can resume from the first).
+        // Fresh connections must not carry a TLS session identity across connection rotations
+        // or isolated Tor circuits. Keep normal certificate and hostname verification.
+        tls.resumption = rustls::client::Resumption::disabled();
         Ok(Self {
             gateway_host: gateway_host.to_string(),
             relay_url: relay_url.to_string(),
@@ -7906,6 +7903,205 @@ pub(crate) mod tests {
             original_key_id,
             "cached key must be the same"
         );
+    }
+
+    fn loopback_tls_acceptor(
+        version: &'static rustls::SupportedProtocolVersion,
+    ) -> tokio_rustls::TlsAcceptor {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let certificate =
+            CertificateDer::from(include_bytes!("../tests/fixtures/ohttp-tls/server.der").to_vec());
+        // Public fixture key, used only by the local test server.
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/ohttp-tls/server-key.der").to_vec(),
+        ));
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[version])
+        .expect("fixture TLS version")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .expect("fixture certificate and key");
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        // The default server session cache and TLS 1.3 tickets offer resumption.
+        tokio_rustls::TlsAcceptor::from(Arc::new(server))
+    }
+
+    fn trust_loopback_tls_ca(config: &rustls::ClientConfig) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                include_bytes!("../tests/fixtures/ohttp-tls/ca.der").to_vec(),
+            ))
+            .expect("fixture CA");
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .expect("fixture certificate verifier");
+        let mut config = config.clone();
+        // Keep normal certificate, signature and hostname checks, with the test CA as its trust anchor.
+        config.dangerous().set_certificate_verifier(verifier);
+        config
+    }
+
+    /// Rotating a connection must not offer a reusable TLS identity to the relay, including
+    /// reconnects within one isolated Tor client. Removing the resumption opt-out breaks this.
+    #[tokio::test]
+    async fn rotated_tls_connections_do_not_resume() {
+        use rustls::HandshakeKind;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let tor = arti_client::TorClient::builder()
+                .create_unbootstrapped()
+                .expect("unbootstrapped Tor client");
+            let mut observed = Vec::new();
+            for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+                for via_tor in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS");
+                    let address = listener.local_addr().expect("TLS address");
+                    let acceptor = loopback_tls_acceptor(version);
+                    let server = tokio::spawn(async move {
+                        let mut handshakes = Vec::new();
+                        for _ in 0..2 {
+                            let (tcp, _) = listener.accept().await.expect("accept TLS TCP");
+                            let mut tls = acceptor.accept(tcp).await.expect("server handshake");
+                            handshakes
+                                .push(tls.get_ref().1.handshake_kind().expect("handshake kind"));
+                            tls.write_all(&[42]).await.expect("write after tickets");
+                            let mut ack = [0];
+                            tls.read_exact(&mut ack)
+                                .await
+                                .expect("read acknowledgement");
+                            assert_eq!(ack, [43]);
+                            tls.shutdown().await.expect("server TLS close");
+                        }
+                        handshakes
+                    });
+                    let client = get_or_create_client(
+                        "tls-rotation.example",
+                        &format!("https://localhost:{}/relay", address.port()),
+                        if via_tor {
+                            Dialer::Tor(tor.isolated_client())
+                        } else {
+                            Dialer::Direct
+                        },
+                        None,
+                        ClientProfile::SLIPSTREAM_HTTP,
+                    )
+                    .await
+                    .expect("construct OHTTP client");
+                    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+                        trust_loopback_tls_ca(&client.tls),
+                    ));
+                    let mut handshakes = Vec::new();
+                    for _ in 0..2 {
+                        // Exercise each constructor's actual TLS config over loopback instead
+                        // of bootstrapping a live Tor network for its underlying byte stream.
+                        let tcp = TcpStream::connect(address).await.expect("connect TLS TCP");
+                        let name = rustls::pki_types::ServerName::try_from("localhost")
+                            .expect("fixture hostname");
+                        let mut tls = connector
+                            .connect(name, tcp)
+                            .await
+                            .expect("client handshake");
+                        let mut marker = [0];
+                        // Reading application data processes the server's preceding TLS 1.3
+                        // NewSessionTicket messages before the next fresh connection starts.
+                        tls.read_exact(&mut marker)
+                            .await
+                            .expect("read after tickets");
+                        assert_eq!(marker, [42]);
+                        handshakes.push(tls.get_ref().1.handshake_kind().expect("handshake kind"));
+                        tls.write_all(&[43]).await.expect("acknowledge server");
+                        tls.shutdown().await.expect("client TLS close");
+                    }
+                    observed.push((
+                        version.version,
+                        via_tor,
+                        handshakes,
+                        server.await.expect("TLS server"),
+                    ));
+                }
+            }
+            // Collect every path before asserting so a failing run diagnoses both constructors.
+            eprintln!("rotated TLS handshakes: {observed:?}");
+            for (version, via_tor, client, server) in observed {
+                assert_eq!(
+                    client,
+                    [HandshakeKind::Full, HandshakeKind::Full],
+                    "client {version:?}, Tor={via_tor}"
+                );
+                assert_eq!(
+                    server,
+                    [HandshakeKind::Full, HandshakeKind::Full],
+                    "server {version:?}, Tor={via_tor}"
+                );
+            }
+        })
+        .await
+        .expect("loopback TLS regression deadline");
+    }
+
+    #[tokio::test]
+    async fn ohttp_tls_rejects_untrusted_certificates_and_wrong_hostnames() {
+        use tokio::net::TcpListener;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS");
+            let port = listener.local_addr().expect("TLS address").port();
+            let acceptor = loopback_tls_acceptor(&rustls::version::TLS13);
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (tcp, _) = listener.accept().await.expect("accept TLS TCP");
+                    assert!(
+                        acceptor.accept(tcp).await.is_err(),
+                        "client must reject certificate"
+                    );
+                }
+            });
+            let mut client = OhttpClient::new(
+                "tls-rejection.example",
+                &format!("https://localhost:{port}/relay"),
+                Dialer::Direct,
+                None,
+                ClientProfile::SLIPSTREAM_HTTP,
+            )
+            .expect("OHTTP client");
+            let target = parse_https(&format!("https://localhost:{port}/relay")).expect("target");
+            let error = client
+                .tls_connect(&target)
+                .await
+                .err()
+                .expect("untrusted CA rejected");
+            assert!(
+                matches!(error, HttpsError::Configuration(_)),
+                "{}",
+                error.into_message()
+            );
+
+            client.tls = Arc::new(trust_loopback_tls_ca(&client.tls));
+            // The fixture is trusted, but its SAN authorizes localhost, not the loopback IP.
+            let target = parse_https(&format!("https://127.0.0.1:{port}/relay")).expect("target");
+            let error = client
+                .tls_connect(&target)
+                .await
+                .err()
+                .expect("wrong hostname rejected");
+            assert!(
+                matches!(error, HttpsError::Configuration(_)),
+                "{}",
+                error.into_message()
+            );
+            server.await.expect("TLS rejection server");
+        })
+        .await
+        .expect("loopback certificate rejection deadline");
     }
 
     /// Privacy: Tor-dialer clients are NEVER cached. A cached Direct client must not be returned

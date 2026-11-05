@@ -12,6 +12,10 @@ workspace.
 
 ### Fixed
 
+- Fresh OHTTP TLS connections always perform full handshakes, preventing session
+  resumption from linking rotated connections or isolated Tor circuits. Certificate
+  and hostname verification remain enabled.
+
 - Only locally generated OHTTP bridge outcomes classify gRPC failures as policy,
   rate-limit or size errors. Reserved outcome metadata from remote servers and
   inner OHTTP response headers or trailers cannot supply these classifications.
