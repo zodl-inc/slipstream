@@ -20,9 +20,16 @@ workspace.
   resumption from linking rotated connections or isolated Tor circuits. Certificate
   and hostname verification remain enabled.
 
-- Only locally generated OHTTP bridge outcomes classify gRPC failures as policy,
-  rate-limit or size errors. Reserved outcome metadata from remote servers and
-  inner OHTTP response headers or trailers cannot supply these classifications.
+- OHTTP bridge outcomes retain policy, rate-limit and size classifications for bare
+  gRPC clients and streams consumed after call scopes end. Connection-owned typed
+  provenance prevents remote metadata or replayed error text from supplying these
+  classifications, without a secret-bearing wire header.
+  Connector functions still return `LwdClient`; its service is now `LwdTransport`.
+  Manual remote clients use `LwdClient::new(channel.into())`, explicit
+  `CompactTxStreamerClient<Channel>` annotations for connector results become
+  `LwdClient`, and the old alias's generated `::connect` becomes `grpc::connect`.
+  Converting a raw `Channel` always treats it as remote; typed OHTTP outcomes require
+  a Slipstream connector-produced client.
 
 - Follow-loop endpoint-unreachable escalation counts only transport failures. Local
   configuration, wallet, scan and stop errors, wire-collapse failover, and HTTP

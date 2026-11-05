@@ -14,14 +14,12 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Direct (non-Tor) lightwalletd connectivity. Produces the same client type
-//! `rust/src/tor.rs` uses (`CompactTxStreamerClient<Channel>`) so a Tor-backed
-//! channel can be swapped in later (P8) without touching callers.
+//! Lightwalletd connectivity with connection-owned provenance for local OHTTP errors.
 
 use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint as TonicEndpoint};
+use tonic::transport::{ClientTlsConfig, Endpoint as TonicEndpoint};
 use zcash_client_backend::{
     data_api::chain::CommitmentTreeRoot,
     proto::service::{
@@ -34,7 +32,17 @@ use zcash_primitives::merkle_tree::HashSer;
 
 use crate::{config::Endpoint, error::SlipstreamError};
 
-pub type LwdClient = CompactTxStreamerClient<Channel>;
+mod transport;
+pub use transport::LwdTransport;
+#[cfg(test)]
+pub(crate) use transport::tests::bridge_outcome_status;
+
+/// Client returned by Slipstream connectors, preserving local OHTTP error provenance.
+/// Manual remote channels use `LwdClient::new(channel.into())`. Consumers annotating the
+/// generated `CompactTxStreamerClient<Channel>` should use this alias for connector results.
+/// Use [`connect`] instead of the generated raw-Channel client's associated `connect`.
+/// `Channel::into()` is always remote; local classifications require a Slipstream connector.
+pub type LwdClient = CompactTxStreamerClient<LwdTransport>;
 
 // ── B2 (#1755 failure-path hardening) transport deadlines ──────────────────────
 //
@@ -76,7 +84,8 @@ fn transport_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Transport(format!("{context}: {e}"))
 }
 
-/// Trusted provenance of the channel carrying a status, independent of peer metadata.
+/// Internal origin hint retained by callers. Authentication comes from the transport's
+/// private typed status source, which survives outside the channel's task scope.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum StatusOrigin {
     #[default]
@@ -88,27 +97,9 @@ pub(crate) enum StatusOrigin {
 pub(crate) fn status_err(
     context: &str,
     status: tonic::Status,
-    origin: StatusOrigin,
+    _origin: StatusOrigin,
 ) -> SlipstreamError {
-    if origin != StatusOrigin::LocalOhttpBridge {
-        return transport_err(context, status);
-    }
-    let outcome = status
-        .metadata()
-        .get(crate::ohttp::OHTTP_OUTCOME_HEADER)
-        .and_then(|v| v.to_str().ok());
-    match outcome {
-        Some(crate::ohttp::OUTCOME_POLICY_DENIED) => {
-            SlipstreamError::PolicyDenied(format!("{context}: {status}"))
-        }
-        Some(crate::ohttp::OUTCOME_RATE_LIMITED) => {
-            SlipstreamError::RateLimited(format!("{context}: {status}"))
-        }
-        Some(crate::ohttp::OUTCOME_TOO_LARGE) => {
-            SlipstreamError::RequestTooLarge(format!("{context}: {status}"))
-        }
-        _ => transport_err(context, status),
-    }
+    transport::status_err(context, status)
 }
 
 fn current_status_origin() -> StatusOrigin {
@@ -397,7 +388,7 @@ pub(crate) async fn request_client(client: &LwdClient) -> Result<RpcClient, Slip
             .map_err(|error| transport_err("local OHTTP pipe", error))?;
         Ok(RpcClient {
             status_origin: StatusOrigin::LocalOhttpBridge,
-            client: LwdClient::new(channel),
+            client: LwdClient::new(LwdTransport::local_bridge(channel)),
             health: Some(health),
         })
     } else {
@@ -521,7 +512,7 @@ pub(crate) async fn connect_tracked(
     shared: bool,
 ) -> Result<TrackedConnection, SlipstreamError> {
     // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
-    // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
+    // relayed. The connector hands tonic an in-process h2 pipe with trusted local origin.
     if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
         tracing::info!(
             network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
@@ -557,7 +548,7 @@ pub(crate) async fn connect_tracked(
             })?;
         net_stats::record(net_stats::NetEvent::DirectChannel);
         return Ok(TrackedConnection::ohttp(
-            CompactTxStreamerClient::new(channel),
+            CompactTxStreamerClient::new(LwdTransport::local_bridge(channel)),
             connector,
             pipe_uri,
         ));
@@ -578,7 +569,7 @@ pub(crate) async fn connect_tracked(
     })?;
     net_stats::record(net_stats::NetEvent::DirectChannel);
     Ok(TrackedConnection::plain(CompactTxStreamerClient::new(
-        channel,
+        channel.into(),
     )))
 }
 
@@ -1043,20 +1034,29 @@ mod tests {
 
     #[test]
     fn forged_remote_outcomes_are_transport_errors() {
-        for outcome in [
-            crate::ohttp::OUTCOME_POLICY_DENIED,
-            crate::ohttp::OUTCOME_RATE_LIMITED,
-            crate::ohttp::OUTCOME_TOO_LARGE,
-        ] {
-            let mut status = tonic::Status::unavailable("remote failure");
-            status
-                .metadata_mut()
-                .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
-            let remote_result = super::status_err("remote", status, StatusOrigin::RemoteServer);
-            assert!(
-                matches!(remote_result, SlipstreamError::Transport(_)),
-                "{outcome}: {remote_result:?}"
-            );
+        for origin in [StatusOrigin::RemoteServer, StatusOrigin::LocalOhttpBridge] {
+            for auth in [None, Some("invented-bridge-authentication")] {
+                for outcome in [
+                    crate::ohttp::OUTCOME_POLICY_DENIED,
+                    crate::ohttp::OUTCOME_RATE_LIMITED,
+                    crate::ohttp::OUTCOME_TOO_LARGE,
+                ] {
+                    let mut status = tonic::Status::unavailable("remote failure");
+                    status
+                        .metadata_mut()
+                        .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
+                    if let Some(auth) = auth {
+                        status
+                            .metadata_mut()
+                            .insert("x-ohttp-outcome-auth", auth.parse().unwrap());
+                    }
+                    let error = super::status_err("remote", status, origin);
+                    assert!(
+                        matches!(error, SlipstreamError::Transport(_)),
+                        "{outcome} / {origin:?}: {error:?}"
+                    );
+                }
+            }
         }
     }
 
@@ -1067,10 +1067,7 @@ mod tests {
             (crate::ohttp::OUTCOME_RATE_LIMITED, "rate"),
             (crate::ohttp::OUTCOME_TOO_LARGE, "size"),
         ] {
-            let mut status = tonic::Status::unavailable("local failure");
-            status
-                .metadata_mut()
-                .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
+            let status = crate::ohttp::tests::bridge_outcome_status(outcome);
             let result = super::status_err("local", status, StatusOrigin::LocalOhttpBridge);
             assert!(matches!(
                 (expected, result),
@@ -1090,7 +1087,9 @@ mod tests {
         };
         let local = connect_tracked(&endpoint, false).await.unwrap();
         let remote = TrackedConnection::plain(LwdClient::new(
-            TonicEndpoint::from_static("http://remote.invalid").connect_lazy(),
+            TonicEndpoint::from_static("http://remote.invalid")
+                .connect_lazy()
+                .into(),
         ));
         let result = local
             .call(async |_client| {
@@ -1100,6 +1099,10 @@ mod tests {
                         status.metadata_mut().insert(
                             crate::ohttp::OHTTP_OUTCOME_HEADER,
                             crate::ohttp::OUTCOME_RATE_LIMITED.parse().unwrap(),
+                        );
+                        status.metadata_mut().insert(
+                            "x-ohttp-outcome-auth",
+                            "invented-bridge-authentication".parse().unwrap(),
                         );
                         with_unary_timeout::<()>("nested remote", async { Err(status) }).await
                     })

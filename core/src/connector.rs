@@ -381,7 +381,7 @@ impl TorConn {
                 ))
             })?;
         Ok(TrackedConnection::ohttp(
-            LwdClient::new(channel),
+            LwdClient::new(crate::grpc::LwdTransport::local_bridge(channel)),
             connector,
             pipe_uri,
         ))
@@ -425,7 +425,7 @@ impl TorConn {
                     crate::ohttp::log_host(&endpoint.host)
                 ))
             })?;
-        Ok(TrackedConnection::plain(LwdClient::new(channel)))
+        Ok(TrackedConnection::plain(LwdClient::new(channel.into())))
     }
 }
 

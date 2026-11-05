@@ -4156,10 +4156,15 @@ mod tests {
                 (crate::ohttp::OUTCOME_RATE_LIMITED, "rate"),
                 (crate::ohttp::OUTCOME_TOO_LARGE, "size"),
             ] {
-                let mut status = tonic::Status::unavailable("stream failure");
-                status
-                    .metadata_mut()
-                    .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
+                let status = if local {
+                    crate::ohttp::tests::bridge_outcome_status(outcome)
+                } else {
+                    let mut status = tonic::Status::unavailable("remote stream failure");
+                    status
+                        .metadata_mut()
+                        .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
+                    status
+                };
                 let mut stream = stream::iter([Err(status)]);
                 let mut cursor = test_cursor(0, 100, 119);
                 let mut refused = false;
@@ -4209,13 +4214,8 @@ mod tests {
         let mut cursor = test_cursor(0, 100, 119);
         let slot = WorkerSlot::new(Arc::default());
         slot.kick();
-        let mut denied = tonic::Status::permission_denied("inner 403");
-        denied.metadata_mut().insert(
-            crate::ohttp::OHTTP_OUTCOME_HEADER,
-            crate::ohttp::OUTCOME_POLICY_DENIED
-                .parse()
-                .expect("ascii metadata"),
-        );
+        let denied =
+            crate::ohttp::tests::bridge_outcome_status(crate::ohttp::OUTCOME_POLICY_DENIED);
         let mut items: Vec<Result<CompactBlock, tonic::Status>> =
             linked(100, 3, 1000).into_iter().map(Ok).collect();
         items.push(Err(denied));
