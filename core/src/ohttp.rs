@@ -45,6 +45,8 @@
 //! [`Dialer::Tor`] opens an arti stream so the relay only ever sees a Tor exit IP. Everything
 //! above TCP (TLS to the relay, HPKE to the gateway) is identical in both cases.
 
+mod direct_dial;
+
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -99,7 +101,7 @@ const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
 /// silence also marks its pooled connection dead (see [`H2InFlight::dead_if_given_up_after`]).
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on opening a direct TCP connection to the relay.
+/// Shared bound on DNS resolution and all direct TCP attempts to the relay.
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The pause an outer 429 without a `Retry-After` starts (the ZIP's reference default). The
@@ -518,9 +520,9 @@ impl Dialer {
     async fn dial(&self, host: &str, port: u16, label: &str) -> Result<BoxedIo, String> {
         match self {
             Dialer::Direct => {
-                let tcp = tokio::time::timeout(
-                    DIRECT_DIAL_TIMEOUT,
-                    tokio::net::TcpStream::connect((host, port)),
+                let tcp = direct_dial::connect(
+                    tokio::net::lookup_host((host, port)),
+                    tokio::net::TcpStream::connect,
                 )
                 .await
                 .map_err(|_| {

@@ -12,6 +12,10 @@ workspace.
 
 ### Fixed
 
+- Direct OHTTP dialing races IPv6 and IPv4 candidates with at most two concurrent
+  connections and one 15-second DNS-and-connect budget. Cancellation and successful
+  connection selection drop losing attempts; Tor routing is unchanged.
+
 - Fresh OHTTP TLS connections always perform full handshakes, preventing session
   resumption from linking rotated connections or isolated Tor circuits. Certificate
   and hostname verification remain enabled.
