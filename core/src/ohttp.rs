@@ -1787,10 +1787,9 @@ impl GrpcFrames {
             if let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(k.as_bytes()),
                 HeaderValue::from_bytes(v.as_bytes()),
-            ) {
-                if name != OHTTP_OUTCOME_HEADER {
-                    trailers.insert(name, value);
-                }
+            ) && name != OHTTP_OUTCOME_HEADER
+            {
+                trailers.insert(name, value);
             }
         }
         if !trailers.contains_key("grpc-status") {

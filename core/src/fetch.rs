@@ -1292,8 +1292,8 @@ async fn worker(
     out: mpsc::Sender<SubChunk>,
     progress: Option<Arc<Progress>>,
 ) -> Result<(), SlipstreamError> {
-    // Bulk is direct (with bounded retry) for plain hosts even with Tor on; for an OHTTP gateway
-    // with Tor on, `connect_via` routes it OHTTP-over-Tor so nothing bypasses the relay/Tor.
+    // Bulk uses Tor for every host when Tor is on, with a circuit per fetch connection.
+    // OHTTP gateways retain encapsulation, including over the Tor transport.
     let mut client = match connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await {
         Ok(client) => client,
         // A worker added by a boost holds no plan chunk yet: the fetch goes on without it.
@@ -2267,8 +2267,8 @@ impl BoostState {
 /// `progress` — if `Some`, bumps `fetched_blocks` by the block count of each
 /// ordered sub-chunk as it is released (Relaxed atomic; no cross-counter guarantees).
 ///
-/// `tor` — the session's Tor handle when Tor is on. Bulk stays direct for plain hosts; for an
-/// OHTTP gateway it makes the workers dial the relay through Tor (see `connector::route`).
+/// `tor` — the session's Tor handle: all hosts use Tor when it is present, with a circuit per
+/// fetch connection. OHTTP gateways retain encapsulation (see `connector::route`).
 pub async fn run_fetch(
     endpoint: &Endpoint,
     tor: Option<TorConn>,

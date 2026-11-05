@@ -14,17 +14,15 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Lightwalletd connection factory honoring the old SDK's per-call Tor policy.
+//! Lightwalletd connection factory honoring the engine's per-call Tor policy.
 //!
-//! Mirrors the old SDK's `ServiceMode`: the **bulk** block fetch is direct (the old
-//! SDK's `blockStream` uses `.direct` — public range data, too high-volume for Tor; per-user
-//! exposure (IP + birthday) is identical with or without Tor). Wallet-**identifying** metadata
-//! (treestate, latest-block, lightd info) goes over **isolated Tor circuits** when Tor is on.
+//! With Tor on, every purpose and host uses Tor: **bulk** block fetch connections each get
+//! a circuit of their own, while metadata uses the isolated, default, or shared circuit
+//! selected by its [`ConnPurpose`]. With Tor off, connections are direct.
 //!
-//! **OHTTP gateways** (`crate::ohttp::relay_for(host).is_some()`) are the exception to "bulk is
-//! direct": with Tor on, EVERY purpose — bulk included — is OHTTP-encapsulated AND its TCP leg to
-//! the relay is dialled through Tor. Anything less would either bypass OHTTP (the gateway refuses
-//! plain gRPC with 426 anyway) or hand the relay the device IP while the user asked for Tor.
+//! **OHTTP gateways** (`crate::ohttp::relay_for(host).is_some()`) encapsulate EVERY purpose,
+//! bulk included. With Tor on, their TCP leg to the relay also goes through Tor, so the relay
+//! never receives the device IP while the user asked for Tor.
 //!
 //! Tor is transport-only — the bytes written to the wallet DB are identical either way, so the
 //! golden + darkside oracles are unaffected.
