@@ -24,12 +24,6 @@ workspace.
   gRPC clients and streams consumed after call scopes end. Connection-owned typed
   provenance prevents remote metadata or replayed error text from supplying these
   classifications, without a secret-bearing wire header.
-  Connector functions still return `LwdClient`; its service is now `LwdTransport`.
-  Manual remote clients use `LwdClient::new(channel.into())`, explicit
-  `CompactTxStreamerClient<Channel>` annotations for connector results become
-  `LwdClient`, and the old alias's generated `::connect` becomes `grpc::connect`.
-  Converting a raw `Channel` always treats it as remote; typed OHTTP outcomes require
-  a Slipstream connector-produced client.
 
 - Follow-loop endpoint-unreachable escalation counts only transport failures. Local
   configuration, wallet, scan and stop errors, wire-collapse failover, and HTTP
@@ -67,6 +61,9 @@ workspace.
   deadline owners share one request's evidence; concurrent calls remain independent.
 
 ### Added
+- `grpc::LwdTransport`, the service behind `LwdClient`. It strips OHTTP outcome markers on every
+  channel and attaches typed policy, rate-limit and size outcomes only for Slipstream's local
+  OHTTP bridge.
 - Opt-in `run_session_with_tor_startup` retains typed, generation-scoped Tor
   readiness and failure status. A host-supplied monotonic deadline bounds pass
   admission, bootstrap and retry backoff together; cancellation or dropping an
@@ -122,6 +119,15 @@ workspace.
   `GetAddressUtxos` does too.
 
 ### Changed
+- **Breaking:** `LwdClient` is now `CompactTxStreamerClient<LwdTransport>` instead of
+  `CompactTxStreamerClient<Channel>`, so the next release after 0.4.0 needs a minor version
+  bump. Connector functions still return `LwdClient`. Manual remote clients use
+  `LwdClient::new(channel.into())`, explicit `CompactTxStreamerClient<Channel>` annotations for
+  connector results become `LwdClient`, and the old alias's generated `::connect` becomes
+  `grpc::connect`. Converting a raw `Channel` always treats it as remote; typed OHTTP outcomes
+  require a Slipstream connector-produced client.
+- Direct connection failures name their kind, for example `connection failed: connection
+  refused`, still without host or address text.
 - Ordinary stop (backgrounding or shutdown) requests the next block boundary
   before aborting the session. An abort alone cannot interrupt synchronous scanning
   and can leave already-fetched chunks scanning for minutes. Earlier commits remain;

@@ -88,7 +88,12 @@ where
                     Ok(stream) => return Ok(stream),
                     // Connector errors may contain resolved addresses. Keep this category
                     // distinct from resolver failures and an empty DNS answer.
-                    Err(error) => last_error = io::Error::new(error.kind(), "connection failed"),
+                    Err(error) => {
+                        last_error = io::Error::new(
+                            error.kind(),
+                            format!("connection failed: {}", error.kind()),
+                        );
+                    }
                 }
                 // A failed attempt frees its slot immediately; do not delay recovery.
                 if let Some(address) = addresses.next() {
@@ -297,6 +302,33 @@ mod tests {
             .unwrap()
             .unwrap_err();
             assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+            for endpoint in ["secret-relay.example", "192.0.2.42", "2001:db8::42"] {
+                assert!(
+                    !error.to_string().contains(endpoint),
+                    "leaked {endpoint}: {error}"
+                );
+            }
+        }
+    }
+
+    // Direct connection failures name their kind but never the host or address they dialed.
+    #[tokio::test]
+    async fn connect_failure_message_names_the_error_kind() {
+        for (kind, expected) in [
+            (
+                io::ErrorKind::ConnectionRefused,
+                "connection failed: connection refused",
+            ),
+            (io::ErrorKind::TimedOut, "connection failed: timed out"),
+        ] {
+            let error = connect(std::future::ready(Ok(addresses())), |_| async move {
+                Err::<SocketAddr, _>(io::Error::from(kind))
+            })
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(error.to_string(), expected);
             for endpoint in ["secret-relay.example", "192.0.2.42", "2001:db8::42"] {
                 assert!(
                     !error.to_string().contains(endpoint),
