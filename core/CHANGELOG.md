@@ -12,6 +12,25 @@ workspace.
 
 ### Fixed
 
+- Direct OHTTP dialing races IPv6 and IPv4 candidates with at most two concurrent
+  connections and one 15-second DNS-and-connect budget. Cancellation and successful
+  connection selection drop losing attempts; Tor routing is unchanged. Its connection
+  failures report only the error kind (for example `connection failed: connection
+  refused`), never host or address text.
+
+- Fresh OHTTP TLS connections always perform full handshakes, preventing session
+  resumption from linking rotated connections or isolated Tor circuits. Certificate
+  and hostname verification remain enabled.
+
+- OHTTP bridge outcomes retain policy, rate-limit and size classifications for bare
+  gRPC clients and streams consumed after call scopes end. Connection-owned typed
+  provenance prevents remote metadata or replayed error text from supplying these
+  classifications, without a secret-bearing wire header.
+
+- Follow-loop endpoint-unreachable escalation counts only transport failures. Local
+  configuration, wallet, scan and stop errors, wire-collapse failover, and HTTP
+  policy, rate-limit and size outcomes do not trigger server switching.
+
 - OHTTP DNS fallback rate limits stay local to the responding resolver, allowing the
   next resolver to recover without pausing relay traffic or replacing relay health.
 
@@ -44,6 +63,9 @@ workspace.
   deadline owners share one request's evidence; concurrent calls remain independent.
 
 ### Added
+- `grpc::LwdTransport`, the service behind `LwdClient`. It strips OHTTP outcome markers on every
+  channel and attaches typed policy, rate-limit and size outcomes only for Slipstream's local
+  OHTTP bridge.
 - Opt-in `run_session_with_tor_startup` retains typed, generation-scoped Tor
   readiness and failure status. A host-supplied monotonic deadline bounds pass
   admission, bootstrap and retry backoff together; cancellation or dropping an
@@ -85,7 +107,9 @@ workspace.
   builds is the caller's job.
 - `connector::TorConn::from_client`, `TorConn::client`,
   `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
-- `SlipstreamError::EndpointUnreachable`.
+- `SlipstreamError::EndpointUnreachable` is declared but not constructed by the
+  engine. The follow loop reports unreachable endpoints directly through
+  `SyncState::Error(3)` and event tag 4/value 3.
 - `SlipstreamError::{RateLimited, RequestTooLarge}` and
   `SlipstreamError::counts_as_unreachable`: an OHTTP relay rate limit (outer
   429, or a request held back while its `Retry-After` pause runs; transient),
@@ -97,6 +121,38 @@ workspace.
   `GetAddressUtxos` does too.
 
 ### Changed
+- **Breaking:** `LwdClient` is now `CompactTxStreamerClient<LwdTransport>` instead of
+  `CompactTxStreamerClient<Channel>`, so the next release after 0.4.0 needs a minor version
+  bump. Connector functions still return `LwdClient`. Manual remote clients use
+  `LwdClient::new(channel.into())`, explicit `CompactTxStreamerClient<Channel>` annotations for
+  connector results become `LwdClient`, and the old alias's generated `::connect` becomes
+  `grpc::connect`. Converting a raw `Channel` always treats it as remote; typed OHTTP outcomes
+  require a Slipstream connector-produced client.
+- Ordinary stop (backgrounding or shutdown) requests the next block boundary
+  before aborting the session. An abort alone cannot interrupt synchronous scanning
+  and can leave already-fetched chunks scanning for minutes. Earlier commits remain;
+  the interrupted scan call and any write-behind unit not yet submitted are discarded
+  and rescanned on resume. Stop is not instantaneous: current computation, queued
+  trial decryption and in-flight writes can still take time. Hosts must check the
+  stop report before changing the wallet.
+- Adaptive fetch boost is on by default: byte-sized plan chunks, fresh connections
+  for slow head streams while the scanner waits, and two extra block streams for
+  OHTTP gateways when the device memory budget is not derated. Extra streams are
+  withdrawn if they do not improve throughput; the ahead-memory budget is unchanged.
+- Write-behind persistence groups scan calls into a commit at 20,000 blocks or
+  100,000 note commitments. Limits are checked after adding a scan call, so a unit
+  can exceed a limit by one call. Larger units amortize transaction and tree costs;
+  an unsubmitted unit must be rescanned after a stop or error.
+- Engine wallet connections checkpoint the WAL at 10,000 pages and retain at most
+  64 MiB after a checkpoint resets the journal. Scan writers use a page-cache bound
+  of 64 MiB per connection on desktop/server and 32 MiB on iOS/Android. These settings
+  reduce repeated page writes without changing transaction atomicity or durability.
+- Dense scan merge combines already-queued chunks of at least 16,000 commitments
+  into scan calls up to a 210,000-commitment target, derated to 105,000 below 3 GiB
+  physical memory. Fewer scan barriers improve throughput without increasing the
+  queue's byte budget. Progress updates follow completed scan calls, so merged calls
+  produce less frequent updates; write-behind completion records work after its
+  database transaction commits.
 - OHTTP relay pauses and key-fetch rate limits remain typed during Tor
   connection warm-up. They return to caller backoff without spending fresh
   circuit retries or falsely marking the endpoint unreachable.
@@ -126,11 +182,12 @@ workspace.
   `zcash_client_backend::tor::Client`).
 - `fetch::run_fetch` takes the session's `Option<TorConn>` as its second
   argument.
-- With Tor on, the bulk block fetch rides the default Tor circuit instead of
-  going direct, and an OHTTP gateway is reached with the relay leg dialled
-  through Tor.
+- With Tor on, bulk block fetch uses a circuit per connection for every host,
+  including the relay leg for an OHTTP gateway. Separate worker circuits avoid
+  sharing one circuit's throughput window; bulk never bypasses Tor.
 - The follow loop surfaces `SyncState::Error(3)` (event tag 4, value 3) after
-  5 consecutive tip-probe or catch-up failures, so a host can switch servers.
+  5 transport failures across its tip-probe and catch-up counters, each reset by
+  its corresponding successful probe or pass, so a host can switch servers.
   Follow-phase failures previously never surfaced an error.
 - Tor transport dependencies use the 0.43 family required by the released NU7 backend.
 - OHTTP channels and split block-range attempts contribute to per-pass network counts;

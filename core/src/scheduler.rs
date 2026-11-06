@@ -741,8 +741,8 @@ pub async fn run_to_completion(
         let endpoint = config.endpoint.clone();
         // Clone the progress Arc for the fetch task so it can bump fetched_blocks.
         let fetch_progress = progress.clone();
-        // Tor handle for the bulk workers: only used when the endpoint is an OHTTP gateway
-        // (bulk stays direct for plain hosts — connector::route).
+        // Tor handle for the bulk workers: when present, every host uses Tor with one
+        // circuit per connection, including plain lightwalletd hosts (connector::route).
         let fetch_tor = tor.cloned();
 
         // Spawn the fetch task so it runs concurrently with scan_chunks below.

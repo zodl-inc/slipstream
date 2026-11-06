@@ -14,17 +14,15 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Lightwalletd connection factory honoring the old SDK's per-call Tor policy.
+//! Lightwalletd connection factory honoring the engine's per-call Tor policy.
 //!
-//! Mirrors the old SDK's `ServiceMode`: the **bulk** block fetch is direct (the old
-//! SDK's `blockStream` uses `.direct` — public range data, too high-volume for Tor; per-user
-//! exposure (IP + birthday) is identical with or without Tor). Wallet-**identifying** metadata
-//! (treestate, latest-block, lightd info) goes over **isolated Tor circuits** when Tor is on.
+//! With Tor on, every purpose and host uses Tor: **bulk** block fetch connections each get
+//! a circuit of their own, while metadata uses the isolated, default, or shared circuit
+//! selected by its [`ConnPurpose`]. With Tor off, connections are direct.
 //!
-//! **OHTTP gateways** (`crate::ohttp::relay_for(host).is_some()`) are the exception to "bulk is
-//! direct": with Tor on, EVERY purpose — bulk included — is OHTTP-encapsulated AND its TCP leg to
-//! the relay is dialled through Tor. Anything less would either bypass OHTTP (the gateway refuses
-//! plain gRPC with 426 anyway) or hand the relay the device IP while the user asked for Tor.
+//! **OHTTP gateways** (`crate::ohttp::relay_for(host).is_some()`) encapsulate EVERY purpose,
+//! bulk included. With Tor on, their TCP leg to the relay also goes through Tor, so the relay
+//! never receives the device IP while the user asked for Tor.
 //!
 //! Tor is transport-only — the bytes written to the wallet DB are identical either way, so the
 //! golden + darkside oracles are unaffected.
@@ -115,9 +113,9 @@ fn tor_mode(purpose: ConnPurpose) -> Option<TorMode> {
 }
 
 /// The full routing decision for one connect. With a Tor handle present (Tor ON) NOTHING bypasses
-/// Tor, whatever the host: OHTTP gateways and clearnet lightwalletd alike carry bulk on the default
-/// circuit and metadata on its usual circuit. `is_ohttp_gateway` is kept for call-site clarity and
-/// logging; it no longer changes the decision. Without Tor, [`connect_via`] goes direct (and
+/// Tor, whatever the host: OHTTP gateways and clearnet lightwalletd alike carry bulk on a circuit
+/// per connection and metadata on its usual circuit. `is_ohttp_gateway` is kept for call-site
+/// clarity and logging; it no longer changes the decision. Without Tor, [`connect_via`] goes direct (and
 /// `grpc::connect` speaks OHTTP to gateways over the direct relay leg).
 fn route(purpose: ConnPurpose, is_ohttp_gateway: bool) -> Option<TorMode> {
     let _ = is_ohttp_gateway;
@@ -237,8 +235,9 @@ impl TorConn {
 
     /// Open an isolated (`.uniqueTor`-style) lightwalletd client to `endpoint` through Tor.
     /// OHTTP gateways are OHTTP-encapsulated with the relay leg dialled through Tor; other hosts
-    /// are dialled directly over Tor. Public entry point for hosts outside the engine (the SDK's
-    /// FFI Tor client) that must share this routing policy.
+    /// are dialled directly over Tor. Public entry point for hosts that own the Tor runtime
+    /// and need the engine's routing policy. The SDK's separate FFI Tor client refuses OHTTP
+    /// gateways; its Swift OHTTP service handles them instead.
     pub async fn connect_isolated(
         &self,
         endpoint: &Endpoint,
@@ -382,11 +381,7 @@ impl TorConn {
                     crate::ohttp::gateway_label(&endpoint.host)
                 ))
             })?;
-        Ok(TrackedConnection::ohttp(
-            LwdClient::new(channel),
-            connector,
-            pipe_uri,
-        ))
+        Ok(TrackedConnection::ohttp(channel, connector, pipe_uri))
     }
 
     /// Non-OHTTP host: gRPC(+TLS) directly over a Tor stream — a port of
@@ -427,7 +422,7 @@ impl TorConn {
                     crate::ohttp::log_host(&endpoint.host)
                 ))
             })?;
-        Ok(TrackedConnection::plain(LwdClient::new(channel)))
+        Ok(TrackedConnection::plain(LwdClient::new(channel.into())))
     }
 }
 
@@ -501,8 +496,8 @@ impl Connector {
         }
     }
 
-    /// Tor-on: metadata over Tor, bulk still direct (unless the endpoint is an OHTTP gateway, in
-    /// which case bulk is OHTTP-over-Tor as well).
+    /// Tor-on: every purpose uses Tor, with a circuit per bulk connection for every host.
+    /// OHTTP gateways use Tor for the relay leg too.
     pub fn with_tor(endpoint: Endpoint, tor: TorConn) -> Self {
         Self {
             endpoint,
@@ -845,6 +840,28 @@ mod tests {
             1,
             "a fresh circuit cannot escape a relay pause"
         );
+    }
+
+    #[tokio::test]
+    async fn tor_ohttp_channel_keeps_authentic_outcomes() {
+        for (outer, inner, expected) in [(429, 200, "rate"), (200, 403, "policy")] {
+            let (connector, _) =
+                crate::ohttp::tests::outcome_connector(&format!("tor-{expected}"), outer, inner)
+                    .await;
+            let mut client = TorConn::connect_ohttp_channel(connector, &ohttp_endpoint())
+                .await
+                .expect("channel")
+                .into_client();
+            let error = grpc::get_latest_block_height(&mut client)
+                .await
+                .unwrap_err();
+            let kind = match &error {
+                SlipstreamError::RateLimited(_) => "rate",
+                SlipstreamError::PolicyDenied(_) => "policy",
+                other => panic!("expected {expected}, got {other:?}"),
+            };
+            assert_eq!(kind, expected, "{error:?}");
+        }
     }
 
     #[tokio::test]

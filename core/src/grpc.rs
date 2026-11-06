@@ -14,14 +14,12 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
-//! Direct (non-Tor) lightwalletd connectivity. Produces the same client type
-//! `rust/src/tor.rs` uses (`CompactTxStreamerClient<Channel>`) so a Tor-backed
-//! channel can be swapped in later (P8) without touching callers.
+//! Lightwalletd connectivity with connection-owned provenance for local OHTTP errors.
 
 use std::{sync::Arc, time::Duration};
 
 use futures_util::StreamExt;
-use tonic::transport::{Channel, ClientTlsConfig, Endpoint as TonicEndpoint};
+use tonic::transport::{ClientTlsConfig, Endpoint as TonicEndpoint};
 use zcash_client_backend::{
     data_api::chain::CommitmentTreeRoot,
     proto::service::{
@@ -34,7 +32,17 @@ use zcash_primitives::merkle_tree::HashSer;
 
 use crate::{config::Endpoint, error::SlipstreamError};
 
-pub type LwdClient = CompactTxStreamerClient<Channel>;
+mod transport;
+pub use transport::LwdTransport;
+#[cfg(test)]
+pub(crate) use transport::tests::bridge_outcome_status;
+
+/// Client returned by Slipstream connectors, preserving local OHTTP error provenance.
+/// Manual remote channels use `LwdClient::new(channel.into())`. Consumers annotating the
+/// generated `CompactTxStreamerClient<Channel>` should use this alias for connector results.
+/// Use [`connect`] instead of the generated raw-Channel client's associated `connect`.
+/// `Channel::into()` is always remote; local classifications require a Slipstream connector.
+pub type LwdClient = CompactTxStreamerClient<LwdTransport>;
 
 // ── B2 (#1755 failure-path hardening) transport deadlines ──────────────────────
 //
@@ -76,26 +84,9 @@ fn transport_err(context: &str, e: impl std::fmt::Display) -> SlipstreamError {
     SlipstreamError::Transport(format!("{context}: {e}"))
 }
 
-/// A gRPC status as an engine error. The OHTTP connector marks its own outcomes (an inner
-/// 403, a relay rate limit, an oversized request) in the status metadata; every other status is
-/// a transport error, as before.
+/// Only the in-process OHTTP bridge may attach a local outcome classification.
 pub(crate) fn status_err(context: &str, status: tonic::Status) -> SlipstreamError {
-    let outcome = status
-        .metadata()
-        .get(crate::ohttp::OHTTP_OUTCOME_HEADER)
-        .and_then(|v| v.to_str().ok());
-    match outcome {
-        Some(crate::ohttp::OUTCOME_POLICY_DENIED) => {
-            SlipstreamError::PolicyDenied(format!("{context}: {status}"))
-        }
-        Some(crate::ohttp::OUTCOME_RATE_LIMITED) => {
-            SlipstreamError::RateLimited(format!("{context}: {status}"))
-        }
-        Some(crate::ohttp::OUTCOME_TOO_LARGE) => {
-            SlipstreamError::RequestTooLarge(format!("{context}: {status}"))
-        }
-        _ => transport_err(context, status),
-    }
+    transport::status_err(context, status)
 }
 
 // ── T6.8-H2 scan-path transient retries ───────────────────────────────────────
@@ -287,8 +278,9 @@ pub(crate) fn current_factory() -> Option<OhttpFactory> {
     OHTTP_FACTORY.try_with(Clone::clone).ok().flatten()
 }
 
-/// Internal companion to the unchanged public tonic client. Its factory keeps the exact
-/// original relay connection, key cache and Tor isolation; only request-local pipes are new.
+/// Internal companion of the public `LwdClient`, whose `LwdTransport` attaches typed local
+/// outcomes. Its factory keeps the exact relay connection, key cache and Tor isolation; only
+/// request-local pipes are new.
 #[derive(Clone)]
 pub(crate) struct TrackedConnection {
     client: LwdClient,
@@ -320,13 +312,15 @@ impl TrackedConnection {
             factory: current_factory(),
         }
     }
+    /// `channel` is the in-process pipe to the local bridge; it is wrapped here so that no caller
+    /// can build a connection whose locally generated outcomes lose their classification.
     pub(crate) fn ohttp(
-        client: LwdClient,
+        channel: tonic::transport::Channel,
         connector: crate::ohttp::OhttpConnector,
         uri: String,
     ) -> Self {
         Self {
-            client,
+            client: LwdClient::new(LwdTransport::local_bridge(channel)),
             factory: Some(OhttpFactory { connector, uri }),
         }
     }
@@ -366,7 +360,7 @@ pub(crate) async fn request_client(client: &LwdClient) -> Result<RpcClient, Slip
             .await
             .map_err(|error| transport_err("local OHTTP pipe", error))?;
         Ok(RpcClient {
-            client: LwdClient::new(channel),
+            client: LwdClient::new(LwdTransport::local_bridge(channel)),
             health: Some(health),
         })
     } else {
@@ -489,7 +483,7 @@ pub(crate) async fn connect_tracked(
     shared: bool,
 ) -> Result<TrackedConnection, SlipstreamError> {
     // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
-    // relayed. The connector hands tonic an in-process h2 pipe, so the client type is unchanged.
+    // relayed. The connector hands tonic an in-process h2 pipe with trusted local origin.
     if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
         tracing::info!(
             network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
@@ -524,11 +518,7 @@ pub(crate) async fn connect_tracked(
                 )
             })?;
         net_stats::record(net_stats::NetEvent::DirectChannel);
-        return Ok(TrackedConnection::ohttp(
-            CompactTxStreamerClient::new(channel),
-            connector,
-            pipe_uri,
-        ));
+        return Ok(TrackedConnection::ohttp(channel, connector, pipe_uri));
     }
     let mut ep = TonicEndpoint::from_shared(endpoint.uri())
         .map_err(|e| transport_err("endpoint uri", e))?
@@ -546,7 +536,7 @@ pub(crate) async fn connect_tracked(
     })?;
     net_stats::record(net_stats::NetEvent::DirectChannel);
     Ok(TrackedConnection::plain(CompactTxStreamerClient::new(
-        channel,
+        channel.into(),
     )))
 }
 
@@ -1004,6 +994,88 @@ pub mod net_stats {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn forged_remote_outcomes_are_transport_errors() {
+        for auth in [None, Some("invented-bridge-authentication")] {
+            for outcome in [
+                crate::ohttp::OUTCOME_POLICY_DENIED,
+                crate::ohttp::OUTCOME_RATE_LIMITED,
+                crate::ohttp::OUTCOME_TOO_LARGE,
+            ] {
+                let mut status = tonic::Status::unavailable("remote failure");
+                status
+                    .metadata_mut()
+                    .insert(crate::ohttp::OHTTP_OUTCOME_HEADER, outcome.parse().unwrap());
+                if let Some(auth) = auth {
+                    status
+                        .metadata_mut()
+                        .insert("x-ohttp-outcome-auth", auth.parse().unwrap());
+                }
+                let error = super::status_err("remote", status);
+                assert!(
+                    matches!(error, SlipstreamError::Transport(_)),
+                    "{outcome}: {error:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_bridge_outcomes_keep_their_classification() {
+        for (outcome, expected) in [
+            (crate::ohttp::OUTCOME_POLICY_DENIED, "policy"),
+            (crate::ohttp::OUTCOME_RATE_LIMITED, "rate"),
+            (crate::ohttp::OUTCOME_TOO_LARGE, "size"),
+        ] {
+            let status = crate::ohttp::tests::bridge_outcome_status(outcome);
+            let result = super::status_err("local", status);
+            assert!(matches!(
+                (expected, result),
+                ("policy", SlipstreamError::PolicyDenied(_))
+                    | ("rate", SlipstreamError::RateLimited(_))
+                    | ("size", SlipstreamError::RequestTooLarge(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_remote_connection_does_not_inherit_local_outcome_origin() {
+        let endpoint = Endpoint {
+            host: crate::ohttp::tests::testnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        let local = connect_tracked(&endpoint, false).await.unwrap();
+        let remote = TrackedConnection::plain(LwdClient::new(
+            TonicEndpoint::from_static("http://remote.invalid")
+                .connect_lazy()
+                .into(),
+        ));
+        let result = local
+            .call(async |_client| {
+                remote
+                    .call(async |_client| {
+                        let mut status = tonic::Status::unavailable("remote failure");
+                        status.metadata_mut().insert(
+                            crate::ohttp::OHTTP_OUTCOME_HEADER,
+                            crate::ohttp::OUTCOME_RATE_LIMITED.parse().unwrap(),
+                        );
+                        status.metadata_mut().insert(
+                            "x-ohttp-outcome-auth",
+                            "invented-bridge-authentication".parse().unwrap(),
+                        );
+                        with_unary_timeout::<()>("nested remote", async { Err(status) }).await
+                    })
+                    .await
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(result, SlipstreamError::Transport(_)),
+            "{result:?}"
+        );
+    }
 
     #[tokio::test(start_paused = true)]
     async fn health_local_setup_consumes_the_existing_unary_deadline_budget() {

@@ -96,12 +96,10 @@ pub enum SlipstreamError {
     #[error("wire collapse: {measured_mbps:.2} MB/s sustained (floor {floor_mbps:.2})")]
     WireCollapse { measured_mbps: f64, floor_mbps: f64 },
 
-    /// The follow-tip loop detected N consecutive probe or catch-up failures
-    /// (transient or non-transient), indicating the endpoint is persistently
-    /// unreachable. Surfaces as `SyncState::Error(3)` + tag-4/value=3 event to
-    /// enable hosts to react (e.g., automatic server switching). The counter
-    /// resets on any successful probe or pass. This is NOT raised during the
-    /// initial sync — only in the follow loop after the first pass succeeds.
+    /// Declared for endpoint-unreachable reporting, but not constructed by the engine.
+    /// The follow-tip loop instead emits `SyncState::Error(3)` and a tag-4/value=3 event
+    /// directly after its transport-failure threshold. Each counter resets on its
+    /// corresponding successful probe or pass; the initial sync does not use that threshold.
     #[error("endpoint unreachable after {attempts} consecutive failures; last: {last}")]
     EndpointUnreachable { attempts: u32, last: String },
 }
@@ -134,16 +132,11 @@ impl SlipstreamError {
         )
     }
 
-    /// Whether this failure says the server could not be reached, as opposed to an OHTTP policy
-    /// denial, a rate limit or an oversized request: only those count towards
-    /// `EndpointUnreachable` (and so towards a server switch).
+    /// Only transport failures indicate that the server could not be reached and count towards
+    /// `EndpointUnreachable` (and so towards a server switch). Local configuration, wallet, scan
+    /// and stop errors, wire-collapse failover, and HTTP policy/rate/size outcomes do not.
     pub fn counts_as_unreachable(&self) -> bool {
-        !matches!(
-            self,
-            SlipstreamError::PolicyDenied(_)
-                | SlipstreamError::RateLimited(_)
-                | SlipstreamError::RequestTooLarge(_)
-        )
+        matches!(self, SlipstreamError::Transport(_))
     }
 
     /// Returns `true` only for [`SlipstreamError::StoppedForWalletChange`]: the host asked the
@@ -229,6 +222,46 @@ mod tests {
     #[test]
     fn stopped_is_not_transient() {
         assert!(!SlipstreamError::Stopped.is_transient());
+    }
+
+    #[test]
+    fn only_transport_errors_count_as_unreachable() {
+        let cases = [
+            (SlipstreamError::Transport("offline".into()), true),
+            (SlipstreamError::Config("invalid".into()), false),
+            (
+                SlipstreamError::Discontinuity {
+                    at: 1,
+                    detail: "prev-hash mismatch".into(),
+                },
+                false,
+            ),
+            (SlipstreamError::Wallet("local".into()), false),
+            (SlipstreamError::MisbehavingServer, false),
+            (SlipstreamError::PolicyDenied("inner 403".into()), false),
+            (SlipstreamError::RateLimited("outer 429".into()), false),
+            (SlipstreamError::RequestTooLarge("outer 413".into()), false),
+            (SlipstreamError::Stopped, false),
+            (SlipstreamError::StoppedForWalletChange, false),
+            (SlipstreamError::ScanContinuity { at: 1 }, false),
+            (
+                SlipstreamError::WireCollapse {
+                    measured_mbps: 0.0,
+                    floor_mbps: 1.0,
+                },
+                false,
+            ),
+            (
+                SlipstreamError::EndpointUnreachable {
+                    attempts: 5,
+                    last: "offline".into(),
+                },
+                false,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.counts_as_unreachable(), expected, "{error:?}");
+        }
     }
 
     #[test]

@@ -1288,8 +1288,8 @@ async fn worker(
     out: mpsc::Sender<SubChunk>,
     progress: Option<Arc<Progress>>,
 ) -> Result<(), SlipstreamError> {
-    // Bulk is direct (with bounded retry) for plain hosts even with Tor on; for an OHTTP gateway
-    // with Tor on, `connect_via` routes it OHTTP-over-Tor so nothing bypasses the relay/Tor.
+    // Bulk uses Tor for every host when Tor is on, with a circuit per fetch connection.
+    // OHTTP gateways retain encapsulation, including over the Tor transport.
     let mut client = match connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await {
         Ok(client) => client,
         // A worker added by a boost holds no plan chunk yet: the fetch goes on without it.
@@ -2263,8 +2263,8 @@ impl BoostState {
 /// `progress` — if `Some`, bumps `fetched_blocks` by the block count of each
 /// ordered sub-chunk as it is released (Relaxed atomic; no cross-counter guarantees).
 ///
-/// `tor` — the session's Tor handle when Tor is on. Bulk stays direct for plain hosts; for an
-/// OHTTP gateway it makes the workers dial the relay through Tor (see `connector::route`).
+/// `tor` — the session's Tor handle: all hosts use Tor when it is present, with a circuit per
+/// fetch connection. OHTTP gateways retain encapsulation (see `connector::route`).
 pub async fn run_fetch(
     endpoint: &Endpoint,
     tor: Option<TorConn>,
@@ -4124,6 +4124,88 @@ mod tests {
         assert_eq!(cursor.resume_from, 105);
     }
 
+    /// The status of a stream opened through `request_client` is classified after the call
+    /// scope has ended. Local-bridge streams keep their typed outcome; a hand-built `Status`
+    /// carrying the same reserved metadata, but not the private local-bridge source, stays a
+    /// transport error.
+    #[tokio::test]
+    async fn stream_outcome_provenance_survives_call_scope() {
+        let (connector, _dispatches) =
+            crate::ohttp::tests::outcome_connector("fetch-stream-provenance", 200, 403).await;
+        let lazy = tonic::transport::Endpoint::from_static("http://stream-provenance.invalid:443")
+            .connect_lazy();
+        // `lazy` is never used: `request_client` opens a fresh bridge pipe inside `call`.
+        let connection = grpc::TrackedConnection::ohttp(
+            lazy,
+            connector,
+            format!("http://{}:443", crate::ohttp::tests::testnet_gateway()),
+        );
+        let mut rpc = connection
+            .call(async |client| grpc::request_client(client).await)
+            .await
+            .unwrap();
+        let local_status = rpc
+            .client
+            .get_block_range(BlockRange {
+                start: Some(BlockId {
+                    height: 100,
+                    hash: vec![],
+                }),
+                end: Some(BlockId {
+                    height: 119,
+                    hash: vec![],
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        let mut remote_status = tonic::Status::unavailable("remote stream failure");
+        remote_status.metadata_mut().insert(
+            crate::ohttp::OHTTP_OUTCOME_HEADER,
+            crate::ohttp::OUTCOME_POLICY_DENIED.parse().unwrap(),
+        );
+        for (status, local) in [
+            (local_status, true),
+            (
+                crate::ohttp::tests::bridge_outcome_status(crate::ohttp::OUTCOME_POLICY_DENIED),
+                true,
+            ),
+            (remote_status, false),
+        ] {
+            let mut stream = stream::iter([Err(status)]);
+            let mut cursor = test_cursor(0, 100, 119);
+            let mut refused = false;
+            let (tx, _rx) = mpsc::channel(1);
+            let gate = open_gate();
+            let result = pump_block_window(
+                &mut stream,
+                &mut cursor,
+                119,
+                1 << 20,
+                Duration::from_secs(120),
+                &gate,
+                &tx,
+                None,
+                &mut refused,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+            if local {
+                assert!(
+                    matches!(result, SlipstreamError::PolicyDenied(_)),
+                    "{result:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, SlipstreamError::Transport(_)),
+                    "{result:?}"
+                );
+            }
+        }
+    }
+
     /// A kick that is pending when the stream fails with a permanent error (an
     /// OHTTP policy denial) does not turn the error into a restart: the error
     /// comes back as the attempt's result, non-transient, so the worker returns
@@ -4135,13 +4217,8 @@ mod tests {
         let mut cursor = test_cursor(0, 100, 119);
         let slot = WorkerSlot::new(Arc::default());
         slot.kick();
-        let mut denied = tonic::Status::permission_denied("inner 403");
-        denied.metadata_mut().insert(
-            crate::ohttp::OHTTP_OUTCOME_HEADER,
-            crate::ohttp::OUTCOME_POLICY_DENIED
-                .parse()
-                .expect("ascii metadata"),
-        );
+        let denied =
+            crate::ohttp::tests::bridge_outcome_status(crate::ohttp::OUTCOME_POLICY_DENIED);
         let mut items: Vec<Result<CompactBlock, tonic::Status>> =
             linked(100, 3, 1000).into_iter().map(Ok).collect();
         items.push(Err(denied));

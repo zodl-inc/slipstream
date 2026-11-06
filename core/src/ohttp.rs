@@ -25,8 +25,8 @@
 //! `tonic::transport::Endpoint::connect_with_connector`, exactly like the Tor connector in
 //! `zcash_client_backend`. It hands tonic an in-memory duplex stream whose other end is an
 //! in-process HTTP/2 server. That server turns each gRPC request into one OHTTP round trip and
-//! replies with a normal gRPC response (headers + body + trailers), so `CompactTxStreamerClient<Channel>`
-//! and every caller in this crate stay unchanged. Responses are Chunked OHTTP: the gateway seals
+//! replies with a normal gRPC response (headers + body + trailers). The connector-created
+//! [`crate::grpc::LwdTransport`] retains local origin before tonic parses error statuses. Responses are Chunked OHTTP: the gateway seals
 //! them chunk by chunk as lightwalletd streams, and this module decodes them the same way, so a
 //! server-streaming RPC delivers its first message before the response has ended.
 //!
@@ -44,6 +44,8 @@
 //! opened through a [`Dialer`]: [`Dialer::Direct`] uses the device's own connection,
 //! [`Dialer::Tor`] opens an arti stream so the relay only ever sees a Tor exit IP. Everything
 //! above TCP (TLS to the relay, HPKE to the gateway) is identical in both cases.
+
+mod direct_dial;
 
 use std::{
     collections::HashMap,
@@ -99,7 +101,7 @@ const ROUND_TRIP_TIMEOUT: Duration = Duration::from_secs(100);
 /// silence also marks its pooled connection dead (see [`H2InFlight::dead_if_given_up_after`]).
 const CHUNK_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Bound on opening a direct TCP connection to the relay.
+/// Shared bound on DNS resolution and all direct TCP attempts to the relay.
 const DIRECT_DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The pause an outer 429 without a `Retry-After` starts (the ZIP's reference default). The
@@ -222,9 +224,12 @@ impl HeadWait {
 }
 
 /// Trailers-only metadata the in-process server attaches to a gRPC error so that the engine can
-/// tell an OHTTP outcome from an unreachable server (see `grpc::status_err`). It never leaves
-/// the process.
+/// tell an OHTTP outcome from an unreachable server (read and stripped by
+/// `LwdTransport::local_status`). It never leaves the process.
 pub(crate) const OHTTP_OUTCOME_HEADER: &str = "x-ohttp-outcome";
+/// Reserved obsolete authentication field; always strip it from peer metadata.
+const OHTTP_OUTCOME_AUTH_HEADER: &str = "x-ohttp-outcome-auth";
+
 /// An inner 403: the gateway refused this operation by policy.
 pub(crate) const OUTCOME_POLICY_DENIED: &str = "policy-denied";
 /// An outer 429, or a request held back while the relay's `Retry-After` pause runs.
@@ -518,9 +523,9 @@ impl Dialer {
     async fn dial(&self, host: &str, port: u16, label: &str) -> Result<BoxedIo, String> {
         match self {
             Dialer::Direct => {
-                let tcp = tokio::time::timeout(
-                    DIRECT_DIAL_TIMEOUT,
-                    tokio::net::TcpStream::connect((host, port)),
+                let tcp = direct_dial::connect(
+                    tokio::net::lookup_host((host, port)),
+                    tokio::net::TcpStream::connect,
                 )
                 .await
                 .map_err(|_| {
@@ -1768,7 +1773,9 @@ struct GrpcFrames {
 }
 
 impl GrpcFrames {
-    fn new(header_fields: HeaderMap) -> Self {
+    fn new(mut header_fields: HeaderMap) -> Self {
+        header_fields.remove(OHTTP_OUTCOME_HEADER);
+        header_fields.remove(OHTTP_OUTCOME_AUTH_HEADER);
         Self {
             header_fields,
             pending: None,
@@ -1784,7 +1791,9 @@ impl GrpcFrames {
             if let (Ok(name), Ok(value)) = (
                 HeaderName::from_bytes(k.as_bytes()),
                 HeaderValue::from_bytes(v.as_bytes()),
-            ) {
+            ) && name != OHTTP_OUTCOME_HEADER
+                && name != OHTTP_OUTCOME_AUTH_HEADER
+            {
                 trailers.insert(name, value);
             }
         }
@@ -2246,9 +2255,7 @@ struct OhttpClient {
     /// Per-key lock to prevent concurrent dials to the same target (single-flight semantics).
     /// Concurrent callers that find no live connection wait for one in-progress dial to complete
     /// and share its resulting sender, so the connection storm (70 dials in seconds with 70
-    /// concurrent GetTransaction calls) never happens. With one dial at a time per key, rustls's
-    /// in-memory session resumption cache (default in ClientConfig) also starts working for later
-    /// reconnects.
+    /// concurrent GetTransaction calls) never happens.
     dial_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Optional client trace ID generator. When set, every relay POST carries X-Client-Trace-Id.
     /// Only present when the `client-trace` feature is enabled.
@@ -2285,10 +2292,9 @@ impl OhttpClient {
         .with_root_certificates(roots)
         .with_no_client_auth();
         tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        // rustls ClientConfig defaults: session resumption enabled (in-memory cache, no storage
-        // backend), max_fragment_size None (16 KiB). With single-flight dials per key, the resumption
-        // cache now starts working for later reconnects (one dial at a time means the second dial
-        // can resume from the first).
+        // Fresh connections must not carry a TLS session identity across connection rotations
+        // or isolated Tor circuits. Keep normal certificate and hostname verification.
+        tls.resumption = rustls::client::Resumption::disabled();
         Ok(Self {
             gateway_host: gateway_host.to_string(),
             relay_url: relay_url.to_string(),
@@ -3858,8 +3864,9 @@ fn grpc_error(code: &'static str, message: &str) -> Response<BoxBody<Bytes, Infa
     grpc_error_with(code, message, None)
 }
 
-/// [`grpc_error`] carrying an [`OHTTP_OUTCOME_HEADER`] (tonic hands it over as the status's
-/// metadata).
+/// [`grpc_error`] carrying an [`OHTTP_OUTCOME_HEADER`]. `LwdTransport` consumes the marker,
+/// strips it on every channel and turns it into a typed local outcome only on local-bridge
+/// transports; tonic's gRPC client never decodes it into `Status` metadata.
 fn grpc_error_with(
     code: &'static str,
     message: &str,
@@ -3905,6 +3912,11 @@ pub(crate) mod tests {
             Some(host) => host,
             None => panic!("set ZODL_OHTTP_GATEWAY_HOST_TESTNET for configured transport tests"),
         }
+    }
+
+    pub(crate) fn bridge_outcome_status(outcome: &'static str) -> tonic::Status {
+        let mut response = grpc_error_with(GRPC_UNAVAILABLE, "local bridge failure", Some(outcome));
+        crate::grpc::bridge_outcome_status(response.headers_mut())
     }
 
     /// A public synthetic signer. Only the fixture supplies it; production resolves its
@@ -4359,7 +4371,6 @@ pub(crate) mod tests {
     }
 
     async fn health_fixture_client(name: &str, grpc: bool) -> OhttpClient {
-        use hpke::{Kem, Serializable};
         let profile = if grpc {
             ClientProfile::SLIPSTREAM
         } else {
@@ -4373,6 +4384,13 @@ pub(crate) mod tests {
             profile,
         )
         .unwrap();
+        cache_fixture_key(&client).await;
+        client
+    }
+
+    /// Gives `client` the key `fixture_response` can decrypt for.
+    async fn cache_fixture_key(client: &OhttpClient) {
+        use hpke::{Kem, Serializable};
         let public: [u8; 32] = hpke::kem::X25519HkdfSha256::sk_to_pk(&fixture_private_key())
             .to_bytes()
             .into();
@@ -4380,7 +4398,6 @@ pub(crate) mod tests {
             config: KeyConfig::select(&key_document(1, public)).unwrap(),
             not_after: unix_now().unwrap() + 3600,
         });
-        client
     }
 
     fn fixture_varint(bytes: &mut Vec<u8>, value: usize) {
@@ -4428,6 +4445,31 @@ pub(crate) mod tests {
         body_message: bool,
         final_chunk: bool,
     ) -> (Vec<u8>, Vec<u8>) {
+        fixture_response_with_fields(
+            request,
+            status,
+            header_status,
+            trailer_status,
+            content_type,
+            body_message,
+            final_chunk,
+            &[],
+            &[],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fixture_response_with_fields(
+        request: &[u8],
+        status: u16,
+        header_status: Option<&str>,
+        trailer_status: Option<&str>,
+        content_type: &str,
+        body_message: bool,
+        final_chunk: bool,
+        headers: &[(&str, &str)],
+        trailers: &[(&str, &str)],
+    ) -> (Vec<u8>, Vec<u8>) {
         use aes_gcm::{
             Aes128Gcm, Nonce,
             aead::{AeadInPlace, KeyInit},
@@ -4463,6 +4505,9 @@ pub(crate) mod tests {
         if let Some(status) = header_status {
             fixture_field(&mut head, "grpc-status", status);
         }
+        for (name, value) in headers {
+            fixture_field(&mut head, name, value);
+        }
         head.push(0); // end headers
         if body_message {
             head.push(5); // one empty gRPC message
@@ -4478,6 +4523,9 @@ pub(crate) mod tests {
         let mut end = vec![0]; // end body
         if let Some(status) = trailer_status {
             fixture_field(&mut end, "grpc-status", status);
+        }
+        for (name, value) in trailers {
+            fixture_field(&mut end, name, value);
         }
         end.push(0); // end trailers
         nonce[11] ^= 1;
@@ -4528,7 +4576,7 @@ pub(crate) mod tests {
                 )))
             })
             .await;
-            let raw = health_tonic_client(client.clone()).await;
+            let raw = health_tonic_channel(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
                 OhttpConnector {
@@ -5069,17 +5117,375 @@ pub(crate) mod tests {
         );
     }
 
+    async fn health_tonic_channel(client: Arc<OhttpClient>) -> tonic::transport::Channel {
+        tonic::transport::Endpoint::from_shared(format!("http://{}:443", testnet_gateway()))
+            .unwrap()
+            .connect_with_connector(OhttpConnector {
+                client,
+                health: None,
+            })
+            .await
+            .unwrap()
+    }
+
     async fn health_tonic_client(client: Arc<OhttpClient>) -> crate::grpc::LwdClient {
-        let channel =
-            tonic::transport::Endpoint::from_shared(format!("http://{}:443", testnet_gateway()))
-                .unwrap()
-                .connect_with_connector(OhttpConnector {
-                    client,
-                    health: None,
+        crate::grpc::LwdClient::new(crate::grpc::LwdTransport::local_bridge(
+            health_tonic_channel(client).await,
+        ))
+    }
+
+    // These tests catch classification depending on a factory task scope rather than the
+    // bridge that produced the status. The relay and encrypted inner response are real.
+    async fn outcome_fixture(
+        name: &str,
+        outer: u16,
+        inner: u16,
+    ) -> (Arc<OhttpClient>, Arc<AtomicUsize>) {
+        let client = Arc::new(health_fixture_client(name, true).await);
+        let dispatches = serve_outcome_relay(&client, outer, inner).await;
+        (client, dispatches)
+    }
+
+    /// Puts the in-process relay of `outcome_fixture` behind `client` and counts its requests.
+    async fn serve_outcome_relay(client: &OhttpClient, outer: u16, inner: u16) -> Arc<AtomicUsize> {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let observed = dispatches.clone();
+        serve_in_process_relay(client, move |request| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            async move {
+                // Local provenance is never sent on the relay connection.
+                assert!(!request.headers().contains_key("x-ohttp-outcome-auth"));
+                assert!(!request.headers().contains_key(OHTTP_OUTCOME_HEADER));
+                if outer != 200 {
+                    let mut response = Response::new(Full::new(Bytes::new()).boxed());
+                    *response.status_mut() = StatusCode::from_u16(outer).unwrap();
+                    response
+                        .headers_mut()
+                        .insert(header::RETRY_AFTER, HeaderValue::from_static("60"));
+                    return response;
+                }
+                let request = request.into_body().collect().await.unwrap().to_bytes();
+                let (mut bytes, end) = fixture_response(&request, inner, "0", "application/grpc");
+                bytes.extend_from_slice(&end);
+                Response::new(Full::new(Bytes::from(bytes)).boxed())
+            }
+        })
+        .await;
+        dispatches
+    }
+
+    /// A connector over the client of `outcome_fixture`, for the Tor channel path.
+    pub(crate) async fn outcome_connector(
+        name: &str,
+        outer: u16,
+        inner: u16,
+    ) -> (OhttpConnector, Arc<AtomicUsize>) {
+        let (client, dispatches) = outcome_fixture(name, outer, inner).await;
+        (
+            OhttpConnector {
+                client,
+                health: None,
+            },
+            dispatches,
+        )
+    }
+
+    /// Replaces the process-cached mainnet client of the public connect functions, and puts the
+    /// previous entry back when dropped. Hold `PUBLIC_CONNECT_LOCK` while one exists. Tests use
+    /// the mainnet key because the testnet cached client is permanently mutated by
+    /// `health_follow_tip_owner_captures_the_selected_endpoint_deadline`.
+    struct CachedClientOverride {
+        key: ClientCacheKey,
+        previous: Option<Arc<OhttpClient>>,
+    }
+
+    static PUBLIC_CONNECT_LOCK: Mutex<()> = Mutex::const_new(());
+
+    impl CachedClientOverride {
+        async fn install(gateway_host: &str, client: Arc<OhttpClient>) -> Self {
+            let relay_url = relay_for(gateway_host).expect("a relay for the gateway");
+            let key = ClientCacheKey::new(
+                gateway_host,
+                relay_url,
+                get_default_client_trace_prefix(),
+                ClientProfile::SLIPSTREAM,
+            )
+            .expect("a cache key");
+            let previous = CLIENT_CACHE
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.clone(), client);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for CachedClientOverride {
+        fn drop(&mut self) {
+            let mut cache = CLIENT_CACHE
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match self.previous.take() {
+                Some(previous) => cache.insert(self.key.clone(), previous),
+                None => cache.remove(&self.key),
+            };
+        }
+    }
+
+    fn assert_local_outcome(error: crate::error::SlipstreamError, expected: &str) {
+        use crate::error::SlipstreamError;
+        assert!(
+            matches!(
+                (expected, &error),
+                ("rate", SlipstreamError::RateLimited(_))
+                    | ("policy", SlipstreamError::PolicyDenied(_))
+                    | ("size", SlipstreamError::RequestTooLarge(_))
+            ),
+            "expected {expected}, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn decrypted_peer_outcomes_cannot_authenticate_local_classification() {
+        for auth in [
+            None,
+            Some("invented-bridge-authentication"),
+            Some("observed-local-outcome-text"),
+        ] {
+            for in_headers in [false, true] {
+                let client = Arc::new(
+                    health_fixture_client(
+                        &format!("forged-decrypted-{}-{in_headers}", auth.is_some()),
+                        true,
+                    )
+                    .await,
+                );
+                serve_in_process_relay(&client, move |request| async move {
+                    let request = request.into_body().collect().await.unwrap().to_bytes();
+                    let mut fields = vec![(OHTTP_OUTCOME_HEADER, OUTCOME_RATE_LIMITED)];
+                    if let Some(auth) = auth {
+                        fields.push((OHTTP_OUTCOME_AUTH_HEADER, auth));
+                    }
+                    let (headers, trailers) = if in_headers {
+                        (fields.as_slice(), &[][..])
+                    } else {
+                        (&[][..], fields.as_slice())
+                    };
+                    let (mut bytes, end) = fixture_response_with_fields(
+                        &request,
+                        200,
+                        Some("14"),
+                        None,
+                        "application/grpc",
+                        false,
+                        true,
+                        headers,
+                        trailers,
+                    );
+                    bytes.extend_from_slice(&end);
+                    Response::new(Full::new(Bytes::from(bytes)).boxed())
                 })
-                .await
-                .unwrap();
-        crate::grpc::LwdClient::new(channel)
+                .await;
+                let raw = health_tonic_channel(client.clone()).await;
+                let tracked = crate::grpc::TrackedConnection::ohttp(
+                    raw,
+                    OhttpConnector {
+                        client,
+                        health: None,
+                    },
+                    "http://forged-decrypted.invalid:443".into(),
+                );
+                let error = tracked
+                    .call(async |client| crate::grpc::get_latest_block_height(client).await)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(error, crate::error::SlipstreamError::Transport(_)),
+                    "{error:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn bare_client_authentic_outcomes_survive_without_factory_scope() {
+        for tracked in [false, true] {
+            for (outer, inner, expected) in
+                [(429, 200, "rate"), (200, 403, "policy"), (413, 200, "size")]
+            {
+                let (client, dispatches) =
+                    outcome_fixture(&format!("bare-outcome-{tracked}-{outer}"), outer, inner).await;
+                let raw = health_tonic_channel(client.clone()).await;
+                let connection = crate::grpc::TrackedConnection::ohttp(
+                    raw,
+                    OhttpConnector {
+                        client,
+                        health: None,
+                    },
+                    "http://bare-outcome.invalid:443".into(),
+                );
+                // The second 429 call exercises the cached Retry-After pause.
+                for _ in 0..if outer == 429 { 2 } else { 1 } {
+                    let error = if tracked {
+                        connection
+                            .call(async |client| crate::grpc::get_latest_block_height(client).await)
+                            .await
+                            .unwrap_err()
+                    } else {
+                        crate::grpc::get_latest_block_height(&mut connection.clone().into_client())
+                            .await
+                            .unwrap_err()
+                    };
+                    assert_local_outcome(error, expected);
+                }
+                assert_eq!(
+                    dispatches.load(Ordering::SeqCst),
+                    1,
+                    "a cached pause must not dispatch another relay request"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_connect_functions_keep_authentic_outcomes() {
+        use crate::config::Endpoint;
+        use crate::connector::{ConnPurpose, Connector, connect_via};
+        let _serial = PUBLIC_CONNECT_LOCK.lock().await;
+        let endpoint = Endpoint {
+            host: mainnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        for entry in ["grpc-connect", "connect-via", "connector-connect"] {
+            for (outer, inner, expected) in [(429, 200, "rate"), (200, 403, "policy")] {
+                let (client, _dispatches) =
+                    outcome_fixture(&format!("public-{entry}-{expected}"), outer, inner).await;
+                let _override = CachedClientOverride::install(mainnet_gateway(), client).await;
+                let mut connection = match entry {
+                    "grpc-connect" => crate::grpc::connect(&endpoint).await,
+                    "connect-via" => {
+                        connect_via(&endpoint, None, ConnPurpose::MetadataUnique).await
+                    }
+                    _ => {
+                        Connector::direct(endpoint.clone())
+                            .connect(ConnPurpose::MetadataUnique)
+                            .await
+                    }
+                }
+                .expect("connect");
+                let error = crate::grpc::get_latest_block_height(&mut connection)
+                    .await
+                    .unwrap_err();
+                assert_local_outcome(error, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_mempool_stream_keeps_rate_limit_after_pause() {
+        use crate::config::Endpoint;
+        let _serial = PUBLIC_CONNECT_LOCK.lock().await;
+        let endpoint = Endpoint {
+            host: mainnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        let (client, dispatches) = outcome_fixture("public-mempool-pause", 429, 200).await;
+        let _override = CachedClientOverride::install(mainnet_gateway(), client).await;
+        let mut connection = crate::grpc::connect(&endpoint).await.expect("connect");
+        let error = crate::grpc::get_latest_block_height(&mut connection)
+            .await
+            .unwrap_err();
+        assert_local_outcome(error, "rate");
+        let error = crate::grpc::open_mempool_stream(&mut connection)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::error::SlipstreamError::RateLimited(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "a cached pause must not dispatch another relay request"
+        );
+    }
+
+    /// Covers `grpc::connect_dedicated` through the calls its body reduces to (`connect_tracked`
+    /// with `shared = false`, then `into_client()`). The dedicated client is built fresh outside
+    /// the process cache, so this needs neither `PUBLIC_CONNECT_LOCK` nor a cache restore.
+    /// Policy only: a 429 here would pause the configured relay URL for the whole process.
+    #[tokio::test]
+    async fn dedicated_connection_keeps_policy_outcome() {
+        use crate::config::Endpoint;
+        let endpoint = Endpoint {
+            host: mainnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        let connection = crate::grpc::connect_tracked(&endpoint, false)
+            .await
+            .expect("connect");
+        let client = connection
+            .factory
+            .as_ref()
+            .expect("an OHTTP connection")
+            .connector
+            .client
+            .clone();
+        cache_fixture_key(&client).await;
+        serve_outcome_relay(&client, 200, 403).await;
+        let mut rpc = connection.into_client();
+        let error = crate::grpc::get_latest_block_height(&mut rpc)
+            .await
+            .unwrap_err();
+        assert_local_outcome(error, "policy");
+    }
+
+    #[tokio::test]
+    async fn bare_stream_authentic_outcome_survives_scope_exit() {
+        for tracked in [false, true] {
+            for (outer, inner, expected) in
+                [(429, 200, "rate"), (200, 403, "policy"), (413, 200, "size")]
+            {
+                let (client, _dispatches) =
+                    outcome_fixture(&format!("bare-stream-{tracked}-{outer}"), outer, inner).await;
+                let raw = health_tonic_channel(client.clone()).await;
+                let connection = crate::grpc::TrackedConnection::ohttp(
+                    raw,
+                    OhttpConnector {
+                        client,
+                        health: None,
+                    },
+                    "http://bare-stream.invalid:443".into(),
+                );
+                let status = if tracked {
+                    connection
+                        .call(async |client| {
+                            Ok(client
+                                .get_mempool_stream(zcash_client_backend::proto::service::Empty {})
+                                .await
+                                .unwrap_err())
+                        })
+                        .await
+                        .unwrap()
+                } else {
+                    connection
+                        .into_client()
+                        .get_mempool_stream(zcash_client_backend::proto::service::Empty {})
+                        .await
+                        .unwrap_err()
+                };
+                assert!(
+                    !format!("{status:?}").contains("x-ohttp-outcome"),
+                    "reserved provenance remained after HTTP/2 decoding"
+                );
+                // Classification happens after the stream-opening call's factory scope ended.
+                assert_local_outcome(crate::grpc::status_err("unscoped stream", status), expected);
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -5981,7 +6387,7 @@ pub(crate) mod tests {
                 response
             })
             .await;
-            let raw = health_tonic_client(client.clone()).await;
+            let raw = health_tonic_channel(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
                 OhttpConnector {
@@ -6227,7 +6633,7 @@ pub(crate) mod tests {
         .await;
         let key = format!("{}:{}", client.relay.host, client.relay.port);
         let opened = client.h2_pool.lock().await.get(&key).unwrap().opened;
-        let raw = health_tonic_client(client.clone()).await;
+        let raw = health_tonic_channel(client.clone()).await;
         let tracked = crate::grpc::TrackedConnection::ohttp(
             raw,
             OhttpConnector {
@@ -6303,7 +6709,7 @@ pub(crate) mod tests {
             .await;
             let key = format!("{}:{}", client.relay.host, client.relay.port);
             let opened = client.h2_pool.lock().await.get(&key).unwrap().opened;
-            let raw = health_tonic_client(client.clone()).await;
+            let raw = health_tonic_channel(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
                 OhttpConnector {
@@ -6848,6 +7254,14 @@ pub(crate) mod tests {
         headers.insert("te", HeaderValue::from_static("trailers"));
         headers.insert("grpc-timeout", HeaderValue::from_static("5S"));
         headers.insert("x-secret", HeaderValue::from_static("hunter2"));
+        headers.insert(
+            OHTTP_OUTCOME_AUTH_HEADER,
+            HeaderValue::from_static("invented-or-replayed-authentication"),
+        );
+        headers.insert(
+            OHTTP_OUTCOME_HEADER,
+            HeaderValue::from_static(OUTCOME_RATE_LIMITED),
+        );
         let request = grpc_request("gw.zodl.com", "POST", "/a.B/C", &headers, b"xyz");
         assert_eq!(request.scheme, b"https");
         assert_eq!(request.authority, b"gw.zodl.com");
@@ -6858,6 +7272,9 @@ pub(crate) mod tests {
         assert!(contains(&encoded, b"grpc-timeout"));
         assert!(contains(&encoded, b"content-type"));
         assert!(!contains(&encoded, b"x-secret"));
+        assert!(!contains(&encoded, OHTTP_OUTCOME_HEADER.as_bytes()));
+        assert!(!contains(&encoded, OHTTP_OUTCOME_AUTH_HEADER.as_bytes()));
+        assert!(!contains(&encoded, b"invented-or-replayed-authentication"));
     }
 
     #[test]
@@ -7188,6 +7605,67 @@ pub(crate) mod tests {
             }
         }
         (data, trailers)
+    }
+
+    #[test]
+    fn inner_headers_and_trailers_cannot_supply_local_outcomes() {
+        for outcome in [
+            OUTCOME_POLICY_DENIED,
+            OUTCOME_RATE_LIMITED,
+            OUTCOME_TOO_LARGE,
+        ] {
+            for auth in [
+                None,
+                Some("invented-bridge-authentication"),
+                Some("observed-local-outcome-text"),
+            ] {
+                for (mut headers, mut trailers) in [
+                    (
+                        vec![("grpc-status", "14"), (OHTTP_OUTCOME_HEADER, outcome)],
+                        vec![],
+                    ),
+                    (
+                        vec![],
+                        vec![("grpc-status", "14"), (OHTTP_OUTCOME_HEADER, outcome)],
+                    ),
+                    (
+                        vec![("grpc-status", "14"), (OHTTP_OUTCOME_HEADER, outcome)],
+                        vec![(OHTTP_OUTCOME_HEADER, outcome)],
+                    ),
+                ] {
+                    if let Some(auth) = auth {
+                        headers.push(("x-ohttp-outcome-auth", auth));
+                        trailers.push(("x-ohttp-outcome-auth", auth));
+                    }
+                    for body in [false, true] {
+                        let mut events = Vec::new();
+                        if body {
+                            events.push(Ok(ResponseEvent::Data(vec![1])));
+                        }
+                        events.push(Ok(ResponseEvent::Trailers(owned(&trailers))));
+                        events.push(Ok(ResponseEvent::End));
+                        let (_, forwarded) = frames_of(&headers, events);
+                        assert_eq!(forwarded.len(), 1);
+                        let forwarded_trailers = &forwarded[0];
+                        assert!(
+                            !forwarded_trailers.contains_key("x-ohttp-outcome-auth"),
+                            "peer provenance leaked: {forwarded_trailers:?}"
+                        );
+                        let status = tonic::Status::from_header_map(forwarded_trailers).unwrap();
+                        let error = crate::grpc::status_err("decrypted peer", status);
+                        assert!(
+                            matches!(error, crate::error::SlipstreamError::Transport(_)),
+                            "{error:?}"
+                        );
+                        assert_eq!(grpc_status(forwarded_trailers), Some("14"));
+                        assert!(
+                            !forwarded_trailers.contains_key(OHTTP_OUTCOME_HEADER),
+                            "{outcome}: {forwarded_trailers:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     fn grpc_status(trailers: &HeaderMap) -> Option<&str> {
@@ -7862,6 +8340,205 @@ pub(crate) mod tests {
             original_key_id,
             "cached key must be the same"
         );
+    }
+
+    fn loopback_tls_acceptor(
+        version: &'static rustls::SupportedProtocolVersion,
+    ) -> tokio_rustls::TlsAcceptor {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+
+        let certificate =
+            CertificateDer::from(include_bytes!("../tests/fixtures/ohttp-tls/server.der").to_vec());
+        // Public fixture key, used only by the local test server.
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../tests/fixtures/ohttp-tls/server-key.der").to_vec(),
+        ));
+        let mut server = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[version])
+        .expect("fixture TLS version")
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate], key)
+        .expect("fixture certificate and key");
+        server.alpn_protocols = vec![b"h2".to_vec()];
+        // The default server session cache and TLS 1.3 tickets offer resumption.
+        tokio_rustls::TlsAcceptor::from(Arc::new(server))
+    }
+
+    fn trust_loopback_tls_ca(config: &rustls::ClientConfig) -> rustls::ClientConfig {
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                include_bytes!("../tests/fixtures/ohttp-tls/ca.der").to_vec(),
+            ))
+            .expect("fixture CA");
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(roots),
+            Arc::new(rustls::crypto::ring::default_provider()),
+        )
+        .build()
+        .expect("fixture certificate verifier");
+        let mut config = config.clone();
+        // Keep normal certificate, signature and hostname checks, with the test CA as its trust anchor.
+        config.dangerous().set_certificate_verifier(verifier);
+        config
+    }
+
+    /// Rotating a connection must not offer a reusable TLS identity to the relay, including
+    /// reconnects within one isolated Tor client. Removing the resumption opt-out breaks this.
+    #[tokio::test]
+    async fn rotated_tls_connections_do_not_resume() {
+        use rustls::HandshakeKind;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let tor = arti_client::TorClient::builder()
+                .create_unbootstrapped()
+                .expect("unbootstrapped Tor client");
+            let mut observed = Vec::new();
+            for version in [&rustls::version::TLS13, &rustls::version::TLS12] {
+                for via_tor in [false, true] {
+                    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS");
+                    let address = listener.local_addr().expect("TLS address");
+                    let acceptor = loopback_tls_acceptor(version);
+                    let server = tokio::spawn(async move {
+                        let mut handshakes = Vec::new();
+                        for _ in 0..2 {
+                            let (tcp, _) = listener.accept().await.expect("accept TLS TCP");
+                            let mut tls = acceptor.accept(tcp).await.expect("server handshake");
+                            handshakes
+                                .push(tls.get_ref().1.handshake_kind().expect("handshake kind"));
+                            tls.write_all(&[42]).await.expect("write after tickets");
+                            let mut ack = [0];
+                            tls.read_exact(&mut ack)
+                                .await
+                                .expect("read acknowledgement");
+                            assert_eq!(ack, [43]);
+                            tls.shutdown().await.expect("server TLS close");
+                        }
+                        handshakes
+                    });
+                    let client = get_or_create_client(
+                        "tls-rotation.example",
+                        &format!("https://localhost:{}/relay", address.port()),
+                        if via_tor {
+                            Dialer::Tor(tor.isolated_client())
+                        } else {
+                            Dialer::Direct
+                        },
+                        None,
+                        ClientProfile::SLIPSTREAM_HTTP,
+                    )
+                    .await
+                    .expect("construct OHTTP client");
+                    let connector = tokio_rustls::TlsConnector::from(Arc::new(
+                        trust_loopback_tls_ca(&client.tls),
+                    ));
+                    let mut handshakes = Vec::new();
+                    for _ in 0..2 {
+                        // Exercise each constructor's actual TLS config over loopback instead
+                        // of bootstrapping a live Tor network for its underlying byte stream.
+                        let tcp = TcpStream::connect(address).await.expect("connect TLS TCP");
+                        let name = rustls::pki_types::ServerName::try_from("localhost")
+                            .expect("fixture hostname");
+                        let mut tls = connector
+                            .connect(name, tcp)
+                            .await
+                            .expect("client handshake");
+                        let mut marker = [0];
+                        // Reading application data processes the server's preceding TLS 1.3
+                        // NewSessionTicket messages before the next fresh connection starts.
+                        tls.read_exact(&mut marker)
+                            .await
+                            .expect("read after tickets");
+                        assert_eq!(marker, [42]);
+                        handshakes.push(tls.get_ref().1.handshake_kind().expect("handshake kind"));
+                        tls.write_all(&[43]).await.expect("acknowledge server");
+                        tls.shutdown().await.expect("client TLS close");
+                    }
+                    observed.push((
+                        version.version,
+                        via_tor,
+                        handshakes,
+                        server.await.expect("TLS server"),
+                    ));
+                }
+            }
+            // Collect every path before asserting so a failing run diagnoses both constructors.
+            eprintln!("rotated TLS handshakes: {observed:?}");
+            for (version, via_tor, client, server) in observed {
+                assert_eq!(
+                    client,
+                    [HandshakeKind::Full, HandshakeKind::Full],
+                    "client {version:?}, Tor={via_tor}"
+                );
+                assert_eq!(
+                    server,
+                    [HandshakeKind::Full, HandshakeKind::Full],
+                    "server {version:?}, Tor={via_tor}"
+                );
+            }
+        })
+        .await
+        .expect("loopback TLS regression deadline");
+    }
+
+    #[tokio::test]
+    async fn ohttp_tls_rejects_untrusted_certificates_and_wrong_hostnames() {
+        use tokio::net::TcpListener;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind TLS");
+            let port = listener.local_addr().expect("TLS address").port();
+            let acceptor = loopback_tls_acceptor(&rustls::version::TLS13);
+            let server = tokio::spawn(async move {
+                for _ in 0..2 {
+                    let (tcp, _) = listener.accept().await.expect("accept TLS TCP");
+                    assert!(
+                        acceptor.accept(tcp).await.is_err(),
+                        "client must reject certificate"
+                    );
+                }
+            });
+            let mut client = OhttpClient::new(
+                "tls-rejection.example",
+                &format!("https://localhost:{port}/relay"),
+                Dialer::Direct,
+                None,
+                ClientProfile::SLIPSTREAM_HTTP,
+            )
+            .expect("OHTTP client");
+            let target = parse_https(&format!("https://localhost:{port}/relay")).expect("target");
+            let error = client
+                .tls_connect(&target)
+                .await
+                .err()
+                .expect("untrusted CA rejected");
+            assert!(
+                matches!(error, HttpsError::Configuration(_)),
+                "{}",
+                error.into_message()
+            );
+
+            client.tls = Arc::new(trust_loopback_tls_ca(&client.tls));
+            // The fixture is trusted, but its SAN authorizes localhost, not the loopback IP.
+            let target = parse_https(&format!("https://127.0.0.1:{port}/relay")).expect("target");
+            let error = client
+                .tls_connect(&target)
+                .await
+                .err()
+                .expect("wrong hostname rejected");
+            assert!(
+                matches!(error, HttpsError::Configuration(_)),
+                "{}",
+                error.into_message()
+            );
+            server.await.expect("TLS rejection server");
+        })
+        .await
+        .expect("loopback certificate rejection deadline");
     }
 
     /// Privacy: Tor-dialer clients are NEVER cached. A cached Direct client must not be returned
