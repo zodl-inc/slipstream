@@ -322,7 +322,10 @@ mod tests {
             (io::ErrorKind::TimedOut, "connection failed: timed out"),
         ] {
             let error = connect(std::future::ready(Ok(addresses())), |_| async move {
-                Err::<SocketAddr, _>(io::Error::from(kind))
+                Err::<SocketAddr, _>(io::Error::new(
+                    kind,
+                    "secret-relay.example 192.0.2.42 [2001:db8::42]:443",
+                ))
             })
             .await
             .unwrap()

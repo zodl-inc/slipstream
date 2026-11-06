@@ -4125,14 +4125,16 @@ mod tests {
     }
 
     /// The status of a stream opened through `request_client` is classified after the call
-    /// scope has ended. Local-bridge streams keep their typed outcome; a remote channel's
-    /// status with the same reserved metadata stays a transport error.
+    /// scope has ended. Local-bridge streams keep their typed outcome; a hand-built `Status`
+    /// carrying the same reserved metadata, but not the private local-bridge source, stays a
+    /// transport error.
     #[tokio::test]
     async fn stream_outcome_provenance_survives_call_scope() {
         let (connector, _dispatches) =
             crate::ohttp::tests::outcome_connector("fetch-stream-provenance", 200, 403).await;
         let lazy = tonic::transport::Endpoint::from_static("http://stream-provenance.invalid:443")
             .connect_lazy();
+        // `lazy` is never used: `request_client` opens a fresh bridge pipe inside `call`.
         let connection = grpc::TrackedConnection::ohttp(
             lazy,
             connector,

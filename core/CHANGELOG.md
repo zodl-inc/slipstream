@@ -14,7 +14,9 @@ workspace.
 
 - Direct OHTTP dialing races IPv6 and IPv4 candidates with at most two concurrent
   connections and one 15-second DNS-and-connect budget. Cancellation and successful
-  connection selection drop losing attempts; Tor routing is unchanged.
+  connection selection drop losing attempts; Tor routing is unchanged. Its connection
+  failures report only the error kind (for example `connection failed: connection
+  refused`), never host or address text.
 
 - Fresh OHTTP TLS connections always perform full handshakes, preventing session
   resumption from linking rotated connections or isolated Tor circuits. Certificate
@@ -126,8 +128,6 @@ workspace.
   connector results become `LwdClient`, and the old alias's generated `::connect` becomes
   `grpc::connect`. Converting a raw `Channel` always treats it as remote; typed OHTTP outcomes
   require a Slipstream connector-produced client.
-- Direct connection failures name their kind, for example `connection failed: connection
-  refused`, still without host or address text.
 - Ordinary stop (backgrounding or shutdown) requests the next block boundary
   before aborting the session. An abort alone cannot interrupt synchronous scanning
   and can leave already-fetched chunks scanning for minutes. Earlier commits remain;

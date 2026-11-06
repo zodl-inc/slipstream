@@ -224,8 +224,8 @@ impl HeadWait {
 }
 
 /// Trailers-only metadata the in-process server attaches to a gRPC error so that the engine can
-/// tell an OHTTP outcome from an unreachable server (see `grpc::status_err`). It never leaves
-/// the process.
+/// tell an OHTTP outcome from an unreachable server (read and stripped by
+/// `LwdTransport::local_status`). It never leaves the process.
 pub(crate) const OHTTP_OUTCOME_HEADER: &str = "x-ohttp-outcome";
 /// Reserved obsolete authentication field; always strip it from peer metadata.
 const OHTTP_OUTCOME_AUTH_HEADER: &str = "x-ohttp-outcome-auth";
@@ -3866,7 +3866,7 @@ fn grpc_error(code: &'static str, message: &str) -> Response<BoxBody<Bytes, Infa
 
 /// [`grpc_error`] carrying an [`OHTTP_OUTCOME_HEADER`]. `LwdTransport` consumes the marker,
 /// strips it on every channel and turns it into a typed local outcome only on local-bridge
-/// transports; tonic never sees it.
+/// transports; tonic's gRPC client never decodes it into `Status` metadata.
 fn grpc_error_with(
     code: &'static str,
     message: &str,
@@ -5191,7 +5191,9 @@ pub(crate) mod tests {
     }
 
     /// Replaces the process-cached mainnet client of the public connect functions, and puts the
-    /// previous entry back when dropped. Hold `PUBLIC_CONNECT_LOCK` while one exists.
+    /// previous entry back when dropped. Hold `PUBLIC_CONNECT_LOCK` while one exists. Tests use
+    /// the mainnet key because the testnet cached client is permanently mutated by
+    /// `health_follow_tip_owner_captures_the_selected_endpoint_deadline`.
     struct CachedClientOverride {
         key: ClientCacheKey,
         previous: Option<Arc<OhttpClient>>,
@@ -5411,6 +5413,9 @@ pub(crate) mod tests {
         );
     }
 
+    /// Covers `grpc::connect_dedicated` through the calls its body reduces to (`connect_tracked`
+    /// with `shared = false`, then `into_client()`). The dedicated client is built fresh outside
+    /// the process cache, so this needs neither `PUBLIC_CONNECT_LOCK` nor a cache restore.
     /// Policy only: a 429 here would pause the configured relay URL for the whole process.
     #[tokio::test]
     async fn dedicated_connection_keeps_policy_outcome() {
