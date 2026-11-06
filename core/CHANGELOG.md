@@ -193,6 +193,11 @@ workspace.
 - OHTTP channels and split block-range attempts contribute to per-pass network counts;
   adaptive prefetch retains a single initial connection for a one-block follow range.
 
+## [0.4.1] - 2026-10-27
+
+### Fixed
+- Allow compatible patch releases of librustzcash dependencies.
+
 ## [0.4.0] - 2026-10-27
 
 ### Added
