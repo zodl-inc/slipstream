@@ -381,11 +381,7 @@ impl TorConn {
                     crate::ohttp::gateway_label(&endpoint.host)
                 ))
             })?;
-        Ok(TrackedConnection::ohttp(
-            LwdClient::new(crate::grpc::LwdTransport::local_bridge(channel)),
-            connector,
-            pipe_uri,
-        ))
+        Ok(TrackedConnection::ohttp(channel, connector, pipe_uri))
     }
 
     /// Non-OHTTP host: gRPC(+TLS) directly over a Tor stream — a port of
@@ -844,6 +840,28 @@ mod tests {
             1,
             "a fresh circuit cannot escape a relay pause"
         );
+    }
+
+    #[tokio::test]
+    async fn tor_ohttp_channel_keeps_authentic_outcomes() {
+        for (outer, inner, expected) in [(429, 200, "rate"), (200, 403, "policy")] {
+            let (connector, _) =
+                crate::ohttp::tests::outcome_connector(&format!("tor-{expected}"), outer, inner)
+                    .await;
+            let mut client = TorConn::connect_ohttp_channel(connector, &ohttp_endpoint())
+                .await
+                .expect("channel")
+                .into_client();
+            let error = grpc::get_latest_block_height(&mut client)
+                .await
+                .unwrap_err();
+            let kind = match &error {
+                SlipstreamError::RateLimited(_) => "rate",
+                SlipstreamError::PolicyDenied(_) => "policy",
+                other => panic!("expected {expected}, got {other:?}"),
+            };
+            assert_eq!(kind, expected, "{error:?}");
+        }
     }
 
     #[tokio::test]

@@ -332,13 +332,15 @@ impl TrackedConnection {
             factory: current_factory(),
         }
     }
+    /// `channel` is the in-process pipe to the local bridge; it is wrapped here so that no caller
+    /// can build a connection whose locally generated outcomes lose their classification.
     pub(crate) fn ohttp(
-        client: LwdClient,
+        channel: tonic::transport::Channel,
         connector: crate::ohttp::OhttpConnector,
         uri: String,
     ) -> Self {
         Self {
-            client,
+            client: LwdClient::new(LwdTransport::local_bridge(channel)),
             factory: Some(OhttpFactory { connector, uri }),
         }
     }
@@ -547,11 +549,7 @@ pub(crate) async fn connect_tracked(
                 )
             })?;
         net_stats::record(net_stats::NetEvent::DirectChannel);
-        return Ok(TrackedConnection::ohttp(
-            CompactTxStreamerClient::new(LwdTransport::local_bridge(channel)),
-            connector,
-            pipe_uri,
-        ));
+        return Ok(TrackedConnection::ohttp(channel, connector, pipe_uri));
     }
     let mut ep = TonicEndpoint::from_shared(endpoint.uri())
         .map_err(|e| transport_err("endpoint uri", e))?

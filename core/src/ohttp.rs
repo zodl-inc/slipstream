@@ -4370,7 +4370,6 @@ pub(crate) mod tests {
     }
 
     async fn health_fixture_client(name: &str, grpc: bool) -> OhttpClient {
-        use hpke::{Kem, Serializable};
         let profile = if grpc {
             ClientProfile::SLIPSTREAM
         } else {
@@ -4384,6 +4383,13 @@ pub(crate) mod tests {
             profile,
         )
         .unwrap();
+        cache_fixture_key(&client).await;
+        client
+    }
+
+    /// Gives `client` the key `fixture_response` can decrypt for.
+    async fn cache_fixture_key(client: &OhttpClient) {
+        use hpke::{Kem, Serializable};
         let public: [u8; 32] = hpke::kem::X25519HkdfSha256::sk_to_pk(&fixture_private_key())
             .to_bytes()
             .into();
@@ -4391,7 +4397,6 @@ pub(crate) mod tests {
             config: KeyConfig::select(&key_document(1, public)).unwrap(),
             not_after: unix_now().unwrap() + 3600,
         });
-        client
     }
 
     fn fixture_varint(bytes: &mut Vec<u8>, value: usize) {
@@ -4570,7 +4575,7 @@ pub(crate) mod tests {
                 )))
             })
             .await;
-            let raw = health_tonic_client(client.clone()).await;
+            let raw = health_tonic_channel(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
                 OhttpConnector {
@@ -5111,17 +5116,21 @@ pub(crate) mod tests {
         );
     }
 
+    async fn health_tonic_channel(client: Arc<OhttpClient>) -> tonic::transport::Channel {
+        tonic::transport::Endpoint::from_shared(format!("http://{}:443", testnet_gateway()))
+            .unwrap()
+            .connect_with_connector(OhttpConnector {
+                client,
+                health: None,
+            })
+            .await
+            .unwrap()
+    }
+
     async fn health_tonic_client(client: Arc<OhttpClient>) -> crate::grpc::LwdClient {
-        let channel =
-            tonic::transport::Endpoint::from_shared(format!("http://{}:443", testnet_gateway()))
-                .unwrap()
-                .connect_with_connector(OhttpConnector {
-                    client,
-                    health: None,
-                })
-                .await
-                .unwrap();
-        crate::grpc::LwdClient::new(crate::grpc::LwdTransport::local_bridge(channel))
+        crate::grpc::LwdClient::new(crate::grpc::LwdTransport::local_bridge(
+            health_tonic_channel(client).await,
+        ))
     }
 
     // These tests catch classification depending on a factory task scope rather than the
@@ -5132,9 +5141,15 @@ pub(crate) mod tests {
         inner: u16,
     ) -> (Arc<OhttpClient>, Arc<AtomicUsize>) {
         let client = Arc::new(health_fixture_client(name, true).await);
+        let dispatches = serve_outcome_relay(&client, outer, inner).await;
+        (client, dispatches)
+    }
+
+    /// Puts the in-process relay of `outcome_fixture` behind `client` and counts its requests.
+    async fn serve_outcome_relay(client: &OhttpClient, outer: u16, inner: u16) -> Arc<AtomicUsize> {
         let dispatches = Arc::new(AtomicUsize::new(0));
         let observed = dispatches.clone();
-        serve_in_process_relay(&client, move |request| {
+        serve_in_process_relay(client, move |request| {
             observed.fetch_add(1, Ordering::SeqCst);
             async move {
                 // Local provenance is never sent on the relay connection.
@@ -5155,7 +5170,64 @@ pub(crate) mod tests {
             }
         })
         .await;
-        (client, dispatches)
+        dispatches
+    }
+
+    /// A connector over the client of `outcome_fixture`, for the Tor channel path.
+    pub(crate) async fn outcome_connector(
+        name: &str,
+        outer: u16,
+        inner: u16,
+    ) -> (OhttpConnector, Arc<AtomicUsize>) {
+        let (client, dispatches) = outcome_fixture(name, outer, inner).await;
+        (
+            OhttpConnector {
+                client,
+                health: None,
+            },
+            dispatches,
+        )
+    }
+
+    /// Replaces the process-cached mainnet client of the public connect functions, and puts the
+    /// previous entry back when dropped. Hold `PUBLIC_CONNECT_LOCK` while one exists.
+    struct CachedClientOverride {
+        key: ClientCacheKey,
+        previous: Option<Arc<OhttpClient>>,
+    }
+
+    static PUBLIC_CONNECT_LOCK: Mutex<()> = Mutex::const_new(());
+
+    impl CachedClientOverride {
+        async fn install(gateway_host: &str, client: Arc<OhttpClient>) -> Self {
+            let relay_url = relay_for(gateway_host).expect("a relay for the gateway");
+            let key = ClientCacheKey::new(
+                gateway_host,
+                relay_url,
+                get_default_client_trace_prefix(),
+                ClientProfile::SLIPSTREAM,
+            )
+            .expect("a cache key");
+            let previous = CLIENT_CACHE
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(key.clone(), client);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for CachedClientOverride {
+        fn drop(&mut self) {
+            let mut cache = CLIENT_CACHE
+                .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            match self.previous.take() {
+                Some(previous) => cache.insert(self.key.clone(), previous),
+                None => cache.remove(&self.key),
+            };
+        }
     }
 
     fn assert_local_outcome(error: crate::error::SlipstreamError, expected: &str) {
@@ -5212,7 +5284,7 @@ pub(crate) mod tests {
                     Response::new(Full::new(Bytes::from(bytes)).boxed())
                 })
                 .await;
-                let raw = health_tonic_client(client.clone()).await;
+                let raw = health_tonic_channel(client.clone()).await;
                 let tracked = crate::grpc::TrackedConnection::ohttp(
                     raw,
                     OhttpConnector {
@@ -5241,7 +5313,7 @@ pub(crate) mod tests {
             {
                 let (client, dispatches) =
                     outcome_fixture(&format!("bare-outcome-{tracked}-{outer}"), outer, inner).await;
-                let raw = health_tonic_client(client.clone()).await;
+                let raw = health_tonic_channel(client.clone()).await;
                 let connection = crate::grpc::TrackedConnection::ohttp(
                     raw,
                     OhttpConnector {
@@ -5274,6 +5346,99 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn public_connect_functions_keep_authentic_outcomes() {
+        use crate::config::Endpoint;
+        use crate::connector::{ConnPurpose, Connector, connect_via};
+        let _serial = PUBLIC_CONNECT_LOCK.lock().await;
+        let endpoint = Endpoint {
+            host: mainnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        for entry in ["grpc-connect", "connect-via", "connector-connect"] {
+            for (outer, inner, expected) in [(429, 200, "rate"), (200, 403, "policy")] {
+                let (client, _dispatches) =
+                    outcome_fixture(&format!("public-{entry}-{expected}"), outer, inner).await;
+                let _override = CachedClientOverride::install(mainnet_gateway(), client).await;
+                let mut connection = match entry {
+                    "grpc-connect" => crate::grpc::connect(&endpoint).await,
+                    "connect-via" => {
+                        connect_via(&endpoint, None, ConnPurpose::MetadataUnique).await
+                    }
+                    _ => {
+                        Connector::direct(endpoint.clone())
+                            .connect(ConnPurpose::MetadataUnique)
+                            .await
+                    }
+                }
+                .expect("connect");
+                let error = crate::grpc::get_latest_block_height(&mut connection)
+                    .await
+                    .unwrap_err();
+                assert_local_outcome(error, expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn public_mempool_stream_keeps_rate_limit_after_pause() {
+        use crate::config::Endpoint;
+        let _serial = PUBLIC_CONNECT_LOCK.lock().await;
+        let endpoint = Endpoint {
+            host: mainnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        let (client, dispatches) = outcome_fixture("public-mempool-pause", 429, 200).await;
+        let _override = CachedClientOverride::install(mainnet_gateway(), client).await;
+        let mut connection = crate::grpc::connect(&endpoint).await.expect("connect");
+        let error = crate::grpc::get_latest_block_height(&mut connection)
+            .await
+            .unwrap_err();
+        assert_local_outcome(error, "rate");
+        let error = crate::grpc::open_mempool_stream(&mut connection)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, crate::error::SlipstreamError::RateLimited(_)),
+            "{error:?}"
+        );
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "a cached pause must not dispatch another relay request"
+        );
+    }
+
+    /// Policy only: a 429 here would pause the configured relay URL for the whole process.
+    #[tokio::test]
+    async fn dedicated_connection_keeps_policy_outcome() {
+        use crate::config::Endpoint;
+        let endpoint = Endpoint {
+            host: mainnet_gateway().into(),
+            port: 443,
+            tls: true,
+        };
+        let connection = crate::grpc::connect_tracked(&endpoint, false)
+            .await
+            .expect("connect");
+        let client = connection
+            .factory
+            .as_ref()
+            .expect("an OHTTP connection")
+            .connector
+            .client
+            .clone();
+        cache_fixture_key(&client).await;
+        serve_outcome_relay(&client, 200, 403).await;
+        let mut rpc = connection.into_client();
+        let error = crate::grpc::get_latest_block_height(&mut rpc)
+            .await
+            .unwrap_err();
+        assert_local_outcome(error, "policy");
+    }
+
+    #[tokio::test]
     async fn bare_stream_authentic_outcome_survives_scope_exit() {
         for tracked in [false, true] {
             for (outer, inner, expected) in
@@ -5281,7 +5446,7 @@ pub(crate) mod tests {
             {
                 let (client, _dispatches) =
                     outcome_fixture(&format!("bare-stream-{tracked}-{outer}"), outer, inner).await;
-                let raw = health_tonic_client(client.clone()).await;
+                let raw = health_tonic_channel(client.clone()).await;
                 let connection = crate::grpc::TrackedConnection::ohttp(
                     raw,
                     OhttpConnector {
@@ -6223,7 +6388,7 @@ pub(crate) mod tests {
                 response
             })
             .await;
-            let raw = health_tonic_client(client.clone()).await;
+            let raw = health_tonic_channel(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
                 OhttpConnector {
@@ -6469,7 +6634,7 @@ pub(crate) mod tests {
         .await;
         let key = format!("{}:{}", client.relay.host, client.relay.port);
         let opened = client.h2_pool.lock().await.get(&key).unwrap().opened;
-        let raw = health_tonic_client(client.clone()).await;
+        let raw = health_tonic_channel(client.clone()).await;
         let tracked = crate::grpc::TrackedConnection::ohttp(
             raw,
             OhttpConnector {
@@ -6545,7 +6710,7 @@ pub(crate) mod tests {
             .await;
             let key = format!("{}:{}", client.relay.host, client.relay.port);
             let opened = client.h2_pool.lock().await.get(&key).unwrap().opened;
-            let raw = health_tonic_client(client.clone()).await;
+            let raw = health_tonic_channel(client.clone()).await;
             let tracked = crate::grpc::TrackedConnection::ohttp(
                 raw,
                 OhttpConnector {
