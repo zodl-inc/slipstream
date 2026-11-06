@@ -631,6 +631,8 @@ pub async fn scan_chunks(
             .map_err(|e| SlipstreamError::Wallet(format!("write-behind seed: {e}")))?;
         // Commit size decoupled from the scan call (the OHTTP window, sub-chunks).
         facade.set_commit_limits(config.persist_commit_limits);
+        let anchor_retention =
+            crate::persist::anchor_retention(&*session.db_mut(), config.anchor_retention.as_ref())?;
         let mut lane = crate::persist::PersistLane::open(
             &config.wallet_db_path,
             config.network,
@@ -638,7 +640,7 @@ pub async fn scan_chunks(
             graft_buffering,
             config.graft_verify_sample,
             config.batch_combine,
-            config.anchor_retention.clone(),
+            anchor_retention,
         )?;
         // [B4-16 drain] Every deferred commit holds the writer gate so the FFI
         // stop()/start() drain can wait out an orphan commit abort() can't cancel.
@@ -794,7 +796,8 @@ async fn scan_chunks_inner(
     sparse_state.gpu_subtree = config.gpu_subtree; // B0: route Orchard build to GPU when set
     sparse_state.graft_buffering = graft_buffering; // v0.4: only used on the inline path (wb's lane carries its own)
     sparse_state.batch_combine = config.batch_combine; // v0.4 Plan B (inline path)
-    sparse_state.anchor_retention = config.anchor_retention.clone(); // [B6]
+    sparse_state.anchor_retention =
+        crate::persist::anchor_retention(&*session.db_mut(), config.anchor_retention.as_ref())?; // [B6]
     // Read config fields once.
     let batch_target_ms = config.scan_batch_target_ms;
     let network = config.network;
