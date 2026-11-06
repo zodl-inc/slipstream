@@ -26,6 +26,20 @@ use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 use crate::error::SlipstreamError;
 use crate::network::SlipstreamNetwork;
 
+/// An OHTTP gateway serves one network: a wallet on another network must not use it (its
+/// calls would reach the wrong chain, under a key configuration signed for that chain). Hosts
+/// that are not gateways are not checked here.
+fn check_gateway_network(host: &str, network: SlipstreamNetwork) -> Result<(), SlipstreamError> {
+    if crate::ohttp::relay_for(host).is_none() {
+        return Ok(());
+    }
+    crate::ohttp::check_gateway_network(
+        host,
+        zcash_protocol::consensus::Parameters::network_type(&network),
+    )
+    .map_err(SlipstreamError::Config)
+}
+
 /// lightwalletd endpoint.
 // Deliberately exhaustive: an endpoint is exactly (host, port, tls).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -218,6 +232,38 @@ pub struct EngineConfig {
     /// Only affects the write-behind path; the committed `data.db` is identical at any
     /// depth (persist stays serial + in-order). Auto-scaled per device RAM in R4.
     pub persist_depth: usize,
+
+    /// Size of one write-behind persist commit, independent of the scan call
+    /// (= fetch chunk or byte-split sub-chunk; over OHTTP at most
+    /// `connector::OHTTP_MAX_CHUNK_BLOCKS` = 2,000 blocks): consecutive scan calls
+    /// are committed as one unit until it holds `max_blocks` blocks or
+    /// `max_outputs` note commitments (see [`crate::persist::CommitLimits`]).
+    /// `None` = one commit per scan call (the pre-round-6 behavior). Only affects
+    /// the write-behind path. Scanned blocks of a unit not yet submitted are lost
+    /// on an error exit or stop and scanned again by the next pass, so the
+    /// limits also bound that rework.
+    #[cfg(feature = "zcash_client_sqlite")]
+    pub persist_commit_limits: Option<crate::persist::CommitLimits>,
+
+    /// Adaptive prefetch (`fetch::FetchBoost`): plan chunks sized by bytes (a
+    /// share of the ahead budget, so normal-era chunks keep `chunk_blocks`)
+    /// instead of a fixed block count; and while the scan measurably waits for
+    /// blocks, slow head streams restarted on a fresh connection and, through an
+    /// OHTTP gateway on a device whose memory budget is not derated, two more
+    /// block streams. Default on; `false` is the kill switch (fixed plan chunks).
+    pub fetch_boost: bool,
+
+    /// Dense ranges: the most note commitments one scan call takes when the scan
+    /// merges chunks already waiting in the queue into it (only chunks of at least
+    /// 16,000 commitments merge). Each scan call ends in a barrier: the decryption
+    /// threads finish the call's last batches and wait while the call's results
+    /// are assembled and handed to persistence and the next call starts. Fewer,
+    /// larger calls pay it less often (dense range on an 8-core Graviton: +14 % at
+    /// [`Self::DEFAULT_SCAN_MERGE_OUTPUTS`], three byte-split sub-chunks); the
+    /// queue's byte budget is unchanged, as merged chunks are already in it.
+    /// Derated to [`Self::SMALL_DEVICE_SCAN_MERGE_OUTPUTS`] on small devices. 0 = one
+    /// scan call per queued chunk.
+    pub scan_merge_outputs: u64,
 }
 
 impl EngineConfig {
@@ -228,6 +274,12 @@ impl EngineConfig {
     /// the default path emits exactly one sub-chunk per plan chunk; a
     /// sandblasting-era chunk (~hundreds of MB) splits into many (T6.8-S).
     pub const DEFAULT_CHUNK_SPLIT_BYTES: usize = 8 * 1024 * 1024;
+    /// `scan_merge_outputs`: three sandblasting-era sub-chunks of the default split (~67,000
+    /// note commitments each).
+    pub const DEFAULT_SCAN_MERGE_OUTPUTS: u64 = 210_000;
+    /// `scan_merge_outputs` on devices under [`Self::SMALL_DEVICE_THRESHOLD_BYTES`] (half,
+    /// like their split).
+    pub const SMALL_DEVICE_SCAN_MERGE_OUTPUTS: u64 = 105_000;
     /// Run an interleaved enhancement pass every 3 completed chunks by default (T6.1).
     pub const DEFAULT_ENHANCE_EVERY_CHUNKS: u32 = 3;
 
@@ -259,12 +311,31 @@ impl EngineConfig {
             local_treestate: false,
             treestate_verify_sample: 1,
             persist_depth: 1,
+            #[cfg(feature = "zcash_client_sqlite")]
+            persist_commit_limits: Some(crate::persist::CommitLimits {
+                max_blocks: crate::persist::CommitLimits::DEFAULT_MAX_BLOCKS,
+                max_outputs: crate::persist::CommitLimits::DEFAULT_MAX_OUTPUTS,
+            }),
+            fetch_boost: true,
+            scan_merge_outputs: Self::DEFAULT_SCAN_MERGE_OUTPUTS,
         }
     }
 
     pub fn validate(&self) -> Result<(), SlipstreamError> {
         if self.endpoint.host.is_empty() {
             return Err(SlipstreamError::Config("endpoint host is empty".into()));
+        }
+        let primary_is_gateway = crate::ohttp::relay_for(&self.endpoint.host).is_some();
+        for alt in &self.alternate_endpoints {
+            let alt_is_gateway = crate::ohttp::relay_for(&alt.host).is_some();
+            if primary_is_gateway != alt_is_gateway {
+                return Err(SlipstreamError::Config(
+                    "alternate_endpoints must not mix Gateway hosts (tier 0) and clearnet servers (tier 1)".into(),
+                ));
+            }
+        }
+        for ep in std::iter::once(&self.endpoint).chain(&self.alternate_endpoints) {
+            check_gateway_network(&ep.host, self.network)?;
         }
         if self.fetch_streams == 0 {
             return Err(SlipstreamError::Config("fetch_streams must be >= 1".into()));
@@ -345,6 +416,9 @@ impl EngineConfig {
         if total_memory_bytes > 0 && total_memory_bytes < Self::SMALL_DEVICE_THRESHOLD_BYTES {
             self.memory_budget_bytes = Self::SMALL_DEVICE_MEMORY_BUDGET;
             self.chunk_split_bytes = Self::SMALL_DEVICE_CHUNK_SPLIT_BYTES;
+            self.scan_merge_outputs = self
+                .scan_merge_outputs
+                .min(Self::SMALL_DEVICE_SCAN_MERGE_OUTPUTS);
         }
         self
     }
@@ -365,14 +439,24 @@ impl EngineConfig {
         if self.alternate_endpoints.is_empty() || via_tor {
             return (self, Duration::ZERO);
         }
-        let mut endpoints = Vec::with_capacity(1 + self.alternate_endpoints.len());
+        let primary_is_gateway = crate::ohttp::relay_for(&self.endpoint.host).is_some();
+        let same_tier: Vec<_> = self
+            .alternate_endpoints
+            .iter()
+            .filter(|ep| {
+                let is_gateway = crate::ohttp::relay_for(&ep.host).is_some();
+                is_gateway == primary_is_gateway
+            })
+            .cloned()
+            .collect();
+        let mut endpoints = Vec::with_capacity(1 + same_tier.len());
         endpoints.push(self.endpoint.clone());
-        endpoints.extend(self.alternate_endpoints.iter().cloned());
+        endpoints.extend(same_tier);
         let outcome =
             crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
         info!(
             chosen = outcome.chosen,
-            host = endpoints[outcome.chosen].host.as_str(),
+            host = crate::ohttp::log_host(&endpoints[outcome.chosen].host),
             port = endpoints[outcome.chosen].port,
             probe_ms = outcome.elapsed.as_millis() as u64,
             "wire probe committed"
@@ -489,6 +573,57 @@ mod tests {
         ] {
             assert!(Endpoint::parse_uri(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    #[test]
+    fn a_gateway_must_serve_the_wallet_network() {
+        let gateway = |host: &str| Endpoint {
+            host: host.into(),
+            port: 443,
+            tls: true,
+        };
+        let main = |ep: Endpoint| {
+            EngineConfig::new(
+                crate::Network::MainNetwork,
+                PathBuf::from("/tmp/data.db"),
+                ep,
+            )
+        };
+        let test = |ep: Endpoint| {
+            EngineConfig::new(
+                crate::Network::TestNetwork,
+                PathBuf::from("/tmp/data.db"),
+                ep,
+            )
+        };
+        assert!(
+            main(gateway(crate::ohttp::tests::mainnet_gateway()))
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            test(gateway(crate::ohttp::tests::testnet_gateway()))
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            test(gateway(crate::ohttp::tests::mainnet_gateway())).validate(),
+            Err(SlipstreamError::Config(m)) if m.contains("mainnet")
+        ));
+        assert!(matches!(
+            main(gateway(crate::ohttp::tests::testnet_gateway())).validate(),
+            Err(SlipstreamError::Config(_))
+        ));
+        // An alternate gateway on the other network is refused as well.
+        let mut c = main(gateway(crate::ohttp::tests::mainnet_gateway()));
+        c.alternate_endpoints = vec![gateway(crate::ohttp::tests::testnet_gateway())];
+        assert!(matches!(c.validate(), Err(SlipstreamError::Config(_))));
+        // Clearnet servers are not checked.
+        assert!(
+            test(gateway("lightwalletd.testnet.example"))
+                .validate()
+                .is_ok()
+        );
     }
 
     #[test]
@@ -633,6 +768,10 @@ mod tests {
         assert_eq!(
             small.chunk_split_bytes,
             EngineConfig::SMALL_DEVICE_CHUNK_SPLIT_BYTES
+        );
+        assert_eq!(
+            small.scan_merge_outputs,
+            EngineConfig::SMALL_DEVICE_SCAN_MERGE_OUTPUTS
         );
         small.validate().expect("derated config must validate");
     }

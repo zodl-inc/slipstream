@@ -14,6 +14,9 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+#![doc(test(attr(recursion_limit = "256")))]
+
 //! Slipstream sync engine core (platform-neutral).
 //! See HOSTING.md for the integration contract and REVIEWING.md for the
 //! module map.
@@ -31,10 +34,14 @@ pub mod events;
 pub mod fetch;
 pub mod grpc;
 pub mod network;
+pub mod ohttp;
 pub mod probe;
 pub mod throttle;
+pub mod tor_startup;
+pub mod transport_health;
 pub mod treestate;
 pub mod verify;
+pub mod work;
 
 // Issue #4: the zcash_client_sqlite wallet-storage backend and — today — the
 // engine loop that is hard-wired to it. A future non-sqlite backend would slot
@@ -63,6 +70,8 @@ pub mod oracle;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod persist;
 #[cfg(feature = "zcash_client_sqlite")]
+mod progress_scope;
+#[cfg(feature = "zcash_client_sqlite")]
 pub mod reconcile;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod report;
@@ -70,6 +79,8 @@ pub mod report;
 pub mod scan;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod scan_queue;
+#[cfg(feature = "zcash_client_sqlite")]
+pub(crate) mod scan_stages;
 #[cfg(feature = "zcash_client_sqlite")]
 pub mod scheduler;
 #[cfg(feature = "zcash_client_sqlite")]
@@ -91,7 +102,10 @@ pub use error::SlipstreamError;
 pub use events::{Bound, Event, Progress, ProgressArc, Snapshot, SyncMode};
 pub use network::{CustomActivations, SlipstreamNetwork};
 #[cfg(feature = "zcash_client_sqlite")]
-pub use session::{SessionConfig, SessionReporter, TorSessionConfig, run_session};
+pub use session::{
+    SessionConfig, SessionReporter, TorSessionConfig, run_session, run_session_with_tor_startup,
+};
+pub use tor_startup::{TorStartupControl, TorStartupPhase, TorStartupSnapshot};
 /// Re-exported so hosts configure the anchor-retention policy from the same types
 /// the wallet itself is configured with — the grid must match or a migration
 /// transfer anchored to a boundary this engine did not retain becomes unprovable.

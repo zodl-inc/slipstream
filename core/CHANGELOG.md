@@ -10,6 +10,189 @@ workspace.
 
 ## [Unreleased]
 
+### Fixed
+
+- Direct OHTTP dialing races IPv6 and IPv4 candidates with at most two concurrent
+  connections and one 15-second DNS-and-connect budget. Cancellation and successful
+  connection selection drop losing attempts; Tor routing is unchanged. Its connection
+  failures report only the error kind (for example `connection failed: connection
+  refused`), never host or address text.
+
+- Fresh OHTTP TLS connections always perform full handshakes, preventing session
+  resumption from linking rotated connections or isolated Tor circuits. Certificate
+  and hostname verification remain enabled.
+
+- OHTTP bridge outcomes retain policy, rate-limit and size classifications for bare
+  gRPC clients and streams consumed after call scopes end. Connection-owned typed
+  provenance prevents remote metadata or replayed error text from supplying these
+  classifications, without a secret-bearing wire header.
+
+- Follow-loop endpoint-unreachable escalation counts only transport failures. Local
+  configuration, wallet, scan and stop errors, wire-collapse failover, and HTTP
+  policy, rate-limit and size outcomes do not trigger server switching.
+
+- OHTTP DNS fallback rate limits stay local to the responding resolver, allowing the
+  next resolver to recover without pausing relay traffic or replacing relay health.
+
+- OHTTP gRPC and extension requests ASCII-lowercase their encoded BHTTP authority.
+  Authority ports, paths, query strings, bodies and existing header policies are
+  preserved. Stored configuration spelling and public interfaces are unchanged.
+
+- OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
+  empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
+  remain supported when split into valid chunks. Public function signatures are unchanged.
+- OHTTP uses `zodl-ohttp-client` 0.1.2 with explicit build-time gateway host,
+  relay URL, signing key and DNS name. Each network requires all four values or none.
+  `ZODL_OHTTP_REQUIRE=1` requires all eight values, and corresponding mainnet/testnet
+  values must differ ignoring ASCII case. Incomplete, malformed or shared
+  configuration fails the build. Zero, one or both complete networks are supported
+  with strict mode off. Gateway identity comes from exact configured DNS hosts,
+  ignoring letter case.
+- Bounded Tor startup waits for traffic readiness before publishing a fresh
+  connection, within the original admission/bootstrap/retry deadline. Legacy
+  unbounded startup behavior is unchanged. No caller changes are needed.
+- `transport_health::HealthSnapshot` preserves newer-start ordinary route success
+  beside diagnostic evidence, even when an older request finishes later. Original
+  failure ordering and request metadata remain intact. No caller changes are needed.
+- Unsupported OHTTP success-status rejections retain their typed health outcome
+  when the response body idles or fails to read, while accepted responses with
+  failed bodies still report transport unavailability. Public errors, body limits
+  and timeout/retry behavior remain unchanged.
+- Known OHTTP policy, configuration, size and rate-limit outcomes survive an
+  error body that outlasts a caller deadline. Native handlers and their exact
+  deadline owners share one request's evidence; concurrent calls remain independent.
+
+### Added
+- `grpc::LwdTransport`, the service behind `LwdClient`. It strips OHTTP outcome markers on every
+  channel and attaches typed policy, rate-limit and size outcomes only for Slipstream's local
+  OHTTP bridge.
+- Opt-in `run_session_with_tor_startup` retains typed, generation-scoped Tor
+  readiness and failure status. A host-supplied monotonic deadline bounds pass
+  admission, bootstrap and retry backoff together; cancellation or dropping an
+  unfinished session interrupts startup without entering the request loop or
+  falling back to direct. Existing session callers retain their retry policy.
+- Native OHTTP traffic now publishes typed health evidence before sync retry
+  backoff, including key-configuration fallback, authenticated backend responses,
+  streamed body failures and cancellation. Route success remains separate from
+  backend failure. Rate-limit evidence retains the relay's actual pause deadline;
+  policy, configuration, crypto and size rejections do not imply a relay outage.
+  Exact endpoint and Tor scopes also report unary, block-stream and Tor setup
+  deadlines at their owning boundaries, without changing request replay or retry
+  policy. Cached warm-up alone supplies no usable-network evidence.
+- `transport_health` provides retained, typed OHTTP request observations and
+  coalesced subscriptions. Success and failure evidence keep their original
+  monotonic times, late subscribers receive bounded historical replay, and
+  closing a subscription fences callbacks and late request completions from
+  its replacement. Notification consumers cannot block transport reporting.
+- `ohttp` module: an OHTTP (RFC 9458) connector for lightwalletd gateways. An
+  endpoint whose host has a relay (`ohttp::relay_for`) is never dialled
+  directly: every RPC is sealed to the gateway's signed key configuration and
+  posted to the relay, over Chunked OHTTP (draft-ietf-ohai-chunked-ohttp-08,
+  `message/ohttp-chunked-req` / `message/ohttp-chunked-res`), so the gateway
+  can stream `GetBlockRange` responses as blocks arrive. The protocol core is
+  the shared `zodl-ohttp-client` crate.
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` send a
+  plain HTTP request to a service behind the gateway through the relay, with
+  `ohttp::Dialer` choosing a direct or Tor leg to the relay.
+  `http_round_trip_with_dispatch` takes a `max_response_bytes` ceiling and stops
+  reading an answer past it (`ohttp::HttpRoundTripError::ResponseTooLarge`). Its
+  hook runs right before the sealed request is written to the relay connection,
+  so a relay pause, an unreachable relay and a connection that is not ready
+  leave it uncalled.
+- `ohttp::HttpRoundTripError`, the error of
+  `ohttp::http_round_trip_with_dispatch`: `ResponseTooLarge` when the answer is
+  past the ceiling, `Failed` for any other failure.
+- `ohttp::set_default_client_trace_prefix` sets an optional
+  `X-Client-Trace-Id` prefix for end-to-end debug tracing. Gating it to debug
+  builds is the caller's job.
+- `connector::TorConn::from_client`, `TorConn::client`,
+  `TorConn::connect_isolated` and `connector::bulk_chunk_blocks`.
+- `SlipstreamError::EndpointUnreachable` is declared but not constructed by the
+  engine. The follow loop reports unreachable endpoints directly through
+  `SyncState::Error(3)` and event tag 4/value 3.
+- `SlipstreamError::{RateLimited, RequestTooLarge}` and
+  `SlipstreamError::counts_as_unreachable`: an OHTTP relay rate limit (outer
+  429, or a request held back while its `Retry-After` pause runs; transient),
+  an oversized request (outer 413, or a sealed request over 10 MiB, which is
+  not sent) and an inner 403 (`PolicyDenied`) never count towards
+  `EndpointUnreachable`.
+- `enhance::run_enhancement_isolated`: with Tor on, each `GetTransaction` and
+  `GetTaddressTxids` of the enhancement step opens its own isolated circuit;
+  `GetAddressUtxos` does too.
+
+### Changed
+- **Breaking:** `LwdClient` is now `CompactTxStreamerClient<LwdTransport>` instead of
+  `CompactTxStreamerClient<Channel>`, so the next release after 0.4.0 needs a minor version
+  bump. Connector functions still return `LwdClient`. Manual remote clients use
+  `LwdClient::new(channel.into())`, explicit `CompactTxStreamerClient<Channel>` annotations for
+  connector results become `LwdClient`, and the old alias's generated `::connect` becomes
+  `grpc::connect`. Converting a raw `Channel` always treats it as remote; typed OHTTP outcomes
+  require a Slipstream connector-produced client.
+- Ordinary stop (backgrounding or shutdown) requests the next block boundary
+  before aborting the session. An abort alone cannot interrupt synchronous scanning
+  and can leave already-fetched chunks scanning for minutes. Earlier commits remain;
+  the interrupted scan call and any write-behind unit not yet submitted are discarded
+  and rescanned on resume. Stop is not instantaneous: current computation, queued
+  trial decryption and in-flight writes can still take time. Hosts must check the
+  stop report before changing the wallet.
+- Adaptive fetch boost is on by default: byte-sized plan chunks, fresh connections
+  for slow head streams while the scanner waits, and two extra block streams for
+  OHTTP gateways when the device memory budget is not derated. Extra streams are
+  withdrawn if they do not improve throughput; the ahead-memory budget is unchanged.
+- Write-behind persistence groups scan calls into a commit at 20,000 blocks or
+  100,000 note commitments. Limits are checked after adding a scan call, so a unit
+  can exceed a limit by one call. Larger units amortize transaction and tree costs;
+  an unsubmitted unit must be rescanned after a stop or error.
+- Engine wallet connections checkpoint the WAL at 10,000 pages and retain at most
+  64 MiB after a checkpoint resets the journal. Scan writers use a page-cache bound
+  of 64 MiB per connection on desktop/server and 32 MiB on iOS/Android. These settings
+  reduce repeated page writes without changing transaction atomicity or durability.
+- Dense scan merge combines already-queued chunks of at least 16,000 commitments
+  into scan calls up to a 210,000-commitment target, derated to 105,000 below 3 GiB
+  physical memory. Fewer scan barriers improve throughput without increasing the
+  queue's byte budget. Progress updates follow completed scan calls, so merged calls
+  produce less frequent updates; write-behind completion records work after its
+  database transaction commits.
+- OHTTP relay pauses and key-fetch rate limits remain typed during Tor
+  connection warm-up. They return to caller backoff without spending fresh
+  circuit retries or falsely marking the endpoint unreachable.
+- `ohttp::http_round_trip` and `ohttp::http_round_trip_with_dispatch` take the
+  wallet's network (`ohttp::NetworkType`, re-exported from `zcash_protocol`)
+  as their second argument and refuse a gateway that serves another network
+  before anything is sent.
+- `EngineConfig::validate` refuses an OHTTP gateway (endpoint or alternate)
+  that serves a network other than the wallet's; the signed key configuration
+  is checked against the network of the gateway's exact host name.
+- OHTTP: an outer 429's `Retry-After` holds every request through that relay
+  until it has run (no sleep inside the call), a 429 without one for 30 s; an
+  outer answer that is not a success (a relay or gateway error page) is read
+  within a fixed 64 KiB guard and keeps its status whatever ceiling the caller
+  set for the answer; an outer 413 and a local size
+  refusal are `RESOURCE_EXHAUSTED`; a response that ends before its final chunk
+  is `UNAVAILABLE`; an inner status other than 200 or a non-gRPC content type
+  is `INTERNAL`; the gRPC status is delivered only once the final chunk has
+  opened; the verified key configuration is shared by every connection to the
+  same gateway and relay until its `not_after`; `http_round_trip` is bounded
+  (100 s overall, 30 s idle body read, 15 s direct dial); a pooled relay
+  connection is replaced after 10 minutes with Tor off; a `GetBlockRange` the
+  gateway refuses with `INVALID_ARGUMENT` is split into smaller windows.
+- `connector::TorConn::bootstrap` takes the client trace prefix as a third
+  argument, and `TorConn` wraps an `Arc<arti_client::TorClient>` (same
+  `arti-data` / `arti-cache` directory layout as
+  `zcash_client_backend::tor::Client`).
+- `fetch::run_fetch` takes the session's `Option<TorConn>` as its second
+  argument.
+- With Tor on, bulk block fetch uses a circuit per connection for every host,
+  including the relay leg for an OHTTP gateway. Separate worker circuits avoid
+  sharing one circuit's throughput window; bulk never bypasses Tor.
+- The follow loop surfaces `SyncState::Error(3)` (event tag 4, value 3) after
+  5 transport failures across its tip-probe and catch-up counters, each reset by
+  its corresponding successful probe or pass, so a host can switch servers.
+  Follow-phase failures previously never surfaced an error.
+- Tor transport dependencies use the 0.43 family required by the released NU7 backend.
+- OHTTP channels and split block-range attempts contribute to per-pass network counts;
+  adaptive prefetch retains a single initial connection for a one-block follow range.
+
 ## [0.4.0] - 2026-10-27
 
 ### Added

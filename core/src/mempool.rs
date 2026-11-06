@@ -127,7 +127,7 @@ pub async fn run_session(
         seen.clear(); // bounded memory; worst case = one re-emit per live tx
     }
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
-    let mut client = crate::connector::connect_via(
+    let client = crate::connector::connect_via_tracked(
         &config.endpoint,
         tor,
         crate::connector::ConnPurpose::MetadataUnique,
@@ -137,7 +137,11 @@ pub async fn run_session(
     // GetMempoolStream response headers lazily (see grpc::open_mempool_stream),
     // so a quiet mempool legitimately blocks the open past 30 s. An over-idle
     // open is a benign reconnect (Deviation D6), not a failure.
-    let mut stream = match tokio::time::timeout(idle, grpc::open_mempool_stream(&mut client)).await
+    let mut stream = match tokio::time::timeout(
+        idle,
+        client.call(async |client| grpc::open_mempool_stream(client).await),
+    )
+    .await
     {
         Err(_elapsed) => return Ok((SessionEnd::IdleReconnect, stats)),
         Ok(res) => res?,
@@ -148,9 +152,7 @@ pub async fn run_session(
             Err(_elapsed) => return Ok((SessionEnd::IdleReconnect, stats)),
             Ok(None) => return Ok((SessionEnd::BlockBoundary, stats)),
             Ok(Some(Err(status))) => {
-                return Err(SlipstreamError::Transport(format!(
-                    "mempool stream: {status}"
-                )));
+                return Err(crate::grpc::status_err("mempool stream", status));
             }
             Ok(Some(Ok(raw))) => raw,
         };

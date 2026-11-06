@@ -124,7 +124,7 @@ pub async fn probe_endpoints(endpoints: &[Endpoint], budget: Duration) -> ProbeO
     for (i, r) in results.iter().enumerate() {
         info!(
             index = i,
-            host = r.endpoint.host.as_str(),
+            host = crate::ohttp::log_host(&r.endpoint.host),
             port = r.endpoint.port,
             tip = r.tip,
             sample_mbps = r.sample_mbps.map(|m| format!("{m:.2}")),
@@ -150,12 +150,18 @@ async fn probe_one(endpoint: Endpoint, deadline: Instant) -> ProbeResult {
         sample_mbps: None,
     };
 
-    let Ok(Ok(mut client)) = timeout(remaining(deadline), grpc::connect(&endpoint)).await else {
+    let Ok(Ok(mut client)) =
+        timeout(remaining(deadline), grpc::connect_tracked(&endpoint, true)).await
+    else {
         return result;
     };
     let Ok(Ok(tip)) = timeout(
         remaining(deadline),
-        grpc::get_latest_block_height(&mut client),
+        grpc::with_ohttp_endpoint(
+            &endpoint,
+            false,
+            client.call(async |client| grpc::get_latest_block_height(client).await),
+        ),
     )
     .await
     else {

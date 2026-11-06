@@ -46,7 +46,7 @@ use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 use crate::{
     config::Endpoint,
-    connector::{ConnPurpose, TorConn, connect_via},
+    connector::{ConnPurpose, TorConn, connect_via_tracked as connect_via},
     grpc,
 };
 
@@ -103,14 +103,26 @@ pub async fn restore_anchor(
                 .map(|h| u64::from(u32::from(h)))
                 .unwrap_or(0);
             let fetched = async {
-                let mut client = client_via(endpoint, tor).await?;
-                let tip = usable_height(grpc::get_latest_block_height(&mut client).await.ok()?)?;
+                let client = client_via(endpoint, tor).await?;
+                let tip = usable_height(
+                    grpc::with_ohttp_endpoint(
+                        endpoint,
+                        tor.is_some(),
+                        client.call(async |client| grpc::get_latest_block_height(client).await),
+                    )
+                    .await
+                    .ok()?,
+                )?;
                 let anchor_height = tip
                     .saturating_sub(ANCHOR_MAX_REORG_BLOCKS)
                     .max(sapling_activation);
-                let ts = grpc::get_tree_state(&mut client, anchor_height)
-                    .await
-                    .ok()?;
+                let ts = grpc::with_ohttp_endpoint(
+                    endpoint,
+                    tor.is_some(),
+                    client.call(async |client| grpc::get_tree_state(client, anchor_height).await),
+                )
+                .await
+                .ok()?;
                 if usable_height(ts.height)? != anchor_height {
                     return None;
                 }
@@ -171,8 +183,16 @@ pub fn offline_anchor(intent: AnchorIntent) -> Anchor {
 /// Fetch the advertised tip over the given transport; `None` on any failure, an unusable
 /// tip included.
 async fn tip_via(endpoint: &Endpoint, tor: Option<&TorConn>) -> Option<u64> {
-    let mut client = client_via(endpoint, tor).await?;
-    usable_height(grpc::get_latest_block_height(&mut client).await.ok()?)
+    let client = client_via(endpoint, tor).await?;
+    usable_height(
+        grpc::with_ohttp_endpoint(
+            endpoint,
+            tor.is_some(),
+            client.call(async |client| grpc::get_latest_block_height(client).await),
+        )
+        .await
+        .ok()?,
+    )
 }
 
 /// `height` if a host can use it; `None`, the unreachable-server answer, above `i32::MAX`.
@@ -195,12 +215,15 @@ fn usable_height(height: u64) -> Option<u64> {
 /// falls back to direct); DIRECT is a SINGLE attempt — old-SDK parity (`try?` + offline
 /// fallback IS the retry policy here, and a user is waiting on the restore spinner, so
 /// the multi-attempt backoff window the sync pass uses would be pure added latency).
-async fn client_via(endpoint: &Endpoint, tor: Option<&TorConn>) -> Option<crate::grpc::LwdClient> {
+async fn client_via(
+    endpoint: &Endpoint,
+    tor: Option<&TorConn>,
+) -> Option<crate::grpc::TrackedConnection> {
     match tor {
         Some(_) => connect_via(endpoint, tor, ConnPurpose::MetadataUnique)
             .await
             .ok(),
-        None => grpc::connect(endpoint).await.ok(),
+        None => grpc::connect_tracked(endpoint, true).await.ok(),
     }
 }
 
