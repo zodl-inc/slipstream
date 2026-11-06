@@ -137,7 +137,6 @@ pub async fn run_session(
     // GetMempoolStream response headers lazily (see grpc::open_mempool_stream),
     // so a quiet mempool legitimately blocks the open past 30 s. An over-idle
     // open is a benign reconnect (Deviation D6), not a failure.
-    let status_origin = client.status_origin();
     let mut stream = match tokio::time::timeout(
         idle,
         client.call(async |client| grpc::open_mempool_stream(client).await),
@@ -153,11 +152,7 @@ pub async fn run_session(
             Err(_elapsed) => return Ok((SessionEnd::IdleReconnect, stats)),
             Ok(None) => return Ok((SessionEnd::BlockBoundary, stats)),
             Ok(Some(Err(status))) => {
-                return Err(crate::grpc::status_err(
-                    "mempool stream",
-                    status,
-                    status_origin,
-                ));
+                return Err(crate::grpc::status_err("mempool stream", status));
             }
             Ok(Some(Ok(raw))) => raw,
         };

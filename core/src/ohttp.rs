@@ -3864,8 +3864,9 @@ fn grpc_error(code: &'static str, message: &str) -> Response<BoxBody<Bytes, Infa
     grpc_error_with(code, message, None)
 }
 
-/// [`grpc_error`] carrying an [`OHTTP_OUTCOME_HEADER`] (tonic hands it over as the status's
-/// metadata).
+/// [`grpc_error`] carrying an [`OHTTP_OUTCOME_HEADER`]. `LwdTransport` consumes the marker,
+/// strips it on every channel and turns it into a typed local outcome only on local-bridge
+/// transports; tonic never sees it.
 fn grpc_error_with(
     code: &'static str,
     message: &str,
@@ -5477,14 +5478,7 @@ pub(crate) mod tests {
                     "reserved provenance remained after HTTP/2 decoding"
                 );
                 // Classification happens after the stream-opening call's factory scope ended.
-                assert_local_outcome(
-                    crate::grpc::status_err(
-                        "unscoped stream",
-                        status,
-                        crate::grpc::StatusOrigin::RemoteServer,
-                    ),
-                    expected,
-                );
+                assert_local_outcome(crate::grpc::status_err("unscoped stream", status), expected);
             }
         }
     }
@@ -7653,11 +7647,7 @@ pub(crate) mod tests {
                             "peer provenance leaked: {forwarded_trailers:?}"
                         );
                         let status = tonic::Status::from_header_map(forwarded_trailers).unwrap();
-                        let error = crate::grpc::status_err(
-                            "decrypted peer",
-                            status,
-                            crate::grpc::StatusOrigin::LocalOhttpBridge,
-                        );
+                        let error = crate::grpc::status_err("decrypted peer", status);
                         assert!(
                             matches!(error, crate::error::SlipstreamError::Transport(_)),
                             "{error:?}"

@@ -282,11 +282,7 @@ pub(crate) mod tests {
     }
 
     fn assert_outcome(status: Status, local: bool, outcome: &str) {
-        let error = crate::grpc::status_err(
-            "transport fixture",
-            status,
-            crate::grpc::StatusOrigin::LocalOhttpBridge,
-        );
+        let error = crate::grpc::status_err("transport fixture", status);
         assert!(
             matches!(
                 (local, outcome, &error),
@@ -465,11 +461,7 @@ pub(crate) mod tests {
                 assert!(!format!("{status:?}").contains("x-ohttp-outcome"));
                 assert!(
                     matches!(
-                        crate::grpc::status_err(
-                            "invalid trailer",
-                            status,
-                            crate::grpc::StatusOrigin::LocalOhttpBridge
-                        ),
+                        crate::grpc::status_err("invalid trailer", status),
                         SlipstreamError::Transport(_)
                     ),
                     "{code} / {outcome}"
@@ -500,11 +492,7 @@ pub(crate) mod tests {
             if let Err(status) = result {
                 assert!(
                     matches!(
-                        crate::grpc::status_err(
-                            "invalid status",
-                            status,
-                            crate::grpc::StatusOrigin::LocalOhttpBridge
-                        ),
+                        crate::grpc::status_err("invalid status", status),
                         SlipstreamError::Transport(_)
                     ),
                     "{code}"
