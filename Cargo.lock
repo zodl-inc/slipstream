@@ -5126,6 +5126,8 @@ dependencies = [
  "rand 0.10.3",
  "rusqlite",
  "sapling-crypto",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
