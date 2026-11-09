@@ -33,6 +33,7 @@ cargo_jobs.each do |name, job|
     raise "#{name}: cache/Cargo precedes private OHTTP authorization" if (cache || cargo) && index <= authorize
   end
 end
+# The forbidden name is built from two parts so that this file itself stays clear of the repo-wide grep.
 raise "OHTTP build-time configuration remains in the workflow" if File.read(File.join(root, ".github/workflows/ci.yml")).include?("ZODL_" + "OHTTP")
 token = action.fetch("runs").fetch("steps").find { |step| step["id"] == "token" }
 raise "wrong private repository token scope" unless token.fetch("with").fetch("repositories") == "zodl-ohttp"

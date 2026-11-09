@@ -37,8 +37,8 @@ struct Cli {
     /// `{"mainnet": {"gateway_host": "", "relay_url": "", "keys_dns_name": "",
     /// "signing_pubkey": ""}, "testnet": {...}}`. Both objects are optional and a
     /// network that is given needs all four values. A `--server` host that is the
-    /// `gateway_host` of the wallet's network is then reached over OHTTP through its
-    /// `relay_url`. Without this option OHTTP is off and every `--server` is dialled
+    /// `gateway_host` of a configured network is then reached over OHTTP through that
+    /// network's `relay_url` (wallet commands refuse the other network's gateway). Without this option OHTTP is off and every `--server` is dialled
     /// directly.
     #[arg(long, global = true, value_name = "PATH")]
     ohttp_config: Option<std::path::PathBuf>,
@@ -1984,7 +1984,8 @@ mod tests {
         assert!(error.contains("mainet"), "{error}");
         let nested = MAINNET_JSON.replace("}", r#", "relay": "x"}"#);
         let (_dir, path) = ohttp_config_file(&format!(r#"{{"mainnet": {nested}}}"#));
-        assert!(load_ohttp_config(Some(&path)).is_err());
+        let error = load_ohttp_config(Some(&path)).expect_err("unknown nested key");
+        assert!(error.contains("relay"), "{error}");
         // A network with some but not all fields is refused, naming the missing one.
         let partial = MAINNET_JSON.replace(r#""keys_dns_name": "mainnet.ohttp-keys.example","#, "");
         let (_dir, path) = ohttp_config_file(&format!(r#"{{"mainnet": {partial}}}"#));

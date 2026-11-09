@@ -100,16 +100,28 @@ use std::sync::{Arc, Mutex};
 use zodl_slipstream::{
     EngineConfig, Endpoint, Network, Progress, SessionConfig, SessionReporter,
     ffi_handle::{self, SyncState, FfiSlipstreamEvent, derive_snapshot, spawn_supervised},
-    ohttp::OhttpNetworks,
+    ohttp::{OhttpConfig, OhttpConfigParams, OhttpNetworks},
     session::run_session,
 };
+
+// OHTTP is configured per network. A network has all four values or none; this builds a
+// mainnet-only configuration (use your own deployment's values, these are examples).
+let mainnet = OhttpConfig::new(OhttpConfigParams {
+    gateway_host: "ohttp-gateway.example",
+    relay_url: "https://relay-mainnet.example/relay",
+    keys_dns_name: "mainnet.ohttp-keys.example",
+    signing_pubkey: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
+})?;
+let ohttp = OhttpNetworks::new(Some(mainnet), None)?; // (mainnet, testnet)
+// A server host that is not the gateway of a configured network (here: any host on
+// testnet, which has no configuration) is dialled as a plain server, not over OHTTP.
 
 let config = SessionConfig {
     engine: EngineConfig::new(
         Network::MainNetwork,
         "/path/to/data.db".into(),
         Endpoint { host: "zec.rocks".into(), port: 443, tls: true },
-        OhttpNetworks::default(), // your OHTTP configuration; the default has OHTTP off
+        ohttp, // or OhttpNetworks::default() for OHTTP off
     ),
     // .scaled_for_device_memory(total_bytes)  // derates budgets on <3 GiB devices
     account: Some((ufvk_string, 2_400_000)),   // or None if you created the account

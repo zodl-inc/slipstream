@@ -82,7 +82,7 @@ mainnet and testnet share no value (ignoring ASCII case). Gateway matching ignor
 DNS letter case.
 
 Tests build their configuration from public example hosts and public test signing
-keys (`*.example`), so plain `cargo test --workspace` needs no setup. Live network
+keys (`*.example`, RFC 8032 test keys), so plain `cargo test --workspace` needs no setup. Live network
 tests read `OHTTP_E2E_{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}_{MAINNET,TESTNET}`
 at run time.
 

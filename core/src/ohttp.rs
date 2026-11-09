@@ -267,13 +267,22 @@ struct SharedKeyId {
 /// values themselves (an [`OhttpConfig`] is not `Hash`), so that nothing cached under one
 /// configuration serves another, a key verified under another signer included. The Tor
 /// client's shared connections are kept with it too (`connector::TorConn`).
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct ConfigurationKey {
     network: &'static str,
     gateway_host: String,
     relay_url: String,
     keys_dns_name: String,
     signing_pubkey: [u8; 32],
+}
+
+/// Shows the network only, so that no log line or panic message can carry a configured value.
+impl std::fmt::Debug for ConfigurationKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConfigurationKey")
+            .field("network", &self.network)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ConfigurationKey {
@@ -11126,6 +11135,53 @@ pub(crate) mod tests {
 
     /// Without a configuration OHTTP is off: no host has a relay or a network, the example
     /// gateways included.
+    #[test]
+    fn configuration_key_debug_shows_no_configured_value() {
+        let key = ConfigurationKey::of(&example_networks(), MAINNET_GATEWAY).expect("key");
+        let shown = format!("{key:?} {:?}", Some(&key));
+        assert!(shown.contains("mainnet"), "{shown}");
+        for value in [
+            MAINNET_GATEWAY,
+            MAINNET_RELAY,
+            MAINNET_KEYS_DNS_NAME,
+            MAINNET_SIGNING_KEY,
+            "example",
+            "d75a9801",
+        ] {
+            assert!(!shown.contains(value), "{shown}");
+        }
+        // Nor does a cache key that contains it.
+        let id = format!(
+            "{:?}",
+            SharedKeyId {
+                gateway_host: String::new(),
+                relay: String::new(),
+                configuration: Some(key),
+            }
+        );
+        assert!(!id.contains("example") && !id.contains("d75a9801"), "{id}");
+    }
+
+    #[test]
+    fn live_input_names_are_the_documented_ones() {
+        let names = live_inputs();
+        let expected = [
+            "OHTTP_E2E_GATEWAY_HOST_MAINNET",
+            "OHTTP_E2E_RELAY_URL_MAINNET",
+            "OHTTP_E2E_KEYS_DNS_NAME_MAINNET",
+            "OHTTP_E2E_SIGNING_PUBKEY_MAINNET",
+            "OHTTP_E2E_GATEWAY_HOST_TESTNET",
+            "OHTTP_E2E_RELAY_URL_TESTNET",
+            "OHTTP_E2E_KEYS_DNS_NAME_TESTNET",
+            "OHTTP_E2E_SIGNING_PUBKEY_TESTNET",
+        ];
+        let mut got = names.clone();
+        got.sort();
+        let mut want: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+        want.sort();
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn relay_for_is_none_without_configuration() {
         let networks = OhttpNetworks::default();

@@ -41,17 +41,6 @@ workspace.
 - OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
   empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
   remain supported when split into valid chunks. Public function signatures are unchanged.
-- OHTTP configuration is supplied at run time instead of build time, using
-  `zodl-ohttp-client` 1.0.0. Nothing is read from the build environment any more.
-  Breaking: `EngineConfig::new` takes an `ohttp: OhttpNetworks` argument;
-  `OhttpConnector::{new, dedicated, with_dialer}`, `relay_for`, `http_round_trip`,
-  `http_round_trip_with_dispatch` and `anchor::restore_anchor` take the configuration
-  as their first argument. `OhttpConfig`, `OhttpConfigParams`, `OhttpNetworks`,
-  `ConfigError` and `ConfigField` are re-exported from `zodl_slipstream::ohttp`. Each
-  network has all four values (gateway host, relay URL, keys DNS name, signing key) or
-  none, and mainnet and testnet share no value ignoring ASCII case. Gateway identity
-  comes from the exact configured DNS host, ignoring letter case. The CLI gains
-  `--ohttp-config <file>`.
 - Bounded Tor startup waits for traffic readiness before publishing a fresh
   connection, within the original admission/bootstrap/retry deadline. Legacy
   unbounded startup behavior is unchanged. No caller changes are needed.
@@ -125,6 +114,26 @@ workspace.
   `GetAddressUtxos` does too.
 
 ### Changed
+- **Breaking:** OHTTP configuration is supplied at run time instead of build time, using
+  `zodl-ohttp-client` 1.0.0. Nothing is read from the build environment any more, and no
+  endpoint or signing-key default is bundled. `EngineConfig::new` takes an
+  `ohttp: OhttpNetworks` argument. These take the configuration as their first argument
+  (`&OhttpNetworks`, or `Arc<OhttpNetworks>` where the call keeps it):
+  `grpc::{connect, connect_dedicated}`,
+  `connector::{connect_via, connect_direct_with_retry, connect_direct_dedicated_with_retry,
+  bulk_chunk_blocks, Connector::direct, Connector::with_tor}`,
+  `fetch::run_fetch`, `probe::probe_endpoints`, `OhttpConnector::{new, dedicated, with_dialer}`,
+  `relay_for`, `http_round_trip`, `http_round_trip_with_dispatch` and
+  `anchor::restore_anchor`. `TorConn::connect_isolated` takes it as a parameter, and
+  `enhance::run_enhancement_isolated` takes it inside its Tor isolation argument.
+  `OhttpConnector::{new, dedicated, with_dialer}` no longer take a `relay_url`: the relay
+  comes from the configuration. `relay_for` returns a reference into the configuration
+  instead of a `&'static str`. `OhttpConfig`, `OhttpConfigParams`, `OhttpNetworks`,
+  `ConfigError` and `ConfigField` are re-exported from `zodl_slipstream::ohttp`. Each
+  network has all four values (gateway host, relay URL, keys DNS name, signing key) or
+  none, and mainnet and testnet share no value ignoring ASCII case. Gateway identity
+  comes from the exact configured DNS host, ignoring letter case. The CLI gains
+  `--ohttp-config <file>`.
 - **Breaking:** `LwdClient` is now `CompactTxStreamerClient<LwdTransport>` instead of
   `CompactTxStreamerClient<Channel>`, so the next release after 0.4.0 needs a minor version
   bump. Connector functions still return `LwdClient`. Manual remote clients use
