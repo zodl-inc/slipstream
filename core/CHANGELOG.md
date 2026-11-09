@@ -41,13 +41,17 @@ workspace.
 - OHTTP decoding rejects individual plaintext response chunks above 64 KiB and authenticated
   empty non-final chunks. Gateways must use chunks of at most 64 KiB; larger total responses
   remain supported when split into valid chunks. Public function signatures are unchanged.
-- OHTTP uses `zodl-ohttp-client` 0.1.2 with explicit build-time gateway host,
-  relay URL, signing key and DNS name. Each network requires all four values or none.
-  `ZODL_OHTTP_REQUIRE=1` requires all eight values, and corresponding mainnet/testnet
-  values must differ ignoring ASCII case. Incomplete, malformed or shared
-  configuration fails the build. Zero, one or both complete networks are supported
-  with strict mode off. Gateway identity comes from exact configured DNS hosts,
-  ignoring letter case.
+- OHTTP configuration is supplied at run time instead of build time, using
+  `zodl-ohttp-client` 1.0.0. Nothing is read from the build environment any more.
+  Breaking: `EngineConfig::new` takes an `ohttp: OhttpNetworks` argument;
+  `OhttpConnector::{new, dedicated, with_dialer}`, `relay_for`, `http_round_trip`,
+  `http_round_trip_with_dispatch` and `anchor::restore_anchor` take the configuration
+  as their first argument. `OhttpConfig`, `OhttpConfigParams`, `OhttpNetworks`,
+  `ConfigError` and `ConfigField` are re-exported from `zodl_slipstream::ohttp`. Each
+  network has all four values (gateway host, relay URL, keys DNS name, signing key) or
+  none, and mainnet and testnet share no value ignoring ASCII case. Gateway identity
+  comes from the exact configured DNS host, ignoring letter case. The CLI gains
+  `--ohttp-config <file>`.
 - Bounded Tor startup waits for traffic readiness before publishing a fresh
   connection, within the original admission/bootstrap/retry deadline. Legacy
   unbounded startup behavior is unchanged. No caller changes are needed.

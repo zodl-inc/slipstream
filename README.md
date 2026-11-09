@@ -63,41 +63,28 @@ not.
 ## Build & test
 
 ```sh
-# Public synthetic configuration for hermetic transport tests.
-python3 scripts/tests/ohttp_configuration.py -- cargo test --workspace
-# Compile complete, absent and single-network states; reject partial or shared values.
-python3 scripts/tests/ohttp_configuration.py
-python3 -B -m unittest discover -s scripts/tests -p test_ohttp_env.py
-ruby scripts/tests/ohttp_workflow_test.rb
+cargo test --workspace
+ruby scripts/tests/ohttp_workflow_test.rb  # CI workflow contract
 cargo build --workspace  # full workspace incl. the parked gpuhash
 ```
 
 Edition 2024, Rust 1.90+. The OHTTP core is pinned to a private Git dependency;
 Cargo needs read access to `zodl-inc/zodl-ohttp`.
 
-Deployment builds supply `ZODL_OHTTP_GATEWAY_HOST_MAINNET`,
-`ZODL_OHTTP_GATEWAY_HOST_TESTNET`, `ZODL_OHTTP_RELAY_URL_MAINNET`,
-`ZODL_OHTTP_RELAY_URL_TESTNET`, `ZODL_OHTTP_SIGNING_PUBKEY_MAINNET`,
-`ZODL_OHTTP_SIGNING_PUBKEY_TESTNET`, `ZODL_OHTTP_KEYS_DNS_NAME_MAINNET` and
-`ZODL_OHTTP_KEYS_DNS_NAME_TESTNET` when compiling Cargo dependencies. These are
-build-time inputs with no bundled endpoint or signing-key defaults. Each network
-requires all four inputs or none. An incomplete network fails the build. With
-`ZODL_OHTTP_REQUIRE` unset or `0`, zero, one or both complete networks are supported.
-`ZODL_OHTTP_REQUIRE=1` requires all eight inputs. Corresponding mainnet/testnet
-values must differ ignoring ASCII case. Gateway matching ignores DNS letter case.
-GitHub CI requires all eight as Actions secrets (`secrets.ZODL_OHTTP_*`). A
-strict preflight rejects missing, empty, malformed or shared inputs before Rust
-caches or Cargo run. CI also sets `ZODL_OHTTP_REQUIRE=1`. A
-versioned digest of the original values binds native caches to the configuration.
-The preflight reads only the inherited environment and never fetches configuration.
-The native OHTTP core independently validates the same build contract. The strict
-policy flag is not a secret or part of the eight-input configuration digest.
+OHTTP configuration is a runtime argument, not a build input: nothing is read from
+the environment at compile time and no endpoint or signing-key default is bundled.
+Library callers pass an `OhttpNetworks` (re-exported from `zodl_slipstream::ohttp`
+with `OhttpConfig`, `OhttpConfigParams`, `ConfigError` and `ConfigField`) to
+`EngineConfig::new`. The CLI takes `--ohttp-config <file>`, a JSON file with optional
+`mainnet` and `testnet` objects, each holding `gateway_host`, `relay_url`,
+`keys_dns_name` and `signing_pubkey`. A network has all four values or none, and
+mainnet and testnet share no value (ignoring ASCII case). Gateway matching ignores
+DNS letter case.
 
-The test wrapper overrides these names with public example hosts and public test
-signing keys, without reading shell startup files or fetching configuration. Its
-configuration regression cases use `--locked --offline` after dependencies have
-been fetched. Explicitly requested live tests require real compiled configuration
-and the runtime relay variables described in their prerequisite errors.
+Tests build their configuration from public example hosts and public test signing
+keys (`*.example`), so plain `cargo test --workspace` needs no setup. Live network
+tests read `OHTTP_E2E_{GATEWAY_HOST,RELAY_URL,KEYS_DNS_NAME,SIGNING_PUBKEY}_{MAINNET,TESTNET}`
+at run time.
 
 ## Documentation
 
