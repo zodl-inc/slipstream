@@ -55,7 +55,7 @@ use crate::{
     config::Endpoint,
     error::SlipstreamError,
     grpc::{self, LwdClient, TrackedConnection},
-    ohttp::{Dialer, OhttpConnector, OhttpNetworks},
+    ohttp::{ConfigurationKey, Dialer, OhttpConnector, OhttpNetworks},
 };
 
 /// Why a lightwalletd connection is being opened — selects direct vs Tor.
@@ -151,13 +151,20 @@ const TOR_GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TOR_GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const TOR_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// One [`TorConn`] shared connection: the connection, the OHTTP configuration of its host it was
+/// opened under ([`ConfigurationKey`]; `None` for a host that was a plain server) and when it was
+/// opened.
+type SharedConnection = (TrackedConnection, Option<ConfigurationKey>, Instant);
+
 /// A bootstrapped arti Tor client, owned by the engine and driven on its own runtime.
 #[derive(Clone)]
 pub struct TorConn {
     client: Arc<TorClient<PreferredRuntime>>,
     client_trace_prefix: Option<String>,
-    /// [`TorMode::Shared`] connections, per endpoint (`host:port`), with their opening time.
-    shared: Arc<std::sync::Mutex<HashMap<String, (TrackedConnection, Instant)>>>,
+    /// [`TorMode::Shared`] connections, one per endpoint (`host:port`). Clones share them, and a
+    /// clone may serve a later session under another OHTTP configuration, so each is kept with
+    /// the configuration it was opened under.
+    shared: Arc<std::sync::Mutex<HashMap<String, SharedConnection>>>,
 }
 
 impl TorConn {
@@ -305,7 +312,8 @@ impl TorConn {
     }
 
     /// Drop the cached shared (`SyncShared`) connection to `endpoint` after a call on it failed, so
-    /// the next `SyncShared` connect opens a fresh one instead of reusing a broken channel.
+    /// the next `SyncShared` connect opens a fresh one instead of reusing a broken channel. It is
+    /// dropped whatever configuration it was opened under.
     pub fn forget_shared(&self, endpoint: &Endpoint) {
         let key = format!("{}:{}", endpoint.host, endpoint.port);
         self.shared
@@ -315,29 +323,51 @@ impl TorConn {
     }
 
     /// [`TorMode::Shared`]: hand out the cached connection to `endpoint` while it is younger than
-    /// [`SHARED_CONN_MAX_AGE`], else open one on the default circuit and cache it. A tonic
-    /// channel multiplexes concurrent calls and redials a broken transport itself; callers that
-    /// retry after a failure use an isolated connection, so a bad shared one is never retried
-    /// into.
+    /// [`SHARED_CONN_MAX_AGE`] and was opened under the configuration `networks` has for its
+    /// host, else open one on the default circuit and cache it in its place. A connection opened
+    /// under another configuration (another relay, signer or network for the gateway, or OHTTP
+    /// turned on or off for the host) is never handed out. A tonic channel multiplexes concurrent
+    /// calls and redials a broken transport itself; callers that retry after a failure use an
+    /// isolated connection, so a bad shared one is never retried into.
     async fn connect_shared(
         &self,
         networks: &OhttpNetworks,
         endpoint: &Endpoint,
     ) -> Result<TrackedConnection, SlipstreamError> {
+        self.shared_or_open(networks, endpoint, || {
+            Box::pin(self.connect(networks, TorMode::Default, endpoint))
+        })
+        .await
+    }
+
+    /// [`Self::connect_shared`], with `open` opening the connection when none can be reused
+    /// (the tests open one without a network).
+    async fn shared_or_open<F, Fut>(
+        &self,
+        networks: &OhttpNetworks,
+        endpoint: &Endpoint,
+        open: F,
+    ) -> Result<TrackedConnection, SlipstreamError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<TrackedConnection, SlipstreamError>>,
+    {
         let key = format!("{}:{}", endpoint.host, endpoint.port);
+        let configuration = ConfigurationKey::of(networks, &endpoint.host);
         {
             let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((client, opened)) = shared.get(&key)
+            if let Some((client, opened_under, opened)) = shared.get(&key)
+                && *opened_under == configuration
                 && opened.elapsed() < SHARED_CONN_MAX_AGE
             {
                 return Ok(client.clone());
             }
         }
-        let client = Box::pin(self.connect(networks, TorMode::Default, endpoint)).await?;
+        let client = open().await?;
         self.shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (client.clone(), Instant::now()));
+            .insert(key, (client.clone(), configuration, Instant::now()));
         Ok(client)
     }
 
@@ -913,6 +943,60 @@ mod tests {
         assert!(!error.counts_as_unreachable());
         assert_eq!(attempts.get(), 1, "return to caller backoff immediately");
         assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A Tor client, and with it its shared connections, outlives a session: a later session of
+    /// the same handle may run under another OHTTP configuration. A shared connection is reused
+    /// only under the configuration of its host it was opened under; another signer for the
+    /// gateway's network, or no configuration at all, gets a connection of its own.
+    /// `forget_shared` drops the endpoint's connection whatever it was opened under.
+    #[tokio::test]
+    async fn shared_connection_is_not_reused_under_another_configuration() {
+        use crate::ohttp::tests::{example_networks, example_testnet_with_another_signer};
+        let tor = TorConn::from_client(
+            arti_client::TorClient::builder()
+                .create_unbootstrapped()
+                .expect("unbootstrapped tor client"),
+            None,
+        );
+        let endpoint = ohttp_endpoint();
+        let opens = std::cell::Cell::new(0);
+        // Opens a connection without any network: a lazy channel, counted.
+        let open = || {
+            opens.set(opens.get() + 1);
+            std::future::ready(Ok(TrackedConnection::plain(LwdClient::new(
+                TonicEndpoint::from_static("http://shared-connection.invalid")
+                    .connect_lazy()
+                    .into(),
+            ))))
+        };
+
+        // An earlier session opened the endpoint's shared connection under the example
+        // configuration; the same configuration reuses it.
+        for _ in 0..2 {
+            tor.shared_or_open(&example_networks(), &endpoint, open)
+                .await
+                .expect("a connection");
+        }
+        assert_eq!(opens.get(), 1, "the same configuration reuses it");
+
+        for (other, case) in [
+            (example_testnet_with_another_signer(), "another signer"),
+            (OhttpNetworks::default(), "OHTTP turned off for the host"),
+            (example_networks(), "OHTTP turned on again"),
+        ] {
+            let before = opens.get();
+            tor.shared_or_open(&other, &endpoint, open)
+                .await
+                .expect("a connection");
+            assert_eq!(opens.get(), before + 1, "{case}: opens its own connection");
+        }
+
+        tor.forget_shared(&endpoint);
+        tor.shared_or_open(&example_networks(), &endpoint, open)
+            .await
+            .expect("a connection");
+        assert_eq!(opens.get(), 5, "a forgotten connection is not reused");
     }
 
     #[tokio::test]

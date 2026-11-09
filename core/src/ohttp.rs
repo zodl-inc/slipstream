@@ -265,9 +265,10 @@ struct SharedKeyId {
 /// Every value of the configuration a client works under: its gateway's network and that
 /// network's gateway host, relay URL, keys DNS name and signing key. The cache keys hold the
 /// values themselves (an [`OhttpConfig`] is not `Hash`), so that nothing cached under one
-/// configuration serves another, a key verified under another signer included.
+/// configuration serves another, a key verified under another signer included. The Tor
+/// client's shared connections are kept with it too (`connector::TorConn`).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct ConfigurationKey {
+pub(crate) struct ConfigurationKey {
     network: &'static str,
     gateway_host: String,
     relay_url: String,
@@ -278,7 +279,7 @@ struct ConfigurationKey {
 impl ConfigurationKey {
     /// The key of the configuration `networks` has for `gateway_host`'s network; `None` for a
     /// host that is not the gateway of a configured network.
-    fn of(networks: &OhttpNetworks, gateway_host: &str) -> Option<Self> {
+    pub(crate) fn of(networks: &OhttpNetworks, gateway_host: &str) -> Option<Self> {
         let network = gateway_network(networks, gateway_host).ok()?;
         let config = networks.get(network)?;
         Some(Self {
@@ -11056,6 +11057,20 @@ pub(crate) mod tests {
         example_networks_signed_by(FIXTURE_SIGNING_KEY)
     }
 
+    /// [`example_networks`]' testnet configuration with another signing key, the RFC 8032 §7.1
+    /// TEST 1 public key (the example mainnet key), and mainnet off: a configuration that differs
+    /// from the example one for the testnet gateway only in its signing key.
+    pub(crate) fn example_testnet_with_another_signer() -> OhttpNetworks {
+        let testnet = OhttpConfig::new(OhttpConfigParams {
+            gateway_host: TESTNET_GATEWAY,
+            relay_url: TESTNET_RELAY,
+            keys_dns_name: TESTNET_KEYS_DNS_NAME,
+            signing_pubkey: MAINNET_SIGNING_KEY,
+        })
+        .expect("an example configuration");
+        OhttpNetworks::new(None, Some(testnet)).expect("one network")
+    }
+
     /// The example configuration with `testnet_signing_key` as the testnet signing key.
     fn example_networks_signed_by(testnet_signing_key: &str) -> OhttpNetworks {
         let config = |gateway_host, relay_url, keys_dns_name, signing_pubkey| {
@@ -11178,7 +11193,7 @@ pub(crate) mod tests {
     async fn client_cache_key_covers_whole_configuration() {
         let relay = "https://relay-cache-configuration.invalid/relay";
         let first = example_networks();
-        let second = fixture_networks();
+        let second = example_testnet_with_another_signer();
         let key = |networks: &OhttpNetworks| {
             ClientCacheKey::new(
                 networks,
