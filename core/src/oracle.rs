@@ -2136,21 +2136,33 @@ mod tests {
         /// top of a `tree_size`-leaf tree: the block at START + `first` + `j` holds position
         /// `tree_size + j`.
         fn chain_at(first: u64, tree_size: u64, count: u64) -> Vec<CompactBlock> {
+            chain_at_without_outputs(first, tree_size, count, &[])
+        }
+
+        /// [`chain`], except that the blocks `without` (indexes from START) hold no output
+        /// at all: a block after one of them holds the position one below [`chain`]'s.
+        fn chain_without_outputs(base_size: u64, count: u64, without: &[u64]) -> Vec<CompactBlock> {
+            chain_at_without_outputs(0, base_size, count, without)
+        }
+
+        /// [`chain_at`], except that the blocks `without` (indexes from START) hold no
+        /// output at all; the tree size grows only with the blocks that hold one.
+        fn chain_at_without_outputs(
+            first: u64,
+            tree_size: u64,
+            count: u64,
+            without: &[u64],
+        ) -> Vec<CompactBlock> {
+            let mut size = tree_size;
             (0..count)
                 .map(|j| {
                     let i = first + j;
                     let height = START + i;
-                    CompactBlock {
-                        height,
-                        hash: h32(0xBB, height).to_vec(),
-                        prev_hash: if i == 0 {
-                            vec![0u8; 32]
-                        } else {
-                            h32(0xBB, height - 1).to_vec()
-                        },
-                        time: height as u32,
-                        header: vec![],
-                        vtx: vec![CompactTx {
+                    let vtx = if without.contains(&i) {
+                        vec![]
+                    } else {
+                        size += 1;
+                        vec![CompactTx {
                             index: 0,
                             txid: h32(0x77, height).to_vec(),
                             fee: 0,
@@ -2162,10 +2174,21 @@ mod tests {
                             }],
                             actions: vec![],
                             ..Default::default()
-                        }],
+                        }]
+                    };
+                    CompactBlock {
+                        height,
+                        hash: h32(0xBB, height).to_vec(),
+                        prev_hash: if i == 0 {
+                            vec![0u8; 32]
+                        } else {
+                            h32(0xBB, height - 1).to_vec()
+                        },
+                        time: height as u32,
+                        header: vec![],
+                        vtx,
                         chain_metadata: Some(ChainMetadata {
-                            sapling_commitment_tree_size: u32::try_from(tree_size + j + 1)
-                                .expect("fits"),
+                            sapling_commitment_tree_size: u32::try_from(size).expect("fits"),
                             orchard_commitment_tree_size: 0,
                             ironwood_commitment_tree_size: 0,
                         }),
@@ -2605,14 +2628,16 @@ mod tests {
         /// R = [20, 150) in two units, on a 50-block anchor grid from START. R crosses into
         /// shard 1 at block 40, so the range-end finish builds its shard-1 rows. Scans one
         /// wallet with graft off and one with graft on, the chain tip `tip_lead` blocks
-        /// above the last block, and returns them in that order.
+        /// above the last block, and returns them in that order. The blocks
+        /// `without_outputs` (indexes from START) hold no output ([`chain_without_outputs`]).
         async fn tip_range_then_r(
             root: &Path,
             tip_lead: u64,
-        ) -> (std::path::PathBuf, std::path::PathBuf) {
+            without_outputs: &[u64],
+        ) -> GraftPair {
             let base_size = SHARD - 40;
             let base = base_frontier(base_size);
-            let blocks = chain(base_size, 300);
+            let blocks = chain_without_outputs(base_size, 300, without_outputs);
             let tip = blocks.last().expect("blocks").height + tip_lead;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
@@ -2656,7 +2681,20 @@ mod tests {
             }
             let on = dirs.pop().expect("graft-on wallet");
             let off = dirs.pop().expect("graft-off wallet");
-            (off, on)
+            GraftPair {
+                off,
+                on,
+                base,
+                blocks,
+            }
+        }
+
+        /// The two wallets [`tip_range_then_r`] scans, and the chain they scanned.
+        struct GraftPair {
+            off: std::path::PathBuf,
+            on: std::path::PathBuf,
+            base: Frontier<sapling::Node, 32>,
+            blocks: Vec<CompactBlock>,
         }
 
         /// Graft on leaves the same wallet as graft off, checkpoint rows and retained marks
@@ -2694,8 +2732,8 @@ mod tests {
         async fn finish_keeps_anchors_when_the_checkpoint_budget_is_full() {
             let root = tempfile::tempdir().expect("tempdir");
             // Not deep: the ChainTip stand-in fills the 100-checkpoint window.
-            let (off, on) = tip_range_then_r(root.path(), 0).await;
-            assert_matches_graft_off(&off, &on);
+            let pair = tip_range_then_r(root.path(), 0, &[]).await;
+            assert_matches_graft_off(&pair.off, &pair.on);
         }
 
         /// Buffered rows are built in a later call than the one that scanned them, so they
@@ -2706,8 +2744,34 @@ mod tests {
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn deferred_builds_keep_no_deep_history_checkpoints_but_the_anchors() {
             let root = tempfile::tempdir().expect("tempdir");
-            let (off, on) = tip_range_then_r(root.path(), 20_000).await;
-            assert_matches_graft_off(&off, &on);
+            let pair = tip_range_then_r(root.path(), 20_000, &[]).await;
+            assert_matches_graft_off(&pair.off, &pair.on);
+        }
+
+        /// An anchor-grid block with no Sapling output gets its Sapling checkpoint at the
+        /// end of the last block below it that has one (upstream's `batch_checkpoints`).
+        /// When that block end lies in a shard the graft accumulator buffers, the planned
+        /// checkpoint travels on the buffered row and is created with its leaf by the build
+        /// that inserts the row (here the range-end finish, deep below the tip, where the
+        /// row's own block end keeps no checkpoint). Added to the store on its own, the
+        /// checkpoint would point into a leaf that build merges away, and the root at the
+        /// anchor could not be computed: an anchor the wallet holds but cannot prove against.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn an_anchor_planned_onto_a_buffered_row_keeps_its_leaf() {
+            let root = tempfile::tempdir().expect("tempdir");
+            // Blocks 50 and 100 (R's anchors, both in its buffered shard 1) hold no output:
+            // their checkpoints are planned onto the ends of blocks 49 and 99.
+            let pair = tip_range_then_r(root.path(), 20_000, &[50, 100]).await;
+            for (name, dir) in [("graft-off", &pair.off), ("graft-on", &pair.on)] {
+                for (anchor, idx) in R_ANCHORS.iter().zip([50, 100]) {
+                    assert_eq!(
+                        sapling_root_at(dir, *anchor),
+                        Ok(Some(chain_root_at(&pair.base, &pair.blocks, idx))),
+                        "[{name}] the root at R's anchor {anchor} is the chain's"
+                    );
+                }
+            }
+            assert_matches_graft_off(&pair.off, &pair.on);
         }
 
         fn summarize(rows: &[(i64, i64, i64)]) -> String {

@@ -699,9 +699,11 @@ struct PoolPlan<H> {
 /// own-pool checkpoint TABLE entries come exclusively from the
 /// `from_iter → insert_tree(subtree, checkpoints)` path — buffered rows'
 /// checkpoints were never inserted at their origin chunk, so a deferred build
-/// MUST carry them. Stale (below-window) ones are handled by the SAME
-/// doomed-cutoff downgrade every build already applies (the first fixture run
-/// stripped them instead and lost 97 of 100 checkpoint rows vs the OFF path).
+/// MUST carry them: the block ends kept for the window as of their batch, and the
+/// planned checkpoints carried onto rows at their positions (`sparse_put_blocks`).
+/// A kept block end that has since fallen below the window is demoted by the SAME
+/// `assign_block_end_retention` every build applies (the first fixture run stripped
+/// them instead and lost 97 of 100 checkpoint rows vs the OFF path).
 fn rows_to_segment<H>(rows: Vec<crate::graft_accumulator::AccRow<H>>) -> Option<BuildSegment<H>> {
     let first = rows.first()?.0;
     let seg = rows.into_iter().map(|(_, h, r)| Some((h, r))).collect();
@@ -1289,11 +1291,15 @@ where
 /// upstream's by construction, not by a mirrored rule.
 ///
 /// The chain tip is read once, before the transaction, as upstream's `WalletDb::put_blocks`
-/// reads it: it fixes the batch's checkpoint floor ([`checkpoint_floor`]) for the graft
-/// plan and the transaction alike. A batch deep below the tip keeps no block-end
-/// checkpoint but the durable anchors, in every build path — the rows the graft
-/// accumulator buffers are built later with the floor of that later time
-/// (`insert_deferred_rows`).
+/// reads it, and the checkpoint planning runs there too, on the batch's streams as scanned
+/// (the very streams `put_blocks_rows` returns): it fixes the batch's checkpoint floor
+/// ([`checkpoint_floor`]) for the graft plan and the transaction alike, and the graft
+/// streams are fed with their block-end retentions assigned for the batch, so a row the
+/// accumulator buffers carries the checkpoint planned at its position (an anchor on a
+/// block without a commitment in its pool) into whichever later build inserts it. A batch
+/// deep below the tip keeps no block-end checkpoint but the durable anchors, in every
+/// build path — the rows the graft accumulator buffers are built later with the floor of
+/// that later time (`insert_deferred_rows`).
 #[allow(clippy::too_many_lines)]
 // sapling::Note / orchard::Note do not implement Copy; clippy false-positive on .clone()
 #[allow(clippy::clone_on_copy)]
@@ -1356,25 +1362,89 @@ pub fn sparse_put_blocks(
     // reads it before calling `put_blocks`.
     let chain_tip = inner.chain_height().map_err(PutBlocksError::Wallet)?;
 
+    // ── Checkpoint planning — upstream's, on the streams as scanned ──────────────
+    // This call's per-pool commitment streams, as `put_blocks_rows` returns them in the
+    // transaction below (each block's commitments in block order, with the scanner's
+    // `Checkpoint` retention still on every block end). The planning is a pure function
+    // of them, the batch's bounds and the tip, so it runs here, before the graft plan:
+    // a checkpoint it plans at a position the graft accumulator buffers must travel with
+    // that row (below). Cross-pool by nature (each tree gains a checkpoint at every
+    // height another tree checkpoints), so it runs once, serially.
+    let last_block_height = blocks.last().map_or(initial_block.height(), |b| b.height());
+    let mut sap_stream = vec![];
+    let mut orch_stream = vec![];
+    let mut iw_stream = vec![];
+    for block in &blocks {
+        sap_stream.extend(block.sapling().commitments().iter().cloned().map(Some));
+        orch_stream.extend(block.orchard().commitments().iter().cloned().map(Some));
+        iw_stream.extend(block.ironwood().commitments().iter().cloned().map(Some));
+    }
+    let BatchCheckpoints {
+        checkpoint_floor,
+        sapling: mut missing_sapling,
+        orchard: mut missing_orchard,
+        ironwood: missing_ironwood,
+    } = batch_checkpoints(
+        from_state,
+        last_block_height,
+        chain_tip,
+        anchor_floor,
+        &sap_stream,
+        &orch_stream,
+        &iw_stream,
+    );
+    // The retention assignment of the graft streams below: its demotions, and its time
+    // in each pool's `downgrade` bucket.
+    let mut pre_downgraded = 0u64;
+    let mut sap_pre_assign_ms = 0u128;
+    let mut orch_pre_assign_ms = 0u128;
+
     // ── v0.4 Plan A pre-txn phase (Task 7b rev 2) — graft-ON lanes only ────────
-    // Borrow-extract this call's per-pool streams + note positions, feed the
-    // accumulators, persist Buffer rows on the side connection (the main txn is
-    // not open yet — no lock conflict; ordering+idempotency per graft.rs), and
-    // hand the closure a build plan. `None` plans = today's path verbatim.
+    // Borrow-extract this call's note positions, feed the accumulators the streams,
+    // persist Buffer rows on the side connection (the main txn is not open yet — no
+    // lock conflict; ordering+idempotency per graft.rs), and hand the closure a build
+    // plan. `None` plans = today's path verbatim.
     //
-    // The streams carry the scanner's retentions as scanned: a row's block end keeps
-    // or gives up its checkpoint when the row is BUILT (this call's segments below, a
-    // later call's deferred build), under the floor of that build.
+    // The streams are fed with their block-end retentions ASSIGNED for this batch
+    // (`assign_block_end_retention` under the batch's floor), as upstream assigns them
+    // before it builds: a block end inside the checkpoint window or on the anchor grid
+    // keeps its checkpoint, any other gives it up, and one at a position the planning
+    // mapped a checkpoint to CARRIES that checkpoint's height. A row the accumulator
+    // buffers so carries the anchor planned at its position into every later build of
+    // it (`plan_pool`'s `contains_anchor` falls a clean shard holding one back to the
+    // built path; `keeps_checkpoint` keeps it when the row is built), and the carried
+    // entry leaves `missing_*`, so `update_tree` adds only the entries no row carries.
+    // Fed as scanned, the entry went to the store as a checkpoint at a position whose
+    // leaf the row's later build merged away (a graft, or a build demoting the row's own
+    // block end), and no root could be computed at that anchor. A block end kept here
+    // for the window is demoted by the build that finds it below the floor of its time
+    // (this call's segments, a later call's deferred build): the floor only rises.
     let (sap_plan, orch_plan, graft_cleanup) = if let Some(ctx) = graft.as_mut() {
         let sap_start_u64 = from_state.final_sapling_tree().tree_size();
         let orch_start_u64 = from_state.final_orchard_tree().tree_size();
-        let mut sap_stream = vec![];
-        let mut orch_stream = vec![];
+        let t = std::time::Instant::now();
+        pre_downgraded += assign_retention(
+            &mut sap_stream,
+            Position::from(sap_start_u64),
+            checkpoint_floor,
+            anchor_floor,
+            &mut missing_sapling,
+        );
+        sap_pre_assign_ms = t.elapsed().as_millis();
+        let t = std::time::Instant::now();
+        pre_downgraded += assign_retention(
+            &mut orch_stream,
+            Position::from(orch_start_u64),
+            checkpoint_floor,
+            anchor_floor,
+            &mut missing_orchard,
+        );
+        orch_pre_assign_ms = t.elapsed().as_millis();
+        let sap_stream: Vec<_> = sap_stream.into_iter().flatten().collect();
+        let orch_stream: Vec<_> = orch_stream.into_iter().flatten().collect();
         let mut sap_notes = vec![];
         let mut orch_notes = vec![];
         for block in &blocks {
-            sap_stream.extend(block.sapling().commitments().iter().cloned());
-            orch_stream.extend(block.orchard().commitments().iter().cloned());
             for wtx in block.transactions() {
                 sap_notes.extend(
                     wtx.sapling_outputs()
@@ -1468,12 +1538,7 @@ pub fn sparse_put_blocks(
 
     // Capture block heights before moving blocks into the transactionally closure.
     let first_height = u32::from(initial_block.height());
-    let last_height = u32::from(
-        blocks
-            .last()
-            .map(|b| b.height())
-            .unwrap_or(initial_block.height()),
-    );
+    let last_height = u32::from(last_block_height);
 
     let t_txn = std::time::Instant::now();
     inner.transactionally::<_, _, LaneTxnError>(|wdb| {
@@ -1519,25 +1584,12 @@ pub fn sparse_put_blocks(
         if let Some(last_scanned_height) = last_scanned_height {
             let t_tree = std::time::Instant::now();
 
-            // ── Checkpoint planning — upstream's, on the streams as scanned ──
-            // Cross-pool by nature (each tree gains a checkpoint at every height
-            // another tree checkpoints), so it runs serially before the per-pool
-            // parallel section. The streams must still carry the scanner's
-            // `Checkpoint` retention on every block end here: the planning reads
-            // the block-end positions before any demotion.
-            let BatchCheckpoints {
-                checkpoint_floor,
-                sapling: missing_sapling,
-                orchard: missing_orchard,
-                ironwood: missing_ironwood,
-            } = batch_checkpoints(
-                from_state,
-                last_scanned_height,
-                chain_tip,
-                anchor_floor,
-                &sapling_commitments,
-                &orchard_commitments,
-                &ironwood_commitments,
+            // The checkpoint planning (`checkpoint_floor`, `missing_*`) ran before the
+            // transaction, on these very streams as scanned (above); with graft on, the
+            // entries the graft streams carry have left `missing_sapling` / `missing_orchard`.
+            debug_assert_eq!(
+                last_scanned_height, last_block_height,
+                "put_blocks_rows ends the batch at its last block"
             );
 
             // ── T6.8 parallel per-pool tree work ──────────────────────────────
@@ -1851,11 +1903,13 @@ pub fn sparse_put_blocks(
                 iw_downgraded
             };
 
-            downgraded = sap_downgraded + orch_downgraded + iw_downgraded;
+            downgraded = pre_downgraded + sap_downgraded + orch_downgraded + iw_downgraded;
             sap_tree_ms = sap_timers.total_ms;
             orch_tree_ms = orch_timers.total_ms;
             sap_split = sap_timers;
             orch_split = orch_timers;
+            sap_split.downgrade_ms += sap_pre_assign_ms;
+            orch_split.downgrade_ms += orch_pre_assign_ms;
 
             tree_ms = t_tree.elapsed().as_millis();
             if let Some(t) = timings {
@@ -2212,11 +2266,12 @@ struct PoolTimers {
 /// Insert rows whose build was deferred (the range-end finish's, or a stranded run the
 /// pass-start sweep builds) into `tree`, as every build in `sparse_put_blocks` inserts:
 /// the block-end retentions assigned under the checkpoint floor of NOW
-/// ([`checkpoint_floor`] of `chain_tip`, or of the rows' own last block when the tip is
-/// unknown), then each subtree with its anchors PRE-registered. A deferred build adds no
-/// planned checkpoint of its own: the batch that scanned these rows planned its
-/// checkpoints when it ran, and `update_tree` added those at positions it did not build
-/// then. Shardtree's excess-checkpoint prune runs INSIDE insert_tree, so with the store at
+/// ([`checkpoint_floor`] of `chain_tip`, or of the rows' highest checkpoint when the tip
+/// is unknown), then each subtree with its anchors PRE-registered. A deferred build plans no
+/// checkpoint of its own: the batch that scanned these rows planned its checkpoints when
+/// it ran, and an entry at a position it buffered travels on that row's retention
+/// (`sparse_put_blocks`), so it is created here with its leaf, as any kept block end is.
+/// Shardtree's excess-checkpoint prune runs INSIDE insert_tree, so with the store at
 /// its budget (the ChainTip range's window) an anchor retained only afterwards is already
 /// gone, and flush_* writes retained marks only for ids the store retains (\[B6\]). `rows`
 /// must be one contiguous run; they are laid out from the first row's position. Returns
