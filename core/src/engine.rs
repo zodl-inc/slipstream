@@ -166,8 +166,15 @@ pub async fn probe_tip(
     tor: Option<&TorConn>,
 ) -> Result<u64, SlipstreamError> {
     // Public tip data (ZIP circuit isolation policy): the session's shared connection.
-    let client = connect_via(&config.endpoint, tor, ConnPurpose::SyncShared).await?;
+    let client = connect_via(
+        &config.ohttp,
+        &config.endpoint,
+        tor,
+        ConnPurpose::SyncShared,
+    )
+    .await?;
     let tip = grpc::with_ohttp_endpoint(
+        &config.ohttp,
         &config.endpoint,
         tor.is_some(),
         client.call(async |client| grpc::get_latest_block_height(client).await),
@@ -262,7 +269,13 @@ pub async fn sync_once(
     let wire_probe_ms = probe_elapsed.as_secs_f64() * 1e3;
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
-    let client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
+    let client = connect_via(
+        &config.ohttp,
+        &config.endpoint,
+        tor,
+        ConnPurpose::MetadataUnique,
+    )
+    .await?;
 
     // Per-account bootstrap (for hosts without their own account manager — the CLI and
     // tests; production hosts import directly into the wallet DB). Each key is imported
@@ -274,6 +287,7 @@ pub async fn sync_once(
             continue;
         }
         let birthday_ts = grpc::with_ohttp_endpoint(
+            &config.ohttp,
             &config.endpoint,
             tor.is_some(),
             client.call(async |client| {
@@ -301,6 +315,7 @@ pub async fn sync_once(
         session.next_subtree_root_start()?
     };
     let roots = grpc::with_ohttp_endpoint(
+        &config.ohttp,
         &config.endpoint,
         tor.is_some(),
         client.call(async |client| {
@@ -323,6 +338,7 @@ pub async fn sync_once(
     );
 
     let tip = grpc::with_ohttp_endpoint(
+        &config.ohttp,
         &config.endpoint,
         tor.is_some(),
         client.call(async |client| grpc::get_latest_block_height(client).await),
@@ -349,8 +365,11 @@ pub async fn sync_once(
     // GetAddressUtxos names the wallet's addresses: with Tor on it gets a circuit of its own.
     let transparent = match tor {
         Some(t) => {
-            let utxo_client = t.connect_isolated_tracked(&config.endpoint).await?;
+            let utxo_client = t
+                .connect_isolated_tracked(&config.ohttp, &config.endpoint)
+                .await?;
             grpc::with_ohttp_endpoint(
+                &config.ohttp,
                 &config.endpoint,
                 true,
                 utxo_client.call(async |client| {
@@ -361,6 +380,7 @@ pub async fn sync_once(
         }
         None => {
             grpc::with_ohttp_endpoint(
+                &config.ohttp,
                 &config.endpoint,
                 false,
                 client.call(async |client| {
@@ -410,18 +430,19 @@ pub async fn sync_once(
                 warn!(
                     measured_mbps = format!("{measured_mbps:.2}").as_str(),
                     floor_mbps = format!("{floor_mbps:.2}").as_str(),
-                    from = crate::ohttp::log_host(&attempt_config.endpoint.host),
+                    from = crate::ohttp::log_host(&config.ohttp, &attempt_config.endpoint.host),
                     switch = wire_switches,
                     "wire collapse — failing over"
                 );
                 cooled.push(attempt_config.endpoint.clone());
                 let current_is_gateway =
-                    crate::ohttp::relay_for(&attempt_config.endpoint.host).is_some();
+                    crate::ohttp::relay_for(&config.ohttp, &attempt_config.endpoint.host).is_some();
                 let mut candidates: Vec<Endpoint> = std::iter::once(config.endpoint.clone())
                     .chain(config.alternate_endpoints.iter().cloned())
                     .filter(|e| {
                         !cooled.contains(e)
-                            && crate::ohttp::relay_for(&e.host).is_some() == current_is_gateway
+                            && crate::ohttp::relay_for(&config.ohttp, &e.host).is_some()
+                                == current_is_gateway
                     })
                     .collect();
                 if candidates.is_empty() {
@@ -432,7 +453,8 @@ pub async fn sync_once(
                         .chain(config.alternate_endpoints.iter().cloned())
                         .filter(|e| {
                             *e != attempt_config.endpoint
-                                && crate::ohttp::relay_for(&e.host).is_some() == current_is_gateway
+                                && crate::ohttp::relay_for(&config.ohttp, &e.host).is_some()
+                                    == current_is_gateway
                         })
                         .collect();
                 }
@@ -440,6 +462,7 @@ pub async fn sync_once(
                     candidates.remove(0)
                 } else {
                     let outcome = crate::probe::probe_endpoints(
+                        Arc::clone(&config.ohttp),
                         &candidates,
                         crate::probe::DEFAULT_PROBE_BUDGET,
                     )
@@ -447,7 +470,7 @@ pub async fn sync_once(
                     candidates.swap_remove(outcome.chosen)
                 };
                 info!(
-                    to = crate::ohttp::log_host(&next.host),
+                    to = crate::ohttp::log_host(&config.ohttp, &next.host),
                     port = next.port,
                     "wire failover committed"
                 );
@@ -471,6 +494,7 @@ pub async fn sync_once(
     // reports total enhancement time (per-range runs + this final run) correctly.
     let enhance_started = Instant::now();
     let final_enhance = grpc::with_ohttp_endpoint(
+        &config.ohttp,
         &config.endpoint,
         tor.is_some(),
         client.call(async |client| {
@@ -480,7 +504,7 @@ pub async fn sync_once(
                 config.network,
                 progress.clone(),
                 &mut skipped_keys,
-                tor.map(|t| (t, &config.endpoint)),
+                tor.map(|t| (&config.ohttp, t, &config.endpoint)),
             )
             .await
         }),
@@ -620,6 +644,7 @@ mod tests {
                 port: 1,
                 tls: false,
             },
+            crate::ohttp::OhttpNetworks::default(),
         );
         let ufvk = UnifiedFullViewingKey::decode(
             &zcash_protocol::consensus::Network::MainNetwork,

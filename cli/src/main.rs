@@ -21,7 +21,7 @@
 
 use clap::{Parser, Subcommand};
 use zcash_protocol::consensus::Parameters;
-use zodl_slipstream::{BlockHeight, UnifiedFullViewingKey};
+use zodl_slipstream::{BlockHeight, UnifiedFullViewingKey, ohttp::OhttpNetworks};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -514,7 +514,15 @@ async fn run_fetch_bench(
     let (tx, mut rx) = zodl_slipstream::chunk::chunk_queue(256 * 1024 * 1024);
     let drain = tokio::spawn(async move { while let Some((_c, _p, _b)) = rx.recv().await {} });
     let plan = zodl_slipstream::fetch::FetchPlan::new(start, end, chunk, streams);
-    let stats = zodl_slipstream::fetch::run_fetch(endpoint, None, plan, tx, None).await?;
+    let stats = zodl_slipstream::fetch::run_fetch(
+        std::sync::Arc::new(OhttpNetworks::default()),
+        endpoint,
+        None,
+        plan,
+        tx,
+        None,
+    )
+    .await?;
     let _ = drain.await;
     Ok(stats)
 }
@@ -674,7 +682,12 @@ fn cmd_watch(
         std::process::exit(2)
     });
     let db_path = wallet_dir.join("data.db");
-    let cfg = zodl_slipstream::EngineConfig::new(network, db_path.clone(), endpoint);
+    let cfg = zodl_slipstream::EngineConfig::new(
+        network,
+        db_path.clone(),
+        endpoint,
+        OhttpNetworks::default(),
+    );
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
@@ -921,7 +934,12 @@ fn cmd_bench(
     };
 
     let json_path = json.unwrap_or_else(|| dir.join("bench.json"));
-    let mut cfg = zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint);
+    let mut cfg = zodl_slipstream::EngineConfig::new(
+        network,
+        dir.join("data.db"),
+        endpoint,
+        OhttpNetworks::default(),
+    );
     cfg.gpu_subtree = gpu_subtree;
     // v0.4 Plan A lever (Task 8+): live A/B switch — the whole point of bench.
     cfg.graft_subtree = graft;
@@ -1063,7 +1081,12 @@ fn cmd_sync(
         std::process::exit(2)
     });
 
-    let mut cfg = zodl_slipstream::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
+    let mut cfg = zodl_slipstream::EngineConfig::new(
+        network,
+        wallet_dir.join("data.db"),
+        endpoint,
+        OhttpNetworks::default(),
+    );
     cfg.fetch_streams = streams;
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
@@ -1315,8 +1338,12 @@ fn cmd_oracle(
                   write_behind: bool,
                   gpu_subtree: bool,
                   persist_depth: usize| {
-        let mut cfg =
-            zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
+        let mut cfg = zodl_slipstream::EngineConfig::new(
+            network,
+            dir.join("data.db"),
+            endpoint.clone(),
+            OhttpNetworks::default(),
+        );
         cfg.fetch_streams = streams;
         cfg.chunk_blocks = chunk;
         cfg.sparse_persistence = sparse;
@@ -1584,7 +1611,8 @@ fn cmd_send(
         .expect("tokio runtime");
     let (code, message) = rt
         .block_on(async {
-            let mut client = zodl_slipstream::grpc::connect(&endpoint).await?;
+            let mut client =
+                zodl_slipstream::grpc::connect(&OhttpNetworks::default(), &endpoint).await?;
             zodl_slipstream::grpc::send_transaction(&mut client, raw).await
         })
         .expect("broadcast");

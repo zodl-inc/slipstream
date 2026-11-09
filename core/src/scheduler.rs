@@ -686,6 +686,7 @@ pub async fn run_to_completion(
         // local-mode boundary is audited is decided scan-side, so local mode
         // still fetches every boundary here.
         {
+            let networks = Arc::clone(&config.ohttp);
             let ep = config.endpoint.clone();
             let tor_owned = tor.cloned();
             let boundary_progress = progress.clone();
@@ -694,11 +695,13 @@ pub async fn run_to_completion(
                 if !needs_server_boundary_state(local_mode, true, end_height, end) {
                     return None;
                 }
+                let networks = Arc::clone(&networks);
                 let ep = ep.clone();
                 let tor_owned = tor_owned.clone();
                 let progress = boundary_progress.clone();
                 Some(tokio::spawn(async move {
                     crate::grpc::retry_get_tree_state(
+                        &networks,
                         &ep,
                         end_height,
                         "boundary prefetch (fetch-side)",
@@ -712,8 +715,11 @@ pub async fn run_to_completion(
         }
         // Smaller plan chunks when bulk rides OHTTP (whole-chunk buffered responses, gateway
         // response cap) — connector::bulk_chunk_blocks; unchanged for direct gRPC.
-        let chunk_blocks =
-            crate::connector::bulk_chunk_blocks(config.chunk_blocks, &config.endpoint);
+        let chunk_blocks = crate::connector::bulk_chunk_blocks(
+            &config.ohttp,
+            config.chunk_blocks,
+            &config.endpoint,
+        );
         let mut plan = FetchPlan::new(start, end, chunk_blocks, config.fetch_streams);
         // T6.8-S: byte-budgeted sub-chunk splitting (sandblasting-era survival).
         plan.split_bytes = config.chunk_split_bytes;
@@ -727,7 +733,7 @@ pub async fn run_to_completion(
         // block streams only through an OHTTP gateway and where the memory budget is
         // not derated for a small device.
         if config.fetch_boost {
-            let gateway = crate::ohttp::relay_for(&config.endpoint.host).is_some();
+            let gateway = crate::ohttp::relay_for(&config.ohttp, &config.endpoint.host).is_some();
             let roomy =
                 config.memory_budget_bytes >= crate::config::EngineConfig::DEFAULT_MEMORY_BUDGET;
             plan.boost = Some(crate::fetch::FetchBoost {
@@ -738,6 +744,7 @@ pub async fn run_to_completion(
                 },
             });
         }
+        let fetch_networks = Arc::clone(&config.ohttp);
         let endpoint = config.endpoint.clone();
         // Clone the progress Arc for the fetch task so it can bump fetched_blocks.
         let fetch_progress = progress.clone();
@@ -752,7 +759,15 @@ pub async fn run_to_completion(
         // the session, not this task), the fetch task is aborted instead of orphaned (see
         // `AbortOnDrop`'s doc).
         let fetch_task = AbortOnDrop(tokio::spawn(async move {
-            run_fetch(&endpoint, fetch_tor, plan, tx, fetch_progress).await
+            run_fetch(
+                fetch_networks,
+                &endpoint,
+                fetch_tor,
+                plan,
+                tx,
+                fetch_progress,
+            )
+            .await
         }));
 
         // scan_chunks runs in the current task. Its interleaved enhancement opens its own
@@ -991,8 +1006,9 @@ pub async fn run_to_completion(
         // sync at a range boundary; we log and continue scanning.
         {
             let enhance_started = std::time::Instant::now();
-            let mut enhance_client = enhancement_connection(&config.endpoint, tor);
+            let mut enhance_client = enhancement_connection(&config.ohttp, &config.endpoint, tor);
             let enhance_result = crate::grpc::with_ohttp_endpoint(
+                &config.ohttp,
                 &config.endpoint,
                 tor.is_some(),
                 run_enhancement_lazily_isolated(
@@ -1001,7 +1017,7 @@ pub async fn run_to_completion(
                     config.network,
                     progress.clone(),
                     skipped_keys,
-                    tor.map(|t| (t, &config.endpoint)),
+                    tor.map(|t| (&config.ohttp, t, &config.endpoint)),
                 ),
             )
             .await;

@@ -52,8 +52,19 @@ use crate::{
     error::SlipstreamError,
     events::Progress,
     grpc::{self, LwdClient, TrackedConnection},
+    ohttp::OhttpNetworks,
     wallet_session::WalletSession,
 };
+
+/// What each wallet-identifying call needs to open an isolated Tor connection of its own: the
+/// OHTTP configuration, the Tor client, the endpoint, and the permits that bound how many are
+/// open at once.
+type Isolation = (
+    Arc<OhttpNetworks>,
+    TorConn,
+    Endpoint,
+    Arc<tokio::sync::Semaphore>,
+);
 
 /// The answer to one txid fetch: the txid, whether it was an enhancement, the result.
 type FetchResult = (
@@ -67,7 +78,7 @@ type FetchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = FetchResul
 /// client, at most [`ISOLATED_FETCH_CONCURRENCY`] at a time.
 fn fetch_transaction(
     client: Option<TrackedConnection>,
-    isolate: Option<&(TorConn, Endpoint, Arc<tokio::sync::Semaphore>)>,
+    isolate: Option<&Isolation>,
     txid: zcash_primitives::transaction::TxId,
     want_enhance: bool,
 ) -> FetchFuture {
@@ -84,15 +95,21 @@ fn fetch_transaction(
                 (txid, want_enhance, raw)
             })
         }
-        Some((tor, endpoint, permits)) => {
-            let (tor, endpoint, permits) = (tor.clone(), endpoint.clone(), Arc::clone(permits));
+        Some((networks, tor, endpoint, permits)) => {
+            let (networks, tor, endpoint, permits) = (
+                Arc::clone(networks),
+                tor.clone(),
+                endpoint.clone(),
+                Arc::clone(permits),
+            );
             Box::pin(async move {
                 let raw = async {
                     let _permit = permits.acquire_owned().await.map_err(|e| {
                         SlipstreamError::Transport(format!("isolated fetch permits: {e}"))
                     })?;
-                    let c = tor.connect_isolated_tracked(&endpoint).await?;
+                    let c = tor.connect_isolated_tracked(&networks, &endpoint).await?;
                     grpc::with_ohttp_endpoint(
+                        &networks,
                         &endpoint,
                         true,
                         c.call(async |client| grpc::get_transaction(client, *txid.as_ref()).await),
@@ -130,7 +147,7 @@ fn txid_retry_backoff(attempt: u32) -> std::time::Duration {
 /// backoff already applied) propagate immediately.
 async fn fetch_with_retry(
     client: Option<TrackedConnection>,
-    isolate: Option<&(TorConn, Endpoint, Arc<tokio::sync::Semaphore>)>,
+    isolate: Option<&Isolation>,
     txid: zcash_primitives::transaction::TxId,
     want_enhance: bool,
 ) -> FetchResult {
@@ -223,16 +240,16 @@ const ISOLATED_FETCH_CONCURRENCY: usize = ENHANCE_FETCH_CONCURRENCY;
 pub const ENHANCE_FETCH_CONCURRENCY: usize = 8;
 
 /// [`run_enhancement`], with every wallet-identifying call (each `GetTransaction`, each
-/// `GetTaddressTxids`) on its own isolated Tor circuit when `isolate` names the Tor client and
-/// the endpoint, so that the relay cannot link them to each other or to the sync traffic.
-/// `client` is used when `isolate` is `None` (Tor off).
+/// `GetTaddressTxids`) on its own isolated Tor circuit when `isolate` names the OHTTP
+/// configuration, the Tor client and the endpoint, so that the relay cannot link them to each
+/// other or to the sync traffic. `client` is used when `isolate` is `None` (Tor off).
 pub async fn run_enhancement_isolated(
     session: &mut WalletSession,
     client: &mut LwdClient,
     network: crate::network::SlipstreamNetwork,
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
-    isolate: Option<(&TorConn, &Endpoint)>,
+    isolate: Option<(&Arc<OhttpNetworks>, &TorConn, &Endpoint)>,
 ) -> Result<EnhanceStats, SlipstreamError> {
     let open = TrackedConnection::in_context(client.clone());
     let mut client = LazyConnection::new(move || std::future::ready(Ok(open.clone())));
@@ -257,11 +274,17 @@ type ConnectFuture<'a> = std::pin::Pin<
 /// carries — transactions by txid, address histories — identifies the wallet, so with Tor
 /// on it is an isolated circuit ([`ConnPurpose::MetadataUnique`]).
 pub(crate) fn enhancement_connection<'a>(
+    networks: &'a OhttpNetworks,
     endpoint: &'a Endpoint,
     tor: Option<&'a TorConn>,
 ) -> LazyConnection<TrackedConnection, impl FnMut() -> ConnectFuture<'a> + Send> {
     LazyConnection::new(move || -> ConnectFuture<'a> {
-        Box::pin(connect_via(endpoint, tor, ConnPurpose::MetadataUnique))
+        Box::pin(connect_via(
+            networks,
+            endpoint,
+            tor,
+            ConnPurpose::MetadataUnique,
+        ))
     })
 }
 
@@ -292,14 +315,15 @@ pub(crate) async fn run_enhancement_lazily_isolated<F, Fut>(
     network: crate::network::SlipstreamNetwork,
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
-    isolate: Option<(&TorConn, &Endpoint)>,
+    isolate: Option<(&Arc<OhttpNetworks>, &TorConn, &Endpoint)>,
 ) -> Result<EnhanceStats, SlipstreamError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<TrackedConnection, SlipstreamError>>,
 {
-    let isolate = isolate.map(|(tor, endpoint)| {
+    let isolate: Option<Isolation> = isolate.map(|(networks, tor, endpoint)| {
         (
+            Arc::clone(networks),
             tor.clone(),
             endpoint.clone(),
             Arc::new(tokio::sync::Semaphore::new(ISOLATED_FETCH_CONCURRENCY)),
@@ -435,20 +459,22 @@ where
             served_any = true;
             let mut isolated;
             let address_client = match &isolate {
-                Some((tor, endpoint, _)) => {
-                    isolated = tor.connect_isolated_tracked(endpoint).await?;
+                Some((networks, tor, endpoint, _)) => {
+                    isolated = tor.connect_isolated_tracked(networks, endpoint).await?;
                     &mut isolated
                 }
                 None => client.get().await?,
             };
             let route = match &isolate {
-                Some((_, endpoint, _)) => crate::ohttp::relay_for(&endpoint.host).map(|relay| {
-                    crate::transport_health::HealthRoute {
-                        gateway_host: endpoint.host.clone(),
-                        relay_url: relay.into(),
-                        via_tor: true,
-                    }
-                }),
+                Some((networks, _, endpoint, _)) => {
+                    crate::ohttp::relay_for(networks, &endpoint.host).map(|relay| {
+                        crate::transport_health::HealthRoute {
+                            gateway_host: endpoint.host.clone(),
+                            relay_url: relay.into(),
+                            via_tor: true,
+                        }
+                    })
+                }
                 None => grpc::current_ohttp_health_route(),
             };
             grpc::with_ohttp_health_route(

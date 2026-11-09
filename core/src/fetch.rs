@@ -51,6 +51,7 @@ use crate::{
     connector::{ConnPurpose, TorConn, connect_via_tracked as connect_via},
     error::SlipstreamError,
     grpc::{self, LwdClient},
+    ohttp::OhttpNetworks,
     verify::Continuity,
 };
 
@@ -1277,6 +1278,7 @@ impl WorkerSlot {
 
 #[allow(clippy::too_many_arguments)]
 async fn worker(
+    networks: Arc<OhttpNetworks>,
     worker_id: usize,
     endpoint: Endpoint,
     tor: Option<TorConn>,
@@ -1290,7 +1292,9 @@ async fn worker(
 ) -> Result<(), SlipstreamError> {
     // Bulk uses Tor for every host when Tor is on, with a circuit per fetch connection.
     // OHTTP gateways retain encapsulation, including over the Tor transport.
-    let mut client = match connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await {
+    let mut client = match connect_via(&networks, &endpoint, tor.as_ref(), ConnPurpose::BulkFetch)
+        .await
+    {
         Ok(client) => client,
         // A worker added by a boost holds no plan chunk yet: the fetch goes on without it.
         Err(err) if worker_id >= plan.streams => {
@@ -1299,8 +1303,8 @@ async fn worker(
         }
         Err(err) => return Err(err),
     };
-    let open_timeout = grpc::range_open_timeout(&endpoint);
-    let split_on_invalid = crate::ohttp::relay_for(&endpoint.host).is_some();
+    let open_timeout = grpc::range_open_timeout(&networks, &endpoint);
+    let split_on_invalid = crate::ohttp::relay_for(&networks, &endpoint.host).is_some();
     let mut max_span = u64::MAX;
     loop {
         // A worker added by a boost stops once the boost has ended, but not while
@@ -1339,6 +1343,7 @@ async fn worker(
             // attempt that ended otherwise) does not cut this one.
             slot.clear_kick();
             match grpc::with_ohttp_endpoint(
+                &networks,
                 &endpoint,
                 tor.is_some(),
                 client.call(async |client| {
@@ -1376,7 +1381,9 @@ async fn worker(
                         resume_from = cursor.resume_from,
                         "slow head stream cut; requesting the rest on a fresh connection"
                     );
-                    client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
+                    client =
+                        connect_via(&networks, &endpoint, tor.as_ref(), ConnPurpose::BulkFetch)
+                            .await?;
                 }
                 // An OHTTP policy denial or an oversized request is refused again on a retry.
                 Err(err) if !err.is_transient() && !err.counts_as_unreachable() => {
@@ -1413,7 +1420,9 @@ async fn worker(
                     // Reconnect: the channel may be poisoned after a stream error. Resilient to a
                     // brief server outage (bounded retry-with-backoff) so a transient connect blip
                     // resumes this chunk in place instead of failing it → restarting the whole pass.
-                    client = connect_via(&endpoint, tor.as_ref(), ConnPurpose::BulkFetch).await?;
+                    client =
+                        connect_via(&networks, &endpoint, tor.as_ref(), ConnPurpose::BulkFetch)
+                            .await?;
                 }
             }
         }
@@ -1802,6 +1811,7 @@ where
 /// Everything a boost needs to start one more worker. Dropped (with its
 /// sender) once every plan chunk is handed out.
 struct WorkerSpawn {
+    networks: Arc<OhttpNetworks>,
     endpoint: Endpoint,
     tor: Option<TorConn>,
     plan: FetchPlan,
@@ -2119,6 +2129,7 @@ impl Booster {
             self.next_extra_id += 1;
             let slot = Arc::new(WorkerSlot::new(Arc::clone(&self.dispatcher.fleet)));
             let handle = workers.spawn(worker(
+                Arc::clone(&spawn.networks),
                 id,
                 spawn.endpoint.clone(),
                 spawn.tor.clone(),
@@ -2264,8 +2275,10 @@ impl BoostState {
 /// ordered sub-chunk as it is released (Relaxed atomic; no cross-counter guarantees).
 ///
 /// `tor` — the session's Tor handle: all hosts use Tor when it is present, with a circuit per
-/// fetch connection. OHTTP gateways retain encapsulation (see `connector::route`).
+/// fetch connection. OHTTP gateways (of `networks`, the OHTTP configuration) retain
+/// encapsulation (see `connector::route`).
 pub async fn run_fetch(
+    networks: Arc<OhttpNetworks>,
     endpoint: &Endpoint,
     tor: Option<TorConn>,
     plan: FetchPlan,
@@ -2312,6 +2325,7 @@ pub async fn run_fetch(
         .collect();
     for (worker_id, slot) in slots.iter().enumerate() {
         workers.spawn(worker(
+            Arc::clone(&networks),
             worker_id,
             endpoint.clone(),
             tor.clone(),
@@ -2336,6 +2350,7 @@ pub async fn run_fetch(
             ahead,
             &slots,
             WorkerSpawn {
+                networks: Arc::clone(&networks),
                 endpoint: endpoint.clone(),
                 tor: tor.clone(),
                 plan: plan.clone(),
@@ -2821,7 +2836,9 @@ mod tests {
             port,
             tls: false,
         };
-        let mut client = grpc::connect(&endpoint).await.expect("connect");
+        let mut client = grpc::connect(&OhttpNetworks::default(), &endpoint)
+            .await
+            .expect("connect");
         let plan = FetchPlan::new(100, 103, 4, 1);
         let mut cursor = test_cursor(0, 100, 103);
         let (tx, mut rx) = mpsc::channel(16);
@@ -2861,7 +2878,7 @@ mod tests {
         let mut follow = FetchPlan::new(100, 100, 2_000, 4);
         follow.boost = Some(FetchBoost { extra_streams: 0 });
         let (queue, mut received) = chunk_queue(1 << 20);
-        let fetched = run_fetch(&endpoint, None, follow, queue, None)
+        let fetched = run_fetch(Arc::default(), &endpoint, None, follow, queue, None)
             .await
             .expect("follow fetch");
         assert_eq!(fetched.blocks, 1);

@@ -48,6 +48,7 @@ use crate::{
     config::Endpoint,
     connector::{ConnPurpose, TorConn, connect_via_tracked as connect_via},
     grpc,
+    ohttp::OhttpNetworks,
 };
 
 /// Reorg-safety margin for a NEW wallet's anchor: the tree state is fetched this many
@@ -80,14 +81,17 @@ pub struct Anchor {
 /// Resolve the provisioning anchor for `intent`. NEVER errors — the offline policy is the
 /// whole point: a restore always gets a valid recover_until, a new wallet degrades to the
 /// host's bundled checkpoint. `tor`: `Some` ⇒ identifying calls ride an isolated circuit.
+/// `networks`: the OHTTP configuration; an `endpoint` that is the gateway of a configured
+/// network is reached through OHTTP.
 pub async fn restore_anchor(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     network: crate::network::SlipstreamNetwork,
     intent: AnchorIntent,
     tor: Option<&TorConn>,
 ) -> Anchor {
     match intent {
-        AnchorIntent::Restore { .. } => match tip_via(endpoint, tor).await {
+        AnchorIntent::Restore { .. } => match tip_via(networks, endpoint, tor).await {
             Some(tip) => {
                 info!(tip, "restore anchor: recover_until = live tip");
                 Anchor {
@@ -103,9 +107,10 @@ pub async fn restore_anchor(
                 .map(|h| u64::from(u32::from(h)))
                 .unwrap_or(0);
             let fetched = async {
-                let client = client_via(endpoint, tor).await?;
+                let client = client_via(networks, endpoint, tor).await?;
                 let tip = usable_height(
                     grpc::with_ohttp_endpoint(
+                        networks,
                         endpoint,
                         tor.is_some(),
                         client.call(async |client| grpc::get_latest_block_height(client).await),
@@ -117,6 +122,7 @@ pub async fn restore_anchor(
                     .saturating_sub(ANCHOR_MAX_REORG_BLOCKS)
                     .max(sapling_activation);
                 let ts = grpc::with_ohttp_endpoint(
+                    networks,
                     endpoint,
                     tor.is_some(),
                     client.call(async |client| grpc::get_tree_state(client, anchor_height).await),
@@ -182,10 +188,15 @@ pub fn offline_anchor(intent: AnchorIntent) -> Anchor {
 
 /// Fetch the advertised tip over the given transport; `None` on any failure, an unusable
 /// tip included.
-async fn tip_via(endpoint: &Endpoint, tor: Option<&TorConn>) -> Option<u64> {
-    let client = client_via(endpoint, tor).await?;
+async fn tip_via(
+    networks: &OhttpNetworks,
+    endpoint: &Endpoint,
+    tor: Option<&TorConn>,
+) -> Option<u64> {
+    let client = client_via(networks, endpoint, tor).await?;
     usable_height(
         grpc::with_ohttp_endpoint(
+            networks,
             endpoint,
             tor.is_some(),
             client.call(async |client| grpc::get_latest_block_height(client).await),
@@ -216,14 +227,15 @@ fn usable_height(height: u64) -> Option<u64> {
 /// fallback IS the retry policy here, and a user is waiting on the restore spinner, so
 /// the multi-attempt backoff window the sync pass uses would be pure added latency).
 async fn client_via(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     tor: Option<&TorConn>,
 ) -> Option<crate::grpc::TrackedConnection> {
     match tor {
-        Some(_) => connect_via(endpoint, tor, ConnPurpose::MetadataUnique)
+        Some(_) => connect_via(networks, endpoint, tor, ConnPurpose::MetadataUnique)
             .await
             .ok(),
-        None => grpc::connect_tracked(endpoint, true).await.ok(),
+        None => grpc::connect_tracked(networks, endpoint, true).await.ok(),
     }
 }
 
@@ -337,6 +349,7 @@ mod tests {
             tls: false,
         };
         restore_anchor(
+            &OhttpNetworks::default(),
             &endpoint,
             crate::network::SlipstreamNetwork::MAIN,
             intent,
@@ -514,6 +527,7 @@ mod tests {
             tls: false,
         };
         let anchor = restore_anchor(
+            &OhttpNetworks::default(),
             &endpoint,
             crate::network::SlipstreamNetwork::MAIN,
             AnchorIntent::Restore {
@@ -533,6 +547,7 @@ mod tests {
         );
 
         let anchor = restore_anchor(
+            &OhttpNetworks::default(),
             &endpoint,
             crate::network::SlipstreamNetwork::MAIN,
             AnchorIntent::Restore {
@@ -558,6 +573,7 @@ mod tests {
             tls: false,
         };
         let anchor = restore_anchor(
+            &OhttpNetworks::default(),
             &endpoint,
             crate::network::SlipstreamNetwork::MAIN,
             AnchorIntent::New,

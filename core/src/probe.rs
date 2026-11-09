@@ -24,6 +24,7 @@
 //! measured a 10× same-morning provider swing (1.5 → 14.7 MB/s) — a ~1 s
 //! probe converts "unlucky server pick" from a 3× restore into a ~1 s tax.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::time::timeout;
@@ -33,6 +34,7 @@ use zcash_client_backend::proto::service::{BlockId, BlockRange};
 use crate::{
     config::Endpoint,
     grpc::{self, LwdClient},
+    ohttp::OhttpNetworks,
 };
 
 /// Default shared wall-clock budget for one [`probe_endpoints`] race (tip
@@ -96,15 +98,20 @@ pub fn rank(results: &[ProbeResult]) -> usize {
 
 /// Probe all `endpoints` in parallel within `budget` and pick the winner.
 /// `endpoints[0]` is the host's preferred server; the returned `chosen`
-/// indexes into the input slice.
-pub async fn probe_endpoints(endpoints: &[Endpoint], budget: Duration) -> ProbeOutcome {
+/// indexes into the input slice. An endpoint that is the gateway of a network
+/// `networks` configures is probed through OHTTP.
+pub async fn probe_endpoints(
+    networks: Arc<OhttpNetworks>,
+    endpoints: &[Endpoint],
+    budget: Duration,
+) -> ProbeOutcome {
     let started = Instant::now();
     let deadline = started + budget;
 
     let mut handles = Vec::with_capacity(endpoints.len());
     for ep in endpoints {
         let ep = ep.clone();
-        handles.push(tokio::spawn(probe_one(ep, deadline)));
+        handles.push(tokio::spawn(probe_one(Arc::clone(&networks), ep, deadline)));
     }
     let mut results = Vec::with_capacity(handles.len());
     for (i, h) in handles.into_iter().enumerate() {
@@ -124,7 +131,7 @@ pub async fn probe_endpoints(endpoints: &[Endpoint], budget: Duration) -> ProbeO
     for (i, r) in results.iter().enumerate() {
         info!(
             index = i,
-            host = crate::ohttp::log_host(&r.endpoint.host),
+            host = crate::ohttp::log_host(&networks, &r.endpoint.host),
             port = r.endpoint.port,
             tip = r.tip,
             sample_mbps = r.sample_mbps.map(|m| format!("{m:.2}")),
@@ -143,21 +150,29 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-async fn probe_one(endpoint: Endpoint, deadline: Instant) -> ProbeResult {
+async fn probe_one(
+    networks: Arc<OhttpNetworks>,
+    endpoint: Endpoint,
+    deadline: Instant,
+) -> ProbeResult {
     let mut result = ProbeResult {
         endpoint: endpoint.clone(),
         tip: None,
         sample_mbps: None,
     };
 
-    let Ok(Ok(mut client)) =
-        timeout(remaining(deadline), grpc::connect_tracked(&endpoint, true)).await
+    let Ok(Ok(mut client)) = timeout(
+        remaining(deadline),
+        grpc::connect_tracked(&networks, &endpoint, true),
+    )
+    .await
     else {
         return result;
     };
     let Ok(Ok(tip)) = timeout(
         remaining(deadline),
         grpc::with_ohttp_endpoint(
+            &networks,
             &endpoint,
             false,
             client.call(async |client| grpc::get_latest_block_height(client).await),

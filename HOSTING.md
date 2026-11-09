@@ -100,6 +100,7 @@ use std::sync::{Arc, Mutex};
 use zodl_slipstream::{
     EngineConfig, Endpoint, Network, Progress, SessionConfig, SessionReporter,
     ffi_handle::{self, SyncState, FfiSlipstreamEvent, derive_snapshot, spawn_supervised},
+    ohttp::OhttpNetworks,
     session::run_session,
 };
 
@@ -108,6 +109,7 @@ let config = SessionConfig {
         Network::MainNetwork,
         "/path/to/data.db".into(),
         Endpoint { host: "zec.rocks".into(), port: 443, tls: true },
+        OhttpNetworks::default(), // your OHTTP configuration; the default has OHTTP off
     ),
     // .scaled_for_device_memory(total_bytes)  // derates budgets on <3 GiB devices
     account: Some((ufvk_string, 2_400_000)),   // or None if you created the account

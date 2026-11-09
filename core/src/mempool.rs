@@ -128,6 +128,7 @@ pub async fn run_session(
     }
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
     let client = crate::connector::connect_via_tracked(
+        &config.ohttp,
         &config.endpoint,
         tor,
         crate::connector::ConnPurpose::MetadataUnique,
