@@ -55,6 +55,8 @@ jobs:
       # catches the cross-feature API drift a default-features build would miss.
       - name: cargo check --all-targets --all-features
         run: cargo check --workspace --all-targets --all-features
+      - name: Check without default features
+        run: cargo check --locked -p zodl-slipstream --no-default-features
 
   fmt:
     name: Rustfmt
@@ -65,6 +67,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check OHTTP workflow contract
+        run: ruby scripts/tests/ohttp_workflow_test.rb
       - name: Check formatting
         run: cargo fmt --all -- --check
 

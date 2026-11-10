@@ -596,6 +596,8 @@ type IronwoodSparseTree = OrchardSparseTree;
 /// invalidate it explicitly).
 #[derive(Default)]
 pub struct SparseTreeState {
+    // Commit evidence outlives the async scan owner on the deferred path.
+    committed_progress: Option<crate::events::ProgressArc>,
     sapling: Option<SaplingSparseTree>,
     orchard: Option<OrchardSparseTree>,
     /// \[B6\] Anchor-retention policy (upstream put_blocks' `anchor_retention`):
@@ -636,6 +638,10 @@ pub struct SparseTreeState {
 }
 
 impl SparseTreeState {
+    pub(crate) fn attach_progress(&mut self, progress: Option<crate::events::ProgressArc>) {
+        self.committed_progress = progress;
+    }
+
     /// \[B6\] Set the anchor-retention policy (see the field docs). Public for
     /// integration tests and direct hosts; production plumbs it from
     /// `EngineConfig::anchor_retention`.
@@ -678,6 +684,11 @@ impl GraftCtx {
             .map_err(|e| {
                 crate::error::SlipstreamError::Wallet(format!("graft side conn busy_timeout: {e}"))
             })?;
+        crate::wallet_session::tune_connection(
+            &conn,
+            Some(crate::wallet_session::SCAN_WRITER_CACHE_BYTES),
+        )
+        .map_err(|e| crate::error::SlipstreamError::Wallet(format!("graft side conn tune: {e}")))?;
         Ok(Self {
             conn,
             verify_sample,
@@ -1308,6 +1319,7 @@ pub fn sparse_put_blocks(
     sparse: &mut SparseTreeState,
     from_state: &ChainState,
     blocks: Vec<ScannedBlock<<Db as WalletRead>::AccountId>>,
+    timings: Option<&std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
 ) -> Result<(), SqliteClientError> {
     // ll/wallet.rs:245-247.
     let Some(initial_block) = blocks.first() else {
@@ -1361,6 +1373,7 @@ pub fn sparse_put_blocks(
         census_orchard,
         graft,
         graft_verdict_totals,
+        committed_progress,
         ..
     } = sparse
     else {
@@ -1485,6 +1498,16 @@ pub fn sparse_put_blocks(
     let mut flush_ms = 0u128;
     let mut downgraded = 0u64;
 
+    // Capture block heights before moving blocks into the transactionally closure.
+    let first_height = u32::from(initial_block.height());
+    let last_height = u32::from(
+        blocks
+            .last()
+            .map(|b| b.height())
+            .unwrap_or(initial_block.height()),
+    );
+
+    let t_txn = std::time::Instant::now();
     inner.transactionally::<_, _, SqliteClientError>(|wdb| {
         // ── Rows stage — upstream verbatim (#2586 extraction + #2604 nfskip) ──
         // `put_blocks_rows` persists every row-level artifact (block meta, tx
@@ -1502,6 +1525,23 @@ pub fn sparse_put_blocks(
         >(wdb, GapLimits::default(), from_state, blocks)
         .map_err(SqliteClientError::from)?;
         rows_ms = t_rows.elapsed().as_millis();
+        if let Some(t) = timings {
+            t.add_rows_ms(rows_ms as u64);
+        }
+        if rows_ms > 5000 {
+            // Log slow rows stage timing to pinpoint first-put stalls.
+            // Field evidence (2026-10-25): 24 s rows stage on the first small pass after a
+            // restore (3 blocks). Hypothesis: deferred work on the first put after a big sparse
+            // restore (graft buffer cleanup, checkpoint pruning, shard tree pruning, index
+            // rebuild, WAL checkpoint). This log helps isolate which stage takes the time.
+            info!(
+                rows_ms,
+                first_height,
+                last_height,
+                block_count = last_height - first_height + 1,
+                "sparse put_blocks: rows stage took >5s (first put after restore?)"
+            );
+        }
 
         let mut sapling_commitments = rows.sapling_commitments;
         let mut orchard_commitments = rows.orchard_commitments;
@@ -2043,6 +2083,9 @@ pub fn sparse_put_blocks(
             orch_split = orch_timers;
 
             tree_ms = t_tree.elapsed().as_millis();
+            if let Some(t) = timings {
+                t.add_tree_ms(tree_ms as u64);
+            }
 
             // Flush the dirty tree delta + scan-queue update in the SAME txn.
             let t_flush = std::time::Instant::now();
@@ -2059,6 +2102,12 @@ pub fn sparse_put_blocks(
         }
         Ok(())
     })?;
+    let txn_ms = t_txn.elapsed().as_millis();
+    if let Some(progress) = committed_progress {
+        // The scan-queue update is durable now. Publish before fallible graft
+        // cleanup, and while a deferred job still owns its wallet writer gate.
+        progress.note_work_completed(u64::from(first_height)..u64::from(last_height) + 1);
+    }
 
     // v0.4 Plan A: buffer rows of the row sets built/grafted this call are dead now
     // the txn committed: exactly their positions, never the rest of their shard.
@@ -2093,12 +2142,15 @@ pub fn sparse_put_blocks(
     // tree_ms ≈ max(sap, orch) when the join truly runs in parallel, ≈ sap + orch when
     // it degenerates to serial (single-thread rayon pool) — this distinguishes
     // "lopsided pools" from "no parallelism" directly in device logs.
+    // txn_ms is the total transaction time (rows + tree + flush + commit); a gap between
+    // txn_ms and (rows_ms + tree_ms + flush_ms) indicates commit/WAL checkpoint overhead.
     info!(
         rows_ms,
         tree_ms,
         sap_tree_ms,
         orch_tree_ms,
         flush_ms,
+        txn_ms,
         downgraded,
         // [B6] retention observability: the active floor and grid, plus how many
         // anchors the orchard store currently pins (None = retention off). The grid
@@ -3462,7 +3514,15 @@ impl WalletWrite for SparseFacade<'_> {
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
-        sparse_put_blocks(self.inner, self.sparse, from_state, blocks)
+        // Inline path: put_blocks runs on the scan thread, under the chunk's timings.
+        let timings = crate::scan_stages::current_chunk_timings();
+        sparse_put_blocks(
+            self.inner,
+            self.sparse,
+            from_state,
+            blocks,
+            timings.as_ref(),
+        )
     }
 
     fn put_received_transparent_utxo(
@@ -3579,6 +3639,11 @@ pub struct PendingPersist {
     /// First/last block height of the unit (log attribution only).
     pub first_height: u64,
     pub last_height: u64,
+    /// Note commitments (all pools) the unit's blocks append to the trees: what
+    /// [`CommitLimits::max_outputs`] counts.
+    pub outputs: u64,
+    /// Chunk stage timings for diagnostic logging.
+    pub timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
 }
 
 /// Mirror of upstream `Nullifiers::update_with` for ONE block's worth of deltas
@@ -3684,6 +3749,51 @@ pub struct WriteBehindFacade {
     /// Snapshot of the wallet's transparent receivers (see read surface item 6).
     transparent_receivers: HashMap<TransparentAddress, (DbAccountId, Option<TransparentKeyScope>)>,
     stash: Option<PendingPersist>,
+    timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
+    /// `Some`: consecutive `put_blocks` calls extend the stash into one persist
+    /// unit until it reaches these limits (see [`CommitLimits`]). `None`: every
+    /// call is its own unit and must be taken before the next (depth-1 invariant).
+    coalesce: Option<CommitLimits>,
+}
+
+/// Size of one persist commit on the write-behind path, decoupled from the scan
+/// call (= fetch chunk or sub-chunk, e.g. the 2,000-block OHTTP window): the
+/// stash of consecutive scan calls is committed as ONE unit once it holds at
+/// least `max_blocks` blocks or `max_outputs` note commitments.
+///
+/// One unit over the blocks of several calls is exactly the `put_blocks` call a
+/// single `scan_cached_blocks` over the merged window makes: the scanned blocks
+/// do not depend on where the scan calls split (the facade serves every call
+/// the state the previous calls left), and the unit keeps the first call's
+/// `from_state`. Larger units amortize the per-commit cost (transaction, the
+/// frontier insert and its checks, flush) — normal-era 10,000-block units
+/// were 26 % faster than 2,000-block ones, and 20,000-block / 100,000-commitment
+/// units another 10 % faster than those (3,300,000 to the tip on an 8-core
+/// Graviton: 49.8 -> 45.2 s, the scan's wait on the persist lane 22 -> 13 s).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitLimits {
+    pub max_blocks: u64,
+    pub max_outputs: u64,
+}
+
+impl CommitLimits {
+    /// 20,000 blocks: two gRPC chunks, ten OHTTP windows
+    /// (`connector::OHTTP_MAX_CHUNK_BLOCKS`). The limit is checked after a scan call is
+    /// added, so a unit can run past it by one call. A stop or an error exit drains the unit
+    /// being committed and drops only the one being filled; a killed process can also lose
+    /// the ones still being committed (`persist_depth` of them), all scanned again.
+    pub const DEFAULT_MAX_BLOCKS: u64 = 20_000;
+    /// 100,000 commitments (all pools, Ironwood included): about two normal-era units,
+    /// and below one merged dense scan call (`EngineConfig::DEFAULT_SCAN_MERGE_OUTPUTS`),
+    /// so a dense call closes the unit it is added to (which can then hold up to one dense
+    /// call more than this). A unit's scanned blocks (commitments and wallet data, tens of
+    /// MB at worst) stay bounded.
+    pub const DEFAULT_MAX_OUTPUTS: u64 = 100_000;
+
+    fn reached(&self, pending: &PendingPersist) -> bool {
+        pending.last_height + 1 - pending.first_height >= self.max_blocks
+            || pending.outputs >= self.max_outputs
+    }
 }
 
 impl WriteBehindFacade {
@@ -3710,6 +3820,8 @@ impl WriteBehindFacade {
             transparent_outpoints: db.get_unspent_transparent_outpoints()?,
             transparent_receivers: db.get_transparent_receiver_accounts()?,
             stash: None,
+            timings: None,
+            coalesce: None,
         })
     }
 
@@ -3739,6 +3851,22 @@ impl WriteBehindFacade {
         self.stash.take()
     }
 
+    /// Let consecutive `put_blocks` calls extend the stash up to `limits` (`None` =
+    /// one unit per call, the default).
+    pub fn set_commit_limits(&mut self, limits: Option<CommitLimits>) {
+        self.coalesce = limits;
+    }
+
+    /// Take the stash if it is due for its commit: always without commit limits,
+    /// otherwise once it has reached them. Barriers (enhancement, range end) take
+    /// it unconditionally with [`Self::take_stash`].
+    pub fn take_full_stash(&mut self) -> Option<PendingPersist> {
+        match (&self.stash, &self.coalesce) {
+            (Some(pending), Some(limits)) if !limits.reached(pending) => None,
+            _ => self.stash.take(),
+        }
+    }
+
     #[cfg(test)]
     fn test_new(prior_meta_height: BlockHeight, prior_meta: Option<BlockMetadata>) -> Self {
         Self {
@@ -3751,6 +3879,8 @@ impl WriteBehindFacade {
             transparent_outpoints: HashMap::new(),
             transparent_receivers: HashMap::new(),
             stash: None,
+            timings: None,
+            coalesce: None,
         }
     }
 }
@@ -4007,8 +4137,10 @@ impl WalletWrite for WriteBehindFacade {
         blocks: Vec<ScannedBlock<<Self as WalletRead>::AccountId>>,
     ) -> Result<(), <Self as WalletRead>::Error> {
         // Depth-1 invariant FIRST: an occupied stash means the scan loop failed
-        // to submit the previous unit — a loop bug, never tolerated silently.
-        if self.stash.is_some() {
+        // to submit the previous unit — a loop bug, never tolerated silently —
+        // unless commit limits let the stash grow (by the blocks that directly
+        // follow it, checked below).
+        if self.stash.is_some() && self.coalesce.is_none() {
             return Err(SqliteClientError::CorruptedData(
                 "write-behind facade: put_blocks with an occupied stash — depth-1 invariant violated".into(),
             ));
@@ -4019,6 +4151,23 @@ impl WalletWrite for WriteBehindFacade {
         };
         let first_height = u64::from(u32::from(first.height()));
         let last_height = u64::from(u32::from(last.height()));
+        if let Some(pending) = &self.stash
+            && first_height != pending.last_height + 1
+        {
+            return Err(SqliteClientError::CorruptedData(format!(
+                "write-behind facade: put_blocks from {first_height} does not continue the \
+                 stashed unit {}..={}",
+                pending.first_height, pending.last_height
+            )));
+        }
+        let outputs: u64 = blocks
+            .iter()
+            .map(|b| {
+                (b.sapling().commitments().len()
+                    + b.orchard().commitments().len()
+                    + b.ironwood().commitments().len()) as u64
+            })
+            .sum();
 
         // Advance the virtualized prior-block metadata to this unit's tail —
         // identical to upstream's intra-call threading (chain.rs:653).
@@ -4098,12 +4247,40 @@ impl WalletWrite for WriteBehindFacade {
             apply_outpoint_delta(&mut self.transparent_outpoints, &t_spent, &t_found);
         }
 
-        self.stash = Some(PendingPersist {
-            from_state: from_state.clone(),
-            blocks,
-            first_height,
-            last_height,
-        });
+        match &mut self.stash {
+            // Commit limits: the unit grows; it keeps its first call's
+            // `from_state` (the treestate below its first block).
+            Some(pending) => {
+                pending.blocks.extend(blocks);
+                pending.last_height = last_height;
+                pending.outputs += outputs;
+                // The commit's numbers go to the chunk that closes the unit.
+                if let Some(t) = &self.timings {
+                    t.mark_stashed();
+                }
+                if let Some(prev) = std::mem::replace(&mut pending.timings, self.timings.clone())
+                    && !self
+                        .timings
+                        .as_ref()
+                        .is_some_and(|t| std::sync::Arc::ptr_eq(t, &prev))
+                {
+                    prev.settle_carried();
+                }
+            }
+            None => {
+                if let Some(t) = &self.timings {
+                    t.mark_stashed();
+                }
+                self.stash = Some(PendingPersist {
+                    from_state: from_state.clone(),
+                    blocks,
+                    first_height,
+                    last_height,
+                    outputs,
+                    timings: self.timings.clone(),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -4292,6 +4469,27 @@ type PersistTaskOutput = (
     Result<std::time::Duration, SqliteClientError>,
 );
 
+/// Per-lane test synchronization. Dropping the release sender also wakes the worker.
+#[cfg(test)]
+pub(crate) struct PersistLanePause {
+    arrived: tokio::sync::oneshot::Receiver<()>,
+    release: std::sync::mpsc::Sender<()>,
+}
+
+#[cfg(test)]
+impl PersistLanePause {
+    pub(crate) async fn arrived(&mut self) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), &mut self.arrived)
+            .await
+            .expect("deferred worker reaches pause")
+            .expect("deferred worker signals arrival");
+    }
+
+    pub(crate) fn release(self) {
+        let _ = self.release.send(());
+    }
+}
+
 /// The write-behind persist lane: owns a SECOND `WalletDb` connection to the
 /// same wallet file (WAL) and the per-range `SparseTreeState`. Runs at most
 /// ONE deferred commit at a time via `spawn_blocking` (ownership ping-pongs
@@ -4342,6 +4540,8 @@ pub struct PersistLane {
     total_wait: std::time::Duration,
     /// Σ commit wall time measured inside the deferred closures.
     total_busy: std::time::Duration,
+    #[cfg(test)]
+    before_next_job: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl PersistLane {
@@ -4370,6 +4570,11 @@ impl PersistLane {
             .map_err(|e| {
                 crate::error::SlipstreamError::Wallet(format!("persist lane busy_timeout: {e}"))
             })?;
+        crate::wallet_session::tune_connection(
+            &lane_conn,
+            Some(crate::wallet_session::SCAN_WRITER_CACHE_BYTES),
+        )
+        .map_err(|e| crate::error::SlipstreamError::Wallet(format!("persist lane tune: {e}")))?;
         rusqlite::vtab::array::load_module(&lane_conn).map_err(|e| {
             crate::error::SlipstreamError::Wallet(format!("persist lane array module: {e}"))
         })?;
@@ -4401,14 +4606,39 @@ impl PersistLane {
             depth: depth.max(1),
             total_wait: std::time::Duration::ZERO,
             total_busy: std::time::Duration::ZERO,
+            #[cfg(test)]
+            before_next_job: None,
         })
     }
 
     /// [B4-16 drain] Attach the handle's shared progress so every deferred commit holds
-    /// the writer gate for its whole life. The production scan path attaches; oracle and
-    /// test drivers (no stop()/start() drain to serve) may skip.
+    /// the writer gate for its whole life and publishes confirmed completion from its
+    /// owned tree state. Attach before submitting the first unit. Oracle and test
+    /// drivers with no progress handle may skip.
     pub fn attach_writer_gate(&mut self, progress: crate::events::ProgressArc) {
+        if let Some(sparse) = self.sparse.as_mut() {
+            sparse.attach_progress(Some(progress.clone()));
+        }
         self.progress = Some(progress);
+    }
+
+    /// Pause only this lane's next worker, after its real writer token is held.
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_job_for_test(&mut self) -> PersistLanePause {
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        assert!(
+            self.before_next_job.is_none(),
+            "a pause is already installed"
+        );
+        self.before_next_job = Some(Box::new(move || {
+            let _ = arrived.send(());
+            let _ = released.recv();
+        }));
+        PersistLanePause {
+            arrived: arrival,
+            release,
+        }
     }
 
     pub fn total_wait(&self) -> std::time::Duration {
@@ -4582,8 +4812,14 @@ impl PersistLane {
             .map(crate::events::WalletWriterGate::hold);
         self.in_flight_span = span;
         let liveness = self.progress.clone();
+        #[cfg(test)]
+        let before_next_job = self.before_next_job.take();
         self.in_flight = Some(tokio::task::spawn_blocking(move || {
             let _gate = gate;
+            #[cfg(test)]
+            if let Some(hook) = before_next_job {
+                hook();
+            }
             let started = std::time::Instant::now();
             let result = job(&mut db, &mut sparse).map(|()| started.elapsed());
             // Liveness: a finished commit is forward progress for the stall clock
@@ -4636,7 +4872,19 @@ impl PersistLane {
         self.submit_job(
             span,
             Box::new(move |db, sparse| {
-                sparse_put_blocks(db, sparse, &pending.from_state, pending.blocks)
+                let started = std::time::Instant::now();
+                sparse_put_blocks(
+                    db,
+                    sparse,
+                    &pending.from_state,
+                    pending.blocks,
+                    pending.timings.as_ref(),
+                )?;
+                // The chunk's `chunk stages` line waits for this (see scan.rs).
+                if let Some(t) = &pending.timings {
+                    t.settle_committed(started.elapsed().as_millis() as u64);
+                }
+                Ok(())
             }),
         )
         .await
@@ -5183,6 +5431,8 @@ mod write_behind_tests {
             blocks: vec![],
             first_height: 2,
             last_height: 2,
+            outputs: 0,
+            timings: None,
         });
         let err = f.put_blocks(&empty_chain_state(1), vec![]).unwrap_err();
         assert!(
@@ -5307,6 +5557,89 @@ mod write_behind_tests {
         assert!(
             lane.total_busy() >= Duration::from_millis(140),
             "busy accounted"
+        );
+    }
+
+    fn initialized_lane(dir: &std::path::Path) -> PersistLane {
+        drop(
+            crate::wallet_session::WalletSession::open(
+                crate::network::SlipstreamNetwork::MAIN,
+                &dir.join("lane.db"),
+            )
+            .expect("initialize wallet"),
+        );
+        lane(dir)
+    }
+
+    async fn submit_tip(lane: &mut PersistLane, height: u32) {
+        lane.submit_job(
+            (u64::from(height), u64::from(height)),
+            Box::new(move |db, _| db.update_chain_tip(BlockHeight::from(height))),
+        )
+        .await
+        .expect("submit real wallet update");
+    }
+
+    #[tokio::test]
+    async fn lane_pause_does_not_block_other_wallet() {
+        let first = tempfile::tempdir().expect("first wallet");
+        let second = tempfile::tempdir().expect("second wallet");
+        let mut paused = initialized_lane(first.path());
+        let progress = Arc::new(crate::events::Progress::default());
+        paused.attach_writer_gate(Arc::clone(&progress));
+        let mut pause = paused.pause_before_next_job_for_test();
+        submit_tip(&mut paused, 3_000_000).await;
+        pause.arrived().await;
+        assert_eq!(progress.wallet_writers(), 1);
+        let mut other = initialized_lane(second.path());
+        submit_tip(&mut other, 3_000_001).await;
+        tokio::time::timeout(Duration::from_secs(5), other.drain())
+            .await
+            .expect("other wallet proceeds")
+            .expect("other wallet commits");
+        assert_eq!(
+            other
+                .db
+                .as_mut()
+                .expect("other db")
+                .chain_height()
+                .expect("other tip"),
+            Some(BlockHeight::from(3_000_001))
+        );
+        assert_eq!(progress.wallet_writers(), 1);
+        pause.release();
+        paused.drain().await.expect("paused wallet commits");
+        assert_eq!(progress.wallet_writers(), 0);
+        assert_eq!(
+            paused
+                .db
+                .as_mut()
+                .expect("paused db")
+                .chain_height()
+                .expect("paused tip"),
+            Some(BlockHeight::from(3_000_000))
+        );
+    }
+
+    #[tokio::test]
+    async fn lane_pause_release_drop_unblocks_worker() {
+        let dir = tempfile::tempdir().expect("wallet");
+        let mut lane = initialized_lane(dir.path());
+        let progress = Arc::new(crate::events::Progress::default());
+        lane.attach_writer_gate(Arc::clone(&progress));
+        let mut pause = lane.pause_before_next_job_for_test();
+        submit_tip(&mut lane, 3_000_000).await;
+        pause.arrived().await;
+        assert_eq!(progress.wallet_writers(), 1);
+        drop(pause);
+        tokio::time::timeout(Duration::from_secs(5), lane.drain())
+            .await
+            .expect("drop releases worker")
+            .expect("real wallet commit");
+        assert_eq!(progress.wallet_writers(), 0);
+        assert_eq!(
+            lane.db.as_mut().expect("db").chain_height().expect("tip"),
+            Some(BlockHeight::from(3_000_000))
         );
     }
 
@@ -6355,5 +6688,15 @@ mod graft_sweep_root_tests {
             None,
             "nor has a shard the store does not hold"
         );
+    }
+}
+
+impl WriteBehindFacade {
+    /// Set the chunk stage timings for diagnostic logging.
+    pub fn set_timings(
+        &mut self,
+        timings: Option<std::sync::Arc<crate::scan_stages::ChunkStageTimings>>,
+    ) {
+        self.timings = timings;
     }
 }

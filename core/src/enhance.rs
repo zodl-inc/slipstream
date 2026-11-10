@@ -18,13 +18,12 @@
 //! fetching full tx data from lightwalletd.
 //!
 //! ## Concurrency model
-//! Fetches run concurrently via `futures_util::stream::FuturesUnordered`: every
-//! request in a round is pushed at once, with the gRPC channel's HTTP/2 stream
-//! multiplexing providing the practical concurrency bound (no explicit cap is
-//! applied — see the note at the `FuturesUnordered` construction site if one is
-//! ever needed). DB applies are serial (driven by `&mut WalletSession`).
-//! Unordered application is correct because each txid write is independent —
-//! there are no cross-txid ordering constraints in the `WalletWrite` API.
+//! Fetches run concurrently via `futures_util::stream::FuturesUnordered` with an
+//! explicit cap ([`ENHANCE_FETCH_CONCURRENCY`]) on the concurrent GetTransaction
+//! calls, so the gateway's per-host heavy-call limit is respected. DB applies are
+//! serial (driven by `&mut WalletSession`). Unordered application is correct
+//! because each txid write is independent — there are no cross-txid ordering
+//! constraints in the `WalletWrite` API.
 //!
 //! ## Variant semantics
 //! Mirrors `Sources/ZcashLightClientKit/Block/Enhance/BlockEnhancer.swift:94-171`
@@ -36,7 +35,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use futures_util::{StreamExt, stream::FuturesUnordered};
+use futures_util::StreamExt;
 use tracing::{debug, info, warn};
 use zcash_client_backend::data_api::{
     OutputStatusFilter, TransactionDataRequest, TransactionStatus, TransactionStatusFilter,
@@ -49,15 +48,134 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     config::Endpoint,
-    connector::{ConnPurpose, LazyConnection, TorConn, connect_via},
+    connector::{ConnPurpose, LazyConnection, TorConn, connect_via_tracked as connect_via},
     error::SlipstreamError,
     events::Progress,
-    grpc::{self, LwdClient},
+    grpc::{self, LwdClient, TrackedConnection},
+    ohttp::OhttpNetworks,
     wallet_session::WalletSession,
 };
 
-/// Counters from one enhancement run: `run_enhancement_lazily`, or [`run_enhancement`],
-/// which wraps it.
+/// What each wallet-identifying call needs to open an isolated Tor connection of its own: the
+/// OHTTP configuration, the Tor client, the endpoint, and the permits that bound how many are
+/// open at once.
+type Isolation = (
+    Arc<OhttpNetworks>,
+    TorConn,
+    Endpoint,
+    Arc<tokio::sync::Semaphore>,
+);
+
+/// The answer to one txid fetch: the txid, whether it was an enhancement, the result.
+type FetchResult = (
+    zcash_primitives::transaction::TxId,
+    bool,
+    Result<Option<zcash_client_backend::proto::service::RawTransaction>, SlipstreamError>,
+);
+type FetchFuture = std::pin::Pin<Box<dyn std::future::Future<Output = FetchResult> + Send>>;
+
+/// One `GetTransaction`: over a clone of `client` (Tor off), or over a fresh isolated Tor
+/// client, at most [`ISOLATED_FETCH_CONCURRENCY`] at a time.
+fn fetch_transaction(
+    client: Option<TrackedConnection>,
+    isolate: Option<&Isolation>,
+    txid: zcash_primitives::transaction::TxId,
+    want_enhance: bool,
+) -> FetchFuture {
+    match isolate {
+        None => {
+            let c = client.expect("a non-isolated fetch has an open client");
+            let route = grpc::current_ohttp_health_route();
+            Box::pin(async move {
+                let raw = grpc::with_ohttp_health_route(
+                    route,
+                    c.call(async |client| grpc::get_transaction(client, *txid.as_ref()).await),
+                )
+                .await;
+                (txid, want_enhance, raw)
+            })
+        }
+        Some((networks, tor, endpoint, permits)) => {
+            let (networks, tor, endpoint, permits) = (
+                Arc::clone(networks),
+                tor.clone(),
+                endpoint.clone(),
+                Arc::clone(permits),
+            );
+            Box::pin(async move {
+                let raw = async {
+                    let _permit = permits.acquire_owned().await.map_err(|e| {
+                        SlipstreamError::Transport(format!("isolated fetch permits: {e}"))
+                    })?;
+                    let c = tor.connect_isolated_tracked(&networks, &endpoint).await?;
+                    grpc::with_ohttp_endpoint(
+                        &networks,
+                        &endpoint,
+                        true,
+                        c.call(async |client| grpc::get_transaction(client, *txid.as_ref()).await),
+                    )
+                    .await
+                }
+                .await;
+                (txid, want_enhance, raw)
+            })
+        }
+    }
+}
+
+/// Maximum per-txid retry attempts after the first failure (4 total attempts).
+const MAX_TXID_RETRIES: u32 = 3;
+
+/// Per-txid retry backoff schedule: attempt index → sleep Duration.
+/// Jittered exponential: 250 ms, 500 ms, 1 s, 2 s (±20% jitter).
+fn txid_retry_backoff(attempt: u32) -> std::time::Duration {
+    let base_ms = match attempt {
+        1 => 250,
+        2 => 500,
+        3 => 1000,
+        _ => 2000,
+    };
+    let jitter = 0.8 + (rand::random::<f64>() * 0.4);
+    std::time::Duration::from_millis((base_ms as f64 * jitter) as u64)
+}
+
+/// One GetTransaction fetch with per-txid retry on transient transport errors.
+/// A transient error (gRPC UNAVAILABLE / RESOURCE_EXHAUSTED / DEADLINE_EXCEEDED,
+/// as classified by [`SlipstreamError::is_transient`]) retries up to
+/// [`MAX_TXID_RETRIES`] times with jittered exponential backoff. Non-transient
+/// errors (wallet DB, decode, policy denial, rate limit with the whole-round
+/// backoff already applied) propagate immediately.
+async fn fetch_with_retry(
+    client: Option<TrackedConnection>,
+    isolate: Option<&Isolation>,
+    txid: zcash_primitives::transaction::TxId,
+    want_enhance: bool,
+) -> FetchResult {
+    let mut attempt = 0;
+    loop {
+        let (_, _, result) = fetch_transaction(client.clone(), isolate, txid, want_enhance).await;
+        match result {
+            Ok(raw) => return (txid, want_enhance, Ok(raw)),
+            Err(e) if e.is_transient() && attempt < MAX_TXID_RETRIES => {
+                attempt += 1;
+                let backoff = txid_retry_backoff(attempt);
+                debug!(
+                    %txid,
+                    %e,
+                    attempt,
+                    backoff_ms = backoff.as_millis(),
+                    "txid fetch failed (transient) — retrying"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+            Err(e) => {
+                return (txid, want_enhance, Err(e));
+            }
+        }
+    }
+}
+
+/// Counters from one `run_enhancement` call.
 #[derive(Debug, Default, Clone)]
 pub struct EnhanceStats {
     /// Total number of `TransactionDataRequest` items processed (across all rounds).
@@ -105,16 +223,50 @@ pub async fn run_enhancement(
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError> {
-    // The run takes its client at the first request that needs the server; this one is
-    // already open, so it gets a handle on the same channel.
-    let open = client.clone();
+    let open = TrackedConnection::in_context(client.clone());
     let mut client = LazyConnection::new(move || std::future::ready(Ok(open.clone())));
     run_enhancement_lazily(session, &mut client, network, progress, skipped_keys).await
 }
 
+/// Concurrent isolated Tor connections opened for wallet-identifying fetches.
+/// Matches [`ENHANCE_FETCH_CONCURRENCY`]: each fetch still gets its own circuit, and a device
+/// resync over Tor spent ~2.5 min on 111 txids at 4.
+const ISOLATED_FETCH_CONCURRENCY: usize = ENHANCE_FETCH_CONCURRENCY;
+
+/// Concurrent GetTransaction fetches (enhancement or status checks). Bounds the
+/// concurrent heavy calls to respect the gateway's per-host cap (field evidence:
+/// 4-32, tested at 8). Each fetch that hits the cap gets `grpc-status 14` and is
+/// retried per-txid with backoff, so this bound prevents the all-at-once storm.
+pub const ENHANCE_FETCH_CONCURRENCY: usize = 8;
+
+/// [`run_enhancement`], with every wallet-identifying call (each `GetTransaction`, each
+/// `GetTaddressTxids`) on its own isolated Tor circuit when `isolate` names the OHTTP
+/// configuration, the Tor client and the endpoint, so that the relay cannot link them to each
+/// other or to the sync traffic. `client` is used when `isolate` is `None` (Tor off).
+pub async fn run_enhancement_isolated(
+    session: &mut WalletSession,
+    client: &mut LwdClient,
+    network: crate::network::SlipstreamNetwork,
+    progress: Option<Arc<Progress>>,
+    skipped_keys: &mut HashSet<String>,
+    isolate: Option<(&Arc<OhttpNetworks>, &TorConn, &Endpoint)>,
+) -> Result<EnhanceStats, SlipstreamError> {
+    let open = TrackedConnection::in_context(client.clone());
+    let mut client = LazyConnection::new(move || std::future::ready(Ok(open.clone())));
+    run_enhancement_lazily_isolated(
+        session,
+        &mut client,
+        network,
+        progress,
+        skipped_keys,
+        isolate,
+    )
+    .await
+}
+
 /// A connect in progress, boxed so that [`enhancement_connection`] can name its type.
 type ConnectFuture<'a> = std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<LwdClient, SlipstreamError>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<TrackedConnection, SlipstreamError>> + Send + 'a>,
 >;
 
 /// The connection the scan's interleaved enhancement and the scheduler's per-range
@@ -122,11 +274,17 @@ type ConnectFuture<'a> = std::pin::Pin<
 /// carries — transactions by txid, address histories — identifies the wallet, so with Tor
 /// on it is an isolated circuit ([`ConnPurpose::MetadataUnique`]).
 pub(crate) fn enhancement_connection<'a>(
+    networks: &'a OhttpNetworks,
     endpoint: &'a Endpoint,
     tor: Option<&'a TorConn>,
-) -> LazyConnection<LwdClient, impl FnMut() -> ConnectFuture<'a> + Send> {
+) -> LazyConnection<TrackedConnection, impl FnMut() -> ConnectFuture<'a> + Send> {
     LazyConnection::new(move || -> ConnectFuture<'a> {
-        Box::pin(connect_via(endpoint, tor, ConnPurpose::MetadataUnique))
+        Box::pin(connect_via(
+            networks,
+            endpoint,
+            tor,
+            ConnPurpose::MetadataUnique,
+        ))
     })
 }
 
@@ -138,15 +296,39 @@ pub(crate) fn enhancement_connection<'a>(
 /// the run.
 pub(crate) async fn run_enhancement_lazily<F, Fut>(
     session: &mut WalletSession,
-    client: &mut LazyConnection<LwdClient, F>,
+    client: &mut LazyConnection<TrackedConnection, F>,
     network: crate::network::SlipstreamNetwork,
     progress: Option<Arc<Progress>>,
     skipped_keys: &mut HashSet<String>,
 ) -> Result<EnhanceStats, SlipstreamError>
 where
     F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
+    Fut: std::future::Future<Output = Result<TrackedConnection, SlipstreamError>>,
 {
+    run_enhancement_lazily_isolated(session, client, network, progress, skipped_keys, None).await
+}
+
+/// Lazy enhancement retaining a fresh Tor circuit for each identifying request.
+pub(crate) async fn run_enhancement_lazily_isolated<F, Fut>(
+    session: &mut WalletSession,
+    client: &mut LazyConnection<TrackedConnection, F>,
+    network: crate::network::SlipstreamNetwork,
+    progress: Option<Arc<Progress>>,
+    skipped_keys: &mut HashSet<String>,
+    isolate: Option<(&Arc<OhttpNetworks>, &TorConn, &Endpoint)>,
+) -> Result<EnhanceStats, SlipstreamError>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<TrackedConnection, SlipstreamError>>,
+{
+    let isolate: Option<Isolation> = isolate.map(|(networks, tor, endpoint)| {
+        (
+            Arc::clone(networks),
+            tor.clone(),
+            endpoint.clone(),
+            Arc::new(tokio::sync::Semaphore::new(ISOLATED_FETCH_CONCURRENCY)),
+        )
+    });
     let mut stats = EnhanceStats::default();
 
     for round in 0..3_u32 {
@@ -164,44 +346,29 @@ where
         // ── Phase 1: concurrent txid fetches ──────────────────────────────────
         //
         // Build a set of futures, each cloning a lightweight `LwdClient` handle
-        // (backed by a shared `Channel` — no new TCP connections per clone; the
-        // run's connection is opened when its first handle is taken).
-        // All fetch futures are pushed into FuturesUnordered at once; the gRPC
-        // channel's HTTP/2 stream multiplexing provides the practical concurrency
-        // bound. An explicit bound (e.g. stream::iter(futs).buffered(N)) is a
-        // future upgrade if unbounded concurrency ever needs capping. DB applies
-        // are serial below — `session` is never held across an await point.
-        //
-        // Each future yields `(TxId, bool, Result<Option<RawTransaction>, SlipstreamError>)`.
-        // The two arms of the match produce different anonymous `async` block types, so
-        // we box them to a uniform `Pin<Box<dyn Future<Output = ...> + Send>>`.
-        type FetchResult = (
-            zcash_primitives::transaction::TxId,
-            bool,
-            Result<Option<zcash_client_backend::proto::service::RawTransaction>, SlipstreamError>,
-        );
-        type BoxFut = std::pin::Pin<Box<dyn std::future::Future<Output = FetchResult> + Send>>;
-
+        // (backed by a shared `Channel` — no new TCP connections per clone).
+        // Bounded by ENHANCE_FETCH_CONCURRENCY to respect the gateway's per-host
+        // cap on concurrent heavy calls (GetTransaction counts as heavy). Each
+        // fetch that fails with a transient transport error (gRPC UNAVAILABLE,
+        // RESOURCE_EXHAUSTED, DEADLINE_EXCEEDED) is retried for that txid only,
+        // with jittered exponential backoff (250 ms, 500 ms, 1 s, 2 s). A txid
+        // that still fails after its retries is left un-enhanced (remains queued
+        // in the wallet DB so the next pass retries it) and does not fail the
+        // pass — the engine reaches DONE, and follow-mode passes and the final
+        // post-loop enhancement will retry it. DB applies are serial below —
+        // `session` is never held across an await point.
         let mut address_reqs: Vec<TransactionsInvolvingAddress> = Vec::new();
-        let mut pending: FuturesUnordered<BoxFut> = FuturesUnordered::new();
+        let mut txid_reqs: Vec<(zcash_primitives::transaction::TxId, bool)> = Vec::new();
 
+        // Whether this round did anything that can change the wallet's next requests.
+        let mut served_any = false;
         for req in requests {
             match req {
                 TransactionDataRequest::GetStatus(txid) => {
-                    let mut c = client.get().await?.clone();
-                    let fut: BoxFut = Box::pin(async move {
-                        let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
-                        (txid, /*want_enhance=*/ false, raw)
-                    });
-                    pending.push(fut);
+                    txid_reqs.push((txid, false));
                 }
                 TransactionDataRequest::Enhancement(txid) => {
-                    let mut c = client.get().await?.clone();
-                    let fut: BoxFut = Box::pin(async move {
-                        let raw = grpc::get_transaction(&mut c, *txid.as_ref()).await;
-                        (txid, /*want_enhance=*/ true, raw)
-                    });
-                    pending.push(fut);
+                    txid_reqs.push((txid, true));
                 }
                 TransactionDataRequest::TransactionsInvolvingAddress(tia) => {
                     address_reqs.push(tia);
@@ -209,16 +376,29 @@ where
             }
         }
 
+        served_any |= !txid_reqs.is_empty();
+
+        // Fetch with retry: each txid is retried up to MAX_TXID_RETRIES times on
+        // transient errors. buffer_unordered bounds the concurrency.
+        let mut failed_txids = Vec::new();
+        let open = if !txid_reqs.is_empty() && isolate.is_none() {
+            Some(client.get().await?.clone())
+        } else {
+            None
+        };
+        let isolate_for_fetches = isolate.clone();
+        let txid_fetches =
+            futures_util::stream::iter(txid_reqs.into_iter().map(move |(txid, want_enhance)| {
+                let c = open.clone();
+                let iso = isolate_for_fetches.clone();
+                async move { fetch_with_retry(c, iso.as_ref(), txid, want_enhance).await }
+            }))
+            .buffer_unordered(ENHANCE_FETCH_CONCURRENCY);
+        futures_util::pin_mut!(txid_fetches);
+
         // Collect results as they arrive and apply to DB immediately (serial apply).
-        // All futures are already pushed; we drain them in order. The gRPC channel's
-        // HTTP/2 multiplexing handles the actual concurrency (not FuturesUnordered).
-        // This design is correct for typical 0-10 enhancement requests per scan pass.
-        loop {
-            // v0.5 pacer: awaiting the next fetch = the network-bound share.
+        while let Some((txid, want_enhance, fetched)) = txid_fetches.next().await {
             let fetch_started = std::time::Instant::now();
-            let Some((txid, want_enhance, fetched)) = pending.next().await else {
-                break;
-            };
             if fetched.is_ok() {
                 // Liveness: each GetTransaction answer is forward progress — over Tor
                 // these take seconds each and most never store a transaction.
@@ -228,7 +408,7 @@ where
             }
             stats.fetch_wait += fetch_started.elapsed();
             let store_started = std::time::Instant::now();
-            apply_txid_fetch(
+            match apply_txid_fetch(
                 session,
                 txid,
                 want_enhance,
@@ -236,25 +416,91 @@ where
                 &network,
                 &mut stats,
                 progress.as_deref(),
-            )?;
+            ) {
+                Ok(()) => {}
+                Err(e) if e.is_transient() => {
+                    // Transient error after all retries: leave un-enhanced, log it.
+                    // The wallet DB keeps the request queued, so the next pass retries.
+                    failed_txids.push((txid, want_enhance, e));
+                }
+                Err(e) => {
+                    // Non-transient error (wallet DB corruption, scan logic bug, etc.) — propagate.
+                    return Err(e);
+                }
+            }
             stats.store += store_started.elapsed();
+        }
+
+        if !failed_txids.is_empty() {
+            warn!(
+                count = failed_txids.len(),
+                "enhancement round: some txids failed after retries (left un-enhanced, will retry next pass)"
+            );
+            for (txid, want_enhance, err) in &failed_txids {
+                let kind = if *want_enhance {
+                    "Enhancement"
+                } else {
+                    "GetStatus"
+                };
+                warn!(%txid, %kind, %err, "txid fetch failed");
+            }
         }
 
         // ── Phase 2: serial address-window requests ────────────────────────────
         let address_started = std::time::Instant::now();
         for tia in address_reqs {
-            apply_address_request(
-                session,
-                client,
-                &network,
-                tia,
-                &mut stats,
-                skipped_keys,
-                progress.as_deref(),
+            // Skip guards first: a skipped request needs no connection, and over Tor each
+            // isolated connection costs a fresh circuit (seconds) for nothing.
+            let Some(block_range_end) =
+                address_request_range_end(session, &network, &tia, &mut stats, skipped_keys)?
+            else {
+                continue;
+            };
+            served_any = true;
+            let mut isolated;
+            let address_client = match &isolate {
+                Some((networks, tor, endpoint, _)) => {
+                    isolated = tor.connect_isolated_tracked(networks, endpoint).await?;
+                    &mut isolated
+                }
+                None => client.get().await?,
+            };
+            let route = match &isolate {
+                Some((networks, _, endpoint, _)) => {
+                    crate::ohttp::relay_for(networks, &endpoint.host).map(|relay| {
+                        crate::transport_health::HealthRoute {
+                            gateway_host: endpoint.host.clone(),
+                            relay_url: relay.into(),
+                            via_tor: true,
+                        }
+                    })
+                }
+                None => grpc::current_ohttp_health_route(),
+            };
+            grpc::with_ohttp_health_route(
+                route,
+                address_client.call(async |client| {
+                    apply_address_request(
+                        session,
+                        client,
+                        &network,
+                        tia,
+                        block_range_end,
+                        &mut stats,
+                        progress.as_deref(),
+                    )
+                    .await
+                }),
             )
             .await?;
         }
         stats.address += address_started.elapsed();
+
+        // A round that fetched no txid and served no address request changed nothing in the
+        // wallet DB, so the next round would get the same (all skipped) requests again.
+        if !served_any {
+            break;
+        }
     }
 
     info!(
@@ -270,6 +516,8 @@ where
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
 /// Apply the result of a `GetTransaction` fetch for one `GetStatus` or `Enhancement` request.
+/// Returns `Err` when the fetch failed or when the DB write failed: the caller distinguishes
+/// transient errors (leave un-enhanced, retry next pass) from non-transient (propagate).
 fn apply_txid_fetch(
     session: &mut WalletSession,
     txid: zcash_primitives::transaction::TxId,
@@ -281,7 +529,9 @@ fn apply_txid_fetch(
 ) -> Result<(), SlipstreamError> {
     match fetched {
         Err(err) => {
-            // Transport-class error (connection refused, timeout, etc.) — propagate.
+            // Transport-class error (connection refused, timeout, rate limit after backoff,
+            // etc.) — return it so the caller can decide whether to leave un-enhanced (transient)
+            // or propagate (non-transient).
             return Err(err);
         }
         Ok(None) => {
@@ -362,39 +612,21 @@ fn effective_range_end(
     block_range_end.unwrap_or(chain_height + 1)
 }
 
-/// Handle one `TransactionsInvolvingAddress` request.
-///
-/// Mirrors `BlockEnhancer.swift:124-171` skip-guards and streaming logic:
-/// 1. Open-ended `block_range_end` (None) → clamp to `chain_height + 1` (T8.5); only
-///    skipped if there is no scanned chain tip yet (cannot happen after preflight).
-/// 2. `request_at` set → skip + warn (timed/decorrelated fetches not supported yet).
-/// 3. `output_status_filter == Unspent` → skip silently (not supported yet).
-/// 4. Otherwise: stream `GetTaddressTxids` over `[block_range_start, block_range_end - 1]`
-///    and apply `decrypt_and_store_transaction` for each returned tx, honoring
-///    `tx_status_filter` (Mined-only / Mempool-only skip per Swift lines 160-163).
-/// 5. On success: call `notify_address_checked` with `block_range_end - 1` so the wallet
-///    advances its check watermark.
-///
-/// `client` is asked for its connection only at step 4, so a skipped request never opens
-/// one.
+/// Skip guards 1-3 of [`apply_address_request`] for one `TransactionsInvolvingAddress` request:
+/// `Ok(None)` when the request is skipped (recorded in `skipped_keys` / `stats`), otherwise the
+/// effective end-exclusive range end to serve it with.
 ///
 /// `skipped_keys` — the per-run dedupe set shared across all rounds.  When a skip guard
 /// fires, the skip key (`address:range_start-range_end` or `address:open-no-tip`) is inserted.
 /// If the key is already present (same request re-issued in a later round), the duplicate
 /// is silently counted without re-emitting a `warn!` or incrementing `stats.skipped`.
-async fn apply_address_request<F, Fut>(
+fn address_request_range_end(
     session: &mut WalletSession,
-    client: &mut LazyConnection<LwdClient, F>,
     network: &crate::network::SlipstreamNetwork,
-    tia: TransactionsInvolvingAddress,
+    tia: &TransactionsInvolvingAddress,
     stats: &mut EnhanceStats,
     skipped_keys: &mut HashSet<String>,
-    progress: Option<&Progress>,
-) -> Result<(), SlipstreamError>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<LwdClient, SlipstreamError>>,
-{
+) -> Result<Option<BlockHeight>, SlipstreamError> {
     // Guard 1 (T8.5): clamp an open-ended range to the wallet's current chain tip instead
     // of skipping it. An open range (None) means "unbounded above" (data_api.rs:1131-1135);
     // the completest answer lightwalletd can give now is through the tip — so we clamp via
@@ -423,7 +655,7 @@ where
                         "TransactionsInvolvingAddress open-no-tip skip (duplicate, already counted)"
                     );
                 }
-                return Ok(());
+                return Ok(None);
             }
         },
     };
@@ -448,7 +680,7 @@ where
                 "TransactionsInvolvingAddress requestAt skip (duplicate, already counted)"
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
     // Guard 3: unspent-only output filter (not implemented).
@@ -467,9 +699,36 @@ where
                 "TransactionsInvolvingAddress unspent-filter skip (duplicate, already counted)"
             );
         }
-        return Ok(());
+        return Ok(None);
     }
 
+    Ok(Some(block_range_end))
+}
+
+/// Handle one `TransactionsInvolvingAddress` request.
+///
+/// Mirrors `BlockEnhancer.swift:124-171` skip-guards and streaming logic:
+/// 1. Open-ended `block_range_end` (None) → clamp to `chain_height + 1` (T8.5); only
+///    skipped if there is no scanned chain tip yet (cannot happen after preflight).
+/// 2. `request_at` set → skip + warn (timed/decorrelated fetches not supported yet).
+/// 3. `output_status_filter == Unspent` → skip silently (not supported yet).
+/// 4. Otherwise: stream `GetTaddressTxids` over `[block_range_start, block_range_end - 1]`
+///    and apply `decrypt_and_store_transaction` for each returned tx, honoring
+///    `tx_status_filter` (Mined-only / Mempool-only skip per Swift lines 160-163).
+/// 5. On success: call `notify_address_checked` with `block_range_end - 1` so the wallet
+///    advances its check watermark.
+///
+/// The skip guards (1-3) run in [`address_request_range_end`], before the caller opens a
+/// connection; this function serves a request that passed them (4-5).
+async fn apply_address_request(
+    session: &mut WalletSession,
+    client: &mut LwdClient,
+    network: &crate::network::SlipstreamNetwork,
+    tia: TransactionsInvolvingAddress,
+    block_range_end: BlockHeight,
+    stats: &mut EnhanceStats,
+    progress: Option<&Progress>,
+) -> Result<(), SlipstreamError> {
     // Build the gRPC filter: range is [start, end - 1] inclusive
     // (lightwalletd's GetTaddressTxids takes a closed range; block_range_end is exclusive
     // per the TransactionsInvolvingAddress contract, matching Swift's `blockRangeEnd - 1`).
@@ -491,12 +750,15 @@ where
         }),
     };
 
-    // Past every skip guard the request needs the server: take the client, connecting if
-    // nothing earlier in the run has.
-    let client = client.get().await?;
     let raw_txs = grpc::get_taddress_txids(client, filter, progress)
         .await
-        .map_err(|e| SlipstreamError::Wallet(format!("get_taddress_txids: {e}")))?;
+        .map_err(|e| {
+            if e.counts_as_unreachable() {
+                SlipstreamError::Wallet(format!("get_taddress_txids: {e}"))
+            } else {
+                e
+            }
+        })?;
     if let Some(p) = progress {
         p.touch(); // liveness: the address-history answer is forward progress
     }
@@ -634,8 +896,8 @@ mod tests {
     fn no_server(
         connects: &std::cell::Cell<u32>,
     ) -> LazyConnection<
-        LwdClient,
-        impl FnMut() -> std::future::Ready<Result<LwdClient, SlipstreamError>> + '_,
+        TrackedConnection,
+        impl FnMut() -> std::future::Ready<Result<TrackedConnection, SlipstreamError>> + '_,
     > {
         LazyConnection::new(move || {
             connects.set(connects.get() + 1);

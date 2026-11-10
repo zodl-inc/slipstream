@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! Correctness test: slipstream engine finds fixture transactions in a darkside chain.
 //!
 //! Mirrors `BalanceTests.testVerifyIncomingTransaction` from
@@ -56,6 +58,7 @@
 #![cfg(feature = "darkside")]
 
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -71,6 +74,7 @@ use zodl_slipstream::{
     enhance::run_enhancement,
     fetch::{FetchPlan, run_fetch},
     grpc,
+    ohttp::OhttpNetworks,
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
 };
@@ -293,7 +297,12 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100; // small chunks for this test chain (~39 blocks)
     cfg.fetch_streams = 2;
 
@@ -315,7 +324,9 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
         .expect("ensure_account");
 
     // Update chain tip from the server (GetLatestBlock supported by v0.4.9).
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
     let chain_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
@@ -423,7 +434,10 @@ async fn fixture_sync_body(sparse: bool, write_behind: bool) {
     );
     let fetch_ep = ep.clone();
 
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep, None, plan, tx, None).await },
+        );
 
     let scan_stats = scan_chunks_from_treestate(
         &mut session,
@@ -578,7 +592,12 @@ async fn sync_enhancement_stores_raw_fields() {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
 
@@ -596,7 +615,9 @@ async fn sync_enhancement_stores_raw_fields() {
         .ensure_account(TEST_UFVK, birthday_ts)
         .expect("ensure_account");
 
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
     let chain_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
@@ -657,7 +678,10 @@ async fn sync_enhancement_stores_raw_fields() {
     );
     let fetch_ep = ep.clone();
 
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep, None, plan, tx, None).await },
+        );
 
     let _scan_stats = scan_chunks_from_treestate(
         &mut session,
@@ -956,7 +980,12 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     // ONE chunk for the whole 101-block range (663150..=663250): scan_chunks_from_treestate
     // synthesizes inter-chunk tree states by COPYING the previous frontier, which is only
     // valid when the later chunks contain no shielded outputs. Chunk 1 here contains both
@@ -980,7 +1009,9 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
         .ensure_account(TEST_UFVK, birthday_ts)
         .expect("ensure_account");
 
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
     let chain_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
@@ -1044,7 +1075,10 @@ async fn spendability_gate_body(sparse: bool, write_behind: bool) {
     );
     let fetch_ep = ep.clone();
 
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep, None, plan, tx, None).await },
+        );
 
     let scan_stats = scan_chunks_from_treestate(
         &mut session,

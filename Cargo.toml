@@ -22,7 +22,7 @@ slipstream-gpuhash = { package = "zodl-slipstream-gpuhash", version = "0.1.2", p
 # Slipstream shared versions (P0-review carry-over). Root package keeps its own
 # [dependencies] block; slipstream crates inherit from here.
 # "net" is for zodl-slipstream::throttle (the v0.7 weather-machine TCP proxy).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
 tonic = "0.14"
 prost = "0.14"
 tonic-prost = "0.14"

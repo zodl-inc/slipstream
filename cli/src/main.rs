@@ -14,12 +14,17 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! Slipstream developer CLI: the primary harness for engine work (decision D5).
 //! Subcommands land per phase: `fetch` (P1), `sync` (P2+), `report` (P5).
 
 use clap::{Parser, Subcommand};
 use zcash_protocol::consensus::Parameters;
-use zodl_slipstream::{BlockHeight, UnifiedFullViewingKey};
+use zodl_slipstream::{
+    BlockHeight, UnifiedFullViewingKey,
+    ohttp::{OhttpConfig, OhttpConfigParams, OhttpNetworks},
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -28,6 +33,15 @@ use zodl_slipstream::{BlockHeight, UnifiedFullViewingKey};
     about = "Slipstream sync engine dev harness"
 )]
 struct Cli {
+    /// JSON file with the OHTTP configuration of mainnet and/or testnet:
+    /// `{"mainnet": {"gateway_host": "", "relay_url": "", "keys_dns_name": "",
+    /// "signing_pubkey": ""}, "testnet": {...}}`. Both objects are optional and a
+    /// network that is given needs all four values. A `--server` host that is the
+    /// `gateway_host` of a configured network is then reached over OHTTP through that
+    /// network's `relay_url` (wallet commands refuse the other network's gateway). Without this option OHTTP is off and every `--server` is dialled
+    /// directly.
+    #[arg(long, global = true, value_name = "PATH")]
+    ohttp_config: Option<std::path::PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -192,12 +206,35 @@ enum Cmd {
         /// devices) at the cost of RAM. The committed data.db is identical at any depth.
         #[arg(long, default_value_t = 1, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=64))]
         persist_depth: usize,
+        /// Write-behind commit size in blocks: consecutive scan calls (chunks or
+        /// sub-chunks) are committed together until this many blocks (or
+        /// `--persist-commit-outputs` note commitments). 0 = one commit per scan call.
+        #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_BLOCKS)]
+        persist_commit_blocks: u64,
+        /// Write-behind commit size in note commitments (all pools): a unit is committed
+        /// once it holds this many, or `--persist-commit-blocks` blocks.
+        #[arg(long, default_value_t = zodl_slipstream::persist::CommitLimits::DEFAULT_MAX_OUTPUTS)]
+        persist_commit_outputs: u64,
+        /// Adaptive prefetch while the scan waits for blocks (slow head stream restarts, more
+        /// OHTTP block streams). `--fetch-boost false` is the kill switch.
+        #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, default_missing_value = "true")]
+        fetch_boost: bool,
+        /// Dense ranges: merge queued chunks into one scan call up to this many note
+        /// commitments (0 = off). Default: the engine's (`EngineConfig::DEFAULT_SCAN_MERGE_OUTPUTS`).
+        #[arg(long)]
+        scan_merge_outputs: Option<u64>,
         /// T8.1: after reaching tip, keep the wallet tracking the chain.
         /// Probes the tip every 10–30 s (jittered); runs a full pass whenever a
         /// new block arrives. Cancellable with Ctrl-C. Useful for Mac CLI validation
         /// and for observing follow behaviour without a full Zodl build.
         #[arg(long, default_value_t = false)]
         follow: bool,
+        /// Route the pass through Tor: bootstrap an arti client from this directory
+        /// (created if absent) and hand it to the engine, as the mobile SDKs do with
+        /// Tor mode on. With an OHTTP gateway (see --ohttp-config) as --server, every call
+        /// (bulk included) is OHTTP-encapsulated and its relay leg dialled through Tor.
+        #[arg(long)]
+        tor_dir: Option<std::path::PathBuf>,
     },
     /// v0.4 P0 bench (spec §3.3): scripted fresh-restore benchmark. Restores the
     /// given UFVK into an EMPTY wallet dir (temp by default — a bench is always a
@@ -445,6 +482,75 @@ fn cmd_derive_ufvk(mnemonic: &str, account: u32, network: zodl_slipstream::Netwo
     );
 }
 
+/// One network's OHTTP configuration in the `--ohttp-config` file. Unknown keys and missing
+/// fields are errors; the values are checked by [`OhttpConfig::new`].
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OhttpNetworkFile {
+    gateway_host: String,
+    relay_url: String,
+    keys_dns_name: String,
+    signing_pubkey: String,
+}
+
+/// The `--ohttp-config` file: the configuration of each network that has OHTTP on.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OhttpConfigFile {
+    mainnet: Option<OhttpNetworkFile>,
+    testnet: Option<OhttpNetworkFile>,
+}
+
+/// A JSON error for the user. serde's messages for a value of the wrong type quote the value,
+/// so only errors that name a key (unknown or missing) keep their text; the rest are reduced
+/// to their kind and position.
+fn describe_json_error(error: &serde_json::Error) -> String {
+    let text = error.to_string();
+    if text.starts_with("unknown field") || text.starts_with("missing field") {
+        return text;
+    }
+    format!(
+        "{:?} error at line {} column {}",
+        error.classify(),
+        error.line(),
+        error.column()
+    )
+}
+
+/// Loads the OHTTP configuration of `--ohttp-config`; no option means OHTTP is off. Errors name
+/// the network, the field and the rule, never a value.
+fn load_ohttp_config(path: Option<&std::path::Path>) -> Result<OhttpNetworks, String> {
+    let Some(path) = path else {
+        return Ok(OhttpNetworks::default());
+    };
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("--ohttp-config {}: {e}", path.display()))?;
+    let file: OhttpConfigFile = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "--ohttp-config {}: {}",
+            path.display(),
+            describe_json_error(&e)
+        )
+    })?;
+    let build = |name: &str, network: Option<OhttpNetworkFile>| {
+        network
+            .map(|n| {
+                OhttpConfig::new(OhttpConfigParams {
+                    gateway_host: &n.gateway_host,
+                    relay_url: &n.relay_url,
+                    keys_dns_name: &n.keys_dns_name,
+                    signing_pubkey: &n.signing_pubkey,
+                })
+                .map_err(|e| format!("--ohttp-config {}: {name}: {e}", path.display()))
+            })
+            .transpose()
+    };
+    let mainnet = build("mainnet", file.mainnet)?;
+    let testnet = build("testnet", file.testnet)?;
+    OhttpNetworks::new(mainnet, testnet)
+        .map_err(|e| format!("--ohttp-config {}: {e}", path.display()))
+}
+
 fn parse_server(s: &str) -> Result<zodl_slipstream::Endpoint, String> {
     let (tls, rest) = if let Some(r) = s.strip_prefix("https://") {
         (true, r)
@@ -480,6 +586,7 @@ fn parse_range(s: &str) -> Result<(u64, u64), String> {
 }
 
 async fn run_fetch_bench(
+    ohttp: &OhttpNetworks,
     endpoint: &zodl_slipstream::Endpoint,
     start: u64,
     end: u64,
@@ -489,7 +596,15 @@ async fn run_fetch_bench(
     let (tx, mut rx) = zodl_slipstream::chunk::chunk_queue(256 * 1024 * 1024);
     let drain = tokio::spawn(async move { while let Some((_c, _p, _b)) = rx.recv().await {} });
     let plan = zodl_slipstream::fetch::FetchPlan::new(start, end, chunk, streams);
-    let stats = zodl_slipstream::fetch::run_fetch(endpoint, plan, tx, None).await?;
+    let stats = zodl_slipstream::fetch::run_fetch(
+        std::sync::Arc::new(ohttp.clone()),
+        endpoint,
+        None,
+        plan,
+        tx,
+        None,
+    )
+    .await?;
     let _ = drain.await;
     Ok(stats)
 }
@@ -548,7 +663,14 @@ fn cmd_throttle_proxy(
     });
 }
 
-fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline: bool) {
+fn cmd_fetch(
+    ohttp: OhttpNetworks,
+    server: String,
+    range: String,
+    streams: usize,
+    chunk: u32,
+    baseline: bool,
+) {
     let endpoint = parse_server(&server).unwrap_or_else(|e| {
         eprintln!("{e}");
         std::process::exit(2)
@@ -562,7 +684,7 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
         let mut base_stats = None;
         if baseline {
             println!("baseline run (streams=1)...");
-            match run_fetch_bench(&endpoint, start, end, chunk, 1).await {
+            match run_fetch_bench(&ohttp, &endpoint, start, end, chunk, 1).await {
                 Ok(s) => {
                     println!(
                         "  K=1: {} blocks, {:.1} MB, {:.1}s, {:.0} blk/s, {:.2} MB/s",
@@ -581,7 +703,7 @@ fn cmd_fetch(server: String, range: String, streams: usize, chunk: u32, baseline
             }
         }
         println!("measured run (streams={streams})...");
-        match run_fetch_bench(&endpoint, start, end, chunk, streams).await {
+        match run_fetch_bench(&ohttp, &endpoint, start, end, chunk, streams).await {
             Ok(s) => {
                 println!(
                     "  K={streams}: {} blocks, {:.1} MB, {:.1}s, {:.0} blk/s, {:.2} MB/s",
@@ -633,6 +755,7 @@ fn uuid_prefix(bytes: &[u8]) -> String {
 /// The Phase C acceptance harness: renders wallet state ONLY from the v2 contract.
 /// If this function ever needs wallet math, the engine API is wrong (ENGINE_API_V2.md §8).
 fn cmd_watch(
+    ohttp: OhttpNetworks,
     network: zodl_slipstream::Network,
     server: String,
     wallet_dir: std::path::PathBuf,
@@ -649,7 +772,7 @@ fn cmd_watch(
         std::process::exit(2)
     });
     let db_path = wallet_dir.join("data.db");
-    let cfg = zodl_slipstream::EngineConfig::new(network, db_path.clone(), endpoint);
+    let cfg = zodl_slipstream::EngineConfig::new(network, db_path.clone(), endpoint, ohttp);
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
@@ -847,6 +970,7 @@ fn require_gpu_feature_if(requested: bool, flag: &str) {
 /// not a restore) and prints/persists the engine-written BenchSummary.
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
+    ohttp: OhttpNetworks,
     network: zodl_slipstream::Network,
     server: String,
     alternate_server: Vec<String>,
@@ -896,7 +1020,7 @@ fn cmd_bench(
     };
 
     let json_path = json.unwrap_or_else(|| dir.join("bench.json"));
-    let mut cfg = zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint);
+    let mut cfg = zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint, ohttp);
     cfg.gpu_subtree = gpu_subtree;
     // v0.4 Plan A lever (Task 8+): live A/B switch — the whole point of bench.
     cfg.graft_subtree = graft;
@@ -1002,6 +1126,7 @@ fn cmd_bench(
 
 #[allow(clippy::too_many_arguments)]
 fn cmd_sync(
+    ohttp: OhttpNetworks,
     network: zodl_slipstream::SlipstreamNetwork,
     server: String,
     wallet_dir: std::path::PathBuf,
@@ -1015,9 +1140,14 @@ fn cmd_sync(
     write_behind: bool,
     gpu_subtree: bool,
     persist_depth: usize,
+    persist_commit_blocks: u64,
+    persist_commit_outputs: u64,
+    fetch_boost: bool,
+    scan_merge_outputs: Option<u64>,
     follow: bool,
     anchor_retention: Option<u32>,
     anchor_retention_interval: u32,
+    tor_dir: Option<std::path::PathBuf>,
 ) {
     let endpoint = parse_server(&server).unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -1033,12 +1163,17 @@ fn cmd_sync(
         std::process::exit(2)
     });
 
-    let mut cfg = zodl_slipstream::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint);
+    let mut cfg =
+        zodl_slipstream::EngineConfig::new(network, wallet_dir.join("data.db"), endpoint, ohttp);
     cfg.fetch_streams = streams;
     cfg.chunk_blocks = chunk;
     cfg.sparse_persistence = sparse;
     cfg.chunk_split_bytes = chunk_split_bytes;
     cfg.memory_budget_bytes = memory_budget_bytes;
+    cfg.fetch_boost = fetch_boost;
+    if let Some(n) = scan_merge_outputs {
+        cfg.scan_merge_outputs = n;
+    }
     // [B6] The floor and the grid together are the retention policy; an interval
     // of zero is not a grid, so it is rejected rather than silently defaulted.
     cfg.anchor_retention = match anchor_retention {
@@ -1064,9 +1199,44 @@ fn cmd_sync(
     // sparse build path, so the sparse kill switch implies graft off.
     cfg.graft_subtree = cfg.graft_subtree && sparse;
     cfg.persist_depth = persist_depth;
+    cfg.persist_commit_limits =
+        (persist_commit_blocks > 0).then_some(zodl_slipstream::persist::CommitLimits {
+            max_blocks: persist_commit_blocks,
+            max_outputs: persist_commit_outputs,
+        });
+
+    if let Err(error) = prepare_tor_directory(tor_dir.as_deref()) {
+        let path = tor_dir.as_deref().map_or_else(
+            || "<unspecified>".to_owned(),
+            |dir| dir.display().to_string(),
+        );
+        eprintln!("error: tor dir {path}: {error}");
+        std::process::exit(2);
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async {
+        // Tor mode: the engine-owned arti client, bootstrapped on this runtime.
+        // (`--follow` hands the directory to the session instead, which bootstraps its own.)
+        let tor = match tor_dir.as_ref().filter(|_| !follow) {
+            Some(dir) => {
+                let started = std::time::Instant::now();
+                match zodl_slipstream::connector::TorConn::bootstrap(dir, false, None).await {
+                    Ok(t) => {
+                        println!(
+                            "tor: bootstrapped in {:.1}s",
+                            started.elapsed().as_secs_f64()
+                        );
+                        Some(t)
+                    }
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => None,
+        };
         // Build shared progress state for the CLI ticker (decision D8 poll-based).
         let progress = std::sync::Arc::new(zodl_slipstream::Progress::default());
         let ticker_progress = std::sync::Arc::clone(&progress);
@@ -1101,7 +1271,12 @@ fn cmd_sync(
             let scfg = zodl_slipstream::SessionConfig {
                 engine: cfg.clone(),
                 accounts: accounts.clone(),
-                tor: None,
+                tor: tor_dir
+                    .clone()
+                    .map(|dir| zodl_slipstream::TorSessionConfig {
+                        dir,
+                        dangerously_trust_everyone: false,
+                    }),
             };
             let reporter = zodl_slipstream::SessionReporter {
                 progress: std::sync::Arc::clone(&progress),
@@ -1123,7 +1298,7 @@ fn cmd_sync(
         }
 
         let result =
-            zodl_slipstream::engine::sync_once(&cfg, &accounts, Some(progress), None).await;
+            zodl_slipstream::engine::sync_once(&cfg, &accounts, Some(progress), tor.as_ref()).await;
 
         // Abort the ticker (JoinHandle::abort is fine per spec — no cleanup needed).
         ticker.abort();
@@ -1192,8 +1367,16 @@ fn cmd_sync(
     });
 }
 
+fn prepare_tor_directory(tor_dir: Option<&std::path::Path>) -> std::io::Result<()> {
+    if let Some(dir) = tor_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn cmd_oracle(
+    ohttp: OhttpNetworks,
     network: zodl_slipstream::Network,
     server: String,
     wallet_a: std::path::PathBuf,
@@ -1234,8 +1417,12 @@ fn cmd_oracle(
                   write_behind: bool,
                   gpu_subtree: bool,
                   persist_depth: usize| {
-        let mut cfg =
-            zodl_slipstream::EngineConfig::new(network, dir.join("data.db"), endpoint.clone());
+        let mut cfg = zodl_slipstream::EngineConfig::new(
+            network,
+            dir.join("data.db"),
+            endpoint.clone(),
+            ohttp.clone(),
+        );
         cfg.fetch_streams = streams;
         cfg.chunk_blocks = chunk;
         cfg.sparse_persistence = sparse;
@@ -1292,6 +1479,7 @@ fn cmd_oracle(
 /// one ever were).
 #[allow(clippy::too_many_arguments)]
 fn cmd_send(
+    ohttp: OhttpNetworks,
     network: zodl_slipstream::Network,
     server: String,
     wallet_dir: std::path::PathBuf,
@@ -1503,7 +1691,7 @@ fn cmd_send(
         .expect("tokio runtime");
     let (code, message) = rt
         .block_on(async {
-            let mut client = zodl_slipstream::grpc::connect(&endpoint).await?;
+            let mut client = zodl_slipstream::grpc::connect(&ohttp, &endpoint).await?;
             zodl_slipstream::grpc::send_transaction(&mut client, raw).await
         })
         .expect("broadcast");
@@ -1528,6 +1716,10 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
+    let ohttp = load_ohttp_config(cli.ohttp_config.as_deref()).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2)
+    });
     match cli.cmd {
         Cmd::Version => {
             println!(
@@ -1552,7 +1744,7 @@ fn main() {
             chunk,
             baseline,
         } => {
-            cmd_fetch(server, range, streams, chunk, baseline);
+            cmd_fetch(ohttp, server, range, streams, chunk, baseline);
         }
         Cmd::DeriveUfvk {
             mnemonic,
@@ -1571,6 +1763,7 @@ fn main() {
             zats,
         } => {
             cmd_send(
+                ohttp,
                 network.to_network(),
                 server,
                 wallet_dir,
@@ -1597,9 +1790,15 @@ fn main() {
             write_behind,
             gpu_subtree,
             persist_depth,
+            persist_commit_blocks,
+            persist_commit_outputs,
+            fetch_boost,
+            scan_merge_outputs,
             follow,
+            tor_dir,
         } => {
             cmd_sync(
+                ohttp,
                 resolve_network(network, custom_heights.as_deref()),
                 server,
                 wallet_dir,
@@ -1613,9 +1812,14 @@ fn main() {
                 write_behind,
                 gpu_subtree,
                 persist_depth,
+                persist_commit_blocks,
+                persist_commit_outputs,
+                fetch_boost,
+                scan_merge_outputs,
                 follow,
                 anchor_retention,
                 anchor_retention_interval,
+                tor_dir,
             );
         }
         Cmd::Bench {
@@ -1636,6 +1840,7 @@ fn main() {
             keep,
         } => {
             cmd_bench(
+                ohttp,
                 network.to_network(),
                 server,
                 alternate_server,
@@ -1662,6 +1867,7 @@ fn main() {
             interval_ms,
         } => {
             cmd_watch(
+                ohttp,
                 network.to_network(),
                 server,
                 wallet_dir,
@@ -1685,6 +1891,7 @@ fn main() {
             chunk,
         } => {
             cmd_oracle(
+                ohttp,
                 network.to_network(),
                 server,
                 wallet_a,
@@ -1705,6 +1912,143 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- --ohttp-config ------------------------------------------------------------
+
+    const MAINNET_JSON: &str = r#"{
+        "gateway_host": "ohttp-gateway.example",
+        "relay_url": "https://relay-mainnet.example/relay",
+        "keys_dns_name": "mainnet.ohttp-keys.example",
+        "signing_pubkey": "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
+    }"#;
+    const TESTNET_JSON: &str = r#"{
+        "gateway_host": "ohttp-gateway-testnet.example",
+        "relay_url": "https://relay-testnet.example/relay",
+        "keys_dns_name": "testnet.ohttp-keys.example",
+        "signing_pubkey": "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+    }"#;
+
+    fn ohttp_config_file(json: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ohttp.json");
+        std::fs::write(&path, json).expect("write config");
+        (dir, path)
+    }
+
+    /// The relay each example gateway host resolves to, `None` for a network with OHTTP off.
+    fn example_relays(networks: &OhttpNetworks) -> (Option<&str>, Option<&str>) {
+        (
+            zodl_slipstream::ohttp::relay_for(networks, "ohttp-gateway.example"),
+            zodl_slipstream::ohttp::relay_for(networks, "ohttp-gateway-testnet.example"),
+        )
+    }
+
+    #[test]
+    fn load_ohttp_config_none_is_off() {
+        let networks = load_ohttp_config(None).expect("no option is OHTTP off");
+        assert_eq!(example_relays(&networks), (None, None));
+    }
+
+    #[test]
+    fn load_ohttp_config_reads_both_networks() {
+        let (_dir, path) = ohttp_config_file(&format!(
+            r#"{{"mainnet": {MAINNET_JSON}, "testnet": {TESTNET_JSON}}}"#
+        ));
+        let networks = load_ohttp_config(Some(&path)).expect("valid configuration");
+        assert_eq!(
+            example_relays(&networks),
+            (
+                Some("https://relay-mainnet.example/relay"),
+                Some("https://relay-testnet.example/relay")
+            )
+        );
+
+        // Both objects are optional: one network alone leaves the other off.
+        let (_dir, path) = ohttp_config_file(&format!(r#"{{"testnet": {TESTNET_JSON}}}"#));
+        let networks = load_ohttp_config(Some(&path)).expect("testnet only");
+        assert_eq!(
+            example_relays(&networks),
+            (None, Some("https://relay-testnet.example/relay"))
+        );
+        let (_dir, path) = ohttp_config_file("{}");
+        let networks = load_ohttp_config(Some(&path)).expect("empty object");
+        assert_eq!(example_relays(&networks), (None, None));
+    }
+
+    #[test]
+    fn load_ohttp_config_rejects_unknown_key() {
+        let (_dir, path) = ohttp_config_file(&format!(
+            r#"{{"mainnet": {MAINNET_JSON}, "mainet": {MAINNET_JSON}}}"#
+        ));
+        let error = load_ohttp_config(Some(&path)).expect_err("unknown top-level key");
+        assert!(error.contains("mainet"), "{error}");
+        let nested = MAINNET_JSON.replace("}", r#", "relay": "x"}"#);
+        let (_dir, path) = ohttp_config_file(&format!(r#"{{"mainnet": {nested}}}"#));
+        let error = load_ohttp_config(Some(&path)).expect_err("unknown nested key");
+        assert!(error.contains("relay"), "{error}");
+        // A network with some but not all fields is refused, naming the missing one.
+        let partial = MAINNET_JSON.replace(r#""keys_dns_name": "mainnet.ohttp-keys.example","#, "");
+        let (_dir, path) = ohttp_config_file(&format!(r#"{{"mainnet": {partial}}}"#));
+        let error = load_ohttp_config(Some(&path)).expect_err("partial network");
+        assert!(error.contains("keys_dns_name"), "{error}");
+        // A missing file is an error too.
+        assert!(load_ohttp_config(Some(std::path::Path::new("/nonexistent/ohttp.json"))).is_err());
+    }
+
+    #[test]
+    fn load_ohttp_config_error_names_field_not_value() {
+        let secret = "http://leaky-value.example/relay";
+        let bad_relay = MAINNET_JSON.replace("https://relay-mainnet.example/relay", secret);
+        let (_dir, path) = ohttp_config_file(&format!(r#"{{"mainnet": {bad_relay}}}"#));
+        let error = load_ohttp_config(Some(&path)).expect_err("http relay");
+        assert!(error.contains("relay_url"), "{error}");
+        assert!(error.contains("mainnet"), "{error}");
+        assert!(!error.contains("leaky-value"), "{error}");
+
+        // A value of the wrong JSON type must not be echoed back either.
+        let (_dir, path) = ohttp_config_file(r#"{"mainnet": "leaky-value.example"}"#);
+        let error = load_ohttp_config(Some(&path)).expect_err("string instead of object");
+        assert!(!error.contains("leaky-value"), "{error}");
+
+        // Shared across networks names the field only.
+        let (_dir, path) = ohttp_config_file(&format!(
+            r#"{{"mainnet": {MAINNET_JSON}, "testnet": {MAINNET_JSON}}}"#
+        ));
+        let error = load_ohttp_config(Some(&path)).expect_err("shared values");
+        assert!(error.contains("gateway_host"), "{error}");
+        assert!(!error.contains("ohttp-gateway.example"), "{error}");
+    }
+
+    #[test]
+    fn ohttp_config_is_a_global_option() {
+        let cli = Cli::try_parse_from([
+            "slipstream",
+            "--ohttp-config",
+            "/tmp/ohttp.json",
+            "fetch",
+            "--server",
+            "http://x:1",
+            "--range",
+            "1..2",
+        ])
+        .expect("global option before the subcommand");
+        assert_eq!(
+            cli.ohttp_config,
+            Some(std::path::PathBuf::from("/tmp/ohttp.json"))
+        );
+        let cli = Cli::try_parse_from([
+            "slipstream",
+            "fetch",
+            "--server",
+            "http://x:1",
+            "--range",
+            "1..2",
+            "--ohttp-config",
+            "/tmp/ohttp.json",
+        ])
+        .expect("global option after the subcommand");
+        assert!(cli.ohttp_config.is_some());
+    }
 
     #[test]
     fn custom_heights_parse_and_resolve_to_custom_params() {
@@ -2437,6 +2781,50 @@ mod tests {
     }
 
     // ── T8.1 follow flag ──────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_startup_prepares_fresh_nested_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let tor_dir = temp.path().join("nested").join("tor");
+
+        prepare_tor_directory(Some(&tor_dir)).expect("prepare Tor directory");
+
+        assert!(tor_dir.exists());
+        assert!(tor_dir.is_dir());
+    }
+
+    #[test]
+    fn sync_startup_accepts_existing_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+
+        prepare_tor_directory(Some(temp.path())).expect("existing directory is valid");
+
+        assert!(temp.path().is_dir());
+    }
+
+    #[test]
+    fn sync_startup_reports_tor_path_that_is_a_regular_file() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let file = temp.path().join("not-a-directory");
+        std::fs::write(&file, "content").expect("create regular file");
+        let tor_dir = file.join("tor");
+
+        assert!(prepare_tor_directory(Some(&tor_dir)).is_err());
+    }
+
+    #[test]
+    fn sync_startup_rejects_existing_regular_file_as_tor_directory() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let file = temp.path().join("tor-file");
+        std::fs::write(&file, "content").expect("create regular file");
+
+        assert!(prepare_tor_directory(Some(&file)).is_err());
+    }
+
+    #[test]
+    fn sync_startup_without_tor_directory_does_not_create_one() {
+        prepare_tor_directory(None).expect("no Tor directory requested");
+    }
 
     #[test]
     fn sync_follow_flag_parses() {

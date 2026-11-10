@@ -25,8 +25,8 @@ use zcash_protocol::consensus::BlockHeight;
 
 use crate::{
     config::{Endpoint, EngineConfig},
-    connector::{ConnPurpose, TorConn, connect_via},
-    enhance::{EnhanceStats, run_enhancement},
+    connector::{ConnPurpose, TorConn, connect_via_tracked as connect_via},
+    enhance::{EnhanceStats, run_enhancement_isolated},
     error::SlipstreamError,
     events::Progress,
     grpc,
@@ -157,15 +157,35 @@ pub fn should_resync(last_synced_tip: u64, observed_tip: u64) -> bool {
 /// One cheap tip probe (T8.1 fast path): connect + GetLatestBlock ONLY —
 /// none of the preflight work of a full pass (subtree roots, UTXO refresh).
 ///
-/// Fresh connection per probe (TLS ~100-300 ms every FOLLOW_POLL; a held
-/// connection would need its own keepalive/staleness handling). All awaits
-/// carry the hardening1 deadlines (connect 10 s, unary 30 s).
+/// Direct: fresh connection per probe (TLS ~100-300 ms every FOLLOW_POLL; a held
+/// connection would need its own keepalive/staleness handling). Tor: the session's
+/// shared connection (`SyncShared`), dropped after a failed probe so the next one
+/// reconnects. All awaits carry the hardening1 deadlines (connect 10 s, unary 30 s).
 pub async fn probe_tip(
     config: &EngineConfig,
     tor: Option<&TorConn>,
 ) -> Result<u64, SlipstreamError> {
-    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
-    grpc::get_latest_block_height(&mut client).await
+    // Public tip data (ZIP circuit isolation policy): the session's shared connection.
+    let client = connect_via(
+        &config.ohttp,
+        &config.endpoint,
+        tor,
+        ConnPurpose::SyncShared,
+    )
+    .await?;
+    let tip = grpc::with_ohttp_endpoint(
+        &config.ohttp,
+        &config.endpoint,
+        tor.is_some(),
+        client.call(async |client| grpc::get_latest_block_height(client).await),
+    )
+    .await;
+    if tip.is_err()
+        && let Some(t) = tor
+    {
+        t.forget_shared(&config.endpoint);
+    }
+    tip
 }
 
 /// One sync pass. `accounts` bootstraps the wallet: each `(ufvk, birthday)` is imported
@@ -249,7 +269,13 @@ pub async fn sync_once(
     let wire_probe_ms = probe_elapsed.as_secs_f64() * 1e3;
 
     let mut session = WalletSession::open(config.network, &config.wallet_db_path)?;
-    let mut client = connect_via(&config.endpoint, tor, ConnPurpose::MetadataUnique).await?;
+    let client = connect_via(
+        &config.ohttp,
+        &config.endpoint,
+        tor,
+        ConnPurpose::MetadataUnique,
+    )
+    .await?;
 
     // Per-account bootstrap (for hosts without their own account manager — the CLI and
     // tests; production hosts import directly into the wallet DB). Each key is imported
@@ -260,8 +286,15 @@ pub async fn sync_once(
         if session.has_account_for_ufvk(ufvk)? {
             continue;
         }
-        let birthday_ts =
-            grpc::get_tree_state(&mut client, u64::from(u32::from(*birthday)) - 1).await?;
+        let birthday_ts = grpc::with_ohttp_endpoint(
+            &config.ohttp,
+            &config.endpoint,
+            tor.is_some(),
+            client.call(async |client| {
+                grpc::get_tree_state(client, u64::from(u32::from(*birthday)) - 1).await
+            }),
+        )
+        .await?;
         if let Some(ref p) = progress {
             p.touch(); // liveness: a server response is forward progress
         }
@@ -281,7 +314,15 @@ pub async fn sync_once(
     } else {
         session.next_subtree_root_start()?
     };
-    let roots = grpc::get_subtree_roots_from(&mut client, roots_start, progress.as_deref()).await?;
+    let roots = grpc::with_ohttp_endpoint(
+        &config.ohttp,
+        &config.endpoint,
+        tor.is_some(),
+        client.call(async |client| {
+            grpc::get_subtree_roots_from(client, roots_start, progress.as_deref()).await
+        }),
+    )
+    .await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -296,7 +337,13 @@ pub async fn sync_once(
         "subtree roots updated"
     );
 
-    let tip = grpc::get_latest_block_height(&mut client).await?;
+    let tip = grpc::with_ohttp_endpoint(
+        &config.ohttp,
+        &config.endpoint,
+        tor.is_some(),
+        client.call(async |client| grpc::get_latest_block_height(client).await),
+    )
+    .await?;
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -315,7 +362,34 @@ pub async fn sync_once(
     // sync.rs:108-121 ("We do this before we perform any shielded scanning, to ensure
     // that we discover any UTXOs between the old fully-scanned height and the current
     // chain tip.").
-    let transparent = refresh_utxos(&mut session, &mut client, progress.as_deref()).await?;
+    // GetAddressUtxos names the wallet's addresses: with Tor on it gets a circuit of its own.
+    let transparent = match tor {
+        Some(t) => {
+            let utxo_client = t
+                .connect_isolated_tracked(&config.ohttp, &config.endpoint)
+                .await?;
+            grpc::with_ohttp_endpoint(
+                &config.ohttp,
+                &config.endpoint,
+                true,
+                utxo_client.call(async |client| {
+                    refresh_utxos(&mut session, client, progress.as_deref()).await
+                }),
+            )
+            .await?
+        }
+        None => {
+            grpc::with_ohttp_endpoint(
+                &config.ohttp,
+                &config.endpoint,
+                false,
+                client.call(async |client| {
+                    refresh_utxos(&mut session, client, progress.as_deref()).await
+                }),
+            )
+            .await?
+        }
+    };
     if let Some(ref p) = progress {
         p.touch(); // liveness: a server response is forward progress
     }
@@ -356,14 +430,20 @@ pub async fn sync_once(
                 warn!(
                     measured_mbps = format!("{measured_mbps:.2}").as_str(),
                     floor_mbps = format!("{floor_mbps:.2}").as_str(),
-                    from = attempt_config.endpoint.host.as_str(),
+                    from = crate::ohttp::log_host(&config.ohttp, &attempt_config.endpoint.host),
                     switch = wire_switches,
                     "wire collapse — failing over"
                 );
                 cooled.push(attempt_config.endpoint.clone());
+                let current_is_gateway =
+                    crate::ohttp::relay_for(&config.ohttp, &attempt_config.endpoint.host).is_some();
                 let mut candidates: Vec<Endpoint> = std::iter::once(config.endpoint.clone())
                     .chain(config.alternate_endpoints.iter().cloned())
-                    .filter(|e| !cooled.contains(e))
+                    .filter(|e| {
+                        !cooled.contains(e)
+                            && crate::ohttp::relay_for(&config.ohttp, &e.host).is_some()
+                                == current_is_gateway
+                    })
                     .collect();
                 if candidates.is_empty() {
                     // Everything configured has collapsed at least once this
@@ -371,13 +451,18 @@ pub async fn sync_once(
                     cooled.clear();
                     candidates = std::iter::once(config.endpoint.clone())
                         .chain(config.alternate_endpoints.iter().cloned())
-                        .filter(|e| *e != attempt_config.endpoint)
+                        .filter(|e| {
+                            *e != attempt_config.endpoint
+                                && crate::ohttp::relay_for(&config.ohttp, &e.host).is_some()
+                                    == current_is_gateway
+                        })
                         .collect();
                 }
                 let next = if candidates.len() == 1 {
                     candidates.remove(0)
                 } else {
                     let outcome = crate::probe::probe_endpoints(
+                        Arc::clone(&config.ohttp),
                         &candidates,
                         crate::probe::DEFAULT_PROBE_BUDGET,
                     )
@@ -385,7 +470,7 @@ pub async fn sync_once(
                     candidates.swap_remove(outcome.chosen)
                 };
                 info!(
-                    to = next.host.as_str(),
+                    to = crate::ohttp::log_host(&config.ohttp, &next.host),
                     port = next.port,
                     "wire failover committed"
                 );
@@ -408,12 +493,21 @@ pub async fn sync_once(
     // Stats are merged into the report's `enhance` field so the stage-split log
     // reports total enhancement time (per-range runs + this final run) correctly.
     let enhance_started = Instant::now();
-    let final_enhance = run_enhancement(
-        &mut session,
-        &mut client,
-        config.network,
-        progress.clone(),
-        &mut skipped_keys,
+    let final_enhance = grpc::with_ohttp_endpoint(
+        &config.ohttp,
+        &config.endpoint,
+        tor.is_some(),
+        client.call(async |client| {
+            run_enhancement_isolated(
+                &mut session,
+                client,
+                config.network,
+                progress.clone(),
+                &mut skipped_keys,
+                tor.map(|t| (&config.ohttp, t, &config.endpoint)),
+            )
+            .await
+        }),
     )
     .await?;
     let final_enhance_elapsed = enhance_started.elapsed();
@@ -550,6 +644,7 @@ mod tests {
                 port: 1,
                 tls: false,
             },
+            crate::ohttp::OhttpNetworks::default(),
         );
         let ufvk = UnifiedFullViewingKey::decode(
             &zcash_protocol::consensus::Network::MainNetwork,

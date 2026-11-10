@@ -40,6 +40,7 @@
 //! Then: cargo test -p zodl-slipstream --features darkside -- --ignored --test-threads=1
 #![cfg(feature = "darkside")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -53,6 +54,7 @@ use zodl_slipstream::{
     darkside::DarksideCtl,
     fetch::{FetchPlan, run_fetch},
     grpc,
+    ohttp::OhttpNetworks,
     oracle::semantic_diff,
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
@@ -157,7 +159,12 @@ async fn run_pipeline(
     write_behind: bool,
     gpu_subtree: bool,
 ) {
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.to_path_buf(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.to_path_buf(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
 
@@ -175,7 +182,9 @@ async fn run_pipeline(
         .ensure_account(TEST_UFVK, birthday_ts)
         .expect("ensure_account");
 
-    let mut client = grpc::connect(ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), ep)
+        .await
+        .expect("grpc connect");
     let chain_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
@@ -234,7 +243,10 @@ async fn run_pipeline(
         cfg.fetch_streams,
     );
     let fetch_ep = ep.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep, None, plan, tx, None).await },
+        );
 
     scan_chunks_from_treestate(
         &mut session,
@@ -589,14 +601,21 @@ async fn truncate_rescan_oracle_is_clean() {
     // so `put_blocks` UPSERTs them with the same values, and blocks
     // rescan_start..=663188 are freshly inserted.
     {
-        let mut cfg = EngineConfig::new(Network::MainNetwork, db_a.clone(), ep.clone());
+        let mut cfg = EngineConfig::new(
+            Network::MainNetwork,
+            db_a.clone(),
+            ep.clone(),
+            OhttpNetworks::default(),
+        );
         cfg.chunk_blocks = 100;
         cfg.fetch_streams = 2;
 
         let mut session_a =
             WalletSession::open(Network::MainNetwork, &db_a).expect("open wallet A for re-scan");
 
-        let mut client_a = grpc::connect(&ep).await.expect("grpc connect A");
+        let mut client_a = grpc::connect(&OhttpNetworks::default(), &ep)
+            .await
+            .expect("grpc connect A");
         let chain_tip_a = grpc::get_latest_block_height(&mut client_a)
             .await
             .expect("get_latest_block_height A");
@@ -621,7 +640,8 @@ async fn truncate_rescan_oracle_is_clean() {
         );
         let fetch_ep_a = ep.clone();
         let fetch_task_a = tokio::spawn(async move {
-            zodl_slipstream::fetch::run_fetch(&fetch_ep_a, plan_a, tx_a, None).await
+            zodl_slipstream::fetch::run_fetch(Arc::default(), &fetch_ep_a, None, plan_a, tx_a, None)
+                .await
         });
 
         zodl_slipstream::scan::scan_chunks_from_treestate(
@@ -644,14 +664,21 @@ async fn truncate_rescan_oracle_is_clean() {
     }
 
     {
-        let mut cfg = EngineConfig::new(Network::MainNetwork, db_b.clone(), ep.clone());
+        let mut cfg = EngineConfig::new(
+            Network::MainNetwork,
+            db_b.clone(),
+            ep.clone(),
+            OhttpNetworks::default(),
+        );
         cfg.chunk_blocks = 100;
         cfg.fetch_streams = 2;
 
         let mut session_b =
             WalletSession::open(Network::MainNetwork, &db_b).expect("open wallet B for re-scan");
 
-        let mut client_b = grpc::connect(&ep).await.expect("grpc connect B");
+        let mut client_b = grpc::connect(&OhttpNetworks::default(), &ep)
+            .await
+            .expect("grpc connect B");
         let chain_tip_b = grpc::get_latest_block_height(&mut client_b)
             .await
             .expect("get_latest_block_height B");
@@ -676,7 +703,8 @@ async fn truncate_rescan_oracle_is_clean() {
         );
         let fetch_ep_b = ep.clone();
         let fetch_task_b = tokio::spawn(async move {
-            zodl_slipstream::fetch::run_fetch(&fetch_ep_b, plan_b, tx_b, None).await
+            zodl_slipstream::fetch::run_fetch(Arc::default(), &fetch_ep_b, None, plan_b, tx_b, None)
+                .await
         });
 
         zodl_slipstream::scan::scan_chunks_from_treestate(

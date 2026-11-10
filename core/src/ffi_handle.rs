@@ -427,6 +427,14 @@ impl StopReport {
     }
 }
 
+impl Drop for SlipstreamHandle {
+    /// Release the engine Tor client cached for this handle's sessions (`session::TOR_CONNS`)
+    /// while this handle's runtime is still alive.
+    fn drop(&mut self) {
+        crate::session::forget_tor_conns(&self.pass_lock);
+    }
+}
+
 impl SlipstreamHandle {
     /// Push one event onto the ring (v2 bounded policy: overflow evicts the oldest
     /// started/progress event first; done/error/found-transactions survive; loss is logged).
@@ -458,15 +466,23 @@ impl SlipstreamHandle {
     /// wait took and what it found: `settle_ms`, `drain_ms`, `settled`, `drained` and
     /// `for_wallet_change`.
     ///
-    /// This is the plain stop (backgrounding, shutdown): a scan call in progress runs to its end,
-    /// by default the end of its chunk, before the abort reaches it. Right before changing the
-    /// wallet, stop with [`Self::stop_for_wallet_change`] instead.
+    /// This is the plain stop (backgrounding, shutdown). It asks the session to stop at its next
+    /// block ([`Progress::request_stop_for_wallet_change`]) before the abort, as
+    /// [`Self::stop_for_wallet_change`] does and for the same reason: the scan runs inside
+    /// `block_in_place`, where the abort cannot reach it until the scan call returns, and a
+    /// scan fed by chunks that are already fetched never yields between calls, so the abort
+    /// may not land for minutes. On a slow link (2026-10-30, Android, app backgrounded
+    /// mid-restore) the aborted pass kept scanning 14 chunks for 2.5 min, the stop reported
+    /// `settled=false` and the next start waited on the pass lock. The interrupted scan call
+    /// writes nothing and the next session scans those blocks again. Right before changing the
+    /// wallet, stop with [`Self::stop_for_wallet_change`], which logs `for_wallet_change`.
     ///
     /// Hosts call this instead of keeping their own copy of the waits; the C and JNI wrappers add
     /// only their own extras around it (on iOS, the `last_stop_at` stamp for tip freshness). It
     /// blocks the calling thread, so call it from a host thread, never from a task on this
     /// handle's runtime (see [`settle_passes`]).
     pub fn stop(&mut self, budget: Duration) -> StopReport {
+        self.progress.request_stop_for_wallet_change();
         self.stop_and_report(budget, false)
     }
 
@@ -576,15 +592,33 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
         // re-baseline (`rebaseline_floor_if_scope_expanded`) folds already-credited work
         // into the new `pass_start_permille` — without subtracting the baseline here, that
         // same work would ALSO inflate this pass-local ratio and double-count it.
-        let pass_total = p.pass_total();
-        let fetched_capped = p
-            .fetched()
-            .saturating_sub(p.pass_base_fetched())
-            .min(pass_total);
-        let scanned_capped = p
-            .scanned()
-            .saturating_sub(p.pass_base_scanned())
-            .min(pass_total);
+        //
+        // Output-weighted progress: a pass whose unit is work (fixed by its first suggest round,
+        // `Progress::fix_pass_unit`) blends work units instead of blocks — the same baselines,
+        // clamps and half weights, so a spam-dense range moves the reading in proportion to its
+        // trial-decryption cost. A zero work total falls back to the block terms.
+        let pass_total_blocks = p.pass_total();
+        let pass_total_work = p.pass_total_work();
+        let (pass_total, fetched, base_fetched, scanned, base_scanned) =
+            if p.pass_unit_is_work() && pass_total_work > 0 {
+                (
+                    pass_total_work,
+                    p.fetched_work(),
+                    p.pass_base_fetched_work(),
+                    p.scanned_work(),
+                    p.pass_base_scanned_work(),
+                )
+            } else {
+                (
+                    pass_total_blocks,
+                    p.fetched(),
+                    p.pass_base_fetched(),
+                    p.scanned(),
+                    p.pass_base_scanned(),
+                )
+            };
+        let fetched_capped = fetched.saturating_sub(base_fetched).min(pass_total);
+        let scanned_capped = scanned.saturating_sub(base_scanned).min(pass_total);
         let pass_permille = fetched_capped
             .saturating_add(scanned_capped)
             .saturating_mul(1000)
@@ -608,9 +642,16 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             }
             None => pass_permille,
         };
+        // Use the pass's unit when available, otherwise the floor's own unit (prevents latching UNSET).
+        let unit = p.pass_unit();
+        let unit_for_floor = if unit == crate::events::PASS_UNIT_UNSET {
+            p.floor_unit()
+        } else {
+            unit
+        };
         let progress_permille = match state {
-            SyncState::Done => p.permille_floor(1000) as u16,
-            _ => p.permille_floor(raw_permille) as u16,
+            SyncState::Done => p.permille_floor(1000, unit_for_floor) as u16,
+            _ => p.permille_floor(raw_permille, unit_for_floor) as u16,
         };
         // Fail-safe latch: terminal states force NOT-recovering regardless of the live flag —
         // a dead pass can never wedge a host's "Restoring" UI (previously Swift-side hardening).
@@ -634,7 +675,7 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
             enhanced_txs: p.enhanced(),
             current_range_end: p.range_end(),
             state: state_u8,
-            pass_total_blocks: p.pass_total(),
+            pass_total_blocks,
             spendable_hint: p.spendable() as u8,
             ranges_completed: p.ranges_completed(),
             is_recovering: is_recovering_u8,
@@ -647,6 +688,7 @@ pub fn derive_snapshot(p: &crate::events::Progress, state: SyncState) -> FfiSlip
 
 #[cfg(test)]
 mod tests {
+    use crate::events::PASS_UNIT_BLOCKS;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
@@ -740,11 +782,23 @@ mod tests {
     #[test]
     fn permille_floor_is_monotonic_and_clamped() {
         let p = crate::events::Progress::default();
-        assert_eq!(p.permille_floor(300), 300);
-        assert_eq!(p.permille_floor(100), 300, "regression must hold the floor");
-        assert_eq!(p.permille_floor(999), 999);
-        assert_eq!(p.permille_floor(5000), 1000, "raw clamps to 1000");
-        assert_eq!(p.permille_floor(0), 1000, "floor persists at max");
+        assert_eq!(p.permille_floor(300, PASS_UNIT_BLOCKS), 300);
+        assert_eq!(
+            p.permille_floor(100, PASS_UNIT_BLOCKS),
+            300,
+            "regression must hold the floor"
+        );
+        assert_eq!(p.permille_floor(999, PASS_UNIT_BLOCKS), 999);
+        assert_eq!(
+            p.permille_floor(5000, PASS_UNIT_BLOCKS),
+            1000,
+            "raw clamps to 1000"
+        );
+        assert_eq!(
+            p.permille_floor(0, PASS_UNIT_BLOCKS),
+            1000,
+            "floor persists at max"
+        );
     }
 
     /// A handle around `progress` in `state`, for snapshot tests (no task, no network).
@@ -1439,28 +1493,36 @@ mod tests {
         );
     }
 
-    /// Only the stop a host makes right before it changes the wallet asks the running session to
-    /// end at its next block. A plain stop (backgrounding, shutdown) must leave that request
-    /// alone, so every other stop behaves exactly as it did before the wallet-change stop.
+    /// Both stops ask the running session to end at its next block: the abort alone cannot
+    /// reach a scan running inside `block_in_place`, so a plain stop (backgrounding, shutdown)
+    /// on a slow link could otherwise wait minutes for the pass. The request is aimed at that
+    /// session only: the next one re-arms it.
     #[test]
-    fn only_a_stop_for_a_wallet_change_asks_the_scan_to_stop() {
-        let progress = Arc::new(Progress::default());
-        let mut handle = handle_in(SyncState::Syncing, progress.clone());
+    fn every_stop_asks_the_scan_to_stop_at_its_next_block() {
         let budget = Duration::from_millis(50);
+        for for_wallet_change in [false, true] {
+            let progress = Arc::new(Progress::default());
+            let mut handle = handle_in(SyncState::Syncing, progress.clone());
+            progress.begin_session();
+            assert!(!progress.stop_requested());
 
-        let report = handle.stop(budget);
-        assert!(report.quiescent(), "nothing was running: {report:?}");
-        assert!(
-            !progress.stop_requested(),
-            "a plain stop must not ask the scan to stop early"
-        );
+            let report = if for_wallet_change {
+                handle.stop_for_wallet_change(budget)
+            } else {
+                handle.stop(budget)
+            };
+            assert!(report.quiescent(), "nothing was running: {report:?}");
+            assert!(
+                progress.stop_requested(),
+                "for_wallet_change={for_wallet_change}: the stop must reach the scan's per-block check"
+            );
 
-        let report = handle.stop_for_wallet_change(budget);
-        assert!(report.quiescent(), "nothing was running: {report:?}");
-        assert!(
-            progress.stop_requested(),
-            "a stop for a wallet change must ask the running session to stop at its next block"
-        );
+            progress.begin_session();
+            assert!(
+                !progress.stop_requested(),
+                "the next session is not stopped by it"
+            );
+        }
     }
 
     /// Both stops leave the handle Idle, and they do so also when they could not prove the wallet

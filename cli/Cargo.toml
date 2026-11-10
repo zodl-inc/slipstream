@@ -22,6 +22,9 @@ gpu = ["zodl-slipstream/gpu"]
 [dependencies]
 zodl-slipstream = { path = "../core", features = ["zcash_client_sqlite"] }
 clap = { version = "4", features = ["derive"] }
+# `--ohttp-config`: the OHTTP configuration file is JSON.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { workspace = true }

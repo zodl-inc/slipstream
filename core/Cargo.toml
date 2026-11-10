@@ -1,7 +1,7 @@
 [package]
 name = "zodl-slipstream"
 description = "A high-performance zcash light wallet sync engine"
-version = "0.4.1"
+version = "0.5.0"
 authors = [
     "Lukas Korba <lukas.korba@seznam.cz>",
     "Kris Nuttycombe <kris@electriccoin.co>"
@@ -48,12 +48,42 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+libc = "0.2"
+tokio-stream = "0.1"
 tonic = { workspace = true }
 prost = { workspace = true }
 tonic-prost = { workspace = true }
 futures-util = { workspace = true }
 
+
+# Tor and OHTTP transport dependencies
+arti-client = { version = "0.43", default-features = false, features = ["compression", "rustls", "tokio", "onion-service-client"] }
+tor-rtcompat = "0.43"
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+# TCP keep-alive on direct relay sockets (ohttp.rs, DIRECT_TCP_KEEPALIVE_TIME); `all` for the probe count.
+socket2 = { version = "0.6", features = ["all"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tower-service = "0.3"
+webpki-roots = "0.26"
+# Shared sans-IO OHTTP core (the OHTTP configuration types, HPKE encapsulation, Binary HTTP,
+# signed-config verification, key selection, outer-status classification, size limits).
+# `default-features = false`: the `client` feature would pull reqwest, and Slipstream does its
+# own I/O. From crates.io, like the crate itself; 1.0.1 is the v1.0.0 release with crates.io
+# metadata.
+zodl-ohttp-client = { version = "1.0.1", default-features = false }
+
 [dev-dependencies]
+# Hermetic authenticated OHTTP relay fixtures use the same locked crypto primitives.
+hpke = { version = "0.13", default-features = false, features = ["alloc", "x25519"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
 tempfile = { workspace = true }
 # T10b spend-proof: the sapling stub prover's trait signatures name these types
 # (never invoked — orchard-only transactions); versions pinned by sapling 0.7.
@@ -63,6 +93,11 @@ bls12_381 = { workspace = true }
 # deadline tests auto-advance the mock clock instead of sleeping 30 s for real.
 # Test-only feature of an existing workspace dep (never enabled in the FFI build).
 tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = "0.3"
+# For live signed-config verification tests and the hand-built envelopes of the ohttp tests
+reqwest = "0.12"
+serde_json = "1"
+base64 = "0.22"
 
 [features]
 default = ["zcash_client_sqlite"]
@@ -89,6 +124,12 @@ darkside = ["zcash_client_sqlite"]
 # lane exists solely for the sqlite persistence path, so it requires that
 # backend.
 gpu = ["dep:slipstream-gpuhash", "zcash_client_sqlite"]
+
+# X-Client-Trace-Id header for QA and debug builds. OFF by default. Release
+# builds MUST NOT enable this feature (ZIP conformance: release builds must not
+# send the trace header and must not contain a run-time code path that can
+# enable it). The mobile SDKs enable this feature only in debug builds.
+client-trace = []
 
 # Integration-test binaries that require the sqlite backend are declared with
 # `required-features`, so `cargo test --no-default-features` SKIPS them instead

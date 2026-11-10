@@ -21,7 +21,7 @@
 //! Then: cargo test -p zodl-slipstream --features darkside -- --ignored
 #![cfg(feature = "darkside")]
 
-use zodl_slipstream::{config::Endpoint, darkside::DarksideCtl, grpc};
+use zodl_slipstream::{config::Endpoint, darkside::DarksideCtl, grpc, ohttp::OhttpNetworks};
 
 fn darkside_endpoint() -> Endpoint {
     Endpoint {
@@ -45,7 +45,9 @@ async fn stage_apply_and_read_tip_roundtrip() {
     // A brief yield ensures the tip is visible before we query it (mirrors Swift DarksideTests sleep(2)).
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
-    let mut client = grpc::connect(&ep).await.expect("lwd connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("lwd connect");
     let tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("tip");
@@ -87,7 +89,9 @@ async fn parallel_fetch_5000_blocks_in_order() {
         total
     });
 
-    let stats = run_fetch(&ep, plan, tx, None).await.expect("fetch");
+    let stats = run_fetch(std::sync::Arc::default(), &ep, None, plan, tx, None)
+        .await
+        .expect("fetch");
     assert_eq!(stats.blocks, 5_000);
     assert_eq!(consumer.await.expect("consumer"), 5_000);
 }

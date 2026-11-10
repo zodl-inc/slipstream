@@ -14,6 +14,8 @@
 //
 // Commercial licensing: see COMMERCIAL-LICENSE.md.
 
+#![recursion_limit = "256"]
+
 //! T8.1 darkside test: probe_tip + should_resync + follow-pass catch-up.
 //!
 //! Tests the exact probe → pass primitive that the FFI follow loop composes:
@@ -39,6 +41,7 @@
 #![cfg(feature = "darkside")]
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -52,6 +55,7 @@ use zodl_slipstream::{
     engine::{probe_tip, should_resync},
     fetch::{FetchPlan, run_fetch},
     grpc, mempool,
+    ohttp::OhttpNetworks,
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
 };
@@ -156,7 +160,12 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
 
@@ -176,7 +185,9 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         .expect("ensure_account");
 
     // Update chain tip via GetLatestBlock (supported by v0.4.9).
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
     let initial_tip = grpc::get_latest_block_height(&mut client)
         .await
         .expect("get_latest_block_height");
@@ -241,7 +252,10 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         cfg.fetch_streams,
     );
     let fetch_ep = ep.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, plan, tx, None).await });
+    let fetch_task =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep, None, plan, tx, None).await },
+        );
 
     scan_chunks_from_treestate(
         &mut session,
@@ -347,7 +361,10 @@ async fn follow_probe_detects_new_blocks_and_catches_up() {
         cfg.fetch_streams,
     );
     let fetch_ep2 = ep.clone();
-    let fetch_task2 = tokio::spawn(async move { run_fetch(&fetch_ep2, plan2, tx2, None).await });
+    let fetch_task2 =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep2, None, plan2, tx2, None).await },
+        );
 
     // The continuation treestate is the block at initial_tip (663188) as seen by the scanner.
     // Use a zero hash (accepted for continuation — the chain continuity check uses DB state).
@@ -444,7 +461,12 @@ async fn mempool_session_handles_quiet_mempool() {
 
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
-    let cfg = EngineConfig::new(Network::MainNetwork, db_path, ep.clone());
+    let cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path,
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
 
     // One bounded session against the quiet mempool. A short idle keeps the test
     // fast; production passes mempool::mempool_session_idle (60 s, 40 s from NU7).
