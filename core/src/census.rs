@@ -166,11 +166,11 @@ pub struct BenchSummary {
     /// tracking / decrypted-tx section / gap-addresses + prune).
     pub persist_tree_join_s: f64,
     pub persist_flush_s: f64,
-    /// The block-end retention assignment.
     pub persist_downgrade_s: f64,
     pub persist_build_s: f64,
-    /// The tree update (frontier, subtrees, planned checkpoints).
+    pub persist_frontier_s: f64,
     pub persist_insert_s: f64,
+    pub persist_ensure_s: f64,
     pub persist_downgraded: u64,
     /// Enhancement wall split: awaiting gRPC tx fetches vs serial DB applies
     /// vs the address-window phase (explains the device enhance_s swings).
@@ -190,7 +190,7 @@ impl BenchSummary {
             )
         }
         format!(
-            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"wire_mbps_avg\":{},\"wire_worst_5s_mbps\":{},\"wire_probe_ms\":{},\"wire_switches\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_insert_s\":{},\"persist_downgraded\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
+            "{{\"engine_build\":\"{}\",\"total_s\":{},\"fetch_s\":{},\"wire_mbps_avg\":{},\"wire_worst_5s_mbps\":{},\"wire_probe_ms\":{},\"wire_switches\":{},\"scan_s\":{},\"enhance_s\":{},\"persist_wait_s\":{},\"persist_overlap_s\":{},\"blocks\":{},\"batch_epk_s\":{},\"scan_recv_wait_s\":{},\"scan_call_s\":{},\"scan_prefetch_wait_s\":{},\"scan_interleave_drain_s\":{},\"scan_final_drain_s\":{},\"scan_absorb_s\":{},\"scan_state_prep_s\":{},\"scan_prefetch_spawn_s\":{},\"scan_submit_wait_s\":{},\"scan_submit_extra_s\":{},\"scan_reseed_s\":{},\"scan_pass1_s\":{},\"scan_pass2_s\":{},\"persist_calls\":{},\"persist_rows_s\":{},\"persist_tree_join_s\":{},\"persist_flush_s\":{},\"persist_downgrade_s\":{},\"persist_build_s\":{},\"persist_frontier_s\":{},\"persist_insert_s\":{},\"persist_ensure_s\":{},\"persist_downgraded\":{},\"enhance_fetch_s\":{},\"enhance_store_s\":{},\"enhance_address_s\":{},\"sapling\":{},\"orchard\":{}}}",
             self.engine_build,
             self.total_s,
             self.fetch_s,
@@ -223,7 +223,9 @@ impl BenchSummary {
             self.persist_flush_s,
             self.persist_downgrade_s,
             self.persist_build_s,
+            self.persist_frontier_s,
             self.persist_insert_s,
+            self.persist_ensure_s,
             self.persist_downgraded,
             self.enhance_fetch_s,
             self.enhance_store_s,
@@ -322,7 +324,9 @@ mod tests {
             persist_flush_s: 0.1,
             persist_downgrade_s: 0.2,
             persist_build_s: 0.4,
+            persist_frontier_s: 0.15,
             persist_insert_s: 0.1,
+            persist_ensure_s: 0.05,
             persist_downgraded: 59000,
             enhance_fetch_s: 0.06,
             enhance_store_s: 0.04,

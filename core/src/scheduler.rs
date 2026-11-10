@@ -378,15 +378,9 @@ pub fn seed_progress_from_wallet(
         .is_some_and(|ru| ranges.iter().any(|r| u64::from(r.block_range().start) < ru));
     progress.set_recovering(recovering);
 
-    // `Anchor` (librustzcash#2333): the unscanned part of the chain-tip pruning window after
-    // the tip advanced or the anchor was disturbed — value is spendable again only once it is
-    // scanned, so it is pending tip work like `ChainTip`.
-    let recent_pending = ranges.iter().any(|r| {
-        matches!(
-            r.priority(),
-            ScanPriority::ChainTip | ScanPriority::Anchor | ScanPriority::Verify
-        )
-    });
+    let recent_pending = ranges
+        .iter()
+        .any(|r| matches!(r.priority(), ScanPriority::ChainTip | ScanPriority::Verify));
     if !recent_pending {
         progress.set_spendable();
     }
@@ -567,14 +561,12 @@ pub async fn run_to_completion(
     // rows at positions it does not feed) for the next pass's sweep, and the pass runs.
     // Its SQLite and tree work blocks, so it runs off the async worker, as the range-end
     // finish does (`block_in_place`, which a current-thread runtime does not offer).
-    let anchor_retention =
-        crate::persist::anchor_retention(&*session.db_mut(), config.anchor_retention.as_ref())?;
     let mut sweep = || {
         crate::persist::sweep_stranded_graft_rows(
             session.db_mut(),
             &config.wallet_db_path,
             config.graft_subtree,
-            anchor_retention.as_ref(),
+            config.anchor_retention.as_ref(),
         )
     };
     let swept = match tokio::runtime::Handle::current().runtime_flavor() {
@@ -973,14 +965,11 @@ pub async fn run_to_completion(
         // B1: accumulate scanned work when using work-based progress.
         scanned_work_so_far_in_pass += scan_stats.work;
 
-        // Spendable latch: if this range was ChainTip (or Anchor: the pruning window
-        // re-established after the tip moved) priority, funds are now likely spendable
-        // (SBS semantics — the tip-priority range covers the most-recent blocks where
-        // the wallet's own notes appear as spendable).
-        if matches!(
-            range.priority(),
-            ScanPriority::ChainTip | ScanPriority::Anchor
-        ) && let Some(ref p) = progress
+        // Spendable latch: if this range was ChainTip priority, funds are now likely
+        // spendable (SBS semantics — the tip-priority range covers the most-recent
+        // blocks where the wallet's own notes appear as spendable).
+        if range.priority() == ScanPriority::ChainTip
+            && let Some(ref p) = progress
         {
             p.set_spendable();
         }
@@ -4207,12 +4196,9 @@ mod tests {
         );
         // Wiring proof: the spendable latch mirrors the actual queue contents.
         let ranges = s.suggest_scan_ranges().expect("ranges");
-        let recent_pending = ranges.iter().any(|r| {
-            matches!(
-                r.priority(),
-                ScanPriority::ChainTip | ScanPriority::Anchor | ScanPriority::Verify
-            )
-        });
+        let recent_pending = ranges
+            .iter()
+            .any(|r| matches!(r.priority(), ScanPriority::ChainTip | ScanPriority::Verify));
         assert_eq!(
             p.spendable() == 1,
             !recent_pending,

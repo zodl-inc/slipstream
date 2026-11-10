@@ -740,9 +740,8 @@ pub mod testkit {
     }
 
     /// As above, but with an explicit chain-tip override — lets a test place the
-    /// scanned windows deep below the tip (below upstream's checkpoint floor,
-    /// `PRUNING_DEPTH` under the tip), the shape of a historic-range restore over
-    /// spam-era blocks.
+    /// scanned windows deep below the tip (DEEP_HISTORY_CHECKPOINT_MARGIN
+    /// territory), the shape of a historic-range restore over spam-era blocks.
     pub async fn scan_synthetic_windows_write_behind_with_tip(
         dir: &Path,
         blocks: Vec<CompactBlock>,
@@ -1412,18 +1411,11 @@ mod tests {
         .expect("uninterrupted graft scan");
         // Restarted: first window with one lane, then a FRESH lane for the rest
         // (drops the first lane's in-memory accumulator — exactly a process kill).
-        // The chain tip is the same on both sides: a restart does not move it, and the
-        // checkpoints a window keeps depend on it (librustzcash#2333: only within
-        // `PRUNING_DEPTH` of the tip).
-        let tip = blocks.last().map(|b| b.height).expect("blocks");
-        super::testkit::scan_synthetic_windows_write_behind_with_tip(
+        super::testkit::scan_synthetic_windows_write_behind(
             &restarted,
             blocks[..1000].to_vec(),
             &[1000],
             true,
-            1,
-            Some(tip),
-            |_, _| Ok(()),
         )
         .await
         .expect("pre-restart scan");
@@ -1683,9 +1675,9 @@ mod tests {
     /// accumulator BUFFERED (never inserted into the tree), and window 2's
     /// prune evicts them in one per-shard `clear_flags` batch straight into
     /// the root-only leaf — "Tree state inconsistent with checkpoints".
-    /// Under upstream's checkpoint floor (`PRUNING_DEPTH` under the tip), deep
-    /// batches create no per-block checkpoints, so there is nothing to evict; the
-    /// scan must complete. Fast (2,200 actions) — guards the suite by default.
+    /// With DEEP_HISTORY_CHECKPOINT_MARGIN dooming, deep batches create no
+    /// per-block checkpoints, so there is nothing to evict; the scan must
+    /// complete. Fast (2,200 actions) — guards the suite by default.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn deep_history_over_ingested_root_only_shard_survives() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2136,33 +2128,21 @@ mod tests {
         /// top of a `tree_size`-leaf tree: the block at START + `first` + `j` holds position
         /// `tree_size + j`.
         fn chain_at(first: u64, tree_size: u64, count: u64) -> Vec<CompactBlock> {
-            chain_at_without_outputs(first, tree_size, count, &[])
-        }
-
-        /// [`chain`], except that the blocks `without` (indexes from START) hold no output
-        /// at all: a block after one of them holds the position one below [`chain`]'s.
-        fn chain_without_outputs(base_size: u64, count: u64, without: &[u64]) -> Vec<CompactBlock> {
-            chain_at_without_outputs(0, base_size, count, without)
-        }
-
-        /// [`chain_at`], except that the blocks `without` (indexes from START) hold no
-        /// output at all; the tree size grows only with the blocks that hold one.
-        fn chain_at_without_outputs(
-            first: u64,
-            tree_size: u64,
-            count: u64,
-            without: &[u64],
-        ) -> Vec<CompactBlock> {
-            let mut size = tree_size;
             (0..count)
                 .map(|j| {
                     let i = first + j;
                     let height = START + i;
-                    let vtx = if without.contains(&i) {
-                        vec![]
-                    } else {
-                        size += 1;
-                        vec![CompactTx {
+                    CompactBlock {
+                        height,
+                        hash: h32(0xBB, height).to_vec(),
+                        prev_hash: if i == 0 {
+                            vec![0u8; 32]
+                        } else {
+                            h32(0xBB, height - 1).to_vec()
+                        },
+                        time: height as u32,
+                        header: vec![],
+                        vtx: vec![CompactTx {
                             index: 0,
                             txid: h32(0x77, height).to_vec(),
                             fee: 0,
@@ -2174,21 +2154,10 @@ mod tests {
                             }],
                             actions: vec![],
                             ..Default::default()
-                        }]
-                    };
-                    CompactBlock {
-                        height,
-                        hash: h32(0xBB, height).to_vec(),
-                        prev_hash: if i == 0 {
-                            vec![0u8; 32]
-                        } else {
-                            h32(0xBB, height - 1).to_vec()
-                        },
-                        time: height as u32,
-                        header: vec![],
-                        vtx,
+                        }],
                         chain_metadata: Some(ChainMetadata {
-                            sapling_commitment_tree_size: u32::try_from(size).expect("fits"),
+                            sapling_commitment_tree_size: u32::try_from(tree_size + j + 1)
+                                .expect("fits"),
                             orchard_commitment_tree_size: 0,
                             ironwood_commitment_tree_size: 0,
                         }),
@@ -2429,17 +2398,6 @@ mod tests {
                 .map_err(|e| format!("{e:?}"))
         }
 
-        /// The wallet's sapling root over every leaf of its tree (no checkpoint needed: a block
-        /// below the chain-tip pruning window keeps none, librustzcash#2333).
-        fn sapling_root(dir: &Path) -> Result<Option<sapling::Node>, String> {
-            let mut s = session(dir);
-            s.db_mut()
-                .with_sapling_tree_mut::<_, _, ShardTreeError<
-                    zcash_client_sqlite::wallet::commitment_tree::Error,
-                >>(|tree| tree.root_at_checkpoint_depth(None))
-                .map_err(|e| format!("{e:?}"))
-        }
-
         /// (position of the sapling checkpoint for `height`, the tree's max leaf position).
         fn sapling_positions(dir: &Path, height: u64) -> (Option<i64>, Option<u64>) {
             let conn = rusqlite::Connection::open(dir.join("data.db")).expect("side conn");
@@ -2506,9 +2464,8 @@ mod tests {
                 import_account_at(&dir, &base, &blocks, birthday_idx);
                 assert_eq!(
                     suggested(&dir),
-                    ["Anchor(1500040..1500080)"],
-                    "[{name}] the import re-queues the forced rescan from its birthday (the \
-                     pruning window: `Anchor`)"
+                    ["Historic(1500040..1500080)"],
+                    "[{name}] the import re-queues the forced rescan from its birthday"
                 );
                 // The next pass's first Historic range: the forced rescan [40, 80).
                 scan_range(
@@ -2628,16 +2585,14 @@ mod tests {
         /// R = [20, 150) in two units, on a 50-block anchor grid from START. R crosses into
         /// shard 1 at block 40, so the range-end finish builds its shard-1 rows. Scans one
         /// wallet with graft off and one with graft on, the chain tip `tip_lead` blocks
-        /// above the last block, and returns them in that order. The blocks
-        /// `without_outputs` (indexes from START) hold no output ([`chain_without_outputs`]).
+        /// above the last block, and returns them in that order.
         async fn tip_range_then_r(
             root: &Path,
             tip_lead: u64,
-            without_outputs: &[u64],
-        ) -> GraftPair {
+        ) -> (std::path::PathBuf, std::path::PathBuf) {
             let base_size = SHARD - 40;
             let base = base_frontier(base_size);
-            let blocks = chain_without_outputs(base_size, 300, without_outputs);
+            let blocks = chain(base_size, 300);
             let tip = blocks.last().expect("blocks").height + tip_lead;
             let anchors = AnchorRetention::new(
                 BlockHeight::from(u32::try_from(START).expect("fits")),
@@ -2681,20 +2636,7 @@ mod tests {
             }
             let on = dirs.pop().expect("graft-on wallet");
             let off = dirs.pop().expect("graft-off wallet");
-            GraftPair {
-                off,
-                on,
-                base,
-                blocks,
-            }
-        }
-
-        /// The two wallets [`tip_range_then_r`] scans, and the chain they scanned.
-        struct GraftPair {
-            off: std::path::PathBuf,
-            on: std::path::PathBuf,
-            base: Frontier<sapling::Node, 32>,
-            blocks: Vec<CompactBlock>,
+            (off, on)
         }
 
         /// Graft on leaves the same wallet as graft off, checkpoint rows and retained marks
@@ -2732,46 +2674,20 @@ mod tests {
         async fn finish_keeps_anchors_when_the_checkpoint_budget_is_full() {
             let root = tempfile::tempdir().expect("tempdir");
             // Not deep: the ChainTip stand-in fills the 100-checkpoint window.
-            let pair = tip_range_then_r(root.path(), 0, &[]).await;
-            assert_matches_graft_off(&pair.off, &pair.on);
+            let (off, on) = tip_range_then_r(root.path(), 0).await;
+            assert_matches_graft_off(&off, &on);
         }
 
         /// Buffered rows are built in a later call than the one that scanned them, so they
         /// carry the retentions that call gives its own commitments. Here every range lies
-        /// deep below the tip (below upstream's checkpoint floor, `PRUNING_DEPTH` under
-        /// the tip), so R's builds (its shard-0 close and the range-end finish) keep no
-        /// per-block checkpoint but the durable anchors, with graft on as with graft off.
+        /// deep below the tip (see `DEEP_HISTORY_CHECKPOINT_MARGIN`), so R's builds (its
+        /// shard-0 close and the range-end finish) keep no per-block checkpoint but the
+        /// durable anchors, with graft on as with graft off.
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
         async fn deferred_builds_keep_no_deep_history_checkpoints_but_the_anchors() {
             let root = tempfile::tempdir().expect("tempdir");
-            let pair = tip_range_then_r(root.path(), 20_000, &[]).await;
-            assert_matches_graft_off(&pair.off, &pair.on);
-        }
-
-        /// An anchor-grid block with no Sapling output gets its Sapling checkpoint at the
-        /// end of the last block below it that has one (upstream's `batch_checkpoints`).
-        /// When that block end lies in a shard the graft accumulator buffers, the planned
-        /// checkpoint travels on the buffered row and is created with its leaf by the build
-        /// that inserts the row (here the range-end finish, deep below the tip, where the
-        /// row's own block end keeps no checkpoint). Added to the store on its own, the
-        /// checkpoint would point into a leaf that build merges away, and the root at the
-        /// anchor could not be computed: an anchor the wallet holds but cannot prove against.
-        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn an_anchor_planned_onto_a_buffered_row_keeps_its_leaf() {
-            let root = tempfile::tempdir().expect("tempdir");
-            // Blocks 50 and 100 (R's anchors, both in its buffered shard 1) hold no output:
-            // their checkpoints are planned onto the ends of blocks 49 and 99.
-            let pair = tip_range_then_r(root.path(), 20_000, &[50, 100]).await;
-            for (name, dir) in [("graft-off", &pair.off), ("graft-on", &pair.on)] {
-                for (anchor, idx) in R_ANCHORS.iter().zip([50, 100]) {
-                    assert_eq!(
-                        sapling_root_at(dir, *anchor),
-                        Ok(Some(chain_root_at(&pair.base, &pair.blocks, idx))),
-                        "[{name}] the root at R's anchor {anchor} is the chain's"
-                    );
-                }
-            }
-            assert_matches_graft_off(&pair.off, &pair.on);
+            let (off, on) = tip_range_then_r(root.path(), 20_000).await;
+            assert_matches_graft_off(&off, &on);
         }
 
         fn summarize(rows: &[(i64, i64, i64)]) -> String {
@@ -2857,12 +2773,8 @@ mod tests {
             .expect("historic range R");
             assert_eq!(
                 suggested(dir),
-                [
-                    "Anchor(1520100..1520200)",
-                    "Historic(1500200..1520100)",
-                    "Historic(1500000..1500020)"
-                ],
-                "R is scanned, whether its finish ran or not (the pruning window: `Anchor`)"
+                ["Historic(1500200..1520200)", "Historic(1500000..1500020)"],
+                "R is scanned, whether its finish ran or not"
             );
             TailShard {
                 base,
@@ -3043,8 +2955,7 @@ mod tests {
                 assert_eq!(
                     suggested(&dir),
                     [
-                        "Anchor(1520100..1520200)",
-                        "Historic(1500200..1520100)",
+                        "Historic(1500200..1520200)",
                         "Historic(1500040..1500110)",
                         "Historic(1500000..1500020)"
                     ],
@@ -3131,8 +3042,7 @@ mod tests {
             assert_eq!(
                 suggested(&dir),
                 [
-                    "Anchor(1520100..1520200)",
-                    "Historic(1500200..1520100)",
+                    "Historic(1500200..1520200)",
                     "Historic(1500065..1500110)",
                     "Historic(1500000..1500020)"
                 ],
@@ -3159,8 +3069,7 @@ mod tests {
             assert_eq!(
                 suggested(&dir),
                 [
-                    "Anchor(1520100..1520200)",
-                    "Historic(1500200..1520100)",
+                    "Historic(1500200..1520200)",
                     "Historic(1500040..1500110)",
                     "Historic(1500000..1500020)"
                 ],
@@ -3417,8 +3326,7 @@ mod tests {
                     assert_eq!(
                         suggested(&dir),
                         [
-                            "Anchor(1520100..1520200)",
-                            "Historic(1500200..1520100)",
+                            "Historic(1500200..1520200)",
                             "Historic(1500040..1500110)",
                             "Historic(1500000..1500020)"
                         ],
@@ -3572,11 +3480,7 @@ mod tests {
             );
             assert_eq!(
                 suggested(&dir),
-                [
-                    "Anchor(1520100..1520200)",
-                    "Historic(1500200..1520100)",
-                    "Historic(1500000..1500020)"
-                ],
+                ["Historic(1500200..1520200)", "Historic(1500000..1500020)"],
                 "no rescan is queued"
             );
             rename("marking_renamed", "marking");
@@ -3614,10 +3518,7 @@ mod tests {
                 .root();
             let root = tempfile::tempdir().expect("tempdir");
             let dir = root.path().join("interrupted");
-            // The tip 100 blocks above the chain: R's remainder stays below the chain-tip
-            // pruning window, whose unscanned part librustzcash#2333 queues as `Anchor` (scanned
-            // without graft buffering, so it would not resume the rows).
-            open_wallet(&dir, &base, &blocks, tip + 100);
+            open_wallet(&dir, &base, &blocks, tip);
             // R, Historic: blocks [0, 80). Only its first unit [0, 50) commits, so shard 1's
             // rows [30, 50) stay buffered.
             scan_range(&dir, &base, &blocks, 0, &[50], true, None, End::Abort)
@@ -3631,8 +3532,8 @@ mod tests {
             import_account_at(&dir, &base, &blocks, 60);
             assert_eq!(
                 suggested(&dir),
-                ["Anchor(1500080..1500180)", "Historic(1500050..1500080)"],
-                "the import's rescan coalesces with R's remainder, below the tip window"
+                ["Historic(1500050..1500080)"],
+                "the import's rescan coalesces with R's remainder"
             );
             assert_eq!(
                 start_next_pass(&dir, None),
@@ -3644,7 +3545,7 @@ mod tests {
                 .await
                 .expect("R's remainder");
             assert_eq!(
-                sapling_root(&dir),
+                sapling_root_at(&dir, tip),
                 Ok(Some(true_root)),
                 "the resumed wallet's sapling root at the tip is the chain's"
             );
@@ -3843,9 +3744,8 @@ mod tests {
             );
             assert_eq!(
                 suggested(&dir),
-                ["Anchor(1500040..1500080)"],
-                "the import queues the blocks from its birthday again (the pruning window: \
-                 `Anchor`)"
+                ["Historic(1500040..1500080)"],
+                "the import queues the blocks from its birthday again"
             );
             scan_range(&dir, &base, &blocks, 40, &[40], true, None, End::Finish)
                 .await
@@ -3922,13 +3822,7 @@ mod tests {
                 prefix,
                 "shard 1's rows [30, 50) are buffered"
             );
-            // librustzcash#2333: the unscanned part of the chain-tip pruning window,
-            // (100, 200], is queued ahead as `Anchor`; the Historic remainder below it
-            // still starts right after the prefix.
-            assert_eq!(
-                suggested(&dir),
-                ["Anchor(1500100..1500150)", "Historic(1500050..1500100)"]
-            );
+            assert_eq!(suggested(&dir), ["Historic(1500050..1500150)"]);
             assert_eq!(
                 start_next_pass(&dir, Some(&anchors)),
                 crate::persist::GraftSweep::default(),
@@ -3941,12 +3835,8 @@ mod tests {
                 .expect("queue a rescan");
             assert_eq!(
                 suggested(&dir),
-                [
-                    "Anchor(1500100..1500150)",
-                    "Historic(1500170..1500200)",
-                    "Historic(1500050..1500100)"
-                ],
-                "the rescan comes before R's Historic remainder"
+                ["Historic(1500170..1500200)", "Historic(1500050..1500150)"],
+                "the rescan comes before R's remainder"
             );
             scan_range(
                 &dir,
@@ -4032,11 +3922,7 @@ mod tests {
                 r_rows,
                 "R's rows stay buffered in shard 1"
             );
-            // librustzcash#2333: the unscanned part of the pruning window is `Anchor`.
-            assert_eq!(
-                suggested(&dir),
-                ["Anchor(1500010..1500060)", "Historic(1500000..1500010)"]
-            );
+            assert_eq!(suggested(&dir), ["Historic(1500000..1500060)"]);
             // No sweep: the range below R scans next.
             scan_range(
                 &dir,
@@ -4149,13 +4035,8 @@ mod tests {
             );
             assert_eq!(
                 suggested(dir),
-                [
-                    "Anchor(1500050..1500080)",
-                    "Historic(1500080..1500081)",
-                    "Historic(1500000..1500050)"
-                ],
-                "the rescan of R's first block is queued with the range below R; R's own \
-                 remainder keeps the pruning window's `Anchor` priority"
+                ["Historic(1500000..1500081)"],
+                "the rescan of R's first block joins the range below R"
             );
             scan_range(
                 dir,
@@ -4311,19 +4192,8 @@ mod tests {
             run: std::ops::Range<u64>,
         }
 
-        /// The last block of [`StoppedR`]'s chain.
-        const STOPPED_R_LAST: u64 = START + 149;
-
-        /// The chain tip: 100 blocks above the chain, so that R's remainder lies below the
-        /// chain-tip pruning window and keeps its `Historic` priority. librustzcash#2333 queues
-        /// the unscanned part of that window as `Anchor`, which the scheduler scans without
-        /// graft buffering, so an `Anchor` remainder would not resume the buffered run (the
-        /// sweep rescans such a run instead). The window above the chain stays queued
-        /// throughout ([`STOPPED_R_WINDOW`]).
-        const STOPPED_R_TIP: u64 = STOPPED_R_LAST + 100;
-
-        /// The queued tip window above [`StoppedR`]'s chain.
-        const STOPPED_R_WINDOW: &str = "Anchor(1500150..1500250)";
+        /// The chain tip: the last block of [`StoppedR`]'s chain.
+        const STOPPED_R_TIP: u64 = START + 149;
 
         /// R's durable anchors on the 50-block grid, blocks 50 and 100.
         const STOPPED_R_ANCHORS: [u64; 2] = [START + 50, START + 100];
@@ -4450,14 +4320,15 @@ mod tests {
             assert!(buffer_rows(dir).is_empty(), "the graft buffer is drained");
             assert_eq!(
                 suggested(dir),
-                std::iter::once(STOPPED_R_WINDOW.to_string())
-                    .chain(queued_then.iter().map(|blocks| format!(
+                queued_then
+                    .iter()
+                    .map(|blocks| format!(
                         "Historic({}..{})",
                         START + blocks.start as u64,
                         START + blocks.end as u64
-                    )))
+                    ))
                     .collect::<Vec<_>>(),
-                "what the second pass scans is queued, below the tip window"
+                "what the second pass scans is queued"
             );
             if let Some(blocks) = queued_then {
                 let rescanned = scan_range(
@@ -4476,36 +4347,25 @@ mod tests {
                     "the second pass scans what is queued: {rescanned:?}"
                 );
             }
-            assert_eq!(
-                suggested(dir),
-                [STOPPED_R_WINDOW],
-                "every block is scanned; only the tip window above the chain is queued"
-            );
+            assert!(suggested(dir).is_empty(), "every block is scanned");
             assert!(buffer_rows(dir).is_empty(), "the graft buffer is drained");
             assert_eq!(
                 sapling_checkpoints_among(dir, &STOPPED_R_ANCHORS),
                 STOPPED_R_ANCHORS,
                 "the wallet holds R's anchors"
             );
-            for idx in [50, 100] {
+            for idx in [50, 100, 149] {
                 assert_eq!(
                     sapling_root_at(dir, START + idx as u64),
                     Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
-                    "the root at R's anchor {idx} is the chain's"
+                    "the root at block {idx} is the chain's"
                 );
             }
-            assert_eq!(
-                sapling_root(dir),
-                Ok(Some(chain_root_at(&t.base, &t.blocks, 149))),
-                "the root over the whole tree is the chain's at its last block"
-            );
             let last_position = t.base.tree_size() + t.blocks.len() as u64 - 1;
-            // The chain's last block lies below the chain-tip pruning window, so it keeps no
-            // checkpoint (librustzcash#2333); the leaf is there all the same.
             assert_eq!(
-                sapling_positions(dir, STOPPED_R_LAST).1,
-                Some(last_position),
-                "the last leaf sits at the chain's last position"
+                sapling_positions(dir, STOPPED_R_TIP),
+                (Some(last_position as i64), Some(last_position)),
+                "the tip checkpoint and the last leaf sit at the chain's last position"
             );
         }
 
@@ -4543,7 +4403,7 @@ mod tests {
                 let t = stopped_r(&dir, SHARD - 20, 0, &[40, 40], replaced).await;
                 assert_eq!(
                     suggested(&dir),
-                    [STOPPED_R_WINDOW, "Historic(1500080..1500150)"],
+                    ["Historic(1500080..1500150)"],
                     "[{case}] R's remainder is queued"
                 );
                 let rescan = replaced.map(|_| 20..80);
@@ -4571,11 +4431,7 @@ mod tests {
                 let t = stopped_r(&dir, SHARD - 40, 60, &[40, 40], replaced).await;
                 assert_eq!(
                     suggested(&dir),
-                    [
-                        STOPPED_R_WINDOW,
-                        "Historic(1500140..1500150)",
-                        "Historic(1500000..1500060)"
-                    ],
+                    ["Historic(1500140..1500150)", "Historic(1500000..1500060)"],
                     "[{case}] R's remainder is queued, above the range below R"
                 );
                 let rescan = replaced.map(|_| 60..140);
@@ -4642,11 +4498,7 @@ mod tests {
                 "the sweep neither builds the run, which the tree refuses, nor places its blocks"
             );
             assert_eq!(buffered_positions(&dir), run, "the sweep keeps the run");
-            assert_eq!(
-                suggested(&dir),
-                [STOPPED_R_WINDOW],
-                "nothing below the tip window is queued"
-            );
+            assert!(suggested(&dir).is_empty(), "nothing is queued");
             session(&dir)
                 .db_mut()
                 .queue_rescan(height(80)..height(150))
@@ -4673,21 +4525,14 @@ mod tests {
                 run,
                 "the rescan does not resume the run either"
             );
-            assert_eq!(
-                suggested(&dir),
-                [STOPPED_R_WINDOW],
-                "every block is scanned; only the tip window above the chain is queued"
-            );
-            assert_eq!(
-                sapling_root_at(&dir, START + 100),
-                Ok(Some(chain_root_at(&t.base, &t.blocks, 100))),
-                "the root at R's anchor 100 is the chain's"
-            );
-            assert_eq!(
-                sapling_root(&dir),
-                Ok(Some(chain_root_at(&t.base, &t.blocks, 149))),
-                "the root over the whole tree is the chain's at its last block"
-            );
+            assert!(suggested(&dir).is_empty(), "every block is scanned");
+            for idx in [100, 149] {
+                assert_eq!(
+                    sapling_root_at(&dir, START + idx as u64),
+                    Ok(Some(chain_root_at(&t.base, &t.blocks, idx))),
+                    "the root at block {idx} is the chain's"
+                );
+            }
         }
 
         // ── The same on the Orchard pool ─────────────────────────────────────────────────

@@ -1159,8 +1159,7 @@ mod tests {
     }
 
     /// Only `Historic` ranges count. With roots stored, the range up to the tip is queued as
-    /// `ChainTip` work instead (its pruning window as `Anchor`, librustzcash#2333), so a pass
-    /// that has only that keeps its incremental start.
+    /// `ChainTip` work instead, so a pass that has only that keeps its incremental start.
     #[test]
     fn scan_ranges_of_other_priorities_are_not_historic_work() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1174,10 +1173,9 @@ mod tests {
         let ranges = s.suggest_scan_ranges().expect("ranges");
         assert!(
             !ranges.is_empty()
-                && ranges.iter().all(|range| matches!(
-                    range.priority(),
-                    ScanPriority::ChainTip | ScanPriority::Anchor
-                )),
+                && ranges
+                    .iter()
+                    .all(|range| range.priority() == ScanPriority::ChainTip),
             "premise: scan work is queued, and none of it is Historic: {ranges:?}"
         );
         assert!(

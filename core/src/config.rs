@@ -198,11 +198,7 @@ pub struct EngineConfig {
     /// `BlockSpacing::for_network(&network)` (`zcash_protocol::zip318`), as upstream's
     /// `put_blocks` does, so that its grid is the wallet's on every network.
     ///
-    /// `None` (default) = the wallet's own policy, read from the wallet at each range
-    /// (`WalletDb::anchor_retention`: the NU6.3 activation floor, the network's block
-    /// spacing, the wallet's interval together with every in-flight migration's committed
-    /// interval) — exactly what upstream's `put_blocks` applies to the same wallet, so a host
-    /// need not set this at all; `Some` overrides it.
+    /// `None` (default) = retention off, byte-identical to pre-B6 behavior.
     pub anchor_retention: Option<AnchorRetention>,
 
     /// v0.4 Plan B (spec §5): batch-affine Orchard combine — all of a fragment's

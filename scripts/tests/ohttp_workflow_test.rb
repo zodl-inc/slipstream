@@ -53,9 +53,7 @@ raise "configuration variants are not run in CI" unless test_steps.any? do |step
   step["run"] == "python3 scripts/tests/ohttp_configuration.py"
 end
 token = action.fetch("runs").fetch("steps").find { |step| step["id"] == "token" }
-# Exactly the private repositories cargo fetches: the OHTTP core, and librustzcash-private for
-# the workspace's `[patch.crates-io]`. Nothing wider.
-raise "wrong private repository token scope" unless token.fetch("with").fetch("repositories") == "zodl-ohttp,librustzcash-private"
+raise "wrong private repository token scope" unless token.fetch("with").fetch("repositories") == "zodl-ohttp"
 manifest = File.read(File.join(root, "core/Cargo.toml"))
 lock = File.read(File.join(root, "Cargo.lock"))
 raise "old dependency URL" if [manifest, lock].any? { |text| text.include?("https://github.com/zodl-inc/ohttp.git") }
