@@ -10,6 +10,8 @@ workspace.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-10
+
 ### Fixed
 
 - Direct OHTTP dialing races IPv6 and IPv4 candidates with at most two concurrent
