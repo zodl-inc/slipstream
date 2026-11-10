@@ -1,9 +1,10 @@
-name: "Authorize cargo against the private ohttp repository"
+name: "Authorize cargo against the private zodl-inc repositories"
 description: >-
-  Mints a short-lived read token for zodl-inc/zodl-ohttp and points cargo's git fetches at it.
-  `zodl-ohttp-client` (the shared sans-IO OHTTP core) is a git dependency on that private repo,
-  and cargo fetches the source while resolving the dependency graph, so every job that runs
-  cargo needs read access.
+  Mints a short-lived read token for the private zodl-inc repositories cargo fetches by git and
+  points cargo's git fetches at it. `zodl-ohttp-client` (the shared sans-IO OHTTP core) is a git
+  dependency on zodl-inc/zodl-ohttp, and the workspace's `[patch.crates-io]` takes the
+  librustzcash crates from zodl-inc/librustzcash-private. Cargo fetches the sources while
+  resolving the dependency graph, so every job that runs cargo needs read access.
 
   A no-op when the inputs are empty, which is what happens on pull requests from forks: secrets
   are unavailable there by design, so those runs cannot resolve the dependency.
@@ -11,8 +12,8 @@ description: >-
 inputs:
   app-id:
     description: >-
-      App ID of the GitHub App holding Contents:Read on zodl-inc/zodl-ohttp. Leave empty to skip the
-      credential setup entirely.
+      App ID of the GitHub App holding Contents:Read on the private zodl-inc repositories (the org
+      secret CARGO_PRIVATE_APP_ID). Leave empty to skip the credential setup entirely.
     required: false
     default: ""
   app-private-key:
@@ -23,7 +24,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Mint a read token for the private ohttp repository
+    - name: Mint a read token for the private repositories
       id: token
       if: inputs.app-id != '' && inputs.app-private-key != ''
       uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -33,7 +34,7 @@ runs:
         # The App is installed on zodl-inc, not on this repository's owner, so the installation
         # to mint against has to be named explicitly.
         owner: zodl-inc
-        repositories: zodl-ohttp
+        repositories: zodl-ohttp,librustzcash-private
         # Fetching a git dependency is a read of repository contents and nothing more.
         permission-contents: read
 

@@ -75,3 +75,23 @@ sinsemilla = "0.2"
 group = "0.14"
 pasta_curves = "0.6"
 ff = "0.14"
+
+# Temporary: zcash/librustzcash#2333 (spendability redesign, merged upstream
+# 2026-11-04) is not on crates.io yet. Until a release carries it, every
+# librustzcash workspace crate in our graph comes from the private mirror at
+# the private mirror's merge of upstream caabbd632c (zodl-inc/librustzcash-private#59)
+# plus the put_blocks checkpoint-planning and anchor-retention seams the lane calls.
+# All of them must move together: the git crates depend on each other by path,
+# so leaving one on crates.io would put two copies of it in the graph.
+[patch.crates-io]
+zcash_client_backend = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_client_sqlite = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_keys = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_primitives = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_protocol = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_address = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_encoding = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_transparent = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zcash_pool_migration = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+pczt = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
+zip321 = { git = "https://github.com/zodl-inc/librustzcash-private.git", rev = "1d1c94206e1ab2e9bc48f223b72a7d1d18cdd69f" }
