@@ -804,13 +804,14 @@ async fn scan_chunks_inner(
     // server and reused by later ones. Most ranges — a follow pass's single block among
     // them — run no interleave, and used to connect anyway (with Tor on, an isolated
     // circuit).
-    let mut enhance_client = enhancement_connection(&config.endpoint, tor);
+    let mut enhance_client = enhancement_connection(&config.ohttp, &config.endpoint, tor);
 
     let mut stats = ScanStats::default();
     // State for the FIRST chunk: seed treestate at (range_start - 1).
     // T6.8-H2: uses retry_get_tree_state (up to 3 attempts, reconnect on retry)
     // instead of bare get_tree_state — a single 30s server stall was FATAL here.
     let mut next_state = grpc::retry_get_tree_state(
+        &config.ohttp,
         &endpoint,
         range_start - 1,
         "initial seed",
@@ -974,11 +975,13 @@ async fn scan_chunks_inner(
                 if needs_server_boundary_state(local_mode, audit_this, sub_end, range_end) {
                     carried.or_else(|| {
                         Some(tokio::spawn({
+                            let networks = Arc::clone(&config.ohttp);
                             let ep = endpoint.clone();
                             let tor_owned = tor.cloned();
                             let progress = progress.clone();
                             async move {
                                 grpc::retry_get_tree_state(
+                                    &networks,
                                     &ep,
                                     sub_end,
                                     "chunk-boundary prefetch",
@@ -1327,6 +1330,7 @@ async fn scan_chunks_inner(
             }
             let started = Instant::now();
             match grpc::with_ohttp_endpoint(
+                &config.ohttp,
                 &endpoint,
                 tor.is_some(),
                 run_enhancement_lazily_isolated(
@@ -1335,7 +1339,7 @@ async fn scan_chunks_inner(
                     network,
                     progress.clone(),
                     skipped_keys,
-                    tor.map(|t| (t, &endpoint)),
+                    tor.map(|t| (&config.ohttp, t, &endpoint)),
                 ),
             )
             .await

@@ -71,10 +71,12 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 tower-service = "0.3"
 webpki-roots = "0.26"
-# Shared sans-IO OHTTP core (HPKE encapsulation, Binary HTTP, signed-config verification, key
-# selection, outer-status classification, size limits). `default-features = false`: the `client`
-# feature would pull reqwest, and Slipstream does its own I/O.
-zodl-ohttp-client = { git = "https://github.com/zodl-inc/zodl-ohttp.git", rev = "0324db3240adf00ea847aa0a93e8d765e32b61da", default-features = false }
+# Shared sans-IO OHTTP core (the OHTTP configuration types, HPKE encapsulation, Binary HTTP,
+# signed-config verification, key selection, outer-status classification, size limits).
+# `default-features = false`: the `client` feature would pull reqwest, and Slipstream does its
+# own I/O. From crates.io, like the crate itself; 1.0.1 is the v1.0.0 release with crates.io
+# metadata.
+zodl-ohttp-client = { version = "1.0.1", default-features = false }
 
 [dev-dependencies]
 # Hermetic authenticated OHTTP relay fixtures use the same locked crypto primitives.

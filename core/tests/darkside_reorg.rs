@@ -57,6 +57,7 @@
 //! Then: cargo test -p zodl-slipstream --features darkside -- --ignored --test-threads=1
 #![cfg(feature = "darkside")]
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -71,6 +72,7 @@ use zodl_slipstream::{
     error::SlipstreamError,
     fetch::{FetchPlan, run_fetch},
     grpc,
+    ohttp::OhttpNetworks,
     scan::scan_chunks_from_treestate,
     wallet_session::{TEST_UFVK, WalletSession},
 };
@@ -222,7 +224,10 @@ async fn direct_pipeline_scan(
     let (tx, rx) = chunk_queue(cfg.memory_budget_bytes);
     let plan = FetchPlan::new(scan_start, chain_tip, cfg.chunk_blocks, cfg.fetch_streams);
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task = tokio::spawn(async move { run_fetch(&fetch_ep, None, plan, tx, None).await });
+    let fetch_task =
+        tokio::spawn(
+            async move { run_fetch(Arc::default(), &fetch_ep, None, plan, tx, None).await },
+        );
 
     // SAPLING_TREE_128607 is correct here because scan_start = BIRTHDAY_HEIGHT = 663150,
     // so from_state.height = 663149, from_state.tree_size = 128607 = START_SAPLING_TREE_SIZE.
@@ -287,7 +292,12 @@ async fn reorg_recovery_produces_correct_tip() {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
 
@@ -320,7 +330,9 @@ async fn reorg_recovery_produces_correct_tip() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut session = WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
 
     setup_wallet(&mut session, &mut client).await;
 
@@ -406,8 +418,9 @@ async fn reorg_recovery_produces_correct_tip() {
         cfg.fetch_streams,
     );
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task =
-        tokio::spawn(async move { run_fetch(&fetch_ep, None, plan_reorg, fetch_tx, None).await });
+    let fetch_task = tokio::spawn(async move {
+        run_fetch(Arc::default(), &fetch_ep, None, plan_reorg, fetch_tx, None).await
+    });
 
     // from_state for 663201: height=663200, sapling_tree=SAPLING_TREE_128607.
     // The tree size in SAPLING_TREE_128607 is 128607, but the actual tree at 663200 is
@@ -565,7 +578,12 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
 
@@ -590,7 +608,9 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut session = WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
 
     setup_wallet(&mut session, &mut client).await;
 
@@ -663,8 +683,9 @@ async fn reorg_recovery_produces_correct_tip_sparse() {
         cfg.fetch_streams,
     );
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task =
-        tokio::spawn(async move { run_fetch(&fetch_ep, None, plan_reorg, fetch_tx, None).await });
+    let fetch_task = tokio::spawn(async move {
+        run_fetch(Arc::default(), &fetch_ep, None, plan_reorg, fetch_tx, None).await
+    });
 
     let from_state_663200 = TreeState {
         network: "main".into(),
@@ -786,7 +807,12 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
     let wallet_dir = tempfile::tempdir().expect("tempdir");
     let db_path = wallet_dir.path().join("data.db");
 
-    let mut cfg = EngineConfig::new(Network::MainNetwork, db_path.clone(), ep.clone());
+    let mut cfg = EngineConfig::new(
+        Network::MainNetwork,
+        db_path.clone(),
+        ep.clone(),
+        OhttpNetworks::default(),
+    );
     cfg.chunk_blocks = 100;
     cfg.fetch_streams = 2;
     cfg.write_behind = true;
@@ -812,7 +838,9 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let mut session = WalletSession::open(Network::MainNetwork, &db_path).expect("open wallet");
-    let mut client = grpc::connect(&ep).await.expect("grpc connect");
+    let mut client = grpc::connect(&OhttpNetworks::default(), &ep)
+        .await
+        .expect("grpc connect");
 
     setup_wallet(&mut session, &mut client).await;
 
@@ -879,8 +907,9 @@ async fn reorg_recovery_produces_correct_tip_write_behind() {
         cfg.fetch_streams,
     );
     let fetch_ep = cfg.endpoint.clone();
-    let fetch_task =
-        tokio::spawn(async move { run_fetch(&fetch_ep, None, plan_reorg, fetch_tx, None).await });
+    let fetch_task = tokio::spawn(async move {
+        run_fetch(Arc::default(), &fetch_ep, None, plan_reorg, fetch_tx, None).await
+    });
 
     let from_state_663200 = TreeState {
         network: "main".into(),

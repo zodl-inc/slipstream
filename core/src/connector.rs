@@ -20,9 +20,10 @@
 //! a circuit of their own, while metadata uses the isolated, default, or shared circuit
 //! selected by its [`ConnPurpose`]. With Tor off, connections are direct.
 //!
-//! **OHTTP gateways** (`crate::ohttp::relay_for(host).is_some()`) encapsulate EVERY purpose,
-//! bulk included. With Tor on, their TCP leg to the relay also goes through Tor, so the relay
-//! never receives the device IP while the user asked for Tor.
+//! **OHTTP gateways** (`crate::ohttp::relay_for(networks, host).is_some()`, for the OHTTP
+//! configuration every connect is given) encapsulate EVERY purpose, bulk included. With Tor on,
+//! their TCP leg to the relay also goes through Tor, so the relay never receives the device IP
+//! while the user asked for Tor.
 //!
 //! Tor is transport-only — the bytes written to the wallet DB are identical either way, so the
 //! golden + darkside oracles are unaffected.
@@ -54,7 +55,7 @@ use crate::{
     config::Endpoint,
     error::SlipstreamError,
     grpc::{self, LwdClient, TrackedConnection},
-    ohttp::{Dialer, OhttpConnector},
+    ohttp::{ConfigurationKey, Dialer, OhttpConnector, OhttpNetworks},
 };
 
 /// Why a lightwalletd connection is being opened — selects direct vs Tor.
@@ -150,13 +151,20 @@ const TOR_GRPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const TOR_GRPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 const TOR_GRPC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// One [`TorConn`] shared connection: the connection, the OHTTP configuration of its host it was
+/// opened under ([`ConfigurationKey`]; `None` for a host that was a plain server) and when it was
+/// opened.
+type SharedConnection = (TrackedConnection, Option<ConfigurationKey>, Instant);
+
 /// A bootstrapped arti Tor client, owned by the engine and driven on its own runtime.
 #[derive(Clone)]
 pub struct TorConn {
     client: Arc<TorClient<PreferredRuntime>>,
     client_trace_prefix: Option<String>,
-    /// [`TorMode::Shared`] connections, per endpoint (`host:port`), with their opening time.
-    shared: Arc<std::sync::Mutex<HashMap<String, (TrackedConnection, Instant)>>>,
+    /// [`TorMode::Shared`] connections, one per endpoint (`host:port`). Clones share them, and a
+    /// clone may serve a later session under another OHTTP configuration, so each is kept with
+    /// the configuration it was opened under.
+    shared: Arc<std::sync::Mutex<HashMap<String, SharedConnection>>>,
 }
 
 impl TorConn {
@@ -234,15 +242,16 @@ impl TorConn {
     }
 
     /// Open an isolated (`.uniqueTor`-style) lightwalletd client to `endpoint` through Tor.
-    /// OHTTP gateways are OHTTP-encapsulated with the relay leg dialled through Tor; other hosts
-    /// are dialled directly over Tor. Public entry point for hosts that own the Tor runtime
-    /// and need the engine's routing policy. The SDK's separate FFI Tor client refuses OHTTP
-    /// gateways; its Swift OHTTP service handles them instead.
+    /// OHTTP gateways (of `networks`) are OHTTP-encapsulated with the relay leg dialled through
+    /// Tor; other hosts are dialled directly over Tor. Public entry point for hosts that own the
+    /// Tor runtime and need the engine's routing policy. The SDK's separate FFI Tor client
+    /// refuses OHTTP gateways; its Swift OHTTP service handles them instead.
     pub async fn connect_isolated(
         &self,
+        networks: &OhttpNetworks,
         endpoint: &Endpoint,
     ) -> Result<LwdClient, SlipstreamError> {
-        self.connect(TorMode::Isolated, endpoint)
+        self.connect(networks, TorMode::Isolated, endpoint)
             .await
             .map(TrackedConnection::into_client)
     }
@@ -250,22 +259,24 @@ impl TorConn {
     #[cfg(feature = "zcash_client_sqlite")]
     pub(crate) async fn connect_isolated_tracked(
         &self,
+        networks: &OhttpNetworks,
         endpoint: &Endpoint,
     ) -> Result<TrackedConnection, SlipstreamError> {
-        self.connect(TorMode::Isolated, endpoint).await
+        self.connect(networks, TorMode::Isolated, endpoint).await
     }
 
     async fn connect(
         &self,
+        networks: &OhttpNetworks,
         mode: TorMode,
         endpoint: &Endpoint,
     ) -> Result<TrackedConnection, SlipstreamError> {
         if mode == TorMode::Shared {
-            return self.connect_shared(endpoint).await;
+            return self.connect_shared(networks, endpoint).await;
         }
         self.ensure_bootstrapped().await?;
-        let relay = crate::ohttp::relay_for(&endpoint.host);
-        let per_attempt = if relay.is_some() {
+        let is_ohttp_gateway = crate::ohttp::relay_for(networks, &endpoint.host).is_some();
+        let per_attempt = if is_ohttp_gateway {
             TOR_OHTTP_CONNECT_TIMEOUT
         } else {
             TOR_CONNECT_TIMEOUT
@@ -276,6 +287,7 @@ impl TorConn {
         // circuit, instead of blocking on arti's long internal timeout. The healthy case connects
         // on attempt 1 with no added latency.
         grpc::with_ohttp_endpoint(
+            networks,
             endpoint,
             true,
             retry_tor_connect(per_attempt, |attempt| {
@@ -288,11 +300,10 @@ impl TorConn {
                 };
                 let client_trace_prefix = self.client_trace_prefix.clone();
                 async move {
-                    match relay {
-                        Some(relay) => {
-                            Self::connect_ohttp(client, endpoint, relay, client_trace_prefix).await
-                        }
-                        None => Self::connect_direct_over_tor(client, endpoint).await,
+                    if is_ohttp_gateway {
+                        Self::connect_ohttp(networks, client, endpoint, client_trace_prefix).await
+                    } else {
+                        Self::connect_direct_over_tor(networks, client, endpoint).await
                     }
                 }
             }),
@@ -301,7 +312,8 @@ impl TorConn {
     }
 
     /// Drop the cached shared (`SyncShared`) connection to `endpoint` after a call on it failed, so
-    /// the next `SyncShared` connect opens a fresh one instead of reusing a broken channel.
+    /// the next `SyncShared` connect opens a fresh one instead of reusing a broken channel. It is
+    /// dropped whatever configuration it was opened under.
     pub fn forget_shared(&self, endpoint: &Endpoint) {
         let key = format!("{}:{}", endpoint.host, endpoint.port);
         self.shared
@@ -311,28 +323,51 @@ impl TorConn {
     }
 
     /// [`TorMode::Shared`]: hand out the cached connection to `endpoint` while it is younger than
-    /// [`SHARED_CONN_MAX_AGE`], else open one on the default circuit and cache it. A tonic
-    /// channel multiplexes concurrent calls and redials a broken transport itself; callers that
-    /// retry after a failure use an isolated connection, so a bad shared one is never retried
-    /// into.
+    /// [`SHARED_CONN_MAX_AGE`] and was opened under the configuration `networks` has for its
+    /// host, else open one on the default circuit and cache it in its place. A connection opened
+    /// under another configuration (another relay, signer or network for the gateway, or OHTTP
+    /// turned on or off for the host) is never handed out. A tonic channel multiplexes concurrent
+    /// calls and redials a broken transport itself; callers that retry after a failure use an
+    /// isolated connection, so a bad shared one is never retried into.
     async fn connect_shared(
         &self,
+        networks: &OhttpNetworks,
         endpoint: &Endpoint,
     ) -> Result<TrackedConnection, SlipstreamError> {
+        self.shared_or_open(networks, endpoint, || {
+            Box::pin(self.connect(networks, TorMode::Default, endpoint))
+        })
+        .await
+    }
+
+    /// [`Self::connect_shared`], with `open` opening the connection when none can be reused
+    /// (the tests open one without a network).
+    async fn shared_or_open<F, Fut>(
+        &self,
+        networks: &OhttpNetworks,
+        endpoint: &Endpoint,
+        open: F,
+    ) -> Result<TrackedConnection, SlipstreamError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<TrackedConnection, SlipstreamError>>,
+    {
         let key = format!("{}:{}", endpoint.host, endpoint.port);
+        let configuration = ConfigurationKey::of(networks, &endpoint.host);
         {
             let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some((client, opened)) = shared.get(&key)
+            if let Some((client, opened_under, opened)) = shared.get(&key)
+                && *opened_under == configuration
                 && opened.elapsed() < SHARED_CONN_MAX_AGE
             {
                 return Ok(client.clone());
             }
         }
-        let client = Box::pin(self.connect(TorMode::Default, endpoint)).await?;
+        let client = open().await?;
         self.shared
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(key, (client.clone(), Instant::now()));
+            .insert(key, (client.clone(), configuration, Instant::now()));
         Ok(client)
     }
 
@@ -342,26 +377,27 @@ impl TorConn {
     /// the caller's per-attempt timeout, so a stuck circuit is retried instead of eating the first
     /// RPC's deadline.
     async fn connect_ohttp(
+        networks: &OhttpNetworks,
         client: Arc<TorClient<PreferredRuntime>>,
         endpoint: &Endpoint,
-        relay: &str,
         client_trace_prefix: Option<String>,
     ) -> Result<TrackedConnection, SlipstreamError> {
         tracing::info!(
-            network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
+            network = ?crate::ohttp::gateway_network(networks, &endpoint.host).ok(),
             "lightwalletd via OHTTP (RFC 9458) over Tor — relay leg dialled through arti"
         );
         let connector = OhttpConnector::with_dialer(
+            networks,
             &endpoint.host,
-            relay,
             Dialer::Tor(client),
             client_trace_prefix,
         )
         .map_err(|e| SlipstreamError::Transport(format!("ohttp connector: {e}")))?;
-        Self::connect_ohttp_channel(connector, endpoint).await
+        Self::connect_ohttp_channel(networks, connector, endpoint).await
     }
 
     async fn connect_ohttp_channel(
+        networks: &OhttpNetworks,
         connector: OhttpConnector,
         endpoint: &Endpoint,
     ) -> Result<TrackedConnection, SlipstreamError> {
@@ -378,7 +414,7 @@ impl TorConn {
                 tracing::debug!(host = %endpoint.host, err = %e, "ohttp connect over Tor failed");
                 SlipstreamError::Transport(format!(
                     "ohttp connect {}: {e}",
-                    crate::ohttp::gateway_label(&endpoint.host)
+                    crate::ohttp::gateway_label(networks, &endpoint.host)
                 ))
             })?;
         Ok(TrackedConnection::ohttp(channel, connector, pipe_uri))
@@ -388,6 +424,7 @@ impl TorConn {
     /// `zcash_client_backend::tor::Client::connect_to_lightwalletd` (same tonic timeouts and
     /// keep-alives, webpki roots, `.onion` allowed when the host is one).
     async fn connect_direct_over_tor(
+        networks: &OhttpNetworks,
         client: Arc<TorClient<PreferredRuntime>>,
         endpoint: &Endpoint,
     ) -> Result<TrackedConnection, SlipstreamError> {
@@ -419,7 +456,7 @@ impl TorConn {
                     .unwrap_or_default();
                 SlipstreamError::Transport(format!(
                     "tor connect {}: {e}{source}",
-                    crate::ohttp::log_host(&endpoint.host)
+                    crate::ohttp::log_host(networks, &endpoint.host)
                 ))
             })?;
         Ok(TrackedConnection::plain(LwdClient::new(channel.into())))
@@ -472,8 +509,8 @@ impl Service<Uri> for TorTcpConnector {
 pub const OHTTP_MAX_CHUNK_BLOCKS: u32 = 2_000;
 
 /// Effective `chunk_blocks` for a bulk fetch of `endpoint`.
-pub fn bulk_chunk_blocks(configured: u32, endpoint: &Endpoint) -> u32 {
-    if crate::ohttp::relay_for(&endpoint.host).is_some() {
+pub fn bulk_chunk_blocks(networks: &OhttpNetworks, configured: u32, endpoint: &Endpoint) -> u32 {
+    if crate::ohttp::relay_for(networks, &endpoint.host).is_some() {
         configured.min(OHTTP_MAX_CHUNK_BLOCKS)
     } else {
         configured
@@ -483,14 +520,17 @@ pub fn bulk_chunk_blocks(configured: u32, endpoint: &Endpoint) -> u32 {
 /// Builds lightwalletd clients honoring the per-call Tor policy.
 #[derive(Clone)]
 pub struct Connector {
+    ohttp: Arc<OhttpNetworks>,
     endpoint: Endpoint,
     tor: Option<TorConn>,
 }
 
 impl Connector {
-    /// Tor-off: every purpose dials directly.
-    pub fn direct(endpoint: Endpoint) -> Self {
+    /// Tor-off: every purpose dials directly. `ohttp` is the OHTTP configuration: an endpoint
+    /// that is the gateway of a configured network is reached through OHTTP.
+    pub fn direct(ohttp: Arc<OhttpNetworks>, endpoint: Endpoint) -> Self {
         Self {
+            ohttp,
             endpoint,
             tor: None,
         }
@@ -498,8 +538,9 @@ impl Connector {
 
     /// Tor-on: every purpose uses Tor, with a circuit per bulk connection for every host.
     /// OHTTP gateways use Tor for the relay leg too.
-    pub fn with_tor(endpoint: Endpoint, tor: TorConn) -> Self {
+    pub fn with_tor(ohttp: Arc<OhttpNetworks>, endpoint: Endpoint, tor: TorConn) -> Self {
         Self {
+            ohttp,
             endpoint,
             tor: Some(tor),
         }
@@ -507,25 +548,26 @@ impl Connector {
 
     /// Open a lightwalletd client for `purpose`.
     pub async fn connect(&self, purpose: ConnPurpose) -> Result<LwdClient, SlipstreamError> {
-        connect_via(&self.endpoint, self.tor.as_ref(), purpose).await
+        connect_via(&self.ohttp, &self.endpoint, self.tor.as_ref(), purpose).await
     }
 }
 
-/// Free-function form of [`Connector::connect`] for call sites that already thread `endpoint`
-/// (from `EngineConfig`) and an optional Tor handle separately — avoids restructuring the run
-/// path around the bundled [`Connector`]. Per-call policy: with `tor` `Some` every purpose rides
-/// Tor (bulk on a circuit per connection, metadata on its own — see `route` helper); with `tor`
-/// `None`, `connect_direct_with_retry` → `grpc::connect`, which already speaks OHTTP to gateways
-/// over the direct relay leg.
+/// Free-function form of [`Connector::connect`] for call sites that already thread the OHTTP
+/// configuration and `endpoint` (from `EngineConfig`) and an optional Tor handle separately —
+/// avoids restructuring the run path around the bundled [`Connector`]. Per-call policy: with
+/// `tor` `Some` every purpose rides Tor (bulk on a circuit per connection, metadata on its own —
+/// see `route` helper); with `tor` `None`, `connect_direct_with_retry` → `grpc::connect`, which
+/// already speaks OHTTP to gateways over the direct relay leg.
 pub async fn connect_via(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     tor: Option<&TorConn>,
     purpose: ConnPurpose,
 ) -> Result<LwdClient, SlipstreamError> {
-    let is_ohttp_gateway = crate::ohttp::relay_for(&endpoint.host).is_some();
+    let is_ohttp_gateway = crate::ohttp::relay_for(networks, &endpoint.host).is_some();
     match (tor, route(purpose, is_ohttp_gateway)) {
         (Some(t), Some(mode)) => t
-            .connect(mode, endpoint)
+            .connect(networks, mode, endpoint)
             .await
             .map(TrackedConnection::into_client),
         // Bulk streams get a relay connection of their own: a block-range body the scan is not
@@ -533,29 +575,34 @@ pub async fn connect_via(
         // tree-state and tip calls it stalled all of them (device, spam era: "no chunk received
         // in 30s" + GetTreeState timeouts until the pass restarted).
         _ if purpose == ConnPurpose::BulkFetch => {
-            connect_direct_dedicated_with_retry(endpoint).await
+            connect_direct_dedicated_with_retry(networks, endpoint).await
         }
-        _ => connect_direct_with_retry(endpoint).await,
+        _ => connect_direct_with_retry(networks, endpoint).await,
     }
 }
 
 pub(crate) async fn connect_via_tracked(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     tor: Option<&TorConn>,
     purpose: ConnPurpose,
 ) -> Result<TrackedConnection, SlipstreamError> {
-    if crate::ohttp::relay_for(&endpoint.host).is_none() {
-        return connect_via(endpoint, tor, purpose)
+    if crate::ohttp::relay_for(networks, &endpoint.host).is_none() {
+        return connect_via(networks, endpoint, tor, purpose)
             .await
             .map(TrackedConnection::plain);
     }
     if let Some(tor) = tor {
         return tor
-            .connect(route(purpose, true).expect("Tor purpose"), endpoint)
+            .connect(
+                networks,
+                route(purpose, true).expect("Tor purpose"),
+                endpoint,
+            )
             .await;
     }
     retry_transient(
-        || grpc::connect_tracked(endpoint, purpose != ConnPurpose::BulkFetch),
+        || grpc::connect_tracked(networks, endpoint, purpose != ConnPurpose::BulkFetch),
         DIRECT_CONNECT_ATTEMPTS,
         direct_connect_backoff,
     )
@@ -611,9 +658,12 @@ where
 /// `DIRECT_CONNECT_ATTEMPTS`). Drop-in for `grpc::connect` at the sites that must survive a brief
 /// server outage without restarting the sync pass: the bulk-fetch workers and the direct branch of
 /// [`connect_via`].
-pub async fn connect_direct_with_retry(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
+pub async fn connect_direct_with_retry(
+    networks: &OhttpNetworks,
+    endpoint: &Endpoint,
+) -> Result<LwdClient, SlipstreamError> {
     retry_transient(
-        || grpc::connect(endpoint),
+        || grpc::connect(networks, endpoint),
         DIRECT_CONNECT_ATTEMPTS,
         direct_connect_backoff,
     )
@@ -720,10 +770,11 @@ where
 /// [`connect_direct_with_retry`] for bulk block download: an OHTTP gateway is reached over a relay
 /// connection used by this client alone (`grpc::connect_dedicated`), never the process-wide one.
 pub async fn connect_direct_dedicated_with_retry(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
 ) -> Result<LwdClient, SlipstreamError> {
     retry_transient(
-        || grpc::connect_dedicated(endpoint),
+        || grpc::connect_dedicated(networks, endpoint),
         DIRECT_CONNECT_ATTEMPTS,
         direct_connect_backoff,
     )
@@ -819,11 +870,12 @@ mod tests {
     #[tokio::test]
     async fn cached_relay_pause_stays_typed_through_tor_warm_up_and_retry() {
         let connector = crate::ohttp::tests::connector_with_cached_relay_pause().await;
+        let networks = crate::ohttp::tests::example_networks();
         let endpoint = ohttp_endpoint();
         let attempts = std::cell::Cell::new(0);
         let result = retry_tor_connect(TOR_OHTTP_CONNECT_TIMEOUT, |_| {
             attempts.set(attempts.get() + 1);
-            TorConn::connect_ohttp_channel(connector.clone(), &endpoint)
+            TorConn::connect_ohttp_channel(&networks, connector.clone(), &endpoint)
         })
         .await;
         let Err(error) = result else {
@@ -848,10 +900,14 @@ mod tests {
             let (connector, _) =
                 crate::ohttp::tests::outcome_connector(&format!("tor-{expected}"), outer, inner)
                     .await;
-            let mut client = TorConn::connect_ohttp_channel(connector, &ohttp_endpoint())
-                .await
-                .expect("channel")
-                .into_client();
+            let mut client = TorConn::connect_ohttp_channel(
+                &crate::ohttp::tests::example_networks(),
+                connector,
+                &ohttp_endpoint(),
+            )
+            .await
+            .expect("channel")
+            .into_client();
             let error = grpc::get_latest_block_height(&mut client)
                 .await
                 .unwrap_err();
@@ -868,11 +924,12 @@ mod tests {
     async fn fresh_key_fetch_rate_limit_stays_typed_through_tor_warm_up_and_retry() {
         let (connector, gets) =
             crate::ohttp::tests::connector_with_fresh_key_fetch_rate_limit().await;
+        let networks = crate::ohttp::tests::example_networks();
         let endpoint = ohttp_endpoint();
         let attempts = std::cell::Cell::new(0);
         let result = retry_tor_connect(TOR_OHTTP_CONNECT_TIMEOUT, |_| {
             attempts.set(attempts.get() + 1);
-            TorConn::connect_ohttp_channel(connector.clone(), &endpoint)
+            TorConn::connect_ohttp_channel(&networks, connector.clone(), &endpoint)
         })
         .await;
         let Err(error) = result else {
@@ -886,6 +943,60 @@ mod tests {
         assert!(!error.counts_as_unreachable());
         assert_eq!(attempts.get(), 1, "return to caller backoff immediately");
         assert_eq!(gets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A Tor client, and with it its shared connections, outlives a session: a later session of
+    /// the same handle may run under another OHTTP configuration. A shared connection is reused
+    /// only under the configuration of its host it was opened under; another signer for the
+    /// gateway's network, or no configuration at all, gets a connection of its own.
+    /// `forget_shared` drops the endpoint's connection whatever it was opened under.
+    #[tokio::test]
+    async fn shared_connection_is_not_reused_under_another_configuration() {
+        use crate::ohttp::tests::{example_networks, example_testnet_with_another_signer};
+        let tor = TorConn::from_client(
+            arti_client::TorClient::builder()
+                .create_unbootstrapped()
+                .expect("unbootstrapped tor client"),
+            None,
+        );
+        let endpoint = ohttp_endpoint();
+        let opens = std::cell::Cell::new(0);
+        // Opens a connection without any network: a lazy channel, counted.
+        let open = || {
+            opens.set(opens.get() + 1);
+            std::future::ready(Ok(TrackedConnection::plain(LwdClient::new(
+                TonicEndpoint::from_static("http://shared-connection.invalid")
+                    .connect_lazy()
+                    .into(),
+            ))))
+        };
+
+        // An earlier session opened the endpoint's shared connection under the example
+        // configuration; the same configuration reuses it.
+        for _ in 0..2 {
+            tor.shared_or_open(&example_networks(), &endpoint, open)
+                .await
+                .expect("a connection");
+        }
+        assert_eq!(opens.get(), 1, "the same configuration reuses it");
+
+        for (other, case) in [
+            (example_testnet_with_another_signer(), "another signer"),
+            (OhttpNetworks::default(), "OHTTP turned off for the host"),
+            (example_networks(), "OHTTP turned on again"),
+        ] {
+            let before = opens.get();
+            tor.shared_or_open(&other, &endpoint, open)
+                .await
+                .expect("a connection");
+            assert_eq!(opens.get(), before + 1, "{case}: opens its own connection");
+        }
+
+        tor.forget_shared(&endpoint);
+        tor.shared_or_open(&example_networks(), &endpoint, open)
+            .await
+            .expect("a connection");
+        assert_eq!(opens.get(), 5, "a forgotten connection is not reused");
     }
 
     #[tokio::test]
@@ -1005,7 +1116,13 @@ mod tests {
             route(ConnPurpose::MetadataDefault, true),
             Some(TorMode::Default)
         );
-        assert!(crate::ohttp::relay_for(crate::ohttp::tests::testnet_gateway()).is_some());
+        assert!(
+            crate::ohttp::relay_for(
+                &crate::ohttp::tests::example_networks(),
+                crate::ohttp::tests::testnet_gateway()
+            )
+            .is_some()
+        );
         // Public sync metadata shares the session connection on the default circuit.
         assert_eq!(route(ConnPurpose::SyncShared, true), Some(TorMode::Shared));
         assert_eq!(route(ConnPurpose::SyncShared, false), Some(TorMode::Shared));
@@ -1023,9 +1140,18 @@ mod tests {
             port: 443,
             tls: true,
         };
-        assert_eq!(bulk_chunk_blocks(10_000, &gw), OHTTP_MAX_CHUNK_BLOCKS);
-        assert_eq!(bulk_chunk_blocks(500, &gw), 500);
-        assert_eq!(bulk_chunk_blocks(10_000, &plain), 10_000);
+        let networks = crate::ohttp::tests::example_networks();
+        assert_eq!(
+            bulk_chunk_blocks(&networks, 10_000, &gw),
+            OHTTP_MAX_CHUNK_BLOCKS
+        );
+        assert_eq!(bulk_chunk_blocks(&networks, 500, &gw), 500);
+        assert_eq!(bulk_chunk_blocks(&networks, 10_000, &plain), 10_000);
+        // Without a configuration of its network the gateway host is a plain server.
+        assert_eq!(
+            bulk_chunk_blocks(&OhttpNetworks::default(), 10_000, &gw),
+            10_000
+        );
         const {
             assert!(
                 OHTTP_MAX_CHUNK_BLOCKS >= 100,

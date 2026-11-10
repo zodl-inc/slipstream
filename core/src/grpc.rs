@@ -30,7 +30,7 @@ use zcash_client_backend::{
 };
 use zcash_primitives::merkle_tree::HashSer;
 
-use crate::{config::Endpoint, error::SlipstreamError};
+use crate::{config::Endpoint, error::SlipstreamError, ohttp::OhttpNetworks};
 
 mod transport;
 pub use transport::LwdTransport;
@@ -72,8 +72,8 @@ pub(crate) const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const OHTTP_RANGE_OPEN_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Deadline for opening a `GetBlockRange` stream to `endpoint` (see [`OHTTP_RANGE_OPEN_TIMEOUT`]).
-pub(crate) fn range_open_timeout(endpoint: &Endpoint) -> Duration {
-    if crate::ohttp::relay_for(&endpoint.host).is_some() {
+pub(crate) fn range_open_timeout(networks: &OhttpNetworks, endpoint: &Endpoint) -> Duration {
+    if crate::ohttp::relay_for(networks, &endpoint.host).is_some() {
         OHTTP_RANGE_OPEN_TIMEOUT
     } else {
         UNARY_TIMEOUT
@@ -120,6 +120,7 @@ pub(crate) fn treestate_retry_backoff(attempt: u32) -> std::time::Duration {
 /// The `context` string is included in every `warn!` so device logs clearly show
 /// where retries are happening.
 pub(crate) async fn retry_get_tree_state(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     height: u64,
     context: &str,
@@ -137,8 +138,10 @@ pub(crate) async fn retry_get_tree_state(
         } else {
             crate::connector::ConnPurpose::MetadataUnique
         };
-        let client = crate::connector::connect_via_tracked(endpoint, tor, purpose).await?;
+        let client =
+            crate::connector::connect_via_tracked(networks, endpoint, tor, purpose).await?;
         match with_ohttp_endpoint(
+            networks,
             endpoint,
             tor.is_some(),
             client.call(async |client| get_tree_state(client, height).await),
@@ -210,16 +213,18 @@ pub(crate) fn current_ohttp_health_route() -> Option<crate::transport_health::He
 }
 
 pub(crate) async fn with_ohttp_endpoint<T>(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     via_tor: bool,
     future: impl std::future::Future<Output = T>,
 ) -> T {
-    let route =
-        crate::ohttp::relay_for(&endpoint.host).map(|relay| crate::transport_health::HealthRoute {
+    let route = crate::ohttp::relay_for(networks, &endpoint.host).map(|relay| {
+        crate::transport_health::HealthRoute {
             gateway_host: endpoint.host.clone(),
             relay_url: relay.to_owned(),
             via_tor,
-        });
+        }
+    });
     with_ohttp_health_route(route, future).await
 }
 
@@ -460,39 +465,51 @@ where
 }
 
 /// Open a channel to lightwalletd. TLS uses webpki roots (same trust source
-/// as the upstream tor module).
-pub async fn connect(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
-    connect_with(endpoint, true).await
+/// as the upstream tor module). An endpoint that is the gateway of a network `networks`
+/// configures is reached through OHTTP; any other is dialled directly.
+pub async fn connect(
+    networks: &OhttpNetworks,
+    endpoint: &Endpoint,
+) -> Result<LwdClient, SlipstreamError> {
+    connect_with(networks, endpoint, true).await
 }
 
 /// [`connect`], except that an OHTTP gateway is reached over a relay connection of this client's
 /// own instead of the process-wide one. For bulk block streams, whose unread bodies hold HTTP/2
 /// flow-control window and would stall every other call sharing their connection.
-pub async fn connect_dedicated(endpoint: &Endpoint) -> Result<LwdClient, SlipstreamError> {
-    connect_with(endpoint, false).await
+pub async fn connect_dedicated(
+    networks: &OhttpNetworks,
+    endpoint: &Endpoint,
+) -> Result<LwdClient, SlipstreamError> {
+    connect_with(networks, endpoint, false).await
 }
 
-async fn connect_with(endpoint: &Endpoint, shared: bool) -> Result<LwdClient, SlipstreamError> {
-    connect_tracked(endpoint, shared)
+async fn connect_with(
+    networks: &OhttpNetworks,
+    endpoint: &Endpoint,
+    shared: bool,
+) -> Result<LwdClient, SlipstreamError> {
+    connect_tracked(networks, endpoint, shared)
         .await
         .map(TrackedConnection::into_client)
 }
 
 pub(crate) async fn connect_tracked(
+    networks: &OhttpNetworks,
     endpoint: &Endpoint,
     shared: bool,
 ) -> Result<TrackedConnection, SlipstreamError> {
     // OHTTP gateways (RFC 9458) are never dialled directly: every RPC is HPKE-encrypted and
     // relayed. The connector hands tonic an in-process h2 pipe with trusted local origin.
-    if let Some(relay) = crate::ohttp::relay_for(&endpoint.host) {
+    if crate::ohttp::relay_for(networks, &endpoint.host).is_some() {
         tracing::info!(
-            network = ?crate::ohttp::gateway_network(&endpoint.host).ok(),
+            network = ?crate::ohttp::gateway_network(networks, &endpoint.host).ok(),
             "lightwalletd via OHTTP (RFC 9458)"
         );
         let connector = if shared {
-            crate::ohttp::OhttpConnector::new(&endpoint.host, relay)
+            crate::ohttp::OhttpConnector::new(networks, &endpoint.host)
         } else {
-            crate::ohttp::OhttpConnector::dedicated(&endpoint.host, relay)
+            crate::ohttp::OhttpConnector::dedicated(networks, &endpoint.host)
         }
         .map_err(|e| transport_err("ohttp connector", e))?;
         // Plain `http://` on purpose: the transport tonic sees is an in-memory pipe to the
@@ -512,7 +529,7 @@ pub(crate) async fn connect_tracked(
                 transport_err(
                     &format!(
                         "ohttp connect {}",
-                        crate::ohttp::gateway_label(&endpoint.host)
+                        crate::ohttp::gateway_label(networks, &endpoint.host)
                     ),
                     format!("{e}{source}"),
                 )
@@ -530,7 +547,10 @@ pub(crate) async fn connect_tracked(
     }
     let channel = ep.connect().await.map_err(|e| {
         transport_err(
-            &format!("connect {}", crate::ohttp::log_host(&endpoint.host)),
+            &format!(
+                "connect {}",
+                crate::ohttp::log_host(networks, &endpoint.host)
+            ),
             e,
         )
     })?;
@@ -1046,7 +1066,9 @@ mod tests {
             port: 443,
             tls: true,
         };
-        let local = connect_tracked(&endpoint, false).await.unwrap();
+        let local = connect_tracked(&crate::ohttp::tests::example_networks(), &endpoint, false)
+            .await
+            .unwrap();
         let remote = TrackedConnection::plain(LwdClient::new(
             TonicEndpoint::from_static("http://remote.invalid")
                 .connect_lazy()
@@ -1120,6 +1142,7 @@ mod tests {
         let result = with_ohttp_health_route(
             Some(route),
             with_ohttp_endpoint(
+                &crate::ohttp::tests::example_networks(),
                 &public,
                 false,
                 with_unary_timeout::<()>("public", std::future::pending()),
@@ -1143,14 +1166,19 @@ mod tests {
             port: 443,
             tls: true,
         };
+        let networks = crate::ohttp::tests::example_networks();
         let first_route = HealthRoute {
             gateway_host: first.host.clone(),
-            relay_url: crate::ohttp::relay_for(&first.host).unwrap().into(),
+            relay_url: crate::ohttp::relay_for(&networks, &first.host)
+                .unwrap()
+                .into(),
             via_tor: false,
         };
         let selected_route = HealthRoute {
             gateway_host: selected.host.clone(),
-            relay_url: crate::ohttp::relay_for(&selected.host).unwrap().into(),
+            relay_url: crate::ohttp::relay_for(&networks, &selected.host)
+                .unwrap()
+                .into(),
             via_tor: true,
         };
         let subscriptions = [
@@ -1160,11 +1188,13 @@ mod tests {
         let start = transport_health::monotonic_time_nanoseconds();
         let (a, b) = tokio::join!(
             with_ohttp_endpoint(
+                &networks,
                 &first,
                 false,
                 with_unary_timeout::<()>("first", std::future::pending())
             ),
             with_ohttp_endpoint(
+                &networks,
                 &selected,
                 true,
                 with_unary_timeout::<()>("selected", std::future::pending())
@@ -1191,7 +1221,9 @@ mod tests {
             port: 443,
             tls: true,
         };
-        let _client = connect(&endpoint).await.expect("open OHTTP pipe");
+        let _client = connect(&crate::ohttp::tests::example_networks(), &endpoint)
+            .await
+            .expect("open OHTTP pipe");
         assert!(
             net_stats::totals().delta_since(&before).direct_channels >= 1,
             "an OHTTP channel without Tor must be counted once it connects"
@@ -1207,7 +1239,7 @@ mod tests {
             port: 1,
             tls: false,
         };
-        match connect(&ep).await {
+        match connect(&OhttpNetworks::default(), &ep).await {
             Err(SlipstreamError::Transport(msg)) => assert!(msg.contains("connect")),
             other => panic!("expected Transport error, got {other:?}"),
         }
@@ -1338,7 +1370,9 @@ mod tests {
             port: 443,
             tls: true,
         };
-        let mut c = connect(&ep).await.expect("connect");
+        let mut c = connect(&OhttpNetworks::default(), &ep)
+            .await
+            .expect("connect");
         let info = get_lightd_info(&mut c).await.expect("info");
         assert_eq!(info.chain_name, "main");
         let h = get_latest_block_height(&mut c).await.expect("height");
@@ -1364,6 +1398,7 @@ mod tests {
         // The test just confirms that: (a) it returns a Transport error (not panic),
         // and (b) the function exists and is callable.
         let result = retry_get_tree_state(
+            &OhttpNetworks::default(),
             &ep,
             1_000_000,
             "test-context",

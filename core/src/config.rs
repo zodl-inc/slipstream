@@ -18,6 +18,7 @@
 //! them later (P8).
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tracing::info;
@@ -25,15 +26,21 @@ use zcash_client_backend::data_api::anchor_retention::AnchorRetention;
 
 use crate::error::SlipstreamError;
 use crate::network::SlipstreamNetwork;
+use crate::ohttp::OhttpNetworks;
 
 /// An OHTTP gateway serves one network: a wallet on another network must not use it (its
 /// calls would reach the wrong chain, under a key configuration signed for that chain). Hosts
-/// that are not gateways are not checked here.
-fn check_gateway_network(host: &str, network: SlipstreamNetwork) -> Result<(), SlipstreamError> {
-    if crate::ohttp::relay_for(host).is_none() {
+/// that are not gateways of a network `networks` configures are not checked here.
+fn check_gateway_network(
+    networks: &OhttpNetworks,
+    host: &str,
+    network: SlipstreamNetwork,
+) -> Result<(), SlipstreamError> {
+    if crate::ohttp::relay_for(networks, host).is_none() {
         return Ok(());
     }
     crate::ohttp::check_gateway_network(
+        networks,
         host,
         zcash_protocol::consensus::Parameters::network_type(&network),
     )
@@ -105,6 +112,12 @@ pub struct EngineConfig {
     /// `endpoint` as configured). Empty = exactly the pre-v0.7 single-server
     /// behavior. Additive: `EngineConfig::new` leaves it empty.
     pub alternate_endpoints: Vec<Endpoint>,
+    /// The OHTTP configuration of each network, as the application passes it to
+    /// [`EngineConfig::new`]. A server whose host is the gateway of a configured network is
+    /// reached through OHTTP ([`crate::ohttp`]); with no configuration for a network, its
+    /// gateway host is a plain server like any other. Shared by every connection the engine
+    /// opens.
+    pub ohttp: Arc<OhttpNetworks>,
     /// [v0.7 P2] Mid-pass wire-collapse failover (armed only when
     /// `alternate_endpoints` is non-empty): the fetch layer detects a
     /// sustained throughput collapse or full stall on the CURRENT server
@@ -283,10 +296,13 @@ impl EngineConfig {
     /// Run an interleaved enhancement pass every 3 completed chunks by default (T6.1).
     pub const DEFAULT_ENHANCE_EVERY_CHUNKS: u32 = 3;
 
+    /// A configuration with the default tunables. `ohttp` is the application's OHTTP
+    /// configuration ([`Self::ohttp`]); `OhttpNetworks::default()` has OHTTP off.
     pub fn new(
         network: impl Into<SlipstreamNetwork>,
         wallet_db_path: PathBuf,
         endpoint: Endpoint,
+        ohttp: OhttpNetworks,
     ) -> Self {
         let network = network.into();
         Self {
@@ -294,6 +310,7 @@ impl EngineConfig {
             wallet_db_path,
             endpoint,
             alternate_endpoints: Vec::new(),
+            ohttp: Arc::new(ohttp),
             wire_failover: true,
             fetch_streams: Self::DEFAULT_FETCH_STREAMS,
             chunk_blocks: Self::DEFAULT_CHUNK_BLOCKS,
@@ -325,9 +342,10 @@ impl EngineConfig {
         if self.endpoint.host.is_empty() {
             return Err(SlipstreamError::Config("endpoint host is empty".into()));
         }
-        let primary_is_gateway = crate::ohttp::relay_for(&self.endpoint.host).is_some();
+        let primary_is_gateway =
+            crate::ohttp::relay_for(&self.ohttp, &self.endpoint.host).is_some();
         for alt in &self.alternate_endpoints {
-            let alt_is_gateway = crate::ohttp::relay_for(&alt.host).is_some();
+            let alt_is_gateway = crate::ohttp::relay_for(&self.ohttp, &alt.host).is_some();
             if primary_is_gateway != alt_is_gateway {
                 return Err(SlipstreamError::Config(
                     "alternate_endpoints must not mix Gateway hosts (tier 0) and clearnet servers (tier 1)".into(),
@@ -335,7 +353,7 @@ impl EngineConfig {
             }
         }
         for ep in std::iter::once(&self.endpoint).chain(&self.alternate_endpoints) {
-            check_gateway_network(&ep.host, self.network)?;
+            check_gateway_network(&self.ohttp, &ep.host, self.network)?;
         }
         if self.fetch_streams == 0 {
             return Err(SlipstreamError::Config("fetch_streams must be >= 1".into()));
@@ -439,12 +457,13 @@ impl EngineConfig {
         if self.alternate_endpoints.is_empty() || via_tor {
             return (self, Duration::ZERO);
         }
-        let primary_is_gateway = crate::ohttp::relay_for(&self.endpoint.host).is_some();
+        let primary_is_gateway =
+            crate::ohttp::relay_for(&self.ohttp, &self.endpoint.host).is_some();
         let same_tier: Vec<_> = self
             .alternate_endpoints
             .iter()
             .filter(|ep| {
-                let is_gateway = crate::ohttp::relay_for(&ep.host).is_some();
+                let is_gateway = crate::ohttp::relay_for(&self.ohttp, &ep.host).is_some();
                 is_gateway == primary_is_gateway
             })
             .cloned()
@@ -452,11 +471,15 @@ impl EngineConfig {
         let mut endpoints = Vec::with_capacity(1 + same_tier.len());
         endpoints.push(self.endpoint.clone());
         endpoints.extend(same_tier);
-        let outcome =
-            crate::probe::probe_endpoints(&endpoints, crate::probe::DEFAULT_PROBE_BUDGET).await;
+        let outcome = crate::probe::probe_endpoints(
+            Arc::clone(&self.ohttp),
+            &endpoints,
+            crate::probe::DEFAULT_PROBE_BUDGET,
+        )
+        .await;
         info!(
             chosen = outcome.chosen,
-            host = crate::ohttp::log_host(&endpoints[outcome.chosen].host),
+            host = crate::ohttp::log_host(&self.ohttp, &endpoints[outcome.chosen].host),
             port = endpoints[outcome.chosen].port,
             probe_ms = outcome.elapsed.as_millis() as u64,
             "wire probe committed"
@@ -486,6 +509,7 @@ mod tests {
             crate::Network::MainNetwork,
             PathBuf::from("/tmp/data.db"),
             endpoint(),
+            OhttpNetworks::default(),
         )
     }
 
@@ -587,6 +611,7 @@ mod tests {
                 crate::Network::MainNetwork,
                 PathBuf::from("/tmp/data.db"),
                 ep,
+                crate::ohttp::tests::example_networks(),
             )
         };
         let test = |ep: Endpoint| {
@@ -594,6 +619,7 @@ mod tests {
                 crate::Network::TestNetwork,
                 PathBuf::from("/tmp/data.db"),
                 ep,
+                crate::ohttp::tests::example_networks(),
             )
         };
         assert!(
@@ -624,6 +650,80 @@ mod tests {
                 .validate()
                 .is_ok()
         );
+    }
+
+    /// The wallet's network is checked against the configuration the engine is given, not
+    /// against anything compiled in: the same gateway host is accepted or refused as that
+    /// configuration says.
+    #[test]
+    fn validate_refuses_gateway_of_other_network_from_passed_configuration() {
+        use crate::ohttp::tests::{example_networks, mainnet_gateway, testnet_gateway};
+        use zodl_ohttp_client::Network;
+        let config = |network: crate::Network, host: &str, ohttp: OhttpNetworks| {
+            EngineConfig::new(network, PathBuf::from("/tmp/data.db"), alt(host), ohttp)
+        };
+        let main = crate::Network::MainNetwork;
+        let test = crate::Network::TestNetwork;
+        assert!(
+            config(main, mainnet_gateway(), example_networks())
+                .validate()
+                .is_ok()
+        );
+        assert!(
+            config(test, testnet_gateway(), example_networks())
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            config(main, testnet_gateway(), example_networks()).validate(),
+            Err(SlipstreamError::Config(m)) if m.contains("testnet")
+        ));
+        assert!(matches!(
+            config(test, "OHTTP-GATEWAY.example", example_networks()).validate(),
+            Err(SlipstreamError::Config(m)) if m.contains("mainnet")
+        ));
+        // The mainnet example configuration given as testnet's: its gateway now serves testnet.
+        let as_testnet =
+            OhttpNetworks::new(None, example_networks().get(Network::Mainnet).cloned())
+                .expect("one network");
+        assert!(
+            config(test, mainnet_gateway(), as_testnet.clone())
+                .validate()
+                .is_ok()
+        );
+        assert!(matches!(
+            config(main, mainnet_gateway(), as_testnet).validate(),
+            Err(SlipstreamError::Config(m)) if m.contains("testnet")
+        ));
+    }
+
+    /// Without a configuration of its network, a gateway host is a plain server like any
+    /// other: it is not checked against the wallet's network, nor kept apart from plain
+    /// alternates.
+    #[test]
+    fn gateway_host_without_configuration_is_a_plain_server() {
+        use crate::ohttp::tests::{example_networks, mainnet_gateway, testnet_gateway};
+        let mut plain = EngineConfig::new(
+            crate::Network::MainNetwork,
+            PathBuf::from("/tmp/data.db"),
+            alt(testnet_gateway()),
+            OhttpNetworks::default(),
+        );
+        plain.alternate_endpoints = vec![alt("zec.rocks"), alt(mainnet_gateway())];
+        assert!(plain.validate().is_ok());
+        for host in [testnet_gateway(), mainnet_gateway()] {
+            assert!(crate::ohttp::relay_for(&plain.ohttp, host).is_none());
+        }
+        // The same endpoints with the configuration: a testnet gateway on mainnet, and
+        // gateways mixed with a plain server.
+        let configured = EngineConfig {
+            ohttp: std::sync::Arc::new(example_networks()),
+            ..plain
+        };
+        assert!(matches!(
+            configured.validate(),
+            Err(SlipstreamError::Config(_))
+        ));
     }
 
     #[test]

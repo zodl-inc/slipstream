@@ -17,45 +17,30 @@
 require "yaml"
 
 root = File.expand_path("../..", __dir__)
-workflow = YAML.load_file(File.join(root, ".github/workflows/ci.yml"))
-action = YAML.load_file(File.join(root, ".github/actions/authorize-private-ohttp/action.yml"))
-required = %w[GATEWAY_HOST RELAY_URL SIGNING_PUBKEY KEYS_DNS_NAME].flat_map do |kind|
-  %w[MAINNET TESTNET].map { |network| "ZODL_OHTTP_#{kind}_#{network}" }
-end
+ci = File.join(root, ".github/workflows/ci.yml")
+workflow = YAML.load_file(ci)
 cargo_jobs = workflow.fetch("jobs").select do |_, job|
   job.fetch("steps", []).any? { |step| step.fetch("run", "").match?(/\bcargo (test|check|clippy|doc)\b/) }
 end
 raise "no Cargo jobs checked" if cargo_jobs.empty?
+# zodl-ohttp-client comes from crates.io, so no job needs a token to fetch it.
 cargo_jobs.each do |name, job|
-  effective = workflow.fetch("env", {}).merge(job.fetch("env", {}))
-  raise "#{name}: strict OHTTP build policy missing" unless effective["ZODL_OHTTP_REQUIRE"] == "1"
-  required.each do |key|
-    raise "#{name}: missing Actions secret #{key}" unless effective[key] == "${{ secrets.#{key} }}"
-  end
-  steps = job.fetch("steps")
-  checkout = steps.index { |step| step.fetch("uses", "").start_with?("actions/checkout@") }
-  preflight = steps.index { |step| step["id"] == "ohttp-config" }
-  raise "#{name}: configuration preflight must follow checkout" unless checkout && preflight && checkout < preflight
-  run = steps.fetch(preflight).fetch("run", "")
-  raise "#{name}: preflight does not hash inherited configuration" unless run.include?("python3 scripts/ci/ohttp_env.py --hash") && run.include?("GITHUB_OUTPUT") && run.include?("hash=")
-  steps.each_with_index do |step, index|
-    cache = step.fetch("uses", "").start_with?("Swatinem/rust-cache@")
-    cargo = step.fetch("run", "").match?(/\bcargo (test|check|clippy|doc)\b/)
-    raise "#{name}: cache/Cargo precedes preflight" if (cache || cargo) && index <= preflight
-    if cache
-      key = step.fetch("with", {}).fetch("shared-key", "")
-      raise "#{name}: cache is not bound to configuration" unless key.include?("${{ steps.ohttp-config.outputs.hash }}")
-    end
+  if job.fetch("steps").any? { |step| step.fetch("uses", "").include?("authorize-private-ohttp") }
+    raise "#{name}: still mints a token for the public zodl-ohttp repository"
   end
 end
-test_steps = workflow.fetch("jobs").fetch("test").fetch("steps")
-raise "configuration variants are not run in CI" unless test_steps.any? do |step|
-  step["run"] == "python3 scripts/tests/ohttp_configuration.py"
-end
-token = action.fetch("runs").fetch("steps").find { |step| step["id"] == "token" }
-raise "wrong private repository token scope" unless token.fetch("with").fetch("repositories") == "zodl-ohttp"
-manifest = File.read(File.join(root, "core/Cargo.toml"))
-lock = File.read(File.join(root, "Cargo.lock"))
+raise "the private OHTTP authorization action remains" if Dir.exist?(File.join(root, ".github/actions/authorize-private-ohttp"))
+# The forbidden name is built from two parts so that this file itself stays clear of the repo-wide grep.
+raise "OHTTP build-time configuration remains in the workflow" if File.read(ci, encoding: "UTF-8").include?("ZODL_" + "OHTTP")
+manifest = File.read(File.join(root, "core/Cargo.toml"), encoding: "UTF-8")
+lock = File.read(File.join(root, "Cargo.lock"), encoding: "UTF-8")
 raise "old dependency URL" if [manifest, lock].any? { |text| text.include?("https://github.com/zodl-inc/ohttp.git") }
-raise "final library missing" unless manifest.include?("https://github.com/zodl-inc/zodl-ohttp.git") && manifest.include?("0324db3240adf00ea847aa0a93e8d765e32b61da") && lock.include?("#0324db3240adf00ea847aa0a93e8d765e32b61da")
-puts "OHTTP workflow contract: #{cargo_jobs.length} Cargo jobs, eight secrets, final dependency and token scope verified"
+# From crates.io, slipstream stays publishable there (cargo publish refuses git dependencies).
+raise "zodl-ohttp-client still comes from git" if [manifest, lock].any? { |text| text.include?("github.com/zodl-inc/zodl-ohttp") }
+dependency = manifest[/^zodl-ohttp-client = .*$/]
+raise "zodl-ohttp-client is not the crates.io 1.0.1 release" unless dependency&.include?('version = "1.0.1"')
+locked = lock[/^\[\[package\]\]\nname = "zodl-ohttp-client"\n.*?\n\n/m]
+unless locked&.include?('version = "1.0.1"') && locked.include?('source = "registry+https://github.com/rust-lang/crates.io-index"')
+  raise "Cargo.lock does not resolve zodl-ohttp-client 1.0.1 from crates.io"
+end
+puts "OHTTP workflow contract: #{cargo_jobs.length} Cargo jobs need no private token; zodl-ohttp-client 1.0.1 comes from crates.io"

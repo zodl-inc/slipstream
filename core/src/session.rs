@@ -1689,6 +1689,7 @@ mod tests {
                 port: 9067,
                 tls: false,
             },
+            crate::ohttp::OhttpNetworks::default(),
         );
         cfg.fetch_streams = 0; // `validate()` rejects this before any I/O
         let err = run_pass_with_retry(&cfg, &[], &progress, None)
@@ -1733,6 +1734,7 @@ mod tests {
                 port: 9067,
                 tls: false,
             },
+            crate::ohttp::OhttpNetworks::default(),
         );
         engine.fetch_streams = 0;
         SessionConfig {

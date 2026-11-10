@@ -5126,6 +5126,8 @@ dependencies = [
  "rand 0.10.3",
  "rusqlite",
  "sapling-crypto",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
@@ -8292,8 +8294,9 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zodl-ohttp-client"
-version = "0.1.2"
-source = "git+https://github.com/zodl-inc/zodl-ohttp.git?rev=0324db3240adf00ea847aa0a93e8d765e32b61da#0324db3240adf00ea847aa0a93e8d765e32b61da"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "012209d071157159ec851ffd98f1a1494459090359edf7c325e63b509abfe522"
 dependencies = [
  "aes-gcm",
  "base64",
