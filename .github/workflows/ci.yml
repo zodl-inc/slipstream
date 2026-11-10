@@ -34,11 +34,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
-      - uses: ./.github/actions/authorize-private-ohttp
-        with:
-          app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
-          app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run tests
         run: cargo test --workspace --verbose
@@ -54,11 +49,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
-      - uses: ./.github/actions/authorize-private-ohttp
-        with:
-          app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
-          app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Compile-only: `darkside` tests need a live lightwalletd and `gpu` tests need a
       # GPU, so neither RUNS in CI. Building every target under all features is what
@@ -91,11 +81,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
-      - uses: ./.github/actions/authorize-private-ohttp
-        with:
-          app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
-          app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Run clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -109,11 +94,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      # zodl-ohttp-client is a git dependency on the private zodl-inc/zodl-ohttp repo.
-      - uses: ./.github/actions/authorize-private-ohttp
-        with:
-          app-id: ${{ secrets.CARGO_PRIVATE_APP_ID }}
-          app-private-key: ${{ secrets.CARGO_PRIVATE_APP_KEY }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # Denies rustdoc warnings (broken intra-doc links included) across public and
       # private items — the same doc hygiene librustzcash gates on.

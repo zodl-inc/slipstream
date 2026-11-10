@@ -7339,7 +7339,11 @@ pub(crate) mod tests {
         }
         let body = field(&mut wire);
         assert!(field(&mut wire).is_empty(), "empty trailers");
-        assert!(wire.is_empty(), "no trailing bytes");
+        // zodl-ohttp-client pads every request with zero bytes after the trailers (RFC 9292 §3.8).
+        assert!(
+            wire.iter().all(|&byte| byte == 0),
+            "only zero padding after the message"
+        );
         BhttpRequest {
             method,
             scheme,
@@ -7372,6 +7376,7 @@ pub(crate) mod tests {
             );
             let wire =
                 encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM.encode).expect("encode");
+            assert_eq!(wire.len() % 4096, 0, "padded to a 4 KiB bucket");
             let decoded = decode_wire_request(&wire);
             assert_eq!(decoded.authority, expected);
             assert_eq!(decoded.method, b"POST");
@@ -7401,6 +7406,7 @@ pub(crate) mod tests {
         let request = http_bhttp_request("POST", target, &headers, b"Body-AbC");
         let wire =
             encode_bhttp_request(&request, &ClientProfile::SLIPSTREAM_HTTP.encode).expect("encode");
+        assert_eq!(wire.len() % 4096, 0, "padded to a 4 KiB bucket");
         let decoded = decode_wire_request(&wire);
         assert_eq!(decoded.authority, b"mixed.gateway.example");
         assert_eq!(decoded.method, b"POST");

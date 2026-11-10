@@ -115,8 +115,8 @@ workspace.
 
 ### Changed
 - **Breaking:** OHTTP configuration is supplied at run time instead of build time, using
-  `zodl-ohttp-client` 1.0.0. Nothing is read from the build environment any more, and no
-  endpoint or signing-key default is bundled. `EngineConfig::new` takes an
+  `zodl-ohttp-client` 1.0 from crates.io. Nothing is read from the build environment any more,
+  and no endpoint or signing-key default is bundled. `EngineConfig::new` takes an
   `ohttp: OhttpNetworks` argument. These take the configuration as their first argument
   (`&OhttpNetworks`, or `Arc<OhttpNetworks>` where the call keeps it):
   `grpc::{connect, connect_dedicated}`,
@@ -134,6 +134,10 @@ workspace.
   none, and mainnet and testnet share no value ignoring ASCII case. Gateway identity
   comes from the exact configured DNS host, ignoring letter case. The CLI gains
   `--ohttp-config <file>`.
+- OHTTP requests are padded to fixed size buckets by `zodl-ohttp-client` 1.0. A
+  `SendTransaction` is padded to 16 KiB, or to 32 KiB and then multiples of 32 KiB when larger.
+  Every other request is padded to the next multiple of 4 KiB. The relay and the network see a few
+  request sizes only. No API change.
 - **Breaking:** `LwdClient` is now `CompactTxStreamerClient<LwdTransport>` instead of
   `CompactTxStreamerClient<Channel>`, so the next release after 0.4.0 needs a minor version
   bump. Connector functions still return `LwdClient`. Manual remote clients use
