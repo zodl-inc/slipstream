@@ -1321,9 +1321,6 @@ fn cmd_oracle(
         cfg.chunk_blocks = chunk;
         cfg.sparse_persistence = sparse;
         cfg.write_behind = write_behind;
-        // Graft (default ON) lives in the sparse write-behind build path; run A (upstream
-        // persistence) and a non-write-behind run B cannot carry it.
-        cfg.graft_subtree = cfg.graft_subtree && sparse && write_behind;
         cfg.gpu_subtree = gpu_subtree;
         cfg.persist_depth = persist_depth;
         cfg

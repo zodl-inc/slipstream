@@ -144,7 +144,9 @@ pub fn log_pass_summary(outcome: &SyncOutcome, config: &EngineConfig) {
         flush_s = persist_lane.flush_ms as f64 / 1e3,
         downgrade_s = persist_lane.downgrade_ms as f64 / 1e3,
         build_s = persist_lane.build_ms as f64 / 1e3,
+        frontier_s = persist_lane.frontier_ms as f64 / 1e3,
         insert_s = persist_lane.insert_ms as f64 / 1e3,
+        ensure_s = persist_lane.ensure_ms as f64 / 1e3,
         downgraded = persist_lane.downgraded,
         "persist lane split"
     );
@@ -214,7 +216,9 @@ pub fn bench_summary(outcome: &SyncOutcome) -> BenchSummary {
         persist_flush_s: persist_lane.flush_ms as f64 / 1e3,
         persist_downgrade_s: persist_lane.downgrade_ms as f64 / 1e3,
         persist_build_s: persist_lane.build_ms as f64 / 1e3,
+        persist_frontier_s: persist_lane.frontier_ms as f64 / 1e3,
         persist_insert_s: persist_lane.insert_ms as f64 / 1e3,
+        persist_ensure_s: persist_lane.ensure_ms as f64 / 1e3,
         persist_downgraded: persist_lane.downgraded,
         enhance_fetch_s: outcome.enhance.fetch_wait.as_secs_f64(),
         enhance_store_s: outcome.enhance.store.as_secs_f64(),
