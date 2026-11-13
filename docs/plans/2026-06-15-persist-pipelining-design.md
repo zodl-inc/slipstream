@@ -73,4 +73,4 @@ persist worker**:
 
 Branch `slipstream`, LOCAL-ONLY, commits `[#1755] slipstream: persist-pipelining — <imperative>`,
 every commit = work + tests green + STATE.md. No `unwrap`/`expect` outside tests; `tracing` not
-`println`; edition 2024. R1-R3 are slipstream-internal (no swift gate); R4 touches `rust/`.
+`println`; edition 2024. R1-R3 are Slipstream-only (no swift gate); R4 touches `rust/`.

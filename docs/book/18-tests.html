@@ -25,7 +25,7 @@
     <span class="label">Always-green commands (before and after every commit)</span>
     <pre><code>cargo test -p slipstream-core -p slipstream-cli      # engine tests (fast)
 swift test --filter OfflineTests                      # old SDK untouched (CI parity)</code></pre>
-    <p>The cargo line runs before and after every commit. The Swift line is required at every phase gate and whenever a commit touches anything outside <code>slipstream/</code> + <code>docs/</code>. Pure slipstream-internal Rust commits may skip it.</p>
+    <p>The cargo line runs before and after every commit. The Swift line is required at every phase gate and whenever a commit touches anything outside <code>slipstream/</code> + <code>docs/</code>. Pure Slipstream-only Rust commits may skip it.</p>
   </div>
 
   <p>Heavier checks run when the touched area demands it:</p>

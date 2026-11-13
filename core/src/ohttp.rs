@@ -86,8 +86,9 @@ use zodl_ohttp_client::CONTENT_TYPE_CHUNKED_RES;
 use zodl_ohttp_client::{
     BhttpRequest, BhttpResponse, ChunkedResponseDecoder, ClientProfile, DOH_RESOLVERS,
     GATEWAY_MAX_ENCAPSULATED_REQUEST_BYTES, GATEWAY_MAX_SEALED_RESPONSE_BYTES, KeyConfig, Network,
-    NetworkRule, RelayBackoff, ResponseEvent, SignedKeys, SizeGuard, check_size, doh_query_url,
-    encapsulate_chunked_request, envelope_from_doh_json, signed_config_url, verify_signed_config,
+    NetworkRule, OuterHeaders, RelayBackoff, ResponseEvent, SignedKeys, SizeGuard, check_size,
+    doh_query_url, encapsulate_chunked_request, envelope_from_doh_json, signed_config_url,
+    verify_signed_config,
 };
 /// The OHTTP configuration the application passes in: [`OhttpNetworks`] holds an
 /// [`OhttpConfig`] (gateway host, relay URL, keys DNS name, signing key) for each network that
@@ -98,6 +99,26 @@ pub use zodl_ohttp_client::{
 
 #[cfg(feature = "client-trace")]
 use zodl_ohttp_client::ClientTrace;
+
+/// The `User-Agent` of every request to the OHTTP relays (the key-configuration fetch and the
+/// encapsulated post): one fixed value for all Zodl clients, so that the relays, which see the
+/// client address, cannot tell the clients apart by it.
+const RELAY_USER_AGENT: &str = "zodl-ohttp/1";
+
+/// The shared crate's `SLIPSTREAM` profile, with the relay `User-Agent` of every Zodl client.
+const SLIPSTREAM: ClientProfile = ClientProfile {
+    headers: OuterHeaders {
+        user_agent: Some(RELAY_USER_AGENT),
+        ..OuterHeaders::SLIPSTREAM
+    },
+    ..ClientProfile::SLIPSTREAM
+};
+
+/// [`SLIPSTREAM`] for non-gRPC requests ([`http_round_trip`]).
+const SLIPSTREAM_HTTP: ClientProfile = ClientProfile {
+    encode: ClientProfile::SLIPSTREAM_HTTP.encode,
+    ..SLIPSTREAM
+};
 
 /// In-memory pipe capacity between tonic and the in-process h2 server.
 const DUPLEX_BUF: usize = 4 << 20;
@@ -343,9 +364,9 @@ impl ClientCacheKey {
             1
         } else if profile == ClientProfile::IOS {
             2
-        } else if profile == ClientProfile::SLIPSTREAM {
+        } else if profile == SLIPSTREAM {
             3
-        } else if profile == ClientProfile::SLIPSTREAM_HTTP {
+        } else if profile == SLIPSTREAM_HTTP {
             4
         } else if profile == ClientProfile::LIBRARY {
             5
@@ -721,7 +742,7 @@ impl OhttpConnector {
                 relay_url,
                 Dialer::Direct,
                 get_default_client_trace_prefix(),
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )?),
         })
     }
@@ -745,7 +766,7 @@ impl OhttpConnector {
                 relay_url,
                 dialer,
                 client_trace_prefix.or_else(get_default_client_trace_prefix),
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )?,
         })
     }
@@ -1301,7 +1322,7 @@ pub(crate) struct RequestHealth {
 
 impl RequestHealth {
     fn new(client: &OhttpClient) -> Self {
-        let scope = if client.profile == ClientProfile::SLIPSTREAM {
+        let scope = if client.profile == SLIPSTREAM {
             HealthScope::Lightwalletd
         } else {
             HealthScope::Other
@@ -3204,13 +3225,8 @@ impl OhttpClient {
                 health.ticket.record_route_usable(HealthStage::Complete);
                 let headers = header_map_from_fields(&response.headers);
                 health.finish(
-                    inner_health(
-                        response.status,
-                        &headers,
-                        self.profile == ClientProfile::SLIPSTREAM,
-                        true,
-                    )
-                    .unwrap_or(HealthOutcome::Usable),
+                    inner_health(response.status, &headers, self.profile == SLIPSTREAM, true)
+                        .unwrap_or(HealthOutcome::Usable),
                     HealthStage::Complete,
                 );
             }
@@ -3326,16 +3342,11 @@ impl OhttpClient {
             Ok((status, headers, events)) => {
                 health.ticket.record_route_usable(HealthStage::ResponseHead);
                 health.boundary(HealthStage::ResponseBody);
-                let initial = inner_health(
-                    status,
-                    &headers,
-                    self.profile == ClientProfile::SLIPSTREAM,
-                    false,
-                );
+                let initial = inner_health(status, &headers, self.profile == SLIPSTREAM, false);
                 if let Some(outcome) = initial {
                     health.finish(outcome, HealthStage::ResponseHead);
                 }
-                let grpc = self.profile == ClientProfile::SLIPSTREAM;
+                let grpc = self.profile == SLIPSTREAM;
                 let header_status = headers
                     .get("grpc-status")
                     .and_then(|v| v.to_str().ok())
@@ -3918,7 +3929,7 @@ where
         relay_url,
         dialer,
         get_default_client_trace_prefix(),
-        ClientProfile::SLIPSTREAM_HTTP,
+        SLIPSTREAM_HTTP,
     )
     .await
     .map_err(HttpRoundTripError::Failed)?;
@@ -4484,11 +4495,7 @@ pub(crate) mod tests {
     }
 
     async fn health_fixture_client(name: &str, grpc: bool) -> OhttpClient {
-        let profile = if grpc {
-            ClientProfile::SLIPSTREAM
-        } else {
-            ClientProfile::SLIPSTREAM_HTTP
-        };
+        let profile = if grpc { SLIPSTREAM } else { SLIPSTREAM_HTTP };
         let client = OhttpClient::new(
             &example_networks(),
             "health-gateway.invalid",
@@ -5194,7 +5201,7 @@ pub(crate) mod tests {
             "https://health-key-verification.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .unwrap();
         let subscription = health_subscription(&client);
@@ -5271,6 +5278,15 @@ pub(crate) mod tests {
                 // Local provenance is never sent on the relay connection.
                 assert!(!request.headers().contains_key("x-ohttp-outcome-auth"));
                 assert!(!request.headers().contains_key(OHTTP_OUTCOME_HEADER));
+                // The relay sees one fixed `User-Agent`, whichever client sent the post.
+                assert_eq!(
+                    request
+                        .headers()
+                        .get_all(header::USER_AGENT)
+                        .iter()
+                        .collect::<Vec<_>>(),
+                    vec!["zodl-ohttp/1"]
+                );
                 if outer != 200 {
                     let mut response = Response::new(Full::new(Bytes::new()).boxed());
                     *response.status_mut() = StatusCode::from_u16(outer).unwrap();
@@ -5325,7 +5341,7 @@ pub(crate) mod tests {
                 gateway_host,
                 relay_url,
                 get_default_client_trace_prefix(),
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .expect("a cache key");
             let previous = CLIENT_CACHE
@@ -5744,7 +5760,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             get_default_client_trace_prefix(),
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .await
         .unwrap();
@@ -5809,7 +5825,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             get_default_client_trace_prefix(),
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .unwrap();
@@ -5853,7 +5869,7 @@ pub(crate) mod tests {
             "https://health-real-fallback.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .unwrap();
         let subscription = health_subscription(&client);
@@ -5874,7 +5890,7 @@ pub(crate) mod tests {
                 &format!("https://{}:{}{}", target.host, target.port, target.path),
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .unwrap();
             let lookups = lookups.clone();
@@ -5918,7 +5934,7 @@ pub(crate) mod tests {
                 "https://health-warmup.invalid/relay",
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .unwrap(),
         );
@@ -6087,7 +6103,7 @@ pub(crate) mod tests {
             "https://health-config-size-relay.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .unwrap();
         let subscription = health_subscription(&client);
@@ -6319,7 +6335,7 @@ pub(crate) mod tests {
                 &relay,
                 Dialer::Direct,
                 get_default_client_trace_prefix(),
-                ClientProfile::SLIPSTREAM_HTTP,
+                SLIPSTREAM_HTTP,
             )
             .await
             .unwrap();
@@ -6391,7 +6407,7 @@ pub(crate) mod tests {
                 &relay,
                 Dialer::Direct,
                 get_default_client_trace_prefix(),
-                ClientProfile::SLIPSTREAM_HTTP,
+                SLIPSTREAM_HTTP,
             )
             .await
             .unwrap();
@@ -6503,7 +6519,7 @@ pub(crate) mod tests {
                     &format!("https://health-owner-key-{status}.invalid/relay"),
                     Dialer::Direct,
                     None,
-                    ClientProfile::SLIPSTREAM,
+                    SLIPSTREAM,
                 )
                 .unwrap(),
             );
@@ -6596,7 +6612,7 @@ pub(crate) mod tests {
                 "https://health-tor-owner-relay.invalid/relay",
                 Dialer::Tor(tor),
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .unwrap(),
         );
@@ -6644,7 +6660,7 @@ pub(crate) mod tests {
                 &relay,
                 Dialer::Direct,
                 get_default_client_trace_prefix(),
-                ClientProfile::SLIPSTREAM_HTTP,
+                SLIPSTREAM_HTTP,
             )
             .await
             .unwrap();
@@ -7255,9 +7271,8 @@ pub(crate) mod tests {
     fn rejects_invalid_signature_in_signed_config() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now - 60, now + 3600);
-        let err =
-            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, testnet_gateway(), now)
-                .expect_err("verify must reject an invalid signature");
+        let err = open_fixture_signed_keys(&SLIPSTREAM, &json, testnet_gateway(), now)
+            .expect_err("verify must reject an invalid signature");
         assert!(err.contains("bad signature"), "got: {err}");
     }
 
@@ -7266,9 +7281,8 @@ pub(crate) mod tests {
     fn rejects_expired_signed_config() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now - 7200, now - 3600);
-        let err =
-            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, testnet_gateway(), now)
-                .expect_err("must reject expired config");
+        let err = open_fixture_signed_keys(&SLIPSTREAM, &json, testnet_gateway(), now)
+            .expect_err("must reject expired config");
         assert!(err.contains("validity window"), "got: {err}");
     }
 
@@ -7277,9 +7291,8 @@ pub(crate) mod tests {
     fn rejects_long_validity_window() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now, now + 25 * 60 * 60);
-        let err =
-            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, testnet_gateway(), now)
-                .expect_err("must reject validity window >24h");
+        let err = open_fixture_signed_keys(&SLIPSTREAM, &json, testnet_gateway(), now)
+            .expect_err("must reject validity window >24h");
         assert!(err.contains("longer than a day"), "got: {err}");
     }
 
@@ -7289,15 +7302,14 @@ pub(crate) mod tests {
     fn rejects_envelope_for_the_other_network() {
         let now = unix_now().unwrap();
         let json = unsigned_testnet_envelope(now - 60, now + 3600);
-        let err =
-            open_fixture_signed_keys(&ClientProfile::SLIPSTREAM, &json, mainnet_gateway(), now)
-                .expect_err("network binding");
+        let err = open_fixture_signed_keys(&SLIPSTREAM, &json, mainnet_gateway(), now)
+            .expect_err("network binding");
         assert!(err.contains("signed for"), "got: {err}");
 
         let mut mainnet_envelope: serde_json::Value = serde_json::from_slice(&json).unwrap();
         mainnet_envelope["network"] = serde_json::json!("mainnet");
         let err = open_fixture_signed_keys(
-            &ClientProfile::SLIPSTREAM,
+            &SLIPSTREAM,
             &serde_json::to_vec(&mainnet_envelope).unwrap(),
             testnet_gateway(),
             now,
@@ -7468,7 +7480,7 @@ pub(crate) mod tests {
     async fn a_relay_post_that_failed_before_send_is_sealed_again() {
         let bodies = StdMutex::new(Vec::<Vec<u8>>::new());
         let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
+            &SLIPSTREAM,
             test_key(),
             &test_request(),
             |body| {
@@ -7494,7 +7506,7 @@ pub(crate) mod tests {
         let bodies = StdMutex::new(Vec::<Vec<u8>>::new());
         let calls = Cell::new(0u32);
         let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
+            &SLIPSTREAM,
             test_key(),
             &test_request(),
             |body| {
@@ -7529,7 +7541,7 @@ pub(crate) mod tests {
             let bodies = StdMutex::new(Vec::<Vec<u8>>::new());
             let refetches = Cell::new(0u32);
             let result = run_exchange(
-                &ClientProfile::SLIPSTREAM,
+                &SLIPSTREAM,
                 test_key(),
                 &test_request(),
                 |body| {
@@ -7562,7 +7574,7 @@ pub(crate) mod tests {
         for status in [401u16, 409, 413, 426, 500, 502, 503] {
             let posts = Cell::new(0u32);
             let result = run_exchange(
-                &ClientProfile::SLIPSTREAM,
+                &SLIPSTREAM,
                 test_key(),
                 &test_request(),
                 |_body| {
@@ -7591,7 +7603,7 @@ pub(crate) mod tests {
         for status in [201u16, 202, 204, 206, 226] {
             let posts = Cell::new(0u32);
             let result = run_exchange(
-                &ClientProfile::SLIPSTREAM,
+                &SLIPSTREAM,
                 test_key(),
                 &test_request(),
                 |_body| {
@@ -7618,7 +7630,7 @@ pub(crate) mod tests {
     async fn outer_200_with_any_content_type_is_attempted() {
         // Content-Type is now ignored; a wrong body will fail at AEAD decapsulation
         let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
+            &SLIPSTREAM,
             test_key(),
             &test_request(),
             |_body| async {
@@ -7641,7 +7653,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_success_answer_that_does_not_open_is_an_error() {
         let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
+            &SLIPSTREAM,
             test_key(),
             &test_request(),
             |_body| async {
@@ -7684,7 +7696,7 @@ pub(crate) mod tests {
             &relay_url,
             Dialer::Direct,
             get_default_client_trace_prefix(),
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("configured client");
@@ -8380,7 +8392,7 @@ pub(crate) mod tests {
     #[tokio::test]
     #[ignore = "network"]
     async fn verify_signed_config_with_live_fixtures() {
-        let profile = ClientProfile::SLIPSTREAM;
+        let profile = SLIPSTREAM;
         let now = unix_now().expect("clock");
         let networks = live_networks_from_env();
         let gateway = |network| {
@@ -8592,7 +8604,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create client");
@@ -8612,7 +8624,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("get cached client");
@@ -8720,7 +8732,7 @@ pub(crate) mod tests {
                             Dialer::Direct
                         },
                         None,
-                        ClientProfile::SLIPSTREAM_HTTP,
+                        SLIPSTREAM_HTTP,
                     )
                     .await
                     .expect("construct OHTTP client");
@@ -8799,7 +8811,7 @@ pub(crate) mod tests {
                 &format!("https://localhost:{port}/relay"),
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM_HTTP,
+                SLIPSTREAM_HTTP,
             )
             .expect("OHTTP client");
             let target = parse_https(&format!("https://localhost:{port}/relay")).expect("target");
@@ -8845,7 +8857,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create direct client");
@@ -8868,7 +8880,7 @@ pub(crate) mod tests {
                     .expect("unbootstrapped tor client"),
             ),
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create tor client");
@@ -8900,7 +8912,7 @@ pub(crate) mod tests {
                     .expect("unbootstrapped tor client"),
             ),
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create second tor client");
@@ -8921,7 +8933,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .await
         .expect("create SLIPSTREAM client");
@@ -8932,7 +8944,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create SLIPSTREAM_HTTP client");
@@ -8949,7 +8961,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create client without trace prefix");
@@ -8960,7 +8972,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             Some("test-prefix".to_string()),
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create client with trace prefix");
@@ -8985,7 +8997,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             Some("test-prefix".to_string()),
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("get cached client");
@@ -9006,7 +9018,7 @@ pub(crate) mod tests {
             "https://relay.example/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("create client");
@@ -9039,7 +9051,7 @@ pub(crate) mod tests {
     async fn key_error_invalidates_and_refetches() {
         let refetch_count = StdMutex::new(0u32);
         let result = run_exchange(
-            &ClientProfile::SLIPSTREAM,
+            &SLIPSTREAM,
             test_key(),
             &test_request(),
             |_body| async {
@@ -9150,7 +9162,7 @@ pub(crate) mod tests {
             relay_url,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .expect("client");
         cache_a_key(&client).await;
@@ -9174,7 +9186,7 @@ pub(crate) mod tests {
                 &url,
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .unwrap();
             let requests = requests.clone();
@@ -9243,7 +9255,7 @@ pub(crate) mod tests {
             "https://tor-warm-up-cached-pause.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         cache_a_key(&client).await;
@@ -9267,7 +9279,7 @@ pub(crate) mod tests {
             "https://tor-warm-up-fresh-key-429.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let gets = Arc::new(AtomicUsize::new(0));
@@ -9386,7 +9398,7 @@ pub(crate) mod tests {
             "https://relay-pause-at-post-test.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let mut headers = HeaderMap::new();
@@ -9416,7 +9428,7 @@ pub(crate) mod tests {
             "https://relay-hook-at-send-test.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let hook_calls = Arc::new(AtomicUsize::new(0));
@@ -9787,7 +9799,7 @@ pub(crate) mod tests {
             "https://relay-announced-length-test.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         serve_in_process_relay(&client, |_req| async {
@@ -9828,7 +9840,7 @@ pub(crate) mod tests {
             relay_url,
             Dialer::Direct,
             get_default_client_trace_prefix(),
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .await
         .expect("client");
@@ -9895,7 +9907,7 @@ pub(crate) mod tests {
             gateway,
             relay_url,
             get_default_client_trace_prefix(),
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .expect("a cache key");
         let removed = CLIENT_CACHE
@@ -10110,7 +10122,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
 
@@ -10228,7 +10240,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let mut headers = HeaderMap::new();
@@ -10245,7 +10257,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM_HTTP,
+            SLIPSTREAM_HTTP,
         )
         .expect("client");
         let dispatched = Cell::new(false);
@@ -10277,7 +10289,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let mut headers = HeaderMap::new();
@@ -10312,7 +10324,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let mut headers = HeaderMap::new();
@@ -10357,7 +10369,7 @@ pub(crate) mod tests {
             "https://relay-429-key-test.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let err = client
@@ -10379,16 +10391,36 @@ pub(crate) mod tests {
     #[test]
     fn a_doh_query_carries_the_relay_fetch_headers_with_the_dns_accept() {
         assert_eq!(
-            doh_headers(&ClientProfile::SLIPSTREAM),
+            doh_headers(&SLIPSTREAM),
             vec![
                 ("accept", "application/dns-json".to_string()),
                 ("Accept-Encoding", "identity".to_string()),
-                ("User-Agent", "zodl-slipstream-ohttp/0.1".to_string()),
+                ("User-Agent", "zodl-ohttp/1".to_string()),
             ]
         );
-        let relay_fetch = ClientProfile::SLIPSTREAM.headers.key_fetch(None);
+        let relay_fetch = SLIPSTREAM.headers.key_fetch(None);
         assert!(relay_fetch.contains(&("Accept-Encoding", "identity".to_string())));
-        assert!(relay_fetch.contains(&("User-Agent", "zodl-slipstream-ohttp/0.1".to_string())));
+        assert!(relay_fetch.contains(&("User-Agent", "zodl-ohttp/1".to_string())));
+    }
+
+    /// Every request to the relay carries the one fixed `User-Agent` of all Zodl clients: the
+    /// post, the key-configuration fetch, and both profiles.
+    #[test]
+    fn relay_requests_carry_the_fixed_user_agent() {
+        let agent = ("User-Agent", "zodl-ohttp/1".to_string());
+        for profile in [SLIPSTREAM, SLIPSTREAM_HTTP] {
+            for headers in [
+                profile.headers.relay_post(None),
+                profile.headers.relay_post(Some("trace")),
+                profile.headers.key_fetch(None),
+            ] {
+                let agents: Vec<_> = headers
+                    .iter()
+                    .filter(|(name, _)| name.eq_ignore_ascii_case("user-agent"))
+                    .collect();
+                assert_eq!(agents, vec![&agent], "{headers:?}");
+            }
+        }
     }
 
     /// A pause that began while the request was prepared stops the post: rate limited, no retry.
@@ -10476,22 +10508,13 @@ pub(crate) mod tests {
         let parsed = envelope_from_doh_json(&example_networks(), &answer, Network::Testnet)
             .expect("parse answer");
         assert_eq!(parsed, envelope);
-        let keys = open_fixture_signed_keys(
-            &ClientProfile::SLIPSTREAM,
-            &parsed,
-            testnet_gateway(),
-            1_700_000_060,
-        )
-        .expect("verify and select public test key");
+        let keys = open_fixture_signed_keys(&SLIPSTREAM, &parsed, testnet_gateway(), 1_700_000_060)
+            .expect("verify and select public test key");
         assert_eq!(keys.not_after, 1_700_021_600);
         assert_eq!(keys.config.key_id(), 1);
-        let error = open_fixture_signed_keys(
-            &ClientProfile::SLIPSTREAM,
-            &parsed,
-            mainnet_gateway(),
-            1_700_000_060,
-        )
-        .expect_err("testnet envelope cannot authenticate mainnet");
+        let error =
+            open_fixture_signed_keys(&SLIPSTREAM, &parsed, mainnet_gateway(), 1_700_000_060)
+                .expect_err("testnet envelope cannot authenticate mainnet");
         assert!(error.contains("signed for testnet"), "{error}");
     }
 
@@ -10509,7 +10532,7 @@ pub(crate) mod tests {
             &format!("https://{label}.invalid/relay"),
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .unwrap();
         let envelope = br#"{"v":1,"network":"testnet","configs":"ACkBACDNzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzQAEAAEAAQ==","not_before":1700000000,"not_after":1700021600,"key_id":"1325b850","sig":"l7xx3/Q7BNFQfnt79s+enN5Lk6KC8S9f1mE9ZhSjaYGxqeSLRyuwgddKLBhwz1boZ2y2q7oWwkmGuUd5GllVDg=="}"#;
@@ -10534,7 +10557,7 @@ pub(crate) mod tests {
                 &format!("https://{}:{}{}", target.host, target.port, target.path),
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .unwrap();
             let calls = calls.clone();
@@ -10585,7 +10608,7 @@ pub(crate) mod tests {
                         &client.relay_url,
                         Dialer::Direct,
                         None,
-                        ClientProfile::SLIPSTREAM,
+                        SLIPSTREAM,
                     )
                     .unwrap();
                     let health = RequestHealth::new(&client);
@@ -10766,7 +10789,7 @@ pub(crate) mod tests {
             "https://relay-unknown-gateway.invalid/relay",
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let started = std::time::Instant::now();
@@ -10792,7 +10815,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("direct client");
         let tor = OhttpClient::new(
@@ -10805,7 +10828,7 @@ pub(crate) mod tests {
                     .expect("unbootstrapped tor client"),
             ),
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("tor client");
         assert_eq!(direct.backoff_key(), relay);
@@ -10908,7 +10931,7 @@ pub(crate) mod tests {
             relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         *client.key_config.lock().await = Some(CachedKey {
@@ -10928,7 +10951,7 @@ pub(crate) mod tests {
                 resolver,
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .expect("resolver client");
             serve_in_process_relay(&peer, refuse).await;
@@ -10980,7 +11003,7 @@ pub(crate) mod tests {
             &relay,
             Dialer::Direct,
             None,
-            ClientProfile::SLIPSTREAM,
+            SLIPSTREAM,
         )
         .expect("client");
         let refuse = |_req: Request<Incoming>| async {
@@ -10995,7 +11018,7 @@ pub(crate) mod tests {
                 resolver,
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM,
+                SLIPSTREAM,
             )
             .expect("resolver client");
             serve_in_process_relay(&peer, refuse).await;
@@ -11257,14 +11280,8 @@ pub(crate) mod tests {
         let first = example_networks();
         let second = example_testnet_with_another_signer();
         let key = |networks: &OhttpNetworks| {
-            ClientCacheKey::new(
-                networks,
-                TESTNET_GATEWAY,
-                relay,
-                None,
-                ClientProfile::SLIPSTREAM_HTTP,
-            )
-            .expect("a cache key")
+            ClientCacheKey::new(networks, TESTNET_GATEWAY, relay, None, SLIPSTREAM_HTTP)
+                .expect("a cache key")
         };
         assert_ne!(key(&first), key(&second));
         assert_eq!(key(&first), key(&example_networks()));
@@ -11276,7 +11293,7 @@ pub(crate) mod tests {
                 relay,
                 Dialer::Direct,
                 None,
-                ClientProfile::SLIPSTREAM_HTTP,
+                SLIPSTREAM_HTTP,
             )
             .expect("client")
         };
