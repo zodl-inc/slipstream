@@ -10,6 +10,17 @@ workspace.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-13
+
+### Fixed
+
+- Every request to an OHTTP relay (the encapsulated post and the key-configuration
+  fetch) sends `User-Agent: zodl-ohttp/1`, the value all Zodl clients send, instead of
+  `zodl-slipstream-ohttp/0.1`. The relays see the client address, so a client-specific
+  `User-Agent` let them tell the users of one Zodl client from another. DNS-over-HTTPS
+  key fetches carry the same value. Encapsulated request headers and public interfaces
+  are unchanged.
+
 ## [0.5.0] - 2026-11-10
 
 ### Fixed
