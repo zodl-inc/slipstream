@@ -10,6 +10,20 @@ workspace.
 
 ## [Unreleased]
 
+### Changed
+
+- Migrated to `arti-client 0.44` and `tor-rtcompat 0.44`, and to `zcash_client_backend 0.25.0`
+  built on the same Arti. The Arti types in the public API (the client inside `TorConn`, and
+  the Tor transport variant in `ohttp`) are now the 0.44 types, so a caller that builds or
+  passes them must depend on `arti-client 0.44` too.
+- MSRV is now 1.91.
+
+### Fixed
+
+- Tor connections no longer fail outright while the Tor consensus omits its
+  `bandwidth-weights` line. With Arti 0.43 every guard then had zero weight and no circuit
+  could be built; Arti 0.44 picks guards at random in that case.
+
 ## [0.6.0] - 2026-11-13
 
 ### Fixed
